@@ -161,10 +161,12 @@ own vnet, NSG and static public IPv4.
 
 [![Deploy to Azure](https://aka.ms/deploytoazurebutton)](https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Fdefangdevs%2Fagent-box%2Fmaster%2Fdeploy%2Fazure%2Fagent-box.json)
 
-Pick a resource group and region, choose `agent` (`claude` or `codex`), set a
+Pick a resource group and region, set a
 `webPassword` (any 16&ndash;64 characters &mdash; it reaches the box
-base64-encoded, so password-manager symbols are safe), paste an SSH public key
-for the debug account, deploy. The deployment reports success only
+base64-encoded, so password-manager symbols are safe), and deploy. Leave the
+recovery authentication fields at their defaults: Azure generates a separate
+recovery password, with no SSH key required. SSH stays closed by default.
+The deployment reports success only
 once the box has finished its first `agentbox apply` &mdash; on Azure that
 needs no signalling handshake, because an ARM deployment waits on the VM
 extension that runs the bootstrap and a failed apply fails the deployment. The

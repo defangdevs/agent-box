@@ -1,11 +1,12 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "languageVersion": "2.0",
   "contentVersion": "1.0.0.0",
   "metadata": {
     "_generator": {
       "name": "bicep",
       "version": "0.39",
-      "templateHash": "15663939857233343051"
+      "templateHash": "9017800245963676478"
     }
   },
   "parameters": {
@@ -127,7 +128,7 @@
       "type": "bool",
       "defaultValue": false,
       "metadata": {
-        "description": "Open port 22 to allowCidr. Off by default: the portal's serial console already gives debug access, authenticated through Azure RBAC rather than through a credential on an open port. Turn it on for an ordinary SSH session - the box is ordinary Ubuntu, and nothing here wipes /home or /root."
+        "description": "Open port 22 to allowCidr. Off by default: Azure Run Command and VMAccess provide recovery through Azure RBAC with SSH closed. To enable SSH, supply your own recovery credential and restrict allowCidr first."
       }
     },
     "adminUsername": {
@@ -139,19 +140,20 @@
     },
     "authenticationType": {
       "type": "string",
-      "defaultValue": "sshPublicKey",
+      "defaultValue": "password",
       "allowedValues": [
         "sshPublicKey",
         "password"
       ],
       "metadata": {
-        "description": "Whether adminPasswordOrKey below is an SSH public key or a password. Azure will not create a Linux VM with neither, even when SSH is closed at the NSG."
+        "description": "Recovery account authentication. Leave password selected and adminPasswordOrKey empty to generate a separate recovery password. For your own SSH key, choose sshPublicKey and supply your public key. SSH stays closed unless debugSsh is enabled."
       }
     },
     "adminPasswordOrKey": {
       "type": "securestring",
+      "defaultValue": "",
       "metadata": {
-        "description": "SSH public key (ssh-ed25519 AAAA...) or admin password for adminUsername, per authenticationType. This is the debug credential, not the browser terminal password."
+        "description": "Optional recovery credential. Leave empty for normal deployment; Azure generates a separate recovery password, so no SSH key or second password is needed. To use your own recovery credential, enter a password or SSH public key matching authenticationType. It is separate from webPassword and is not returned in outputs. Reset it through Azure if recovery access is needed."
       }
     },
     "namePrefix": {
@@ -173,6 +175,8 @@
   },
   "variables": {
     "effectiveSslipDomains": "[if(not(empty(parameters('sslipDomain'))), createArray(parameters('sslipDomain')), parameters('sslipDomains'))]",
+    "usePasswordAuth": "[and(equals(parameters('authenticationType'), 'password'), not(startsWith(parameters('adminPasswordOrKey'), 'ssh-')))]",
+    "generateRecoveryPassword": "[and(variables('usePasswordAuth'), empty(parameters('adminPasswordOrKey')))]",
     "vmSize": "[split(parameters('vmSizeChoice'), ' ')[0]]",
     "imageSkuBySize": {
       "Standard_B2pls_v2": "server-arm64",
@@ -181,7 +185,7 @@
       "Standard_B4ps_v2": "server-arm64",
       "Standard_B2als_v2": "server"
     },
-    "linuxConfiguration": "[if(equals(parameters('authenticationType'), 'password'), createObject('disablePasswordAuthentication', false()), createObject('disablePasswordAuthentication', true(), 'ssh', createObject('publicKeys', createArray(createObject('path', format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername')), 'keyData', parameters('adminPasswordOrKey'))))))]",
+    "linuxConfiguration": "[if(variables('usePasswordAuth'), createObject('disablePasswordAuthentication', false()), createObject('disablePasswordAuthentication', true(), 'ssh', createObject('publicKeys', createArray(createObject('path', format('/home/{0}/.ssh/authorized_keys', parameters('adminUsername')), 'keyData', parameters('adminPasswordOrKey'))))))]",
     "sshRule": "[if(parameters('debugSsh'), createArray(createObject('name', 'ssh', 'properties', createObject('priority', 1001, 'protocol', 'Tcp', 'access', 'Allow', 'direction', 'Inbound', 'sourceAddressPrefix', parameters('allowCidr'), 'sourcePortRange', '*', 'destinationAddressPrefix', '*', 'destinationPortRange', '22'))), createArray())]",
     "httpsRule": {
       "name": "https",
@@ -214,8 +218,8 @@
     "portalUserYaml": "[if(variables('portalOn'), parameters('portalUser'), '')]",
     "portalIssuerYaml": "[if(variables('portalOn'), parameters('portalIssuer'), '')]"
   },
-  "resources": [
-    {
+  "resources": {
+    "publicIp": {
       "type": "Microsoft.Network/publicIPAddresses",
       "apiVersion": "2024-05-01",
       "name": "[format('{0}-pip', parameters('namePrefix'))]",
@@ -228,7 +232,7 @@
         "publicIPAddressVersion": "IPv4"
       }
     },
-    {
+    "nsg": {
       "type": "Microsoft.Network/networkSecurityGroups",
       "apiVersion": "2024-05-01",
       "name": "[format('{0}-nsg', parameters('namePrefix'))]",
@@ -237,7 +241,7 @@
         "securityRules": "[concat(createArray(variables('httpsRule'), variables('smtpEgressRule')), variables('sshRule'))]"
       }
     },
-    {
+    "vnet": {
       "type": "Microsoft.Network/virtualNetworks",
       "apiVersion": "2024-05-01",
       "name": "[format('{0}-vnet', parameters('namePrefix'))]",
@@ -261,10 +265,10 @@
         ]
       },
       "dependsOn": [
-        "[resourceId('Microsoft.Network/networkSecurityGroups', format('{0}-nsg', parameters('namePrefix')))]"
+        "nsg"
       ]
     },
-    {
+    "nic": {
       "type": "Microsoft.Network/networkInterfaces",
       "apiVersion": "2024-05-01",
       "name": "[format('{0}-nic', parameters('namePrefix'))]",
@@ -275,7 +279,7 @@
             "name": "ipconfig1",
             "properties": {
               "subnet": {
-                "id": "[reference(resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('namePrefix'))), '2024-05-01').subnets[0].id]"
+                "id": "[reference('vnet').subnets[0].id]"
               },
               "privateIPAllocationMethod": "Dynamic",
               "publicIPAddress": {
@@ -286,11 +290,11 @@
         ]
       },
       "dependsOn": [
-        "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix')))]",
-        "[resourceId('Microsoft.Network/virtualNetworks', format('{0}-vnet', parameters('namePrefix')))]"
+        "publicIp",
+        "vnet"
       ]
     },
-    {
+    "vm": {
       "type": "Microsoft.Compute/virtualMachines",
       "apiVersion": "2024-07-01",
       "name": "[format('{0}-vm', parameters('namePrefix'))]",
@@ -312,7 +316,7 @@
         "osProfile": {
           "computerName": "[parameters('namePrefix')]",
           "adminUsername": "[parameters('adminUsername')]",
-          "adminPassword": "[if(equals(parameters('authenticationType'), 'password'), parameters('adminPasswordOrKey'), null())]",
+          "adminPassword": "[if(variables('usePasswordAuth'), if(variables('generateRecoveryPassword'), listOutputsWithSecureValues('recoveryPassword', '2025-04-01').password, parameters('adminPasswordOrKey')), null())]",
           "linuxConfiguration": "[variables('linuxConfiguration')]"
         },
         "networkProfile": {
@@ -329,10 +333,11 @@
         }
       },
       "dependsOn": [
-        "[resourceId('Microsoft.Network/networkInterfaces', format('{0}-nic', parameters('namePrefix')))]"
+        "nic",
+        "recoveryPassword"
       ]
     },
-    {
+    "bootstrapExtension": {
       "type": "Microsoft.Compute/virtualMachines/extensions",
       "apiVersion": "2024-07-01",
       "name": "[format('{0}/{1}', format('{0}-vm', parameters('namePrefix')), 'agent-box-bootstrap')]",
@@ -343,57 +348,93 @@
         "typeHandlerVersion": "2.1",
         "autoUpgradeMinorVersion": true,
         "protectedSettings": {
-          "script": "[base64(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(variables('bootstrapTemplate'), '@@NIXINSTALLER@@', parameters('nixInstallerUrl')), '@@FLAKEREF@@', parameters('agentBoxFlakeRef')), '@@USER@@', parameters('userName')), '@@AGENTSMDB64@@', base64(parameters('agentsMd'))), '@@SSLIPDOMAINSB64@@', base64(string(variables('effectiveSslipDomains')))), '@@WEBPASSWORD@@', base64(parameters('webPassword'))), '@@PORTALISSUERB64@@', base64(variables('portalIssuerYaml'))), '@@PORTALUSERIDB64@@', base64(variables('portalUserYaml'))), '@@IMAGERUNTIME@@', toLower(string(parameters('imageIncludesRuntime')))), '@@PUBLICIPB64@@', base64(reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress)))]"
+          "script": "[base64(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(variables('bootstrapTemplate'), '@@NIXINSTALLER@@', parameters('nixInstallerUrl')), '@@FLAKEREF@@', parameters('agentBoxFlakeRef')), '@@USER@@', parameters('userName')), '@@AGENTSMDB64@@', base64(parameters('agentsMd'))), '@@SSLIPDOMAINSB64@@', base64(string(variables('effectiveSslipDomains')))), '@@WEBPASSWORD@@', base64(parameters('webPassword'))), '@@PORTALISSUERB64@@', base64(variables('portalIssuerYaml'))), '@@PORTALUSERIDB64@@', base64(variables('portalUserYaml'))), '@@IMAGERUNTIME@@', toLower(string(parameters('imageIncludesRuntime')))), '@@PUBLICIPB64@@', base64(reference('publicIp').ipAddress)))]"
         }
       },
       "dependsOn": [
-        "[resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix')))]",
-        "[resourceId('Microsoft.Compute/virtualMachines', format('{0}-vm', parameters('namePrefix')))]"
+        "publicIp",
+        "vm"
       ]
+    },
+    "recoveryPassword": {
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "2025-04-01",
+      "name": "[format('{0}-recovery-password', parameters('namePrefix'))]",
+      "properties": {
+        "expressionEvaluationOptions": {
+          "scope": "inner"
+        },
+        "mode": "Incremental",
+        "template": {
+          "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+          "languageVersion": "2.0",
+          "contentVersion": "1.0.0.0",
+          "metadata": {
+            "_generator": {
+              "name": "bicep",
+              "version": "0.39",
+              "templateHash": "6346329396001149470"
+            }
+          },
+          "parameters": {
+            "generatedPassword": {
+              "type": "securestring",
+              "defaultValue": "[format('Ab1!{0}', newGuid())]"
+            }
+          },
+          "resources": {},
+          "outputs": {
+            "password": {
+              "type": "securestring",
+              "value": "[parameters('generatedPassword')]"
+            }
+          }
+        }
+      }
     }
-  ],
+  },
   "outputs": {
     "webUrl": {
       "type": "string",
       "metadata": {
         "description": "Browser terminal. Sign in with the userName and the webPassword chosen at deployment time. The first load waits on Caddy's ACME certificate. (The URL deliberately carries no user@ prefix: Chrome answers the auth challenge with URL userinfo plus an EMPTY password, and credentials typed into the prompt cannot override the URL-embedded identity.)"
       },
-      "value": "[format('https://{0}/{1}/', reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress, parameters('userName'))]"
+      "value": "[format('https://{0}/{1}/', reference('publicIp').ipAddress, parameters('userName'))]"
     },
     "aliasUrls": {
       "type": "array",
       "metadata": {
         "description": "DNS alias URLs. Caddy obtains each certificate on first use."
       },
-      "value": "[map(variables('effectiveSslipDomains'), lambda('suffix', format('https://{0}.{1}/{2}/', replace(reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress, '.', '-'), lambdaVariables('suffix'), parameters('userName'))))]"
+      "value": "[map(variables('effectiveSslipDomains'), lambda('suffix', format('https://{0}.{1}/{2}/', replace(reference('publicIp').ipAddress, '.', '-'), lambdaVariables('suffix'), parameters('userName'))))]"
     },
     "sslipUrl": {
       "type": "string",
       "metadata": {
         "description": "First DNS alias URL, retained for clients of the former single-value output. Empty when sslipDomains is empty."
       },
-      "value": "[if(equals(length(map(variables('effectiveSslipDomains'), lambda('suffix', format('https://{0}.{1}/{2}/', replace(reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress, '.', '-'), lambdaVariables('suffix'), parameters('userName'))))), 0), '', map(variables('effectiveSslipDomains'), lambda('suffix', format('https://{0}.{1}/{2}/', replace(reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress, '.', '-'), lambdaVariables('suffix'), parameters('userName'))))[0])]"
+      "value": "[if(equals(length(map(variables('effectiveSslipDomains'), lambda('suffix', format('https://{0}.{1}/{2}/', replace(reference('publicIp').ipAddress, '.', '-'), lambdaVariables('suffix'), parameters('userName'))))), 0), '', map(variables('effectiveSslipDomains'), lambda('suffix', format('https://{0}.{1}/{2}/', replace(reference('publicIp').ipAddress, '.', '-'), lambdaVariables('suffix'), parameters('userName'))))[0])]"
     },
     "remoteControlSession": {
       "type": "string",
       "metadata": {
         "description": "Claude Remote Control session name. Only meaningful if the session started from the settings page's install+sign-in cards is a claude one: after finishing `claude login` once in the browser terminal, the Claude desktop and mobile apps can drive it."
       },
-      "value": "[format('{0}-main@{1}', parameters('userName'), reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress)]"
+      "value": "[format('{0}-main@{1}', parameters('userName'), reference('publicIp').ipAddress)]"
     },
     "publicAddress": {
       "type": "string",
       "metadata": {
         "description": "Static public IPv4 address."
       },
-      "value": "[reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress]"
+      "value": "[reference('publicIp').ipAddress]"
     },
     "sshCommand": {
       "type": "string",
       "metadata": {
-        "description": "Debug access. Closed at the NSG unless debugSsh is true; the portal's serial console works either way."
+        "description": "Debug access. Closed at the NSG unless debugSsh is true. Supply a known recovery credential for SSH, or use Azure Run Command/VMAccess with SSH closed."
       },
-      "value": "[format('ssh {0}@{1}', parameters('adminUsername'), reference(resourceId('Microsoft.Network/publicIPAddresses', format('{0}-pip', parameters('namePrefix'))), '2024-05-01').ipAddress)]"
+      "value": "[format('ssh {0}@{1}', parameters('adminUsername'), reference('publicIp').ipAddress)]"
     },
     "bootstrapLog": {
       "type": "string",

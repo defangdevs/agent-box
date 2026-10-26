@@ -77,9 +77,11 @@ async function main() {
     assert.ok(!link.href.includes(awsPassword));
     assert.ok(!link.href.includes(azurePassword));
   }
-  const azureLink = html.split('class="launch azure" href="')[1]?.split('"')[0];
+  const azureLink = html.match(/<a class="launch azure"[^>]*>/)?.[0];
   assert.ok(azureLink);
   assert.ok(!azureLink.includes('webPassword'));
+  assert.ok(azureLink.includes('target="_blank"'));
+  assert.ok(azureLink.includes('rel="noopener noreferrer"'));
 
   const noHash = await loadPage({ hashAvailable: false });
   assert.equal(noHash.elements.get('azure-password-generated').hidden, false);

@@ -25,7 +25,7 @@ on:
   push:
     branches-ignore: [ master ]
     paths:
-      - 'deploy/azure/agent-box.bicep'
+      - 'deploy/azure/*.bicep'
       - '.github/workflows/azure-bicep-sync.yml'
 
 concurrency:
