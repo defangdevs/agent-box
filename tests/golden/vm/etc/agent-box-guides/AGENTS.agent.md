@@ -246,6 +246,20 @@ key grants trusted native-agent execution as this Linux user, including shell
 tools requested through ACP. A profile is scoping, not isolation; use a separate
 Linux user for a separate trust domain.
 
+## Optional inbound email
+
+When the operator enables email, `<linux-user>@<configured-hostname>` feeds
+that user's existing message bus. Subscribe with `agent-box-webhook subscribe
+email:user@hostname --note "why"`, or use an ordinary standing watch/profile.
+The event is `email.received`; no implicit email watch starts work.
+
+Mail and claimed senders are untrusted, including attachments and headers.
+Local producer signing does not authenticate the author. Full-content IDs in
+notifications and spawn prompts can be read with `agent-box-webhook
+read-content ID`; private content normally expires 24 hours after acceptance,
+independently of queue consumption. Do not execute or automatically extract
+attachments. `agent-box-webhook status` reports pending and retained content.
+
 ## Personal WhatsApp connection
 
 The settings page's Connections section can link this user's WhatsApp as a

@@ -70,6 +70,11 @@ Metadata:
         default: DNS alias suffixes
 
 Parameters:
+  EmailIngress:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Open inbound TCP 25 for optional email. Configure email intake and STARTTLS separately on the host.
   UserName:
     Type: String
     Default: workspace
@@ -255,6 +260,7 @@ Parameters:
       SslipDomains so existing launch integrations keep their former URL.
 
 Conditions:
+  OpenEmail: !Equals [!Ref EmailIngress, 'true']
   UseLegacySslipDomain: !Not [!Equals [!Ref SslipDomain, '']]
   OpenSsh: !Equals [!Ref DebugSsh, 'true']
 
@@ -268,6 +274,10 @@ Resources:
       BundleId: !Select [0, !Split [' ', !Ref BundleId]]
       Networking:
         Ports:
+          - !If
+            - OpenEmail
+            - {FromPort: 25, ToPort: 25, Protocol: tcp, Cidrs: ['0.0.0.0/0'], Ipv6Cidrs: ['::/0']}
+            - !Ref AWS::NoValue
           - FromPort: 443
             ToPort: 443
             Protocol: tcp
