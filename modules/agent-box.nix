@@ -6180,6 +6180,11 @@ hibernate_one() {
     return 1
   fi
 
+  # tmux kill-session returns once the session is destroyed, not once the
+  # native process has exited, so it can still land one last transcript write
+  # after the second _still_quiet snapshot. Remember the pane pids and wait
+  # (bounded) for them and their process groups to go before re-checking.
+  _panepids="$(t list-panes -t "=$_name" -F '#{pane_pid}' 2>/dev/null || true)"
   if ! kill_session "$_name"; then
     # A failed kill freed no slot. Undo only our own transition; a concurrent
     # explicit stop/restart is authoritative and changes hibernatedAt first.
@@ -6187,6 +6192,25 @@ hibernate_one() {
     return 1
   fi
 
+  _i=0
+  while [ "$_i" -lt 50 ]; do
+    _alive=0
+    for _pp in $_panepids; do
+      if kill -0 "$_pp" 2>/dev/null \
+          || { command -v pgrep >/dev/null 2>&1 && pgrep -g "$_pp" >/dev/null 2>&1; }; then
+        _alive=1
+      fi
+    done
+    [ "$_alive" = 1 ] || break
+    _i=$((_i + 1))
+    sleep 0.1
+  done
+  # A writer that outlives the wait can still append after the snapshot, so
+  # the quiet check proves nothing: un-park and let the supervisor resume.
+  if [ "$_alive" = 1 ]; then
+    _undo_hibernation || return $?
+    return 1
+  fi
   if ! _still_quiet; then
     _undo_hibernation || return $?
     return 1

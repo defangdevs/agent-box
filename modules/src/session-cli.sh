@@ -354,6 +354,12 @@ hibernate_one() {
     _i=$((_i + 1))
     sleep 0.1
   done
+  # A writer that outlives the wait can still append after the snapshot, so
+  # the quiet check proves nothing: un-park and let the supervisor resume.
+  if [ "$_alive" = 1 ]; then
+    _undo_hibernation || return $?
+    return 1
+  fi
   if ! _still_quiet; then
     _undo_hibernation || return $?
     return 1
