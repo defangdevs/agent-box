@@ -407,7 +407,7 @@
             "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
             " kill-server"
         )
-        machine.wait_until_succeeds("! pgrep -u agent -x tmux", timeout=30)
+        machine.wait_until_succeeds("! pgrep -u agent -x 'tmux: server'", timeout=30)
 
     machine.succeed("systemctl stop agent-box@agent.service")
     quiesce_sessions()
