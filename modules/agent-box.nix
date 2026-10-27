@@ -35236,6 +35236,7 @@ if __name__ == "__main__":
     environment.etc."agent-box/bin/agent-box-email".source = "${emailCli}/bin/agent-box-email";
     environment.etc."agent-box/bin/agent-box-email-smtpd".source = "${pkgs.opensmtpd}/sbin/smtpd";
     environment.etc."agent-box/email-webhook.py".source = localWebhookScript;
+    environment.etc."agent-box/email-tools/smtpctl".source = "${pkgs.opensmtpd}/bin/smtpctl";
     networking.firewall.allowedTCPPorts = [ 25 ];
     users.groups.smtpd = { };
     users.groups.smtpq = { };

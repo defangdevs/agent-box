@@ -29,7 +29,7 @@
         -days 2 -subj /CN=box.test
       chmod 600 /etc/agent-box-email-key.pem
     '';
-    environment.systemPackages = [ pkgs.python3 pkgs.opensmtpd ];
+    environment.systemPackages = [ pkgs.python3 pkgs.util-linux ];
     environment.etc."email-probe.py".text = ''
       import smtplib, ssl
       body = b"From: claimed@example.org\r\nTo: other@elsewhere.example\r\nSubject: Test mail\r\nMessage-ID: <reused@example.org>\r\n\r\nComplete private body\r\n"
@@ -69,7 +69,7 @@
     machine.fail("test -d /home/agent/.local/state/local-webhook/spool/content/new")
     machine.succeed("systemctl start agent-box-webhook@agent.socket")
     # Force the MTA retry now instead of waiting for its normal backoff.
-    machine.succeed("/run/current-system/sw/bin/smtpctl schedule all")
+    machine.succeed("runuser -u root -g smtpq -- /etc/agent-box/email-tools/smtpctl schedule all")
     machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 2")
     machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/peers/emailwait/new -type f | wc -l) -eq 2")
     machine.succeed("find /home/agent/.local/state/local-webhook/spool/content/new -type f -exec stat -c '%U %a' {} + | grep 'agent 600' >/dev/null")

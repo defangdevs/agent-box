@@ -113,6 +113,7 @@ class NativeEmail(unittest.TestCase):
             self.assertEqual(cfg['domains'], ['box.example'])
             links = dict(tree.links)
             self.assertEqual(links['/etc/agent-box/bin/agent-box-email-smtpd'], str(profile / 'sbin/smtpd'))
+            self.assertEqual(links['/etc/agent-box/email-tools/smtpctl'], str(profile / 'bin/smtpctl'))
             self.assertIn('agent-box-email.service', tree.units)
             self.assertIn('smtpq', text('/etc/tmpfiles.d/agent-box.conf'))
             self.assertIn('User=alice', text('/etc/systemd/system/agent-box-email-source@alice.service'))

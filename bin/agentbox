@@ -1420,6 +1420,7 @@ class Renderer:
         t.link(self.p("/etc/agent-box/bin/agent-box-email"), self.bin / "agent-box-email")
         t.link(self.p("/etc/agent-box/bin/agent-box-email-smtpd"), self.profile / "sbin" / "smtpd")
         t.link(self.p("/etc/agent-box/email-webhook.py"), self.spec.webhook_script)
+        t.link(self.p("/etc/agent-box/email-tools/smtpctl"), self.bin / "smtpctl")
         cfg_path = self.p("/etc/agent-box/email.json")
         cfg_text = json.dumps(cfg, sort_keys=True) + "\n"
         try:

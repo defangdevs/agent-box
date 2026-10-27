@@ -121,7 +121,9 @@ local-channels#105 storage-limit work remains separate.
 from 1 KiB to 8 MiB). Attachments share that message budget. The adapter allows an additional 64 KiB for MTA-added transport headers.
 Parsing is limited to 100 MIME parts; SMTP transactions allow 10 recipients and 10 messages per
 connection. Undeliverable transport mail expires after one day. Inspect the
-OpenSMTPD queue with `smtpctl show queue` as the administrator, and bus/content
+OpenSMTPD queue as root with
+`runuser -u root -g smtpq -- /etc/agent-box/email-tools/smtpctl show queue`
+(the tool requires the queue group), and bus/content
 state with `agent-box-webhook status` as the recipient user.
 
 Turning email off stops reception. Transport queue files are preserved under
