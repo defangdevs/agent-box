@@ -372,6 +372,14 @@ UNIT_VARS_BY_DESIGN = {
         "used to leave a bare `nix` for the pane's shell, which on a native "
         "box resolves against a PATH that carries none). The daemon already "
         "treats the variable as optional and resolves it itself when unset"),
+    "agent-box-harness-upgrade@.service AGENT_BOX_NIX_BIN": (
+        "module",
+        "same divergence as agent-box@.service above, for the per-user "
+        "harness upgrade (issue #742). The module's drop-in replaces the "
+        "unit's PATH with one that has no nix, and NixOS has none of the "
+        "fallback locations agent_nix_bin probes, so it names the store "
+        "path. A native box keeps nix on the unit's PATH or in the "
+        "standard multi-user profile, which agent_nix_bin finds at USE"),
     "agent-web-terminal@.service AGENT_BOX_SESSION_BIN": (
         "native",
         "the attach wrapper needs the session CLI to start a stopped "

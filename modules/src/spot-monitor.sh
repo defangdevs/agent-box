@@ -45,17 +45,23 @@ notify_user() {
         '.sessions[$s].agent // ""' "$sf" 2>/dev/null)
       rc=$($JQ -r --arg s "$s" \
         '.sessions[$s].remoteControl // false' "$sf" 2>/dev/null)
-      # A codex remoteControl session's foreground process is the pairing
-      # daemon wrapper (codex-remote-control.sh), not a codex conversation —
-      # its pane shows a pairing code and takes single-key commands of its
-      # own ([Enter], "login"), so send-keys lands the notice on a screen
-      # with nobody reading it and can trigger the wrapper's own bindings
-      # instead of being seen as a message (issue #691). There is no
+      rcserver=$($JQ -r --arg s "$s" \
+        '.sessions[$s].remoteControlServer // false' "$sf" 2>/dev/null)
+      rcdaemon=$($JQ -r --arg s "$s" \
+        '.sessions[$s].remoteControlDaemon // false' "$sf" 2>/dev/null)
+      # A remote-control server pane is not one conversation. For Codex its
+      # foreground process is the pairing daemon wrapper; for Claude it is
+      # `claude remote-control`, which may serve several app-created sessions.
+      # Both panes have server controls of their own, so send-keys lands on a
+      # screen with nobody reading it; it may trigger those controls instead
+      # of being seen as a message (issue #691). There is no
       # per-conversation tmux target to fall back to either — every live
       # remote thread the daemon serves shares this one pane. Log the skip
       # rather than silently typing into it.
-      if [ "$agent" = codex ] && [ "$rc" = true ]; then
-        echo "spot-monitor: skipping '$s' — codex remote-control daemon pane, not a conversation" >&2
+      if [ "$rcdaemon" = true ] \
+           || { [ "$agent" = codex ] && [ "$rc" = true ]; } \
+           || { [ "$agent" = claude ] && [ "$rcserver" = true ]; }; then
+        echo "spot-monitor: skipping '$s' - daemon pane, not a conversation" >&2
         continue
       fi
       # Target "=NAME:" — an EXACT session match resolved to its

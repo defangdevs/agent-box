@@ -379,7 +379,12 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
             or entry.get("origin") == "webhook" or name.startswith("hook-")
             or _hibernate_crashed(entry)):
         return None
-    if harness == "codex" and entry.get("remoteControl") is True:
+    # These panes own a daemon, not one resumable conversation. Recognize
+    # both legacy harness-specific encodings as well as the canonical bit.
+    if (entry.get("remoteControlDaemon") is True
+            or (harness == "codex" and entry.get("remoteControl") is True)
+            or (harness == "claude"
+                and entry.get("remoteControlServer") is True)):
         return None
     lease, lease_path, lease_hash = _hibernate_has_lease(name)
     watching, watch_path, watch_hash = _hibernate_has_watch(name)

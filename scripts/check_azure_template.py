@@ -207,6 +207,12 @@ def render_bootstrap(template: dict, values: dict | None = None) -> str:
     return script
 
 
+def resources(template: dict):
+    """ARM 1.x arrays and 2.0 symbolic resource maps."""
+    entries = template.get("resources", [])
+    return entries.values() if isinstance(entries, dict) else entries
+
+
 def bootstrap_chain(template: dict) -> str:
     """The compiled expression that substitutes and encodes the bootstrap.
 
@@ -218,7 +224,7 @@ def bootstrap_chain(template: dict) -> str:
     chain = template.get("variables", {}).get("bootstrap")
     if chain:
         return chain
-    for resource in template.get("resources", []):
+    for resource in resources(template):
         if resource.get("type") != "Microsoft.Compute/virtualMachines/extensions":
             continue
         script = (resource.get("properties", {}).get("protectedSettings", {})
@@ -284,7 +290,8 @@ def check_static_domain(template: dict) -> int:
                      .get("defaultValue"))
     domains_default = (template.get("parameters", {}).get("sslipDomains", {})
                        .get("defaultValue"))
-    public_ip_ref = "reference(resourceId('Microsoft.Network/publicIPAddresses'"
+    public_ip_ref = ("reference('publicIp')" if template.get("languageVersion") == "2.0"
+                     else "reference(resourceId('Microsoft.Network/publicIPAddresses'")
     failures = []
     if "--settle-delay" in script:
         failures.append("bootstrap still requests an avoidable settle delay")
@@ -641,7 +648,7 @@ def check_secrets(template: dict) -> int:
         return 1
 
     exposed = []
-    for res in template.get("resources", []):
+    for res in resources(template):
         if res.get("type") != "Microsoft.Compute/virtualMachines/extensions":
             continue
         props = res.get("properties", {})
@@ -669,6 +676,68 @@ def check_secrets(template: dict) -> int:
     return 0
 
 
+def check_recovery_defaults(template: dict) -> int:
+    """A browser password must be the only required deployment credential."""
+    params = template["parameters"]
+    recovery = params["adminPasswordOrKey"]
+    failures = []
+    if params["authenticationType"].get("defaultValue") != "password":
+        failures.append("default authentication still requires an SSH key")
+    if recovery.get("type") != "securestring":
+        failures.append("recovery credential is not a securestring")
+    if recovery.get("defaultValue") != "":
+        failures.append("portal recovery field must be empty and optional")
+    deployment = template["resources"]["recoveryPassword"]["properties"]
+    if deployment.get("parameters"):
+        failures.append("internal generated password must not be supplied by the portal")
+    generator = deployment["template"]
+    seed = generator["parameters"]["generatedPassword"]
+    if (seed.get("type") != "securestring"
+            or seed.get("defaultValue") != "[format('Ab1!{0}', newGuid())]"):
+        failures.append("internal recovery password is not securely generated")
+    output = generator["outputs"]["password"]
+    if (output.get("type") != "securestring"
+            or output.get("value") != "[parameters('generatedPassword')]"):
+        failures.append("internal recovery output is not protected")
+    if "defaultValue" in params["webPassword"]:
+        failures.append("browser password must still be supplied by the visitor")
+    if params["debugSsh"].get("defaultValue") is not False:
+        failures.append("SSH must remain closed by default")
+    public_outputs = json.dumps(template.get("outputs", {}))
+    if ("adminPasswordOrKey" in public_outputs
+            or "listOutputsWithSecureValues" in public_outputs):
+        failures.append("recovery credential is exposed in deployment outputs")
+    if "adminPasswordOrKey" in bootstrap_chain(template):
+        failures.append("recovery credential is being sent to the bootstrap")
+    vm = next(r for r in resources(template)
+              if r["type"] == "Microsoft.Compute/virtualMachines")
+    profile = vm["properties"]["osProfile"]
+    if profile.get("adminPassword") != (
+            "[if(variables('usePasswordAuth'), "
+            "if(variables('generateRecoveryPassword'), "
+            "listOutputsWithSecureValues('recoveryPassword', '2025-04-01').password, "
+            "parameters('adminPasswordOrKey')), null())]"):
+        failures.append("password authentication does not use the recovery credential")
+    if template["variables"].get("generateRecoveryPassword") != (
+            "[and(variables('usePasswordAuth'), "
+            "empty(parameters('adminPasswordOrKey')))]"):
+        failures.append("explicit recovery credentials must override generation")
+    if template["variables"].get("usePasswordAuth") != (
+            "[and(equals(parameters('authenticationType'), 'password'), "
+            "not(startsWith(parameters('adminPasswordOrKey'), 'ssh-')))]"):
+        failures.append("an ssh- value must be installed as a key, not a password")
+    linux = template["variables"]["linuxConfiguration"]
+    if "parameters('adminPasswordOrKey')" not in linux:
+        failures.append("explicit SSH key authentication no longer uses the supplied key")
+    if failures:
+        print("FAIL: Azure recovery defaults:\n       "
+              + "\n       ".join(failures), file=sys.stderr)
+        return 1
+    print("OK: only the browser password is required; recovery password is "
+          "generated, protected, and SSH stays closed.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -690,6 +759,7 @@ def main() -> int:
         check_bootstrap(template, SAMPLE, "hostile sample values"),
         check_bootstrap(template, defaults_render(template), "template defaults"),
         check_secrets(template),
+        check_recovery_defaults(template),
         check_written_config(template),
     )
     if not args.no_build:

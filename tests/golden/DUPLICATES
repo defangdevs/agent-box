@@ -39,3 +39,5 @@ web/units/agent-box-nixpkgs-cache.service -> vm/units/agent-box-nixpkgs-cache.se
 web/units/agent-box-nixpkgs-cache.timer -> vm/units/agent-box-nixpkgs-cache.timer
 web/units/agent-box-webhook@robot.service -> web/units/agent-box-webhook@agent.service
 web/units/earlyoom.service -> vm/units/earlyoom.service
+web/units/nix-daemon.service -> vm/units/nix-daemon.service
+web/units/nix-daemon.socket -> vm/units/nix-daemon.socket

@@ -617,6 +617,8 @@ SESSION_SCHEMA = _Obj({
     "agent": STR,
     "skipPermissions": BOOL,
     "remoteControl": BOOL,
+    "remoteControlDaemon": BOOL,
+    "remoteControlServer": BOOL,
     "remoteControlName": STR,
     "extraArgs": STR_LIST,
     "cwd": STR,
@@ -1047,6 +1049,31 @@ class User:
                     f"user {name}: session {sname!r} uses agent {agent!r}, "
                     f"which is not in agents {spec.agents!r}"
                 )
+            daemon = bool((s or {}).get("remoteControlDaemon")
+                          or (s or {}).get("remoteControlServer")
+                          or (agent == "codex"
+                              and (s or {}).get("remoteControl") is True))
+            if (s or {}).get("remoteControlDaemon") and agent not in ("claude", "codex"):
+                raise ConfigError(
+                    f"user {name}: session {sname!r} may enable "
+                    "remoteControlDaemon only for Claude or Codex"
+                )
+            if (s or {}).get("remoteControlServer"):
+                if (agent != "claude"
+                        or (s or {}).get("remoteControl", True) is not True):
+                    raise ConfigError(
+                        f"user {name}: session {sname!r} may enable "
+                        "remoteControlServer only for a Claude session with "
+                        "remoteControl: true"
+                    )
+            if (agent == "claude" and daemon
+                    and ((s or {}).get("prompt") is not None
+                         or (s or {}).get("initialPrompt") is not None
+                         or (s or {}).get("resumePrompt") is not None)):
+                raise ConfigError(
+                    f"user {name}: session {sname!r} cannot set a prompt "
+                    "in Claude daemon mode"
+                )
 
     @property
     def url(self):
@@ -1265,6 +1292,47 @@ class Renderer:
             out += f"export {entry['name']}={rendered}\n"
         return out
 
+    def tls_environment(self):
+        """The runtime owns distrust, even when the distro bundle is stale."""
+        bundle = str(self.profile / "etc/ssl/certs/ca-no-trust-rules-bundle.crt")
+        return {
+            "SSL_CERT_FILE": bundle,
+            "SSL_CERT_DIR": str(self.profile / "etc/agent-box/empty-ca-dir"),
+            "NIX_SSL_CERT_FILE": bundle,
+            "CURL_CA_BUNDLE": bundle,
+            "REQUESTS_CA_BUNDLE": bundle,
+            "NODE_OPTIONS": "--use-openssl-ca",
+        }
+
+    def tls_policy(self, t):
+        pairs = sorted(self.tls_environment().items())
+        t.file(self.p("/etc/agent-box/tls.env"), env_file(pairs))
+        t.file(self.p("/etc/profile.d/agent-box-tls.sh"), GENERATED_HEADER
+               + "".join(f"export {k}={shlex.quote(v)}\n" for k, v in pairs))
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in pairs)
+        # t.units lists only units to enable. Discover socket/timer-activated
+        # services from their rendered files too. Keep the original unit bytes
+        # intact: feature-off cleanup uses them as an ownership witness.
+        services = {"nix-daemon.service"}
+        for path, (text, mode) in list(t.files.items()):
+            file = Path(path)
+            if file.name.endswith(".service"):
+                services.add(file.name)
+            elif file.parent.name.endswith(".service.d"):
+                services.add(file.parent.name[:-2])
+            if mode & 0o111 and GENERATED_HEADER in text and text.startswith("#!"):
+                # Keep the ownership header directly after the shebang.
+                t.file(file, text.replace(GENERATED_HEADER, GENERATED_HEADER + exports, 1), mode)
+        active = set()
+        for unit in sorted(services):
+            path = self.p("/etc/systemd/system", f"{unit}.d", "05-tls.conf")
+            active.add(path)
+            t.file(path, dropin(["EnvironmentFile=/etc/agent-box/tls.env"]))
+        # These generated drop-ins belong only to the services still rendered.
+        for path in self.p("/etc/systemd/system").glob("*.service.d/05-tls.conf"):
+            if path not in active:
+                t.gone(path)
+
     def render(self):
         t = Tree()
         self.dirs(t)
@@ -1300,6 +1368,7 @@ class Renderer:
             self.web_off(t)
         if not self.spec.webhook_enable:
             self.webhook_off(t)
+        self.tls_policy(t)
         return t
 
     # -- agent defaults ------------------------------------------------------
@@ -3234,6 +3303,10 @@ class Renderer:
         for sname in sorted(u.sessions):
             s = u.sessions[sname] or {}
             agent = s.get("agent") or u.agent
+            daemon = bool(s.get("remoteControlDaemon")
+                          or s.get("remoteControlServer")
+                          or (agent == "codex"
+                              and s.get("remoteControl") is True))
             sessions[sname] = {
                 "agent": agent,
                 "skipPermissions": bool(s.get("skipPermissions", True)),
@@ -3243,7 +3316,15 @@ class Renderer:
                 # interactive TUI (issue #623), mirroring
                 # sessionOpts.remoteControl's default in agent-box.nix.in.
                 # Every other harness keeps the old default.
-                "remoteControl": bool(s.get("remoteControl", agent != "codex")),
+                "remoteControl": (True if daemon else
+                                  bool(s.get("remoteControl", agent != "codex"))),
+                "remoteControlDaemon": daemon,
+                # Explicit because existing Claude remoteControl=true records
+                # are ordinary TUIs mirrored to the apps. An update must not
+                # reinterpret them as the newer multi-session server mode.
+                "remoteControlServer": bool(
+                    s.get("remoteControlServer")
+                    or (daemon and agent == "claude")),
                 "extraArgs": list(s.get("extraArgs") or []),
                 # null → the supervisor derives "<user>-<session>@<host>"
                 # at start time.
@@ -4536,6 +4617,11 @@ def activate(spec, tree, removed, advisory, act):
                         ["systemctl", "enable", "--now", OOMD_UNIT]):
             remove_if_ours(OOMD_STAMP)
     act.require("systemctl daemon-reload", ["systemctl", "daemon-reload"])
+    # The multi-user Nix daemon fetches independently of an agent's process
+    # environment. Re-read the runtime trust policy without enabling it.
+    if "nix-daemon.service" in active_units("nix-daemon.service"):
+        act.require("refresh Nix daemon TLS trust",
+                    ["systemctl", "restart", "nix-daemon.service"])
     # Enable what the config declares; stop instances for users that
     # were removed from it, so a shrinking config is honored too.
     for unit in tree.units:

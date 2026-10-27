@@ -180,7 +180,7 @@
           # Capturing the override text here is what would have caught it.
           unitFilter = n:
             builtins.match
-              "(agent-box|agent-web|caddy|fail2ban|earlyoom).*|multi-user\\.target|sockets\\.target"
+              "(agent-box|agent-web|caddy|fail2ban|earlyoom|nix-daemon).*|multi-user\\.target|sockets\\.target"
               n != null;
           # /etc content the module owns or materially shapes. The fail2ban
           # dir entries (filter.d/, action.d/) are upstream package trees and
@@ -445,6 +445,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             ];
           };
           services = multiUser.config.systemd.services;
+          tlsCacert = pkgs.cacert.override {
+            blacklist = builtins.fromJSON (builtins.readFile ./modules/src/tls-roots.json);
+          };
+
           # issue #154 Phase 3: "agent-box@" is the systemd %i template unit,
           # shipped verbatim via systemd.packages (not a systemd.services
           # Nix declaration — a template-level drop-in there was found to
@@ -1833,6 +1837,22 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               printf 'fail2ban jail parses, is armed, and matches\n' > "$out"
             '';
 
+          tls-trust =
+            assert builtins.all (name: builtins.elem name multiUser.config.security.pki.caCertificateBlacklist)
+              (builtins.fromJSON (builtins.readFile ./modules/src/tls-roots.json));
+            assert multiUser.config.systemd.globalEnvironment.NODE_OPTIONS == "--use-openssl-ca";
+            assert multiUser.config.systemd.services.nix-daemon.environment.SSL_CERT_FILE == "/etc/ssl/certs/ca-certificates.crt";
+            pkgs.runCommand "agent-box-tls-trust" {
+            nativeBuildInputs = [ pkgs.python3 pkgs.openssl ];
+          } ''
+            export SSL_CERT_FILE="${tlsCacert}/etc/ssl/certs/ca-no-trust-rules-bundle.crt"
+            export NIX_SSL_CERT_FILE="$SSL_CERT_FILE"
+            mkdir empty-certs
+            export SSL_CERT_DIR="$PWD/empty-certs"
+            python3 ${./tests}/check-tls-trust.py
+            touch $out
+          '';
+
           module-generated-up-to-date =
             pkgs.runCommand "agent-box-module-generated-up-to-date"
               {
@@ -1898,6 +1918,22 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               }
               cat log
               cp log "$out"
+            '';
+
+          landing-passwords =
+            pkgs.runCommand "agent-box-landing-passwords"
+              {
+                nativeBuildInputs = [ pkgs.nodejs ];
+                test = ./tests/test-landing-passwords.cjs;
+                page = ./docs/index.html;
+                launch = ./docs/launch-passwords.js;
+              } ''
+              mkdir -p repo/docs repo/tests
+              cp "$test" repo/tests/test-landing-passwords.cjs
+              cp "$page" repo/docs/index.html
+              cp "$launch" repo/docs/launch-passwords.js
+              node repo/tests/test-landing-passwords.cjs
+              touch "$out"
             '';
 
           assemble-module-escaping =
@@ -2508,6 +2544,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The Codex remote-control wrapper ends an app-server that only an
+          # older CLI's legacy pid file records (issue #904).
+          codex-legacy-app-server =
+            pkgs.runCommand "agent-box-codex-legacy-app-server"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnused pkgs.procps ];
+                wrapper = ./modules/src/codex-remote-control.sh;
+                tests = ./tests/test-codex-legacy-app-server.sh;
+              } ''
+              bash "$tests" "$wrapper" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # The settings daemon's session API for portals (issue #787): the
           # JSON list, web stop, and the JSON answers of restart/delete.
           # Same subject (the GOLDEN PAYLOAD) as the pairing check above.
@@ -2564,6 +2617,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 tests = ./tests/test-whatsapp-cli.py;
                 supervisorTests = ./tests/test-whatsapp-supervisor.sh;
                 slackSupervisorTests = ./tests/test-slack-supervisor.sh;
+                sessionTmpTests = ./tests/test-session-tmp.sh;
                 codexResumeTests = ./tests/test-codex-registered-thread.sh;
               } ''
               install -d repo/modules/src repo/tests
@@ -2578,6 +2632,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 exit 1
               }
               bash "$slackSupervisorTests" "$supervisor" >> log 2>&1 || {
+                cat log
+                exit 1
+              }
+              bash "$sessionTmpTests" "$supervisor" >> log 2>&1 || {
                 cat log
                 exit 1
               }

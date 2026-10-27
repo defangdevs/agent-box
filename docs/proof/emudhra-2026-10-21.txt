@@ -1,0 +1,120 @@
+CVE-2026-111943 verification, 2026-10-21.
+nix build --no-link -L --keep-going --max-jobs 4 --cores 2 .#ci-native: PASS (all discovered native checks, including offline TLS, golden snapshot, renderer and parity).
+python3 tests/test_agentbox.py: 159 tests passed, 1 existing skip (PyYAML unavailable on host).
+The applied native environment was rendered with the built runtime via agentbox apply --root; no live host configuration was changed.
+Offline: 12 public compromised certificate chains rejected at disclosure time, with a nonempty store.
+Runtime Python: compromised direct and AAA endpoints rejected; station.defang.io accepted.
+Runtime curl: compromised endpoint exit 60; station.defang.io HTTP 200.
+Old Node v24.19.0 under the rendered policy (verification enabled):
+{
+  "node": "v24.19.0",
+  "results": [
+    {
+      "host": "dv-g3b-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "dv-g3b-aaa-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "dv-g3c-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "dv-g3c-aaa-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "ov-g3b-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "ov-g3b-aaa-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "ov-g3c-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "ov-g3c-aaa-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "ev-g3b-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "ev-g3b-aaa-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "ev-g3c-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "ev-g3c-aaa-emudhra.we-have-a-problem.com",
+      "result": "REJECT",
+      "code": "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "expected": "REJECT"
+    },
+    {
+      "host": "station.defang.io",
+      "result": "ACCEPT",
+      "expected": "ACCEPT"
+    },
+    {
+      "host": "management.azure.com",
+      "result": "ACCEPT",
+      "expected": "ACCEPT"
+    },
+    {
+      "host": "api.stripe.com",
+      "result": "ACCEPT",
+      "expected": "ACCEPT"
+    }
+  ]
+}
+
+Native runtime Python probes:
+[
+  {
+    "host": "dv-g3b-emudhra.we-have-a-problem.com",
+    "result": "REJECT"
+  },
+  {
+    "host": "dv-g3b-aaa-emudhra.we-have-a-problem.com",
+    "result": "REJECT"
+  },
+  {
+    "host": "station.defang.io",
+    "result": "ACCEPT"
+  }
+]
+
+Dependency scope: retain the previously tested nixpkgs pin; the explicit filtered bundle and both deployment environments implement distrust without a harness upgrade. Full ci-native passed again with this pin.
+
+Limitations: no deployed-host upgrade or AWS/NixOS VM boot was performed locally. Full VM lanes run in CI. A bare software-only runtime does not apply its environment; embedded CA stores and user-managed containers need independent validation.

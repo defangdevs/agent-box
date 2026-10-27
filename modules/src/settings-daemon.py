@@ -1002,6 +1002,8 @@ def ensure_harness_profile(agent):
 
 
 def ensure_harness_session(agent, remote_control, only_rc=False,
+                           remote_control_daemon=False,
+                           remote_control_server=False,
                            raise_capacity=False):
     """Auto-start one session for `agent` the moment its connect card
     signs in (issue #504), so install+login leaves an actual running
@@ -1017,20 +1019,19 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
     default exists, the starter becomes it; an existing default is a user
     choice and is never replaced.
 
-    `remote_control` is the one thing that differs by harness. claude's rc
-    is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
-    so this session is both a normal worker AND immediately visible to
-    desktop/mobile. codex's rc replaces the process outright with the
-    app-server pairing daemon (codex-remote-control.sh). The connect card
+    `remote_control` defaults to each harness's original behavior. Claude's
+    is a flag on the ordinary TUI, so that session is both a normal worker
+    AND immediately visible to desktop/mobile. `remote_control_daemon` selects
+    the persistent process shared by the harness's app-created conversations.
+    `remote_control_server` remains a compatibility input for Claude. Codex's
+    legacy remote_control=true also selects its app-server pairing daemon
+    (codex-remote-control.sh). The connect card
     only SIGNS IN (`codex login --device-auth`); it pairs nothing. Pairing
     is the /codex/pairing API below, or Enter in an rc session's pane. So
     by default what closes issue #504's "a codex session running" is a real
     interactive session (remoteControl: false), and a box configured with
-    AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control gets the daemon instead
-    (issue #780). Written directly here rather than
-    through session-cli.sh/`/sessions/add`, both of which still hardcode
-    remoteControl: true unconditionally -- neither writer offers a way to
-    ask for false today.
+    AGENT_BOX_CODEX_SESSION_DEFAULT=daemon gets the daemon instead (issue
+    #780). The legacy `remote-control` value remains accepted.
 
     `only_rc` narrows "already has a session" to "already has a REMOTE-CONTROL
     one", for the pairing API (issue #780): a TUI codex session cannot be
@@ -1046,10 +1047,12 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
         # Profile storage failure must not undo a successful login or
         # prevent its worker from starting.
         pass
-    if agent == "codex" and remote_control:
-        # A remote-control codex session is the pairing daemon, which has no
-        # model, effort or profile of its own. The ensured profile still
-        # remains available (and can be the default) for worker sessions.
+    daemon = bool(remote_control_daemon or remote_control_server
+                  or (agent == "codex" and remote_control))
+    if daemon:
+        # A Remote Control server has no worker profile of its own. The
+        # connected app selects a conversation's model and settings. The
+        # ensured profile remains available as the default for normal workers.
         profile, args = None, []
     try:
         # Read before the lock (issue #748): capacity_check's tmux spawn must
@@ -1065,7 +1068,7 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                 # that rather than wait on a daemon nobody will start.
                 rc = [s for s in sessions.values()
                       if isinstance(s, dict) and s.get("agent") == agent
-                      and s.get("remoteControl") is not False]
+                      and session_is_daemon(s)]
                 if rc and all(s.get("stopped") for s in rc):
                     rc[0].pop("stopped", None)
                     rc[0].pop("hibernatedAt", None)
@@ -1083,6 +1086,10 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                 "agent": agent,
                 "skipPermissions": True,
                 "remoteControl": remote_control,
+                "remoteControlDaemon": daemon,
+                # Compatibility for releases before issue #915.
+                "remoteControlServer": bool(remote_control_server
+                                            or (daemon and agent == "claude")),
                 "remoteControlName": None,
                 "workingDirectory": None,
                 "extraArgs": args,
@@ -1395,6 +1402,11 @@ def transcript_of(name, entry):
     The launch id comes from the supervisor's own state file, falling back
     to the registry copy for a session that last spawned before #282 (and
     for the id `agent-box-session add` mints up front)."""
+    if (entry or {}).get("agent") == "claude" and session_is_daemon(entry):
+        # One Claude server owns several Claude-native conversations. The
+        # agent-box launch id identifies the server pane, not any one of
+        # those transcripts, so there is no honest single download target.
+        return None
     box_id = read_launch_id(name) or str((entry or {}).get("boxSessionId") or "")
     if not UUID_RE.match(box_id):
         # Never spawned, or a hand-written record: no id, so no transcript
@@ -2996,6 +3008,17 @@ def defang_stored_env():
     }
 
 
+def session_is_daemon(entry):
+    """Recognize the canonical daemon bit and both pre-#915 encodings."""
+    if not isinstance(entry, dict):
+        return False
+    agent = entry.get("agent")
+    return (entry.get("remoteControlDaemon") is True
+            or (agent == "claude"
+                and entry.get("remoteControlServer") is True)
+            or (agent == "codex" and entry.get("remoteControl") is True))
+
+
 def defang_workspaces():
     """Workspace rows with the Station's explicit selection marked current.
 
@@ -3316,16 +3339,20 @@ def connect_signed_in(flow):
     if signed_in_at is not None and flow_id in RELOGIN_CONFIG_DIRS:
         restart_login_sessions(flow, signed_in_at)
     # One session per harness, started the moment sign-in lands (issue
-    # #504). The sign-in pane only signs in; it never paired anything. So
-    # codex gets an interactive worker session (remote_control=False) unless
-    # the box asks for remote control (issue #780), whose daemon is what the
-    # Codex apps can see. claude's rc is a flag on the same worker session,
-    # so one session covers both being usable AND remote-visible.
+    # #504). The sign-in pane only signs in; it never paired anything. Each
+    # harness keeps its interactive default. A runtime env setting can
+    # instead make the completed sign-in start the explicit server entry,
+    # whose app-created conversations are intentionally not agent-box rows.
     if flow_id == "claude":
-        return ensure_harness_session("claude", remote_control=True)
+        daemon = claude_session_default() == "daemon"
+        return ensure_harness_session(
+            "claude", remote_control=True,
+            remote_control_daemon=daemon,
+            remote_control_server=daemon)
     if flow_id == "codex":
         return ensure_harness_session(
-            "codex", remote_control=codex_session_default() == "remote-control")
+            "codex", remote_control=codex_session_default() == "daemon",
+            remote_control_daemon=codex_session_default() == "daemon")
     return None
 
 
@@ -3343,6 +3370,7 @@ def connect_signed_in(flow):
 # lives in _codex_pairing in memory and is never logged, written to disk,
 # put in an error string, or echoed to the pane.
 
+CLAUDE_SESSION_DEFAULT_KEY = "AGENT_BOX_CLAUDE_SESSION_DEFAULT"
 CODEX_SESSION_DEFAULT_KEY = "AGENT_BOX_CODEX_SESSION_DEFAULT"
 CODEX_START_MIN_INTERVAL = 5.0
 CODEX_CACHE_TTL = 2.0
@@ -3362,7 +3390,7 @@ CODEX_REDACT_RES = (
 
 
 def codex_session_default():
-    """"remote-control" or "tui": what a finished Codex sign-in starts.
+    """"daemon" or "tui": what a finished Codex sign-in starts.
 
     A runtime setting read from the env store (the module deliberately has no
     option for it: `agent-box-session env set` needs no root and no rebuild).
@@ -3374,7 +3402,22 @@ def codex_session_default():
         value = as_dict(load(ENV_FILE)).get(CODEX_SESSION_DEFAULT_KEY, "")
     except (OSError, ValueError):
         pass
-    return "remote-control" if value.strip() == "remote-control" else "tui"
+    return "daemon" if value.strip() in ("daemon", "remote-control") else "tui"
+
+
+def claude_session_default():
+    """"daemon" or "tui": what a finished Claude sign-in starts.
+
+    The default stays the interactive TUI with its additive Remote Control
+    flag. This opt-in mirrors AGENT_BOX_CODEX_SESSION_DEFAULT without
+    reinterpreting existing Claude sessions after an update.
+    """
+    value = ""
+    try:
+        value = as_dict(load(ENV_FILE)).get(CLAUDE_SESSION_DEFAULT_KEY, "")
+    except (OSError, ValueError):
+        pass
+    return "daemon" if value.strip() in ("daemon", "remote-control") else "tui"
 
 
 def codex_redact(text):
@@ -3750,7 +3793,7 @@ def codex_rc_session_crashed():
         return False
     rc = [s for s in sessions.values()
           if isinstance(s, dict) and s.get("agent") == "codex"
-          and s.get("remoteControl") is not False]
+          and session_is_daemon(s)]
     return bool(rc) and all(crashed_status(s) is not None for s in rc)
 
 
@@ -4438,6 +4481,8 @@ def session_list_payload():
             "exit_status": crashed_status(entry) if state == "died" else None,
             "origin": origin if origin in SESSION_ORIGINS else None,
             "remote_control": entry.get("remoteControl") is not False,
+            "remote_control_daemon": session_is_daemon(entry),
+            "remote_control_server": entry.get("remoteControlServer") is True,
             "remote_control_name": rc_name if isinstance(rc_name, str) else None,
             "working_directory": cwd if isinstance(cwd, str) and cwd else os.path.expanduser("~"),
             "ephemeral": entry.get("ephemeral") is True,
@@ -5190,7 +5235,14 @@ SHELL_PSEUDO_PROFILE = ":shell"
 # branch), not a codex profile with a flag flipped -- it has no model,
 # effort or profile of its own, since the paired client decides those -- so
 # it gets its own pseudo-profile rather than overloading a real one.
-CODEX_RC_PSEUDO_PROFILE = ":codex-remote-control"
+CODEX_DAEMON_PSEUDO_PROFILE = ":codex-daemon"
+CODEX_RC_PSEUDO_PROFILE = ":codex-remote-control"  # compatibility
+
+# Claude's persistent server is also not a worker profile. Keep it distinct
+# from the older `--remote-control` TUI behavior so existing sessions do not
+# change programs when this feature lands (issue #383).
+CLAUDE_DAEMON_PSEUDO_PROFILE = ":claude-daemon"
+CLAUDE_RC_PSEUDO_PROFILE = ":claude-remote-control"  # compatibility
 
 
 def render_profile_options(profiles):
@@ -5218,14 +5270,20 @@ def render_profile_options(profiles):
     socket activated with stopIfChanged = false, so a daemon that survived
     an update can still be running on the environment it started with - and
     on one that predates AGENT_BOX_PROFILE_BIN every pick would fail. Such a
-    daemon can still start a shell, which is the one entry needing no
-    resolver, and says why the rest are missing.
+    daemon can still start the standalone Remote Control servers or a shell,
+    none of which needs a resolver, and says why the profiles are missing.
     """
     shell_opt = ('<option value="%s">shell (no assistant)</option>'
                  % SHELL_PSEUDO_PROFILE)
+    standalone = []
+    if "codex" in AGENTS:
+        standalone.append('<option value="%s">codex daemon (Remote Control, no profile)</option>' % CODEX_DAEMON_PSEUDO_PROFILE)
+    if "claude" in AGENTS:
+        standalone.append('<option value="%s">claude daemon (Remote Control, no profile)</option>' % CLAUDE_DAEMON_PSEUDO_PROFILE)
+    standalone.append(shell_opt)
     if not PROFILE_BIN:
         return ('<option value="" disabled selected>Restart the settings '
-                'service to list profiles</option>' + shell_opt)
+                'service to list profiles</option>' + "".join(standalone))
     default = default_profile(profiles)
     items = ['<option value="" disabled%s>Choose a profile</option>'
              % ("" if default else " selected")]
@@ -5237,11 +5295,9 @@ def render_profile_options(profiles):
             label += ", default"
         sel = " selected" if name == default else ""
         items.append(f'<option value="{safe}"{sel}>{label}</option>')
-    if "codex" in AGENTS:
-        # A real codex profile always opens the interactive TUI now (issue
-        # #623); the daemon is offered here instead, as its own entry.
-        items.append('<option value="%s">codex remote control (pairing daemon, no profile)</option>' % CODEX_RC_PSEUDO_PROFILE)
-    items.append(shell_opt)
+    # Real profiles open interactive workers; the standalone servers and
+    # shell are their own entries, independent of the profile resolver.
+    items.extend(standalone)
     return "".join(items)
 
 
@@ -5730,6 +5786,10 @@ def render_sessions(subs=None):
                 prof_tag = (f'<span class="meta prof-tag" '
                             f'title="Agent profile it was started with">'
                             f'{pf}</span>')
+            if session_is_daemon(entries[name]):
+                prof_tag = ('<span class="meta prof-tag" '
+                            'title="App-created conversations are served '
+                            'behind this pane">daemon</span>')
             cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
             # stopped = listed but deliberately down (clean agent exit or
             # agent-box-session stop); the same route revives it.
@@ -10133,10 +10193,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # to say the other thing from a shell.
             profile = (form.get("profile", [""])[0]).strip()
             agent = (form.get("agent", [""])[0]).strip()
-            # Captured before profile is cleared below: the one signal that
-            # this add asked for codex's pairing daemon rather than a TUI
-            # (issue #623), read again where remoteControl is decided.
-            codex_daemon = profile == CODEX_RC_PSEUDO_PROFILE
+            # Captured before profile is cleared below: these pseudo-profiles
+            # select a server program instead of one profile's worker TUI.
+            codex_daemon = profile in (CODEX_DAEMON_PSEUDO_PROFILE,
+                                       CODEX_RC_PSEUDO_PROFILE)
+            claude_daemon = profile in (CLAUDE_DAEMON_PSEUDO_PROFILE,
+                                        CLAUDE_RC_PSEUDO_PROFILE)
             if profile == SHELL_PSEUDO_PROFILE:
                 # The one entry that is not a profile file: a bare shell has
                 # no model, reasoning level or instructions to carry.
@@ -10146,6 +10208,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # or profile of its own, since the paired client decides
                 # those once it connects.
                 agent, profile = "codex", ""
+            elif claude_daemon:
+                # Claude's foreground server likewise owns app-created
+                # conversations rather than one profile's worker settings.
+                agent, profile = "claude", ""
             elif profile:
                 agent = ""      # resolved from the profile below
             elif not agent:
@@ -10239,6 +10305,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # before this value reaches the agent as one argv element.
             prompt = form.get("prompt", [""])[0].replace("\r\n", "\n")
             prompt = prompt.replace("\r", "\n").strip()
+            if claude_daemon and prompt:
+                self._send_html(
+                    render("Claude daemon mode cannot target one kickoff "
+                           "prompt; start the conversation from the Claude app.",
+                           kind="error"), status=400)
+                return
+            if (claude_daemon
+                    and form.get("whatsapp", [""])[0] == "on"):
+                self._send_html(
+                    render("WhatsApp cannot target a Claude daemon's "
+                           "app-created conversations.", kind="error"),
+                    status=400)
+                return
             # Read, name and write as one step (issue #254): the uniqueness
             # gen_session_name promises comes from the dict it was handed, so
             # a concurrent add — from another browser tab, this daemon's own
@@ -10265,15 +10344,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
-                        # codex's remote control is a different PROGRAM
-                        # entirely (the pairing daemon, not a TUI flag -
-                        # see ensure_harness_session), so only the explicit
-                        # pseudo-profile above asks for it; a real codex
-                        # profile, or --harness codex with none, now opens
-                        # the interactive TUI instead (issue #623). claude's
-                        # own remote control is just a flag on its ordinary
-                        # TUI and keeps the old default.
-                        "remoteControl": codex_daemon or agent != "codex",
+                        # The pseudo-profiles select servers explicitly. A
+                        # real Codex profile opens its TUI; a real Claude
+                        # profile preserves the older additive RC flag.
+                        "remoteControl": (codex_daemon or claude_daemon
+                                          or agent != "codex"),
+                        "remoteControlDaemon": codex_daemon or claude_daemon,
+                        # Compatibility for releases before issue #915.
+                        "remoteControlServer": claude_daemon,
                         "whatsapp": (form.get("whatsapp", [""])[0] == "on"
                                      and agent in ("claude", "codex")),
                         "remoteControlName": None,
@@ -10335,6 +10413,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if state == "on" and entry.get("agent") not in ("claude", "codex"):
                         self._send_html(render_page("WhatsApp supports Claude and Codex sessions.",
                                                     kind="error"), status=400)
+                        return
+                    if (state == "on" and entry.get("agent") == "claude"
+                            and session_is_daemon(entry)):
+                        self._send_html(
+                            render_page(
+                                "WhatsApp cannot target a Claude daemon's "
+                                "app-created conversations.",
+                                kind="error"),
+                            status=400)
                         return
                     if state == "on":
                         for other in sessions.values():

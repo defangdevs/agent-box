@@ -10,6 +10,19 @@
 
 let
   cfg = config.services.agent-box;
+  # Include alternate cross-signing paths, including hosts on older nixpkgs.
+  tlsBlacklist = builtins.fromJSON ''
+@@include:src/tls-roots.json@@
+  '';
+  tlsEnvironment = {
+    SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
+    SSL_CERT_DIR = "${pkgs.runCommand "agent-box-empty-ca-dir" { } "mkdir -p $out"}";
+    NIX_SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
+    CURL_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
+    REQUESTS_CA_BUNDLE = "/etc/ssl/certs/ca-certificates.crt";
+    # Adding roots cannot revoke Node's compiled-in roots. Use the filtered store.
+    NODE_OPTIONS = "--use-openssl-ca";
+  };
   supportedAgents = [ "claude" "codex" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
   # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
@@ -476,8 +489,9 @@ let
     @@include:src/mark-stopped.sh@@
   '');
 
-  # Codex Remote Control supervisor (issue 103). Unlike claude's
-  # `--remote-control` TUI flag, codex uses a dedicated app-server daemon.
+  # Codex Remote Control supervisor (issue 103). Codex uses a detached
+  # app-server daemon; Claude's newer foreground server is launched directly
+  # by supervisor.sh and does not need a wrapper.
   # `remote-control start` eagerly connects to the backend and fails before
   # creating the local control socket when the user is logged out or the
   # network is unavailable. Start the offline-safe local daemon first, then
@@ -801,7 +815,8 @@ let
     else if !(seedMain u) then { }
     else {
       main = {
-        inherit (u) agent skipPermissions remoteControl remoteControlName extraArgs;
+        inherit (u) agent skipPermissions remoteControl remoteControlDaemon remoteControlServer
+          remoteControlName extraArgs;
         inherit (u) workingDirectory;
         # No legacy top-level equivalents — the single "main" session just
         # starts interactively and resumes on respawn like any other.
@@ -812,9 +827,19 @@ let
   sessionsSeedFile = name: u:
     pkgs.writeText "agent-box-${name}-sessions.json" (builtins.toJSON {
       version = 1;
-      sessions = lib.mapAttrs (sname: s: {
-        agent = if s.agent != null then s.agent else cfg.agent;
-        inherit (s) skipPermissions remoteControl extraArgs;
+      sessions = lib.mapAttrs (sname: s:
+        let
+          agent = if s.agent != null then s.agent else cfg.agent;
+          daemon = s.remoteControlDaemon || s.remoteControlServer
+            || (agent == "codex" && s.remoteControl);
+        in {
+        inherit agent;
+        inherit (s) skipPermissions extraArgs;
+        remoteControl = if daemon then true else s.remoteControl;
+        remoteControlDaemon = daemon;
+        # Keep both legacy discriminators so an older Agentbox release can
+        # still launch a daemon after rollback.
+        remoteControlServer = s.remoteControlServer || (daemon && agent == "claude");
         # null → the supervisor derives "<user>-<session>@<host>" at
         # start time (see remoteControlHost).
         remoteControlName = s.remoteControlName;
@@ -1243,7 +1268,26 @@ let
         # cfg.agent so a null (box-default) agent is judged the same way
         # sessionsSeedFile itself resolves it.
         default = (if config.agent != null then config.agent else cfg.agent) != "codex";
-        description = "Make the session drivable from the agent's apps (see users.<name>.remoteControl).";
+        description = "Mirror a Claude interactive session in the Claude apps (see users.<name>.remoteControl).";
+      };
+      remoteControlDaemon = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Run the harness's persistent multi-session daemon instead of an
+          interactive TUI: `claude remote-control` for Claude or the Codex
+          app-server pairing daemon. The daemon owns app-created conversations
+          rather than one agent-box worker profile.
+        '';
+      };
+      remoteControlServer = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Deprecated compatibility alias for Claude daemon mode. New
+          configurations should set remoteControlDaemon = true. Existing
+          remoteControlServer = true configurations remain accepted.
+        '';
       };
       remoteControlName = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
@@ -1381,21 +1425,19 @@ let
         # this is set explicitly. Every other harness keeps `true`.
         default = (if config.agent != null then config.agent else cfg.agent) != "codex";
         description = ''
-          Make the session drivable from the agent's desktop and mobile apps.
-          Default `true` because "drive it from your phone" is one of the
-          module's headline features -- except for codex, which defaults to
-          `false` (see below) since remote control there means a different
-          program altogether.
+          Mirror Claude's ordinary interactive TUI in the Claude desktop and
+          mobile apps. This corresponds to Claude's `--remote-control` flag
+          and the `/rc` command available inside a running session.
 
           Set false to disable remote-app control for this user — then the
           agent is only reachable through the local tmux session (or the
           ttyd browser terminal in the AWS variant).
 
-          How it is wired depends on the agent:
-          - claude: adds `--remote-control <remoteControlName>` to the normal
-            TUI, so the browser terminal still shows the interactive session.
-          - codex: starts the local app-server daemon and enables Remote Control
-            on it (issue 103) INSTEAD of the interactive TUI. The daemon starts
+          For Claude this adds `--remote-control <remoteControlName>` to the
+          normal TUI, so the browser terminal still shows the interactive
+          session. For Codex, true remains accepted as a compatibility spelling
+          for remoteControlDaemon = true; new configurations should use that
+          explicit option. The Codex daemon starts
             even while logged out or offline; its relay connects once login and
             network are available. The session's pane then drives onboarding
             (issue 159): it runs the device-code sign-in when the box is logged
@@ -1405,6 +1447,23 @@ let
             browser terminal. The codex daemon is a per-user singleton (one
             control socket per user), so enable it on at most ONE codex session
             per user; two would fight over the same daemon.
+        '';
+      };
+      remoteControlDaemon = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Run the persistent multi-session daemon for the seeded "main"
+          session instead of an interactive TUI. Claude upstream calls its
+          daemon `remote-control` server mode; Codex uses its app-server daemon.
+        '';
+      };
+      remoteControlServer = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Deprecated compatibility alias for Claude daemon mode. New
+          configurations should set remoteControlDaemon = true.
         '';
       };
       remoteControlName = lib.mkOption {
@@ -2997,6 +3056,25 @@ in
           );
           message = "services.agent-box.users.${name}: session \"${sname}\"'s remoteControlName must be non-empty and free of newlines.";
         }
+        {
+          assertion = !s.remoteControlDaemon || builtins.elem
+            (if s.agent != null then s.agent else cfg.agent) [ "claude" "codex" ];
+          message = "services.agent-box.users.${name}: session \"${sname}\" may enable remoteControlDaemon only for Claude or Codex.";
+        }
+        {
+          assertion = !s.remoteControlServer || (
+            (if s.agent != null then s.agent else cfg.agent) == "claude"
+            && s.remoteControl
+          );
+          message = "services.agent-box.users.${name}: session \"${sname}\" may enable remoteControlServer only for a Claude session with remoteControl = true.";
+        }
+        {
+          assertion = !(s.remoteControlServer || (s.remoteControlDaemon
+            && (if s.agent != null then s.agent else cfg.agent) == "claude")) || (
+            s.initialPrompt == null && s.resumePrompt == null
+          );
+          message = "services.agent-box.users.${name}: session \"${sname}\" cannot set initialPrompt or resumePrompt in Claude daemon mode because the daemon owns multiple app-created conversations and has no single prompt target.";
+        }
       ]) (seedSessions name u))) cfg.users);
 
     # Claude Code is unfree; allow just the bundled supported agent packages
@@ -3076,6 +3154,9 @@ in
       shell = lib.mkOverride 900 pkgs.bashInteractive;
     }) cfg.users;
 
+    security.pki.caCertificateBlacklist = tlsBlacklist;
+    environment.variables = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment;
+    systemd.globalEnvironment = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment;
     environment.systemPackages = agentRuntimePackages;
 
     # Canonical, read-only agent guide per user at /etc/agent-box-guides/
@@ -3184,6 +3265,7 @@ in
     # drop-in — a real but acceptable price for something that actually
     # works.
     systemd.services =
+    { nix-daemon.environment = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment; } //
     (lib.mapAttrs' (name: u: lib.nameValuePair "agent-box@${name}" (
       { overrideStrategy = "asDropin";
         # NOTE: every optional env var below is merged INTO this one
@@ -3554,6 +3636,11 @@ in
       # new unit file anyway.
       restartIfChanged = false;
       stopIfChanged = false;
+      # The drop-in's own PATH replaces the unit file's, and nix is not on
+      # it, so agent_nix_bin's probes all missed and the unit reported "no
+      # nix on this box" and moved nothing (issue #742). agent_nix_bin
+      # honours this before it probes anything.
+      environment.AGENT_BOX_NIX_BIN = "${config.nix.package}/bin/nix";
     }) cfg.users;
   }) (lib.mkIf cfg.selfUpdate.enable {
     # Agent-triggerable box update. The agents' only power here is the
@@ -4557,8 +4644,6 @@ in
         # in-boot retries instead of waiting for the next reboot entirely.
         Restart = "on-failure";
         RestartSec = "30s";
-        StartLimitIntervalSec = "10min";
-        StartLimitBurst = 5;
         # This is a fallback path (the substituter above should make it a
         # download, not a build) but if it EVER does fall back to compiling
         # — a Cachix outage, a bump to defangVersion before the matching
@@ -4572,6 +4657,11 @@ in
         IOSchedulingClass = "idle";
         OOMScoreAdjust = 1000;
         MemoryMax = "1536M";
+      };
+      # StartLimit* belong to [Unit]; in [Service] systemd ignores them.
+      unitConfig = {
+        StartLimitIntervalSec = "10min";
+        StartLimitBurst = 5;
       };
       # No ConditionPathExists gate: that could only ever check "a defang
       # binary exists somewhere," not "it's the one THIS module currently

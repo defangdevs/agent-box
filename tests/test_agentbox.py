@@ -230,6 +230,25 @@ def tree_modes(root):
 
 
 class RenderTest(unittest.TestCase):
+    def test_tls_policy_reaches_socket_and_timer_services_and_keeps_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = render(tmp, CONFIG_JSON)
+            unit_root = out / "etc/systemd/system"
+            for name in ["agent-box-settings@agent.service", "agent-box-update.service",
+                         "agent-box-webhook@agent.service", "agent-box@agent.service",
+                         "caddy.service", "nix-daemon.service"]:
+                self.assertIn("EnvironmentFile=/etc/agent-box/tls.env",
+                              (unit_root / (name + ".d") / "05-tls.conf").read_text())
+            env = (out / "etc/agent-box/tls.env").read_text()
+            self.assertIn("NODE_OPTIONS=--use-openssl-ca", env)
+            self.assertIn("SSL_CERT_DIR=@PROFILE@/etc/agent-box/empty-ca-dir", env)
+            wrapper = (out / "usr/local/bin/agent-box-session").read_text()
+            self.assertIn("export NODE_OPTIONS=--use-openssl-ca", wrapper)
+            self.assertTrue(load_agentbox().generated_by_us(out / "usr/local/bin/agent-box-session"))
+            # Byte-for-byte unit copies remain recognizable by feature-off cleanup.
+            shared = (out / "etc/systemd/system/agent-box-settings@.service").read_text()
+            self.assertEqual(shared, (SRC / "units/agent-box-settings@.service").read_text())
+
     def test_ip_certificate_and_optional_dns_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "config.json"
@@ -2948,6 +2967,41 @@ class ConfigSchemaTest(unittest.TestCase):
                 "sessionHibernationGraceSeconds",
                 self.refused(lambda c: c.update(
                     sessionHibernationGraceSeconds=value)))
+
+    def test_claude_remote_control_server_has_one_unambiguous_shape(self):
+        # The valid form is accepted and rendered by the golden fixture.
+        self.spec(lambda c: c["users"]["agent"]["sessions"]["main"].update(
+            remoteControlServer=True))
+        for message, mutate in [
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["review"].update(
+                 remoteControlServer=True)),
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControl=False, remoteControlServer=True)),
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControl=None, remoteControlServer=True)),
+            ("cannot set a prompt in Claude daemon mode",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControlServer=True, prompt="one task")),
+        ]:
+            self.assertIn(message, self.refused(mutate))
+
+    def test_remote_control_daemon_is_harness_neutral(self):
+        for agent in ("claude", "codex"):
+            spec = self.spec(
+                lambda c, agent=agent: c["users"]["agent"]["sessions"]
+                ["main"].update(agent=agent, remoteControlDaemon=True))
+            user = next(user for user in spec.users if user.name == "agent")
+            session = user.sessions["main"]
+            self.assertTrue(session["remoteControlDaemon"])
+        self.assertIn(
+            "remoteControlDaemon only for Claude or Codex",
+            self.refused(lambda c: (
+                c["agents"].append("opencode"),
+                c["users"]["agent"]["sessions"]["main"].update(
+                    agent="opencode", remoteControlDaemon=True))))
 
     def test_the_reported_coercions_are_refused_with_the_field_named(self):
         """Every example from issue #525, each with the path in the message.

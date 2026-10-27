@@ -49,6 +49,12 @@
 , webhookPin ? import ./webhook-pin.nix
 }:
 let
+  # Native hosts do not evaluate NixOS's security.pki module. Ship the same
+  # distrust policy in the runtime, independent of the distro CA package.
+  tlsCacert = pkgs.cacert.override {
+    blacklist = builtins.fromJSON (builtins.readFile ../modules/src/tls-roots.json);
+  };
+  emptyCaDir = pkgs.runCommand "agent-box-empty-ca-dir" { } "mkdir -p $out/etc/agent-box/empty-ca-dir";
   src = ../modules/src;
   readSrc = file: builtins.readFile (src + "/${file}");
   # bin/agentbox lives outside modules/src (it is a tool, not a payload).
@@ -425,7 +431,7 @@ pkgs.buildEnv {
   paths = unitPayloads ++ cliPayloads ++ baseTools ++ serviceTools
           ++ [ agentboxCli pythonForHelper ]
           ++ map agentPackage eagerAgents
-          ++ [ assets ];
+          ++ [ assets tlsCacert emptyCaDir ];
   # A profile is a user-visible PATH: keep man pages, drop nothing silently.
   extraOutputsToInstall = [ "man" ];
   meta = {

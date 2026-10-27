@@ -42,7 +42,41 @@ fi
 wake_thread=$1; shift
 wake_prompt=$1; shift
 codex=$1; shift
-stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
+# An older CLI, run from packages/standalone, records its app-server in the
+# legacy app-server.pid. Once packages/app-server-daemon/current exists (the
+# mirror seeds it, issue #788) a current CLI reads daemon.pid instead, so its
+# `daemon stop` cannot see the old app-server, and `daemon start` then dies
+# with "app server is running but is not managed by codex app-server daemon"
+# (issue #904). End that orphan ourselves. The recorded start time and the
+# argv must both still match, so a reused pid is never killed.
+stop_legacy_app_server() {
+  _lpf="${CODEX_HOME:-$HOME/.codex}/app-server-daemon/app-server.pid"
+  [ -r "$_lpf" ] || return 0
+  _lrec=$(cat "$_lpf" 2>/dev/null) || return 0
+  case "$_lrec" in *'"pid":'*'"processStartTime":"'*) ;; *) return 0 ;; esac
+  _lpid=${_lrec#*'"pid":'}; _lpid=${_lpid%%[!0-9]*}
+  _lstart=${_lrec#*'"processStartTime":"'}; _lstart=${_lstart%%'"'*}
+  [ -n "$_lpid" ] || return 0
+  # Word splitting collapses ps's padding ("Oct  6") to compare like for like.
+  # shellcheck disable=SC2086,SC2116
+  _lnow=$(ps -o lstart= -p "$_lpid" 2>/dev/null) && _lnow=$(echo $_lnow) || return 0
+  # shellcheck disable=SC2086,SC2116
+  [ "$_lnow" = "$(echo $_lstart)" ] || return 0
+  case "$(ps -o args= -p "$_lpid" 2>/dev/null)" in
+    *codex*" app-server"*) ;;
+    *) return 0 ;;
+  esac
+  kill -TERM "$_lpid" 2>/dev/null || return 0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$_lpid" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  kill -KILL "$_lpid" 2>/dev/null || true
+}
+stop() {
+  "$codex" app-server daemon stop >/dev/null 2>&1 || true
+  stop_legacy_app_server
+}
 # A daemon left over from an earlier start would make ours a no-op and
 # leave us supervising nothing, so clear it first, then own a fresh one.
 stop
@@ -57,11 +91,13 @@ signed_in() { "$codex" login status >/dev/null 2>&1; }
 # When the settings page drives pairing (its /codex/pairing API, issue #780),
 # a code minted HERE would be a second live code beside the page's, and it
 # would print to a pane the user never needed to open. The page's
-# `AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control` is the signal. In that
-# mode the pane signs in and reports status on its own; it mints a code only
-# when someone presses Enter.
+# `AGENT_BOX_CODEX_SESSION_DEFAULT=daemon` is the signal. In that mode the
+# pane signs in and reports status on its own; it mints a code only when
+# someone presses Enter. Keep the old `remote-control` value for compatibility.
 quiet=false
-[ "${AGENT_BOX_CODEX_SESSION_DEFAULT:-}" = remote-control ] && quiet=true
+case "${AGENT_BOX_CODEX_SESSION_DEFAULT:-}" in
+  daemon|remote-control) quiet=true ;;
+esac
 # Run the sign-in HERE rather than printing the command for someone to paste
 # into another session. This box is headless, so device auth is the only
 # flow that works: plain `codex login` serves a localhost URL no outside
