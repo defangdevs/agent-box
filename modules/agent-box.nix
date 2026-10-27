@@ -22184,11 +22184,12 @@ def claude_custom_title(path):
     <projects>/<key>/<id>/custom-title.json on every rename (issue #587);
     `path` is that conversation's <id>.jsonl. Only the explicit title is
     read: the transcript's own custom-title lines are re-appended at each
-    start and the AI-generated title changes by itself."""
+    start and the AI-generated title changes by itself. The file holds one
+    short object; the 64 KiB cap only bounds a corrupt or hostile file."""
     base = os.path.splitext(path)[0]
     try:
         with open(os.path.join(base, "custom-title.json"), "rb") as handle:
-            record = json.loads(handle.read(4096))
+            record = json.loads(handle.read(65536))
     except (OSError, ValueError, RecursionError):
         return ""
     title = record.get("customTitle") if isinstance(record, dict) else None
