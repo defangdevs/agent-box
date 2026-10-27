@@ -436,8 +436,17 @@ class Cli(unittest.TestCase):
         tmux.write_text(
             "#!" + shutil.which("bash") + "\n"
             "case \"$3\" in\n"
-            "  list-sessions) cat \"$TEST_LIVE_FILE\" ;;\n"
+            "  list-sessions)\n"
+            "    if [ -n \"${TEST_INPUT_AFTER_STOP:-}\" ] && [ ! -e \"$TEST_INPUT_AFTER_STOP.done\" ] "
+            "&& jq -e '.sessions.idle.stopped' \"$TEST_ACTIVATE_REGISTRY\" >/dev/null; then\n"
+            "      : > \"$TEST_INPUT_AFTER_STOP.done\"\n"
+            "      printf '%s\\n' '{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}' >> \"$TEST_INPUT_AFTER_STOP\"\n"
+            "    fi\n"
+            "    cat \"$TEST_LIVE_FILE\" ;;\n"
             "  kill-session)\n"
+            "    if [ -n \"${TEST_INPUT_ON_KILL:-}\" ]; then\n"
+            "      printf '%s\\n' '{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}' >> \"$TEST_INPUT_ON_KILL\"\n"
+            "    fi\n"
             "    if [ -n \"${TEST_ACTIVATE_REGISTRY:-}\" ]; then\n"
             "      jq 'del(.sessions.idle.stopped) | "
             "del(.sessions.idle.hibernatedAt) | "
@@ -516,6 +525,36 @@ class Cli(unittest.TestCase):
         self.assertNotIn("stopped", entry)
         self.assertNotIn("hibernatedAt", entry)
         self.assertNotIn("hibernationGeneration", entry)
+
+    def _assert_unparked_after_input(self, var, result):
+        self.assertEqual(result.returncode, 1, result.stderr)
+        entry = json.loads(self.registry.read_text())["sessions"]["idle"]
+        for key in ("stopped", "hibernatedAt", "hibernationGeneration"):
+            self.assertNotIn(key, entry)
+        transcript = (self.work / ".claude/projects/-work/"
+                      "44444444-4444-4444-8444-444444444444.jsonl")
+        self.assertEqual(json.loads(
+            transcript.read_text().splitlines()[-1])["type"], "user")
+
+    def test_input_after_verify_before_kill_cancels_parking(self):
+        live = self.make_live_claude()
+        self.limit.write_text("1\n")
+        transcript = (self.work / ".claude/projects/-work/"
+                      "44444444-4444-4444-8444-444444444444.jsonl")
+        self.env["TEST_ACTIVATE_REGISTRY"] = str(self.registry)
+        self.env["TEST_INPUT_AFTER_STOP"] = str(transcript)
+        result = self.run_cli("hibernate")
+        self._assert_unparked_after_input("list", result)
+        self.assertEqual(live.read_text(), "idle\n")
+
+    def test_input_during_kill_unparks_the_session(self):
+        self.make_live_claude()
+        self.limit.write_text("1\n")
+        transcript = (self.work / ".claude/projects/-work/"
+                      "44444444-4444-4444-8444-444444444444.jsonl")
+        self.env["TEST_INPUT_ON_KILL"] = str(transcript)
+        result = self.run_cli("hibernate")
+        self._assert_unparked_after_input("kill", result)
 
 
 if __name__ == "__main__":
