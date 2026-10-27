@@ -22189,7 +22189,7 @@ def claude_custom_title(path):
     try:
         with open(os.path.join(base, "custom-title.json"), "rb") as handle:
             record = json.loads(handle.read(4096))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return ""
     title = record.get("customTitle") if isinstance(record, dict) else None
     return " ".join(title.split()) if isinstance(title, str) else ""
