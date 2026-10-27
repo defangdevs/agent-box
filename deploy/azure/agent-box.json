@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.39",
-      "templateHash": "440675705882371278"
+      "templateHash": "15310147253341780194"
     }
   },
   "parameters": {
@@ -207,7 +207,7 @@
         "destinationPortRange": "443"
       }
     },
-    "emailIngressRules": "[if(parameters('emailIngress'), createArray(createObject('name', 'email-ingress', 'properties', createObject('priority', 1001, 'protocol', 'Tcp', 'access', 'Allow', 'direction', 'Inbound', 'sourceAddressPrefix', '*', 'sourcePortRange', '*', 'destinationAddressPrefix', '*', 'destinationPortRange', '25'))), createArray())]",
+    "emailIngressRules": "[if(parameters('emailIngress'), createArray(createObject('name', 'email-ingress', 'properties', createObject('priority', 1002, 'protocol', 'Tcp', 'access', 'Allow', 'direction', 'Inbound', 'sourceAddressPrefix', '*', 'sourcePortRange', '*', 'destinationAddressPrefix', '*', 'destinationPortRange', '25'))), createArray())]",
     "smtpEgressRule": {
       "name": "block-smtp-egress",
       "properties": {

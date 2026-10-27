@@ -264,16 +264,10 @@ var httpsRule = {
   }
 }
 
-// Raw SMTP outbound is the way a hijacked box gets used to send spam, and
-// nothing this box legitimately runs needs it: mail through a real provider
-// (SendGrid, SES, ...) goes out over authenticated submission on 587/465,
-// which this rule leaves open. Explicit and low-numbered so it is evaluated
-// ahead of the platform's own AllowInternetOutBound default rule (priority
-// 65001), which would otherwise let it straight through.
 var emailIngressRules = emailIngress ? [{
   name: 'email-ingress'
   properties: {
-    priority: 1001
+    priority: 1002
     protocol: 'Tcp'
     access: 'Allow'
     direction: 'Inbound'
@@ -284,6 +278,12 @@ var emailIngressRules = emailIngress ? [{
   }
 }] : []
 
+// Raw SMTP outbound is the way a hijacked box gets used to send spam, and
+// nothing this box legitimately runs needs it: mail through a real provider
+// (SendGrid, SES, ...) goes out over authenticated submission on 587/465,
+// which this rule leaves open. Explicit and low-numbered so it is evaluated
+// ahead of the platform's own AllowInternetOutBound default rule (priority
+// 65001), which would otherwise let it straight through.
 var smtpEgressRule = {
   name: 'block-smtp-egress'
   properties: {

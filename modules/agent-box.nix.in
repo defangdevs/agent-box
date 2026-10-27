@@ -4802,13 +4802,13 @@ in
     assertions = [
       { assertion = webhookEnabled; message = "agent-box email requires web.enable and webhook.enable."; }
       { assertion = emailUsers != { }; message = "agent-box email requires at least one users.<name>.email = true."; }
-      { assertion = cfg.email.domains != [ ] && lib.all (d: builtins.match "[A-Za-z0-9][A-Za-z0-9.-]*" d != null) cfg.email.domains;
+      { assertion = cfg.email.domains != [ ] && lib.all (d: builtins.stringLength d <= 253 && builtins.match "[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?" d != null) cfg.email.domains;
         message = "agent-box email.domains must contain exact DNS hostnames."; }
       { assertion = lib.all (p: builtins.match "/[A-Za-z0-9/_.+-]+" p != null) [ cfg.email.certificateFile cfg.email.keyFile ];
         message = "agent-box email requires absolute certificateFile/keyFile paths without whitespace."; }
     ] ++ lib.mapAttrsToList (name: u: {
-      assertion = u.web.passwordHashFile != null;
-      message = "agent-box email user ${name} requires a configured webhook endpoint (web.passwordHashFile).";
+      assertion = u.web.passwordHashFile != null && builtins.match "[a-z_][a-z0-9_-]{0,31}" name != null;
+      message = "agent-box email user ${name} requires web.passwordHashFile and a lowercase Linux user name matching [a-z_][a-z0-9_-]{0,31}.";
     }) emailUsers;
     environment.etc."agent-box/email.json".text = builtins.toJSON emailConfig;
     environment.etc."agent-box/bin/agent-box-email".source = "${emailCli}/bin/agent-box-email";

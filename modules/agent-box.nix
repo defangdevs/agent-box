@@ -64,6 +64,10 @@ let
     DOMAIN = re.compile(r"(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?")
 
 
+    class PermanentMessageError(ValueError):
+        """Message content or recipient cannot succeed on a later attempt."""
+
+
     def load_config():
         # Both backends own this fixed file and the fixed executable symlinks.
         # A caller cannot supply an alternate config or executable as CLI data.
@@ -126,7 +130,7 @@ let
         msg = BytesParser(policy=email.policy.default).parsebytes(raw)
         parts = list(msg.walk())
         if len(parts) > 100:
-            raise ValueError("email has more than 100 MIME parts")
+            raise PermanentMessageError("email has more than 100 MIME parts")
         text, html, attachments = [], [], []
         for part in parts:
             if part.is_multipart():
@@ -169,13 +173,13 @@ let
             raise ValueError("email delivery must run as its configured recipient Linux user")
         recipient = os.environ.get("ORIGINAL_RECIPIENT", "").lower()
         if recipient not in [user + '@' + d.lower() for d in cfg["domains"]]:
-            raise ValueError("email envelope recipient is not enabled for this Linux user")
+            raise PermanentMessageError("email envelope recipient is not enabled for this Linux user")
         # OpenSMTPD enforces the wire limit before accepting. Its own transport
         # headers are additional bytes when the MDA reads the queued message.
         limit = cfg["maxMessageBytes"] + 65536
         raw = stream.read(limit + 1)
         if len(raw) > limit:
-            raise ValueError("email exceeds maxMessageBytes")
+            raise PermanentMessageError("email exceeds maxMessageBytes")
         sender = os.environ.get("SENDER", "")
         payload = normalized_message(raw, recipient, sender)
         # The MTA's prepended Received header contains its own transaction id.
@@ -192,7 +196,7 @@ let
                               input=body.encode("ascii"), env=env, timeout=60,
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         if proc.returncode:
-            # All adapter failures leave transport responsibility with OpenSMTPD.
+            # Handoff failures leave transport responsibility with OpenSMTPD.
             # Avoid logging arbitrary mail text or tokens from helper output.
             raise OSError("email bus handoff failed; transport must retry")
 
@@ -221,12 +225,20 @@ let
             os.execv(SMTPD, [SMTPD, "-d", "-f", str(path)])
 
 
-    if __name__ == "__main__":
+    def cli():
         try:
             main()
+        except PermanentMessageError as error:
+            print("agent-box-email: " + str(error), file=sys.stderr)
+            return 65
         except (OSError, ValueError, subprocess.SubprocessError, RecursionError) as error:
             print("agent-box-email: " + str(error), file=sys.stderr)
-            sys.exit(75)
+            return 75
+        return 0
+
+
+    if __name__ == "__main__":
+        sys.exit(cli())
   '';
   emailConfig = {
     domains = cfg.email.domains;
@@ -35224,13 +35236,13 @@ if __name__ == "__main__":
     assertions = [
       { assertion = webhookEnabled; message = "agent-box email requires web.enable and webhook.enable."; }
       { assertion = emailUsers != { }; message = "agent-box email requires at least one users.<name>.email = true."; }
-      { assertion = cfg.email.domains != [ ] && lib.all (d: builtins.match "[A-Za-z0-9][A-Za-z0-9.-]*" d != null) cfg.email.domains;
+      { assertion = cfg.email.domains != [ ] && lib.all (d: builtins.stringLength d <= 253 && builtins.match "[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?" d != null) cfg.email.domains;
         message = "agent-box email.domains must contain exact DNS hostnames."; }
       { assertion = lib.all (p: builtins.match "/[A-Za-z0-9/_.+-]+" p != null) [ cfg.email.certificateFile cfg.email.keyFile ];
         message = "agent-box email requires absolute certificateFile/keyFile paths without whitespace."; }
     ] ++ lib.mapAttrsToList (name: u: {
-      assertion = u.web.passwordHashFile != null;
-      message = "agent-box email user ${name} requires a configured webhook endpoint (web.passwordHashFile).";
+      assertion = u.web.passwordHashFile != null && builtins.match "[a-z_][a-z0-9_-]{0,31}" name != null;
+      message = "agent-box email user ${name} requires web.passwordHashFile and a lowercase Linux user name matching [a-z_][a-z0-9_-]{0,31}.";
     }) emailUsers;
     environment.etc."agent-box/email.json".text = builtins.toJSON emailConfig;
     environment.etc."agent-box/bin/agent-box-email".source = "${emailCli}/bin/agent-box-email";

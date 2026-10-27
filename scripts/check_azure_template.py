@@ -738,6 +738,26 @@ def check_recovery_defaults(template: dict) -> int:
     return 0
 
 
+def check_inbound_priorities() -> int:
+    # These conditional rules must coexist when both optional ports are on.
+    source = BICEP.read_text()
+    priorities = {}
+    for name in ("httpsRule", "sshRule", "emailIngressRules"):
+        block = re.search(r"(?ms)^var " + name + r"\b(.*?)(?=^var |\Z)", source)
+        value = re.search(r"\bpriority:\s*(\d+)", block[1]) if block else None
+        if not value:
+            print("FAIL: missing literal inbound priority for " + name, file=sys.stderr)
+            return 1
+        priority = int(value[1])
+        if priority in priorities:
+            print(f"FAIL: inbound priority {priority} is shared by {priorities[priority]} and {name}",
+                  file=sys.stderr)
+            return 1
+        priorities[priority] = name
+    print("OK: optional SSH and email ingress use distinct inbound priorities.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -761,6 +781,7 @@ def main() -> int:
         check_secrets(template),
         check_recovery_defaults(template),
         check_written_config(template),
+        check_inbound_priorities(),
     )
     if not args.no_build:
         rc = max(rc, check_no_drift())

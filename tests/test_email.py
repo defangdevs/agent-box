@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The SMTP adapter must preserve envelope ownership and retry identity."""
 import base64
+import contextlib
 import importlib.util
 import io
 import json
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import pwd
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -67,14 +69,25 @@ class EmailAdapter(unittest.TestCase):
         for recipient in ('other@' + self.cfg['domains'][0], self.user + '@elsewhere.example',
                           self.user + '+session@' + self.cfg['domains'][0], ''):
             with mock.patch.dict(os.environ, {'ORIGINAL_RECIPIENT': recipient}):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(mail.PermanentMessageError):
                     mail.deliver(self.cfg, self.user, io.BytesIO(self.raw))
         with mock.patch.dict(os.environ, {'ORIGINAL_RECIPIENT': self.recipient}):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(mail.PermanentMessageError):
                 mail.deliver(dict(self.cfg, maxMessageBytes=4), self.user, io.BytesIO(b'x' * 70000))
             with mock.patch.object(mail.subprocess, 'run', return_value=mock.Mock(returncode=1)):
                 with self.assertRaises(OSError):
                     mail.deliver(self.cfg, self.user, io.BytesIO(self.raw))
+
+    def test_permanent_message_refusal_and_temporary_service_exit_status(self):
+        raw = (b'Content-Type: multipart/mixed; boundary=x\r\n\r\n'
+               + b'--x\r\nContent-Type: text/plain\r\n\r\nx\r\n' * 101 + b'--x--\r\n')
+        with self.assertRaises(mail.PermanentMessageError):
+            mail.normalized_message(raw, self.recipient, '')
+        for error, expected in ((mail.PermanentMessageError('invalid message'), 65),
+                                (ValueError('invalid configuration'), 75),
+                                (OSError('bus unavailable'), 75)):
+            with mock.patch.object(mail, 'main', side_effect=error), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(mail.cli(), expected)
 
     def test_agent_owned_or_writable_configuration_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,6 +110,83 @@ class EmailAdapter(unittest.TestCase):
 
 
 class NativeEmail(unittest.TestCase):
+    def email_config(self):
+        return {'domain': 'box.example', 'users': {'alice': {'email': True}},
+                'email': {'enable': True, 'certificateFile': '/etc/mail/cert.pem',
+                          'keyFile': '/etc/mail/key.pem'}}
+
+    def test_default_domains_follow_first_boot_but_explicit_domains_survive(self):
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = build_fake_profile(tmp)
+            for domain in ('', 'auto', 'sslip.io'):
+                for explicit in (None, ['mail.example']):
+                    with self.subTest(domain=domain, explicit=explicit):
+                        data = self.email_config()
+                        data['domain'] = domain
+                        if explicit is not None:
+                            data['email']['domains'] = explicit
+                        path = Path(tmp) / 'config.json'
+                        path.write_text(json.dumps(data))
+                        spec = mod.Spec(data, profile=profile)
+                        args = SimpleNamespace(config=str(path), settle_delay=0)
+                        with mock.patch.object(mod, 'settle_public_ip', return_value='203.0.113.7'), \
+                                mock.patch.object(mod, 'resolve_web_password_source', return_value=(None, None)), \
+                                contextlib.redirect_stdout(io.StringIO()):
+                            mod.first_boot(spec, args)
+                        self.assertEqual(spec.email_domains, explicit or ['203-0-113-7.sslip.io'])
+                        tree = mod.Renderer(spec, profile).render()
+                        self.assertEqual(json.loads(tree.files['/etc/agent-box/email.json'][0])['domains'],
+                                         spec.email_domains)
+
+    def test_runtime_upgrade_refreshes_intake_without_json_changes(self):
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = build_fake_profile(tmp)
+            root = Path(tmp) / 'host'
+            spec = mod.Spec(self.email_config(), profile=profile)
+            executable = profile / 'bin/agent-box-email'
+            (profile / 'sbin').mkdir()
+            smtpd = profile / 'sbin/smtpd'
+            for path in (executable, smtpd):
+                path.unlink(missing_ok=True)
+                target = Path(tmp) / (path.name + '-v1')
+                target.write_text('v1')
+                path.symlink_to(target)
+
+            def render():
+                return mod.Renderer(spec, profile, root=root).render()
+
+            def save(tree):
+                for name in ('email.json', 'email-runtime'):
+                    path = root / 'etc/agent-box' / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text(tree.files[str(path)][0])
+
+            save(render())
+            self.assertFalse(render().email_restart)
+            for path in (executable, smtpd):
+                target = Path(tmp) / (path.name + '-v2')
+                target.write_text('v2')
+                path.unlink()
+                path.symlink_to(target)
+                updated = render()
+                self.assertTrue(updated.email_restart)
+                save(updated)
+                self.assertFalse(render().email_restart)
+
+    def test_existing_account_home_must_match_before_committing(self):
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = build_fake_profile(tmp)
+            spec = mod.Spec(self.email_config(), profile=profile)
+            for home, failures in (('/srv/old-home', 1), ('/home/alice', 0)):
+                act = mod.Activation()
+                with mock.patch.object(pwd, 'getpwnam', return_value=SimpleNamespace(pw_dir=home)), \
+                        contextlib.redirect_stderr(io.StringIO()):
+                    mod.validate_render(spec, mod.Tree(), act, profile)
+                self.assertEqual(len(act.failures), failures)
+
     def test_opt_in_render_and_disable(self):
         mod = load_agentbox()
         with tempfile.TemporaryDirectory() as tmp:

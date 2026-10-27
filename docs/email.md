@@ -47,6 +47,9 @@ users:
     email: true
 ```
 
+On a native host, an enabled user's configured home must match the existing
+Linux account's passwd home; apply rejects a mismatch before writing changes.
+
 The existing browser/webhook capability must be enabled for participating
 users. On NixOS they need `web.passwordHashFile`, as for any webhook receiver.
 If omitted, `email.domains` defaults to the box's configured web domain;
@@ -107,6 +110,10 @@ handoff; OpenSMTPD retries from its queue. Once accepted by the bus, the
 existing durable inbox handles peer downtime, receiver restart and deferred
 standing-watch work. No second application dispatcher is introduced.
 Delivery is at-least-once.
+
+Message-size, MIME-part and recipient refusals are permanent delivery errors;
+configuration, identity and bus-handoff failures remain temporary so the MTA
+can retry after the service is repaired.
 
 The adapter hashes the delivered message and envelope for its producer ID;
 the MTA's prepended Received header distinguishes independent SMTP

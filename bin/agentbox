@@ -39,6 +39,7 @@ comparison.
 
 import argparse
 import contextlib
+import hashlib
 import ipaddress
 import json
 import os
@@ -1005,7 +1006,7 @@ class Spec:
 
         email = data.get("email") or {}
         self.email_enable = bool(email.get("enable", False))
-        self.email_domains = email.get("domains") if email.get("domains") is not None else [self.domain]
+        self._email_domains = email.get("domains")
         self.email_certificate = email.get("certificateFile") or ""
         self.email_key = email.get("keyFile") or ""
         self.email_max_bytes = email.get("maxMessageBytes") or 2097152
@@ -1014,10 +1015,17 @@ class Spec:
                 raise ConfigError("email.enable requires web.enable and webhook.enable with a pinned webhook script")
             if not any(u.email for u in self.users):
                 raise ConfigError("email.enable requires at least one users.<name>.email: true")
-            if not self.email_domains or not all(DOMAIN_SUFFIX_RE.fullmatch(d) for d in self.email_domains):
+            unresolved_default = self._email_domains is None and self.domain in ("", "auto", self.domain_suffix)
+            if not unresolved_default and (not self.email_domains or not all(
+                    len(d) <= 253 and DOMAIN_SUFFIX_RE.fullmatch(d) for d in self.email_domains)):
                 raise ConfigError("email.domains must contain exact DNS hostnames")
             if not all(re.fullmatch(r"/[A-Za-z0-9/_.+-]+", p) for p in (self.email_certificate, self.email_key)):
                 raise ConfigError("email requires absolute certificateFile/keyFile paths without whitespace")
+
+    @property
+    def email_domains(self):
+        # first_boot may resolve domain after the spec is constructed.
+        return self._email_domains if self._email_domains is not None else [self.domain]
 
     @property
     def webhook_enable(self):
@@ -1414,6 +1422,8 @@ class Renderer:
                     t.disable.append(source.name)
             return
         users = [u for u in self.spec.users if u.email]
+        if not all(len(d) <= 253 and DOMAIN_SUFFIX_RE.fullmatch(d) for d in self.spec.email_domains):
+            raise ConfigError("email.domains needs resolved DNS hostnames; use --first-boot for domain discovery")
         cfg = {"domains": self.spec.email_domains, "users": [u.name for u in users],
                "certificateFile": self.spec.email_certificate, "keyFile": self.spec.email_key,
                "maxMessageBytes": self.spec.email_max_bytes}
@@ -1427,7 +1437,20 @@ class Renderer:
             old_config = cfg_path.read_text()
         except FileNotFoundError:
             old_config = None
-        t.email_restart = old_config is not None and old_config != cfg_text
+        # The profile symlink has already moved when apply runs. Record the
+        # immutable executable identities so an unchanged JSON config still
+        # refreshes the MTA and its forked delivery helpers after an upgrade.
+        runtime = json.dumps([str(p.resolve()) for p in (
+            self.bin / "agent-box-email", self.profile / "sbin/smtpd",
+            Path(self.spec.webhook_script))])
+        runtime_text = hashlib.sha256(runtime.encode()).hexdigest() + "\n"
+        runtime_path = self.p("/etc/agent-box/email-runtime")
+        try:
+            old_runtime = runtime_path.read_text()
+        except FileNotFoundError:
+            old_runtime = None
+        t.email_restart = old_config is not None and (old_config != cfg_text or old_runtime != runtime_text)
+        t.file(runtime_path, runtime_text)
         t.file(cfg_path, cfg_text)
         for u in users:
             t.file(self.p("/etc/systemd/system", f"agent-box-email-source@{u.name}.service"),
@@ -4343,6 +4366,18 @@ def validate_render(spec, tree, act, profile):
     cause. `systemctl daemon-reload` and the enable/start in activate() are
     the real gate on a unit, and both are required actions now.
     """
+    if spec.email_enable:
+        import pwd
+        for u in spec.users:
+            if not u.email:
+                continue
+            try:
+                account = pwd.getpwnam(u.name)
+            except KeyError:
+                continue  # ensure_user creates it with the configured home.
+            if Path(account.pw_dir) != Path(u.home):
+                act.failed("email home for " + u.name,
+                           f"configured home {u.home} differs from passwd home {account.pw_dir}")
     for path, (text, _mode) in sorted(tree.files.items()):
         if Path(path).parent == Path(SUDOERS_DIR):
             validate_sudoers(path, text, act)

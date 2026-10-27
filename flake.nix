@@ -2292,6 +2292,11 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          email-options = import ./tests/email-options.nix {
+            inherit nixpkgs system pkgs;
+            agent-box = self.nixosModules.agent-box;
+          };
+
           # Eval regression for selfUpdate.checkout's assertions and fork
           # opt-in (issue #242, PR #478 review). The path assertion guards
           # a value whose only other feedback is a background job failing

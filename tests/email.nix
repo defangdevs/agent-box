@@ -46,6 +46,13 @@
           for address in ("agent@box.test", "agent@1-2-3-4.defangstation.com"):
               assert client.sendmail("sender@example.org", [address], body) == {}
     '';
+    environment.etc."email-retry-probe.py".text = ''
+      import re, subprocess
+      log = subprocess.check_output(["journalctl", "-u", "agent-box-email.service",
+                                     "-o", "cat", "--no-pager"], text=True)
+      failed = set(re.findall(r"mda delivery evpid=([0-9a-f]+).*result=TempFail", log))
+      assert len(failed) == 2, log
+    '';
     system.stateVersion = "25.05";
   };
   testScript = ''
@@ -66,6 +73,7 @@
     # SMTP 250 means the MTA owns a durable copy, even while the bus is down.
     machine.succeed("systemctl stop agent-box-webhook@agent.socket agent-box-webhook@agent.service")
     machine.succeed("python3 /etc/email-probe.py")
+    machine.wait_until_succeeds("python3 /etc/email-retry-probe.py", timeout=60)
     machine.fail("test -d /home/agent/.local/state/local-webhook/spool/content/new")
     machine.succeed("systemctl start agent-box-webhook@agent.socket")
     # Force the MTA retry now instead of waiting for its normal backoff.
