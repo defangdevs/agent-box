@@ -23,6 +23,17 @@ let
     # Adding roots cannot revoke Node's compiled-in roots. Use the filtered store.
     NODE_OPTIONS = "--use-openssl-ca";
   };
+  emailUsers = lib.filterAttrs (_: u: u.email) cfg.users;
+  emailCli = pkgs.writers.writePython3Bin "agent-box-email" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+    @@include:src/email-cli.py@@
+  '';
+  emailConfig = {
+    domains = cfg.email.domains;
+    users = builtins.attrNames emailUsers;
+    inherit (cfg.email) certificateFile keyFile maxMessageBytes;
+  };
   supportedAgents = [ "claude" "codex" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
   # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
@@ -1341,6 +1352,11 @@ let
 
   userOpts = { name, config, ... }: {
     options = {
+      email = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Accept email for this Linux user when email.enable is set.";
+      };
       sessions = lib.mkOption {
         type = lib.types.attrsOf (lib.types.submodule sessionOpts);
         default = { };
@@ -1995,6 +2011,30 @@ in
         sslip host, and a bare-metal host that never set it did not. Reported
         by one-spec-both-backends (#451, #455).
       '';
+    };
+
+    email = {
+      enable = lib.mkEnableOption "inbound email through the existing message bus";
+      domains = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ cfg.web.domain ];
+        description = "Exact recipient hostnames, such as 1-2-3-4.defangstation.com.";
+      };
+      certificateFile = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Root-managed PEM certificate chain for SMTP STARTTLS. Restart intake after renewal.";
+      };
+      keyFile = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        description = "Root-readable private key matching email.certificateFile.";
+      };
+      maxMessageBytes = lib.mkOption {
+        type = lib.types.ints.between 1024 8388608;
+        default = 2097152;
+        description = "Maximum entire MIME message, including attachments (default 2 MiB).";
+      };
     };
 
     users = lib.mkOption {
@@ -4758,5 +4798,74 @@ in
       };
     };
   }
+  (lib.mkIf cfg.email.enable {
+    assertions = [
+      { assertion = webhookEnabled; message = "agent-box email requires web.enable and webhook.enable."; }
+      { assertion = emailUsers != { }; message = "agent-box email requires at least one users.<name>.email = true."; }
+      { assertion = cfg.email.domains != [ ] && lib.all (d: builtins.stringLength d <= 253 && builtins.match "[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?" d != null) cfg.email.domains;
+        message = "agent-box email.domains must contain exact DNS hostnames."; }
+      { assertion = lib.all (p: builtins.match "/[A-Za-z0-9/_.+-]+" p != null) [ cfg.email.certificateFile cfg.email.keyFile ];
+        message = "agent-box email requires absolute certificateFile/keyFile paths without whitespace."; }
+    ] ++ lib.mapAttrsToList (name: u: {
+      assertion = u.web.passwordHashFile != null && builtins.match "[a-z_][a-z0-9_-]{0,31}" name != null;
+      message = "agent-box email user ${name} requires web.passwordHashFile and a lowercase Linux user name matching [a-z_][a-z0-9_-]{0,31}.";
+    }) emailUsers;
+    environment.etc."agent-box/email.json".text = builtins.toJSON emailConfig;
+    environment.etc."agent-box/bin/agent-box-email".source = "${emailCli}/bin/agent-box-email";
+    environment.etc."agent-box/bin/agent-box-email-smtpd".source = "${pkgs.opensmtpd}/sbin/smtpd";
+    environment.etc."agent-box/email-webhook.py".source = localWebhookScript;
+    environment.etc."agent-box/email-tools/smtpctl".source = "${pkgs.opensmtpd}/bin/smtpctl";
+    networking.firewall.allowedTCPPorts = [ 25 ];
+    users.groups.smtpd = { };
+    users.groups.smtpq = { };
+    users.users.smtpd = { isSystemUser = true; group = "smtpd"; };
+    users.users.smtpq = { isSystemUser = true; group = "smtpq"; };
+    systemd.tmpfiles.rules = [
+      "d /var/empty 0755 root root - -"
+      "d /var/spool/smtpd 0711 root root - -"
+      "d /var/spool/smtpd/offline 0770 root smtpq - -"
+      "d /var/spool/smtpd/purge 0700 smtpq root - -"
+      "d /var/spool/smtpd/queue 0700 smtpq root - -"
+    ];
+    systemd.services = (lib.mapAttrs' (name: _: lib.nameValuePair "agent-box-email-source@${name}" {
+      description = "Configure the private email bus source for ${name}";
+      before = [ "agent-box-email.service" ];
+      path = [ pkgs.python3 pkgs.jq pkgs.coreutils ];
+      environment = {
+        HOME = "/home/${name}";
+        AGENT_BOX_WEBHOOK_URL = "https://${cfg.web.domain}${webhookPathOf name}";
+      };
+      serviceConfig = {
+        Type = "oneshot";
+        User = name;
+        ExecStart = "${webhookCli}/bin/agent-box-webhook setup email";
+        StandardOutput = "null";
+        StandardError = "journal";
+        RemainAfterExit = true;
+      };
+    }) emailUsers) // {
+      agent-box-email = {
+        description = "Optional inbound email to Linux-user message buses";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network.target" ] ++ map (n: "agent-box-email-source@${n}.service") (builtins.attrNames emailUsers);
+        requires = map (n: "agent-box-email-source@${n}.service") (builtins.attrNames emailUsers);
+        restartTriggers = [ config.environment.etc."agent-box/email.json".source ];
+        serviceConfig = {
+          ExecStart = "${emailCli}/bin/agent-box-email server";
+          RuntimeDirectory = "agent-box-email";
+          Restart = "on-failure";
+          RestartSec = 5;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ "/run" "/var/spool/smtpd" ] ++ map (n: "/home/${n}") (builtins.attrNames emailUsers);
+          NoNewPrivileges = true;
+          # Linux getifaddrs uses netlink while OpenSMTPD discovers listeners.
+          RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ];
+          MemoryMax = "256M";
+          TasksMax = 64;
+        };
+      };
+    };
+  })
   ]);
 }

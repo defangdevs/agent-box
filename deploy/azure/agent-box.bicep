@@ -159,6 +159,9 @@ var effectiveSslipDomains = !empty(sslipDomain) ? [sslipDomain] : sslipDomains
 @description('Open port 22 to allowCidr. Off by default: Azure Run Command and VMAccess provide recovery through Azure RBAC with SSH closed. To enable SSH, supply your own recovery credential and restrict allowCidr first.')
 param debugSsh bool = false
 
+@description('Open inbound TCP 25 for optional email. Configure host email intake and STARTTLS separately; outbound SMTP restrictions remain in force.')
+param emailIngress bool = false
+
 @description('Linux user for SSH/serial-console debug access. NOT the agent user - the agent runs as userName.')
 param adminUsername string = 'azureuser'
 
@@ -260,6 +263,20 @@ var httpsRule = {
     destinationPortRange: '443'
   }
 }
+
+var emailIngressRules = emailIngress ? [{
+  name: 'email-ingress'
+  properties: {
+    priority: 1002
+    protocol: 'Tcp'
+    access: 'Allow'
+    direction: 'Inbound'
+    sourceAddressPrefix: '*'
+    sourcePortRange: '*'
+    destinationAddressPrefix: '*'
+    destinationPortRange: '25'
+  }
+}] : []
 
 // Raw SMTP outbound is the way a hijacked box gets used to send spam, and
 // nothing this box legitimately runs needs it: mail through a real provider
@@ -578,7 +595,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
   name: '${namePrefix}-nsg'
   location: location
   properties: {
-    securityRules: concat([httpsRule, smtpEgressRule], sshRule)
+    securityRules: concat([httpsRule, smtpEgressRule], sshRule, emailIngressRules)
   }
 }
 

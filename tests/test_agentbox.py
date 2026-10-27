@@ -3194,6 +3194,7 @@ class ConfigSchemaTest(unittest.TestCase):
             ("Spec", "__init__"): {
                 "data": mod.BOX_SCHEMA,
                 "wh": webhook,
+                "email": mod.BOX_SCHEMA.fields["email"],
                 "web": mod.BOX_SCHEMA.fields["web"],
                 "os_updates": mod.BOX_SCHEMA.fields["osUpdates"],
                 "containers": mod.BOX_SCHEMA.fields["containers"],

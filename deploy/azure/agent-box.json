@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.39",
-      "templateHash": "9017800245963676478"
+      "templateHash": "15310147253341780194"
     }
   },
   "parameters": {
@@ -131,6 +131,13 @@
         "description": "Open port 22 to allowCidr. Off by default: Azure Run Command and VMAccess provide recovery through Azure RBAC with SSH closed. To enable SSH, supply your own recovery credential and restrict allowCidr first."
       }
     },
+    "emailIngress": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "Open inbound TCP 25 for optional email. Configure host email intake and STARTTLS separately; outbound SMTP restrictions remain in force."
+      }
+    },
     "adminUsername": {
       "type": "string",
       "defaultValue": "azureuser",
@@ -200,6 +207,7 @@
         "destinationPortRange": "443"
       }
     },
+    "emailIngressRules": "[if(parameters('emailIngress'), createArray(createObject('name', 'email-ingress', 'properties', createObject('priority', 1002, 'protocol', 'Tcp', 'access', 'Allow', 'direction', 'Inbound', 'sourceAddressPrefix', '*', 'sourcePortRange', '*', 'destinationAddressPrefix', '*', 'destinationPortRange', '25'))), createArray())]",
     "smtpEgressRule": {
       "name": "block-smtp-egress",
       "properties": {
@@ -238,7 +246,7 @@
       "name": "[format('{0}-nsg', parameters('namePrefix'))]",
       "location": "[parameters('location')]",
       "properties": {
-        "securityRules": "[concat(createArray(variables('httpsRule'), variables('smtpEgressRule')), variables('sshRule'))]"
+        "securityRules": "[concat(createArray(variables('httpsRule'), variables('smtpEgressRule')), variables('sshRule'), variables('emailIngressRules'))]"
       }
     },
     "vnet": {

@@ -36,7 +36,7 @@
         };
         host = {
           jobs = 1;
-          checks = [ "containers" "memory-protection" "ttyd-isolation" "web-surface" ];
+          checks = [ "containers" "memory-protection" "ttyd-isolation" "web-surface" "email" ];
         };
       };
 
@@ -143,6 +143,9 @@
           # filter, and the discovery surface (CLI on PATH,
           # AGENT_BOX_WEBHOOK_URL, per-session LOCAL_WEBHOOK_SESSION, seeded
           # claude plugin settings).
+          email = pkgs.testers.runNixOSTest
+            (import ./tests/email.nix { agent-box = self.nixosModules.agent-box; });
+
           webhook = pkgs.testers.runNixOSTest
             (import ./tests/webhook.nix { agent-box = self.nixosModules.agent-box; });
         };
@@ -1637,6 +1640,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 exit 1
               fi
               tail -5 render.log
+              python3 tests/test_email.py
 
               # The rendered Caddyfile must be a config caddy accepts. Env
               # placeholders are resolved from a throwaway env file with a
@@ -2287,6 +2291,11 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cat log
               cp log "$out"
             '';
+
+          email-options = import ./tests/email-options.nix {
+            inherit nixpkgs system pkgs;
+            agent-box = self.nixosModules.agent-box;
+          };
 
           # Eval regression for selfUpdate.checkout's assertions and fork
           # opt-in (issue #242, PR #478 review). The path assertion guards
