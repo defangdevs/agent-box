@@ -1470,6 +1470,8 @@ class Renderer:
                # Linux getifaddrs uses netlink while OpenSMTPD discovers listeners.
                + "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\nMemoryMax=256M\nTasksMax=64\n"
                + "\n[Install]\nWantedBy=multi-user.target\n")
+        # Cleanup must retain the sources required by the intake service.
+        t.units.extend(source_units)
         t.units.append(unit)
 
     def agent_defaults(self, t):
