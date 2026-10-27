@@ -6276,6 +6276,21 @@ hibernate_one() {
   # seen after the runtime is gone means the turn was cut off, so un-park
   # and let the supervisor resume that exact conversation.
   _quiet="$(printf '%s' "$_verified" | "$JQ" -r '.quiet // empty')"
+  # True while any process is in process group $1. Read from /proc rather
+  # than pgrep: a webhook spawn's PATH does not carry procps.
+  _pgroup_alive() {
+    _pg="$1"
+    for _f in /proc/[0-9]*/stat; do
+      read -r _stat < "$_f" 2>/dev/null || continue
+      # Field 2 (comm) may hold spaces; what follows the last ") " is
+      # state, ppid, pgrp.
+      _rest="''${_stat##*) }"
+      _rest="''${_rest#* }"
+      _rest="''${_rest#* }"
+      [ "''${_rest%% *}" = "$_pg" ] && return 0
+    done
+    return 1
+  }
   _still_quiet() {
     [ -n "$_quiet" ] || return 1
     _q="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
@@ -6303,7 +6318,7 @@ hibernate_one() {
     _alive=0
     for _pp in $_panepids; do
       if kill -0 "$_pp" 2>/dev/null \
-          || { command -v pgrep >/dev/null 2>&1 && pgrep -g "$_pp" >/dev/null 2>&1; }; then
+          || _pgroup_alive "$_pp"; then
         _alive=1
       fi
     done
