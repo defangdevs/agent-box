@@ -1444,7 +1444,8 @@ class Renderer:
                + "RuntimeDirectory=agent-box-email\nRestart=on-failure\nRestartSec=5\n"
                + "PrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/run /var/spool/smtpd "
                + " ".join(u.home for u in users) + "\nNoNewPrivileges=true\n"
-               + "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nMemoryMax=256M\nTasksMax=64\n"
+               # Linux getifaddrs uses netlink while OpenSMTPD discovers listeners.
+               + "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\nMemoryMax=256M\nTasksMax=64\n"
                + "\n[Install]\nWantedBy=multi-user.target\n")
         t.units.append(unit)
 

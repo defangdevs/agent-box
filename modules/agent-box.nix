@@ -35281,7 +35281,8 @@ if __name__ == "__main__":
           ProtectSystem = "strict";
           ReadWritePaths = [ "/run" "/var/spool/smtpd" ] ++ map (n: "/home/${n}") (builtins.attrNames emailUsers);
           NoNewPrivileges = true;
-          RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" ];
+          # Linux getifaddrs uses netlink while OpenSMTPD discovers listeners.
+          RestrictAddressFamilies = [ "AF_UNIX" "AF_INET" "AF_INET6" "AF_NETLINK" ];
           MemoryMax = "256M";
           TasksMax = 64;
         };
