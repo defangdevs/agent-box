@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -186,6 +187,35 @@ class NativeEmail(unittest.TestCase):
                         contextlib.redirect_stderr(io.StringIO()):
                     mod.validate_render(spec, mod.Tree(), act, profile)
                 self.assertEqual(len(act.failures), failures)
+
+    def test_activation_keeps_enabled_sources_and_stops_removed_sources(self):
+        mod = load_agentbox()
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = build_fake_profile(tmp)
+            data = self.email_config()
+            data.update(protectMemory=False, containers={'enable': False})
+            data['users']['bob'] = {}
+            spec = mod.Spec(data, profile=profile)
+            tree = mod.Renderer(spec, profile, root=Path(tmp) / 'host').render()
+            enabled = 'agent-box-email-source@alice.service'
+            removed = 'agent-box-email-source@bob.service'
+            live = lambda prefix: [enabled, removed] if prefix == 'agent-box-email-source@' else []
+            act = mod.Activation()
+            with mock.patch.object(mod, 'ensure_user'), \
+                    mock.patch.object(mod, 'ensure_linger'), \
+                    mock.patch.object(mod, 'ensure_group_user'), \
+                    mock.patch.object(mod, 'unit_is_enabled', return_value=False), \
+                    mock.patch.object(mod, 'active_units', return_value=[]), \
+                    mock.patch.object(mod, 'systemd_units_live', side_effect=live), \
+                    mock.patch.object(mod, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                failures = mod.activate(spec, tree, [], set(), act)
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertEqual(failures, set())
+            self.assertEqual(act.failures, [])
+            self.assertNotIn(['systemctl', 'stop', enabled], commands)
+            self.assertIn(['systemctl', 'start', enabled], commands)
+            self.assertIn(['systemctl', 'stop', removed], commands)
 
     def test_opt_in_render_and_disable(self):
         mod = load_agentbox()
