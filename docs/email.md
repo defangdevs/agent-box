@@ -23,7 +23,8 @@ feature does not export Caddy's private key or change its renewal lifecycle.
 OpenSMTPD requires both certificate and key files to be owned by root. If
 your certificate manager runs as another user (such as Caddy), use a
 root-managed renewal hook to validate and copy the matching certificate/key
-pair into a private mail directory, then restart the mail service. Pointing
+pair into a private mail directory (mode `0644` for the certificate and
+`0600` for the key; OpenSMTPD rejects wider modes), then restart the mail service. Pointing
 intake directly at Caddy-owned certificate files fails OpenSMTPD validation.
 
 NixOS:
