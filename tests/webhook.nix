@@ -397,7 +397,20 @@
     # cache on every (re)start of that live claude process, and a restart
     # mid-block races the hand-written versions below. Same idiom the
     # delivery-spawn assertion further down uses to remove a different race.
+    # Stopping the unit does not stop its tmux server (#893): a lingering
+    # session pane can respawn the env-exec wrapper, whose plugin sync then
+    # rewrites installed_plugins.json under the fixtures below. Kill the
+    # server and wait until no tmux process of the agent is left, so nothing
+    # but this test writes the cache. The stand-in peer is its own unit.
+    def quiesce_sessions():
+        machine.execute(
+            "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+            " kill-server"
+        )
+        machine.wait_until_succeeds("! pgrep -u agent -x 'tmux: server'", timeout=30)
+
     machine.succeed("systemctl stop agent-box@agent.service")
+    quiesce_sessions()
     hookenv = (
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
@@ -696,6 +709,7 @@
     # 30740226645). With it stopped, the wrapper's write is the only actor;
     # restarting it afterwards proves the spawn + consumption half.
     machine.succeed("systemctl stop agent-box@agent.service")
+    quiesce_sessions()
     client.succeed(
         f"{fresh()} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
