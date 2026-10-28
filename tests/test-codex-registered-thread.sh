@@ -137,11 +137,11 @@ codex_live_thread 33333333-3333-4333-8333-333333333333 2> "$TEST_ROOT/missing.er
 # block the supervisor and prevent later sessions from starting.
 sed -n '/^      codex_local_arg=""$/,/^      if \[ "$rcdaemon" = true \]; then/p' "$SUPERVISOR" \
   | sed '$d' > "$TEST_ROOT/local-mode.sh"
-printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$TEST_ROOT/hanging-codex"
+printf '#!%s\nexec sleep 30\n' "$BASH" > "$TEST_ROOT/hanging-codex"
 chmod +x "$TEST_ROOT/hanging-codex"
 GREP=grep rcdaemon=false bin="$TEST_ROOT/hanging-codex" \
   timeout 6 bash -c '. "$1"; [ -z "$codex_local_arg" ]' -- "$TEST_ROOT/local-mode.sh"
-printf '#!/usr/bin/env bash\nprintf "%%s\\n" --no-daemon\n' > "$TEST_ROOT/modern-codex"
+printf '#!%s\nprintf "%%s\\n" --no-daemon\n' "$BASH" > "$TEST_ROOT/modern-codex"
 chmod +x "$TEST_ROOT/modern-codex"
 GREP=grep rcdaemon=false bin="$TEST_ROOT/modern-codex" \
   bash -c '. "$1"; [ "$codex_local_arg" = --no-daemon ]' -- "$TEST_ROOT/local-mode.sh"
