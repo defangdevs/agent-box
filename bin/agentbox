@@ -3775,7 +3775,8 @@ class Renderer:
         has no character that could break out of the Caddy string or the
         attribute; anything else renders no hint rather than a broken page.
         """
-        m = re.fullmatch(r"(https?://[A-Za-z0-9.-]+(?::[0-9]+)?)(?:[/?#].*)?",
+        m = re.fullmatch(r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?)"
+                         r"(?:[/?#].*)?",
                          self.spec.portal_issuer)
         if not m:
             return ""

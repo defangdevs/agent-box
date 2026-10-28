@@ -4503,6 +4503,10 @@ class PortalHandoff(unittest.TestCase):
                            {"portalIssuer": "https://x.test/a?b=1"})[
             "/etc/agent-box/Caddyfile"]
         self.assertIn("href='https://x.test'", odd)
+        v6 = self._render({"agent": {"root": True}},
+                          {"portalIssuer": "https://[2001:db8::1]:8443/x"})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertIn("href='https://[2001:db8::1]:8443'", v6)
         bad = self._render({"agent": {"root": True}},
                            {"portalIssuer": "https://x.test'\"{"})[
             "/etc/agent-box/Caddyfile"]
