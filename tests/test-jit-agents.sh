@@ -179,7 +179,7 @@ export AGENT_BOX_AGENT_BINS="claude=$HOME/gone/bin/claude shell=$BASH_BIN"
 printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/claude"
 chmod +x "$HOME/.nix-profile/bin/claude"
 is "a table entry naming a missing binary falls through to the profile" \
-   "$HOME/.nix-profile/bin/claude" "$(agent_bin claude)"
+   "$(readlink -f "$HOME/.nix-profile/bin/claude")" "$(agent_bin claude)"
 
 # --- profile fallback ---------------------------------------------------
 setup fallback
@@ -191,7 +191,20 @@ fi
 printf '#!%s\n' "$BASH_BIN" > "$HOME/.nix-profile/bin/claude"
 chmod +x "$HOME/.nix-profile/bin/claude"
 is "a JIT-installed harness resolves from the user profile" \
-   "$HOME/.nix-profile/bin/claude" "$(agent_bin claude)"
+   "$(readlink -f "$HOME/.nix-profile/bin/claude")" "$(agent_bin claude)"
+
+# Issue #938: the profile element is removed and re-added during an
+# upgrade. The path agent_bin returned must survive that flip.
+setup upgrade_race
+mkdir -p "$HOME/store1"
+printf '#!%s\n' "$BASH_BIN" > "$HOME/store1/claude"; chmod +x "$HOME/store1/claude"
+ln -s "$HOME/store1/claude" "$HOME/.nix-profile/bin/claude"
+raced="$(agent_bin claude)"
+rm -f "$HOME/.nix-profile/bin/claude"
+is "a resolved harness path is not the mutable profile symlink" \
+   "$HOME/store1/claude" "$raced"
+if [ -x "$raced" ]; then ok "the resolved path still execs after the profile flip"
+else no "the resolved path still execs after the profile flip" "$raced is gone"; fi
 
 # --- a registry name can never become a path ----------------------------
 setup hostile
@@ -210,7 +223,7 @@ setup install
 if agent_install claude >/dev/null 2>&1; then ok "agent_install claude succeeds"
 else no "agent_install claude succeeds" "it returned failure"; fi
 is "the installed harness now resolves" \
-   "$HOME/.nix-profile/bin/claude" "$(agent_bin claude)"
+   "$(readlink -f "$HOME/.nix-profile/bin/claude")" "$(agent_bin claude)"
 call=$(cat "$NIX_CALLS")
 case "$call" in
   *"profile add"*) ok "it ran 'nix profile add'" ;;

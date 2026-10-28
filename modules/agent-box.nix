@@ -8385,10 +8385,21 @@ agent_bin() {
   # Only ever a harness name we know; never an arbitrary string off the
   # registry turned into a path.
   agent_attr "$1" >/dev/null 2>&1 || return 1
-  if [ -x "$HOME/.nix-profile/bin/$1" ]; then
-    printf '%s\n' "$HOME/.nix-profile/bin/$1"
-    return 0
-  fi
+  # Return the immutable store path, not the profile symlink. A harness
+  # upgrade is a `nix profile remove` then `add`, so for one generation
+  # ~/.nix-profile/bin/NAME does not exist; a launch holding that path
+  # between this check and exec would die with exit 127 (issue #938). The
+  # store path stays valid, because the old generation roots it. The flip
+  # can also land between the -x test and the resolve, so retry that pair
+  # once; a harness that is simply not installed still fails at once.
+  for _ab_try in 1 2; do
+    [ -x "$HOME/.nix-profile/bin/$1" ] || return 1
+    _ab_real="$(readlink -f "$HOME/.nix-profile/bin/$1" 2>/dev/null)" || _ab_real=""
+    if [ -n "$_ab_real" ] && [ -x "$_ab_real" ]; then
+      printf '%s\n' "$_ab_real"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -16028,10 +16039,21 @@ esac
       # Only ever a harness name we know; never an arbitrary string off the
       # registry turned into a path.
       agent_attr "$1" >/dev/null 2>&1 || return 1
-      if [ -x "$HOME/.nix-profile/bin/$1" ]; then
-        printf '%s\n' "$HOME/.nix-profile/bin/$1"
-        return 0
-      fi
+      # Return the immutable store path, not the profile symlink. A harness
+      # upgrade is a `nix profile remove` then `add`, so for one generation
+      # ~/.nix-profile/bin/NAME does not exist; a launch holding that path
+      # between this check and exec would die with exit 127 (issue #938). The
+      # store path stays valid, because the old generation roots it. The flip
+      # can also land between the -x test and the resolve, so retry that pair
+      # once; a harness that is simply not installed still fails at once.
+      for _ab_try in 1 2; do
+        [ -x "$HOME/.nix-profile/bin/$1" ] || return 1
+        _ab_real="$(readlink -f "$HOME/.nix-profile/bin/$1" 2>/dev/null)" || _ab_real=""
+        if [ -n "$_ab_real" ] && [ -x "$_ab_real" ]; then
+          printf '%s\n' "$_ab_real"
+          return 0
+        fi
+      done
       return 1
     }
 
