@@ -16873,7 +16873,7 @@ esac
         (????????-????-????-????-????????????) ;;
         (*) return 0 ;;
       esac
-      read -r thread < "$HOME/.local/state/agent-box/live-session-id/$1" 2>/dev/null \
+      read -r thread 2>/dev/null < "$HOME/.local/state/agent-box/live-session-id/$1" \
         || thread=""
       case "$thread" in
         (*[!0-9a-fA-F-]*|"") return 0 ;;
@@ -16980,10 +16980,9 @@ esac
 
     codex_sync_last=0
     sync_codex_threads() {
-      # Resolve newly-started Codex sessions after their rollout appears. Codex
-      # does expose the UUID to SessionStart hooks, but releases 0.148 through
-      # 0.161 can time out before a hook command body runs; the supervisor already
-      # owns all inputs needed to resolve the same id without that lifecycle race.
+      # Publish newly-started Codex sessions after their rollout appears. The
+      # SessionStart record supplies the native id even without a kickoff
+      # prompt; the launch marker remains the fallback for older sessions.
       # Ten seconds bounds the scan cost for the selected prompt-less session
       # while staying below local-whatsapp's normal retry interval.
       [ -f "$HOME/.local/state/local-whatsapp/ready" ] || return 0
@@ -17384,7 +17383,7 @@ esac
           # sessions local so SessionStart sees this pane's launch id. Older
           # versions already run locally and do not recognize this flag.
           codex_local_arg=""
-          if [ "$rcdaemon" != true ] && "$bin" --help 2>/dev/null \
+          if [ "$rcdaemon" != true ] && timeout --kill-after=1s 2s "$bin" --help 2>/dev/null \
               | $GREP -F -- '--no-daemon' >/dev/null; then
             codex_local_arg=--no-daemon
           fi
@@ -17460,6 +17459,11 @@ esac
             if [ -n "$prompt" ]; then
               cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
             fi
+          fi
+          if [ "$rcdaemon" != true ]; then
+            # env-exec loads the profile before this wrapper sets the actual
+            # Codex owner pid. Nested CLIs inherit it and the hook rejects them.
+            cmd="$(printf '%q' "$BASH") -c $(printf '%q' 'export AGENT_BOX_CODEX_PID=$$; exec "$@"') agent-box-codex $cmd"
           fi
           ;;
         shell)
@@ -18028,10 +18032,42 @@ esac
       esac
       return 1
     }
+    codex_process_matches() {
+      # Tool shells inherit the launch id. Only the nearest Codex owner may
+      # update it; a nested `codex exec` has its own pid and must not replace
+      # the terminal's conversation. exec-server is a transport child, not a
+      # conversation owner. The launch wrapper sets the pid just before exec.
+      local expected="''${AGENT_BOX_CODEX_PID:-}" parent=$PPID next key value rest n binary
+      local -a args
+      case "$expected" in (""|*[!0-9]*) return 1 ;; esac
+      for ((n = 0; n < 64; n++)); do
+        [ "$parent" -gt 1 ] || return 1
+        mapfile -d ''' -t args 2>/dev/null < "/proc/$parent/cmdline" || return 1
+        binary="''${args[0]:-}"
+        case "''${binary##*/}" in
+          codex|.codex-wrapped)
+            if [ "''${args[1]:-}" != exec-server ]; then
+              [ "$parent" = "$expected" ]
+              return
+            fi
+            ;;
+        esac
+        next=""
+        while read -r key value rest; do
+          if [ "$key" = PPid: ]; then next=$value; break; fi
+        done 2>/dev/null < "/proc/$parent/status"
+        case "$next" in (""|*[!0-9]*) return 1 ;; esac
+        parent=$next
+      done
+      return 1
+    }
     # Drain stdin BEFORE any gate can exit (the #220/#222 lesson): claude is
     # still writing the payload, and an early exit would slam the pipe shut
     # under it. Unreachable-in-practice gates are exactly the ones that bite.
     payload="$(cat 2>/dev/null)" || payload=""
+    if [ "''${1:-}" = codex ]; then
+      codex_process_matches || exit 0
+    fi
     box="''${AGENT_BOX_SESSION_ID:-}"
     valid_uuid "$box" || exit 0
     sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)" || exit 0
@@ -19568,7 +19604,7 @@ in
         [[hooks.SessionStart]]
         [[hooks.SessionStart.hooks]]
         type = "command"
-        command = "${claudeSessionStartHook}"
+        command = "${claudeSessionStartHook} codex"
       '';
     };
 

@@ -1498,6 +1498,12 @@ class Renderer:
                    json.dumps(settings, indent=2, sort_keys=True) + "\n")
         codex_conf = self.p("/etc/codex/config.toml")
         if "codex" in self.spec.agents:
+            if not self.spec.codex_full_access and foreign_file(codex_conf):
+                self.notes.append(
+                    f"{codex_conf}: not written by agentbox - left alone; "
+                    "add the Agentbox SessionStart recorder to enable "
+                    "prompt-less Codex resume")
+                return
             t.dir(self.p("/etc/codex"), 0o755)
             content = GENERATED_HEADER
             if self.spec.codex_full_access:
@@ -1505,7 +1511,7 @@ class Renderer:
                             'sandbox_mode = "danger-full-access"\n')
             # System hooks are managed by the box; keep user hooks intact
             # and record prompt-less TUI conversations without a model turn.
-            hook = str(self.bin / "agent-box-claude-session-start-hook")
+            hook = str(self.bin / "agent-box-claude-session-start-hook") + " codex"
             content += ('[[hooks.SessionStart]]\n'
                         '[[hooks.SessionStart.hooks]]\n'
                         'type = "command"\n'

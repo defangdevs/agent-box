@@ -106,15 +106,47 @@ grep -qF '  sync_codex_threads' "$SUPERVISOR" \
 launch=11111111-1111-4111-8111-111111111111
 custom_cxhome=$cxhome
 sibling_launch=22222222-2222-4222-8222-222222222222
-record_start() {
+# A real process tree with a Codex-shaped argv exercises owner validation.
+cat > "$TEST_ROOT/fake-codex.sh" <<'SH'
+if [ "${4:-}" = nested ]; then
+  bash -c 'exec -a codex bash "$@"' codex "$0" "$1" "$2" "$3"
+else
   printf '{"hook_event_name":"SessionStart","source":"%s","session_id":"%s"}\n' "$3" "$2" \
-    | AGENT_BOX_SESSION_ID="$1" bash "$HOOK"
+    | AGENT_BOX_SESSION_ID="$1" bash "$HOOK" codex
+fi
+:
+SH
+export HOOK
+record_start() {
+  bash -c 'export AGENT_BOX_CODEX_PID=$$; exec -a codex bash "$@"' \
+    codex "$TEST_ROOT/fake-codex.sh" "$@"
 }
 record_start "$launch" "$live" startup
 record_start "$sibling_launch" "$marked" startup
 [ "$(codex_live_thread "$launch")" = "$live" ]
 [ "$(codex_live_thread "$sibling_launch")" = "$marked" ]
 [ -z "$(codex_live_thread ../escape)" ]
+record_start "$launch" "$marked" startup nested
+[ "$(codex_live_thread "$launch")" = "$live" ] \
+  || { echo "FAIL: a nested Codex overwrote its parent's conversation" >&2; exit 1; }
+codex_live_thread 33333333-3333-4333-8333-333333333333 2> "$TEST_ROOT/missing.err"
+[ ! -s "$TEST_ROOT/missing.err" ] \
+  || { echo "FAIL: an absent hook record wrote to stderr" >&2; exit 1; }
+
+# A wrapper or test harness may ignore --help. A capability probe must not
+# block the supervisor and prevent later sessions from starting.
+sed -n '/^      codex_local_arg=""$/,/^      if \[ "$rcdaemon" = true \]; then/p' "$SUPERVISOR" \
+  | sed '$d' > "$TEST_ROOT/local-mode.sh"
+printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$TEST_ROOT/hanging-codex"
+chmod +x "$TEST_ROOT/hanging-codex"
+GREP=grep rcdaemon=false bin="$TEST_ROOT/hanging-codex" \
+  timeout 6 bash -c '. "$1"; [ -z "$codex_local_arg" ]' -- "$TEST_ROOT/local-mode.sh"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" --no-daemon\n' > "$TEST_ROOT/modern-codex"
+chmod +x "$TEST_ROOT/modern-codex"
+GREP=grep rcdaemon=false bin="$TEST_ROOT/modern-codex" \
+  bash -c '. "$1"; [ "$codex_local_arg" = --no-daemon ]' -- "$TEST_ROOT/local-mode.sh"
+GREP=grep rcdaemon=true bin="$TEST_ROOT/modern-codex" \
+  bash -c '. "$1"; [ -z "$codex_local_arg" ]' -- "$TEST_ROOT/local-mode.sh"
 
 # A rotated thread wins even if the old transcript still has our marker.
 printf 'agent-box session %s\n' "$launch" >> "$sessions/rollout-2026-10-03T20-00-00-$marked.jsonl"

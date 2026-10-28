@@ -1447,8 +1447,13 @@ in
             ).strip()
             payload = json.dumps({"session_id": native, "source": "startup",
                                   "hook_event_name": "SessionStart"})
+            # Stand in for the supervised native process after quiescing it.
+            hook_call = (f"printf %s {shlex.quote(payload)} | "
+                         f"AGENT_BOX_SESSION_ID={launch} {hook}; :")
             machine.succeed(as_agent(
-                f"printf %s {shlex.quote(payload)} | AGENT_BOX_SESSION_ID={launch} {hook}"
+                "bash -c " + shlex.quote(
+                    'export AGENT_BOX_CODEX_PID=$$; exec -a codex bash -c '
+                    + shlex.quote(hook_call))
             ))
             machine.succeed(
                 "install -D -o agent /dev/null /home/agent/.codex/sessions/2026/10/28/"

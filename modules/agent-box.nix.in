@@ -3279,7 +3279,7 @@ in
         [[hooks.SessionStart]]
         [[hooks.SessionStart.hooks]]
         type = "command"
-        command = "${claudeSessionStartHook}"
+        command = "${claudeSessionStartHook} codex"
       '';
     };
 

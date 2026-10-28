@@ -935,7 +935,7 @@ codex_live_thread() {
     (????????-????-????-????-????????????) ;;
     (*) return 0 ;;
   esac
-  read -r thread < "$HOME/.local/state/agent-box/live-session-id/$1" 2>/dev/null \
+  read -r thread 2>/dev/null < "$HOME/.local/state/agent-box/live-session-id/$1" \
     || thread=""
   case "$thread" in
     (*[!0-9a-fA-F-]*|"") return 0 ;;
@@ -1042,10 +1042,9 @@ codex_publish_thread() {
 
 codex_sync_last=0
 sync_codex_threads() {
-  # Resolve newly-started Codex sessions after their rollout appears. Codex
-  # does expose the UUID to SessionStart hooks, but releases 0.148 through
-  # 0.161 can time out before a hook command body runs; the supervisor already
-  # owns all inputs needed to resolve the same id without that lifecycle race.
+  # Publish newly-started Codex sessions after their rollout appears. The
+  # SessionStart record supplies the native id even without a kickoff
+  # prompt; the launch marker remains the fallback for older sessions.
   # Ten seconds bounds the scan cost for the selected prompt-less session
   # while staying below local-whatsapp's normal retry interval.
   [ -f "$HOME/.local/state/local-whatsapp/ready" ] || return 0
@@ -1446,7 +1445,7 @@ start_session() {
       # sessions local so SessionStart sees this pane's launch id. Older
       # versions already run locally and do not recognize this flag.
       codex_local_arg=""
-      if [ "$rcdaemon" != true ] && "$bin" --help 2>/dev/null \
+      if [ "$rcdaemon" != true ] && timeout --kill-after=1s 2s "$bin" --help 2>/dev/null \
           | $GREP -F -- '--no-daemon' >/dev/null; then
         codex_local_arg=--no-daemon
       fi
@@ -1522,6 +1521,11 @@ start_session() {
         if [ -n "$prompt" ]; then
           cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
         fi
+      fi
+      if [ "$rcdaemon" != true ]; then
+        # env-exec loads the profile before this wrapper sets the actual
+        # Codex owner pid. Nested CLIs inherit it and the hook rejects them.
+        cmd="$(printf '%q' "$BASH") -c $(printf '%q' 'export AGENT_BOX_CODEX_PID=$$; exec "$@"') agent-box-codex $cmd"
       fi
       ;;
     shell)

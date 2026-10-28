@@ -4,4 +4,4 @@ sandbox_mode = "danger-full-access"
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "@PROFILE@/bin/agent-box-claude-session-start-hook"
+command = "@PROFILE@/bin/agent-box-claude-session-start-hook codex"

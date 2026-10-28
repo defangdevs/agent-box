@@ -3,4 +3,4 @@ sandbox_mode = "danger-full-access"
 [[hooks.SessionStart]]
 [[hooks.SessionStart.hooks]]
 type = "command"
-command = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-claude-session-start-hook"
+command = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-claude-session-start-hook codex"

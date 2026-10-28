@@ -1584,7 +1584,7 @@ class RenderTest(unittest.TestCase):
         # Both keys, or the box opens the filesystem and still stops to ask.
         self.assertIn('sandbox_mode = "danger-full-access"', toml)
         self.assertIn('[[hooks.SessionStart.hooks]]', toml)
-        self.assertIn('command = "@PROFILE@/bin/agent-box-claude-session-start-hook"', toml)
+        self.assertIn('command = "@PROFILE@/bin/agent-box-claude-session-start-hook codex"', toml)
         for user in ("agent", "robot"):
             env = (FIXTURE / "etc/agent-box/units" / f"{user}.env").read_text()
             self.assertIn("AGENT_BOX_CLAUDE_SETTINGS="
@@ -1681,6 +1681,23 @@ class RenderTest(unittest.TestCase):
             self.assertTrue(elsewhere.exists())
             self.assertEqual(mod.GENERATED_HEADER + "x = 1\n",
                              elsewhere.read_text())
+
+    def test_codex_hook_preserves_foreign_restricted_configuration(self):
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["codexFullAccess"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "root"
+            conf = out / "etc/codex/config.toml"
+            conf.parent.mkdir(parents=True)
+            content = 'model = "custom-model"\n'
+            conf.write_text(content)
+            renderer = mod.Renderer(mod.Spec(config, prof), prof, root=out)
+            tree = renderer.render()
+            self.assertNotIn(str(conf), tree.files)
+            self.assertEqual(conf.read_text(), content)
+            self.assertTrue(any("SessionStart" in note for note in renderer.notes))
 
     def test_codex_full_access_is_file_and_flag_together(self):
         """Never the flag without the file. supervisor.sh reads the flag as
