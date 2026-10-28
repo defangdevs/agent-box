@@ -2322,6 +2322,24 @@ def transcript_of(name, entry):
     return path, info.st_size, info.st_mtime
 
 
+def claude_custom_title(path):
+    """The title a user gave a claude conversation with /rename, or from the
+    desktop app (issue #935), or "". claude rewrites
+    <projects>/<key>/<id>/custom-title.json on every rename (issue #587);
+    `path` is that conversation's <id>.jsonl. Only the explicit title is
+    read: the transcript's own custom-title lines are re-appended at each
+    start and the AI-generated title changes by itself. The file holds one
+    short object; the 64 KiB cap only bounds a corrupt or hostile file."""
+    base = os.path.splitext(path)[0]
+    try:
+        with open(os.path.join(base, "custom-title.json"), "rb") as handle:
+            record = json.loads(handle.read(65536))
+    except (OSError, ValueError, RecursionError):
+        return ""
+    title = record.get("customTitle") if isinstance(record, dict) else None
+    return " ".join(title.split()) if isinstance(title, str) else ""
+
+
 def human_size(size):
     """Byte count for a tooltip or a file-drop listing: whole KB, then one
     decimal, since the point is only whether this is a short conversation
@@ -8685,6 +8703,10 @@ def render_sessions(subs=None):
             # chromium, and the same rule the Restart button relies on).
             found = transcript_of(name, entries[name])
             topic = transcript_topic(found[0], found[1]) if found else ""
+            # A name the user chose beats the opening prompt as the answer
+            # to "which conversation is this" (issue #935).
+            if found and entries[name].get("agent") == "claude":
+                topic = claude_custom_title(found[0]) or topic
             if found:
                 # Both halves of "which conversation is this": the opening
                 # prompt and when the file was last appended to. html.escape
