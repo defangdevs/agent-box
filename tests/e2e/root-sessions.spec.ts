@@ -17,11 +17,12 @@
 //   - the live feed: sessions created or deleted elsewhere show up in an
 //     already-open page without a reload,
 //   - the grid layout: every session's terminal at once, reached and left
-//     without a page load (PR #580).
+//     without a page load (PR #580),
+//   - selection guidance triggered by terminal clipboard shortcuts (#945).
 //
 // See playwright.config.ts for the E2E_* environment contract.
 
-import { test, expect, Browser, Page } from '@playwright/test';
+import { test, expect, Browser, Page, Frame } from '@playwright/test';
 
 const USER = process.env.E2E_USER || 'claude';
 const PASSWORD = process.env.E2E_PASSWORD || '';
@@ -38,12 +39,140 @@ test.beforeAll(() => {
   if (!PASSWORD) throw new Error('E2E_PASSWORD is required');
 });
 
-async function authedPage(browser: Browser): Promise<Page> {
+async function authedPage(browser: Browser, platform?: string): Promise<Page> {
   const ctx = await browser.newContext({
     httpCredentials: { username: USER, password: PASSWORD },
   });
+  if (platform) {
+    await ctx.addInitScript((value) => {
+      Object.defineProperty(navigator, 'platform', { get: () => value });
+    }, platform);
+  }
   return ctx.newPage();
 }
+
+// Dispatch at the document so testing Ctrl+C or paste never interrupts a
+// live agent or pastes the runner's clipboard into its terminal. The hint
+// listens here in capture phase; terminal input itself is xterm's job.
+async function terminalKey(frame: Frame, key: string, modifiers = {}) {
+  return frame.evaluate(({ key, modifiers }) => {
+    const event = new KeyboardEvent('keydown', { key, ...modifiers, cancelable: true });
+    return document.dispatchEvent(event);
+  }, { key, modifiers });
+}
+
+async function hintTerminal(page: Page): Promise<Frame> {
+  const pane = page.locator('#panes iframe.pane').first();
+  await expect(pane).toBeVisible({ timeout: 30_000 });
+  const frame = await (await pane.elementHandle())!.contentFrame();
+  await expect(frame!.locator('.xterm')).toBeVisible({ timeout: 30_000 });
+  return frame!;
+}
+
+test('selection hint uses Option on Mac, preserves shortcuts, and expires', async ({ browser }) => {
+  const page = await authedPage(browser, 'MacIntel');
+  await page.goto('/');
+  const frame = await hintTerminal(page);
+  const hint = page.locator('#terminal-copy-hint');
+  await expect(hint).toBeHidden();
+  expect(await terminalKey(frame, 'Meta', { metaKey: true })).toBe(true);
+  await expect(hint).toHaveText('Hold Option while dragging to select and copy terminal text.');
+  await expect(hint).toBeVisible();
+  await expect(hint).toHaveCSS('pointer-events', 'none');
+  await terminalKey(frame, 'a');
+  await expect(hint).toBeHidden();
+  for (const key of ['c', 'v']) {
+    expect(await terminalKey(frame, key, { metaKey: true })).toBe(true);
+    await expect(hint).toBeVisible();
+  }
+  await expect(hint).toBeHidden({ timeout: 6_000 });
+  await page.context().close();
+});
+
+for (const platform of ['Linux x86_64', 'Win32']) {
+  test(`selection hint uses Shift on ${platform} and leaves Ctrl keys alone`, async ({ browser }) => {
+    const page = await authedPage(browser, platform);
+    await page.goto('/');
+    const frame = await hintTerminal(page);
+    const hint = page.locator('#terminal-copy-hint');
+    await terminalKey(frame, 'Control', { ctrlKey: true });
+    await expect(hint).toBeHidden();
+    for (const key of ['c', 'v']) {
+      expect(await terminalKey(frame, key, { ctrlKey: true, shiftKey: true })).toBe(true);
+      await expect(hint).toHaveText('Hold Shift while dragging to select and copy terminal text.');
+      await expect(hint).toBeVisible();
+      await terminalKey(frame, 'Escape');
+      await expect(hint).toBeHidden();
+    }
+    expect(await terminalKey(frame, 'c', { ctrlKey: true })).toBe(true);
+    await expect(hint).toBeVisible();
+    await terminalKey(frame, 'a', { ctrlKey: true });
+    await expect(hint).toBeHidden();
+    await terminalKey(frame, 'c', { ctrlKey: true, altKey: true });
+    await expect(hint).toBeHidden();
+    await page.context().close();
+  });
+}
+
+test('selection hint respects xterm selection and clears when dragging starts', async ({ browser }) => {
+  const page = await authedPage(browser, 'MacIntel');
+  await page.goto('/');
+  const frame = await hintTerminal(page);
+  // xterm renders its selection independently of the browser DOM selection.
+  // Use the same public API that ttyd exposes as window.term.
+  await frame.evaluate(() => {
+    const term = (window as any).term;
+    term.select(0, term.buffer.active.cursorY, 1);
+  });
+  await terminalKey(frame, 'Meta', { metaKey: true });
+  await expect(page.locator('#terminal-copy-hint')).toBeHidden();
+  await frame.evaluate(() => (window as any).term.clearSelection());
+  await terminalKey(frame, 'Meta', { metaKey: true });
+  await expect(page.locator('#terminal-copy-hint')).toBeVisible();
+  await frame.locator('.xterm').dispatchEvent('mousedown');
+  await expect(page.locator('#terminal-copy-hint')).toBeHidden();
+  await page.context().close();
+});
+
+test('selection hint follows the pointer, fits the viewport, and survives iframe reload', async ({ browser }) => {
+  const page = await authedPage(browser, 'MacIntel');
+  await page.goto('/');
+  let frame = await hintTerminal(page);
+  const pane = page.locator('#panes iframe.pane').first();
+  const rect = (await pane.boundingBox())!;
+  await page.mouse.move(rect.x + rect.width - 4, rect.y + rect.height - 4);
+  await terminalKey(frame, 'Meta', { metaKey: true });
+  const hint = page.locator('#terminal-copy-hint');
+  const box = (await hint.boundingBox())!;
+  const viewport = page.viewportSize()!;
+  expect(box.x).toBeGreaterThanOrEqual(8);
+  expect(box.y).toBeGreaterThanOrEqual(8);
+  expect(box.x + box.width).toBeLessThanOrEqual(viewport.width - 8);
+  expect(box.y + box.height).toBeLessThan(rect.y + rect.height - 4);
+  await page.mouse.move(rect.x + 60, rect.y + 60);
+  expect((await hint.boundingBox())!.x).toBeCloseTo(rect.x + 74, 0);
+  await frame.evaluate(() => window.location.reload());
+  frame = await hintTerminal(page);
+  await expect(hint).toBeHidden();
+  await terminalKey(frame, 'Meta', { metaKey: true });
+  await expect(hint).toBeVisible();
+  await page.context().close();
+});
+
+test('selection hint also attaches to dynamically mounted grid panes', async ({ browser }) => {
+  const page = await authedPage(browser, 'MacIntel');
+  await page.goto('/');
+  await hintTerminal(page);
+  const names = await tabNames(page);
+  test.skip(names.length < 2, 'Needs two live sessions to exercise a newly mounted iframe');
+  await page.locator('#tab-bar a.viewtog').click();
+  const pane = page.locator('#panes iframe.pane').last();
+  const frame = await (await pane.elementHandle())!.contentFrame();
+  await expect(frame!.locator('.xterm')).toBeVisible({ timeout: 30_000 });
+  await terminalKey(frame!, 'Meta', { metaKey: true });
+  await expect(page.locator('#terminal-copy-hint')).toBeVisible();
+  await page.context().close();
+});
 
 // Did the page RELOAD? Counted from the request that would fetch the new
 // document, and not from performance.getEntriesByType('navigation').length,

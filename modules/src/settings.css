@@ -337,6 +337,14 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 .tabs a.gear:hover, .tabs a.gear:focus-visible,
 .tabs a.viewtog:hover,
 .tabs a.viewtog:focus-visible { color: #e6edf3; }
+/* Outside the iframe so the tip is not clipped by a grid tile. It must
+   never intercept a drag or take focus from the terminal. */
+#terminal-copy-hint { position: fixed; z-index: 20; pointer-events: none;
+                      box-sizing: border-box;
+                      max-width: min(320px, calc(100vw - 16px));
+                      padding: 8px 12px; border: 1px solid #484f58;
+                      border-radius: 6px; background: #161b22; color: #e6edf3;
+                      font-size: 13px; box-shadow: 0 4px 12px #0006; }
 .ws .editor, .ws .msg { margin: 8px; flex: none; }
 .panes { position: relative; flex: 1; min-height: 0; }
 /* A cell is a pane plus the caption naming it. Stacked and toggled the

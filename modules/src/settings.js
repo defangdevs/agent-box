@@ -733,6 +733,87 @@
       last.style.gridColumn = "span " + (spare + 1);
     }
   }
+  // ttyd's keys and mouse events stay inside its same-origin iframe. Listen
+  // there without cancelling anything: Ctrl+C must still reach the terminal,
+  // and clipboard shortcuts must keep the browser's normal behavior.
+  var copyHintFrames = new WeakSet(), copyHintDocs = new WeakSet();
+  var copyHint = null, copyHintTimer = null, copyHintPane = null;
+  var copyHintMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  function hideCopyHint() {
+    if (copyHint) { copyHint.hidden = true; }
+    window.clearTimeout(copyHintTimer);
+    copyHintPane = null;
+  }
+  function placeCopyHint(frame, point) {
+    var rect = frame.getBoundingClientRect();
+    var x = rect.left + (point ? point.x : rect.width / 2);
+    var y = rect.top + (point ? point.y : rect.height / 2);
+    var w = copyHint.offsetWidth, h = copyHint.offsetHeight;
+    copyHint.style.left = Math.max(8, Math.min(x + 14, window.innerWidth - w - 8)) + "px";
+    // Flip above the pointer near the bottom edge.
+    y = y + 18 + h > window.innerHeight - 8 ? y - h - 12 : y + 18;
+    copyHint.style.top = Math.max(8, Math.min(y, window.innerHeight - h - 8)) + "px";
+  }
+  function watchCopyHint(frame) {
+    if (copyHintFrames.has(frame)) { return; }
+    copyHintFrames.add(frame);
+    function bind() {
+      var doc, win;
+      try { doc = frame.contentDocument; win = frame.contentWindow; }
+      catch (err) { return; }
+      if (!doc || copyHintDocs.has(doc)) { return; }
+      copyHintDocs.add(doc);
+      var point = null;
+      function selected() {
+        // xterm paints its own selection; window.getSelection alone misses
+        // it. ttyd exposes the terminal as window.term.
+        return (win.term && win.term.hasSelection()) ||
+          String(win.getSelection()).length > 0;
+      }
+      doc.addEventListener("mousemove", function (e) {
+        point = { x: e.clientX, y: e.clientY };
+        if (copyHintPane === frame) { placeCopyHint(frame, point); }
+      });
+      doc.addEventListener("keydown", function (e) {
+        var key = e.key.toLowerCase();
+        var shortcut = (key === "c" || key === "v") &&
+          (copyHintMac ? e.metaKey : e.ctrlKey);
+        var command = copyHintMac && key === "meta" && !e.shiftKey;
+        var field = e.target.closest && e.target.closest("input,textarea,select,[contenteditable]");
+        if (e.altKey || (copyHintMac && e.ctrlKey) ||
+            (!copyHintMac && e.metaKey) || !(shortcut || command) ||
+            (field && !field.closest(".xterm")) || selected()) {
+          hideCopyHint();
+          return;
+        }
+        if (e.repeat) { return; }
+        if (!copyHint) {
+          copyHint = document.createElement("div");
+          copyHint.id = "terminal-copy-hint";
+          copyHint.setAttribute("role", "status");
+          document.body.appendChild(copyHint);
+          copyHint.textContent = "Hold " + (copyHintMac ? "Option" : "Shift") +
+            " while dragging to select and copy terminal text.";
+        }
+        copyHint.hidden = false;
+        copyHintPane = frame;
+        placeCopyHint(frame, point);
+        window.clearTimeout(copyHintTimer);
+        copyHintTimer = window.setTimeout(hideCopyHint, 4000);
+      }, true);
+      doc.addEventListener("mousedown", hideCopyHint, true);
+      doc.addEventListener("selectionchange", function () {
+        if (selected()) { hideCopyHint(); }
+      });
+      doc.addEventListener("mouseleave", hideCopyHint);
+      win.addEventListener("blur", hideCopyHint);
+    }
+    frame.addEventListener("load", function () { hideCopyHint(); bind(); });
+    bind();
+  }
+  window.addEventListener("resize", hideCopyHint);
+  document.addEventListener("scroll", hideCopyHint, true);
+  document.addEventListener("mousedown", hideCopyHint, true);
   function ensurePane(name) {
     var cell = ensureCell(name);
     var cur = cell.querySelector('.pane[data-pane="' + name + '"]');
@@ -777,6 +858,7 @@
       cell.querySelectorAll(".pane").forEach(function (pane) {
         if (pane !== cur) { pane.remove(); }
       });
+      if (cur.tagName === "IFRAME") { watchCopyHint(cur); }
       return cur;
     }
     var el;
@@ -805,6 +887,7 @@
     cell.querySelectorAll(".pane").forEach(function (pane) {
       if (pane !== el) { pane.remove(); }
     });
+    if (el.tagName === "IFRAME") { watchCopyHint(el); }
     return el;
   }
   function wsSelect(name, focus) {
