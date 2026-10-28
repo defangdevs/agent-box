@@ -10130,7 +10130,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     assignments.append((key, value))
                 else:
                     drop.append(key)
-            if name.endswith("-daemon") and name[:-len("-daemon")] in AGENTS:
+            if (name.endswith("-daemon") and name[:-len("-daemon")] in AGENTS
+                    and not os.path.lexists(profile_path(name))):
                 # Reserved: `agent-box-session add --profile` resolves these
                 # itself (issue #942), so a file by that name is shadowed.
                 self._send_html(

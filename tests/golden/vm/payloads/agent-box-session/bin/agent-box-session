@@ -1605,6 +1605,12 @@ case "$cmd" in
     # Any HARNESS-daemon name works, so a harness that grows daemon support
     # needs no change here; the check below refuses one that has none.
     pseudo="${profile#:}"
+    # A file profile that already has the name keeps resolving as itself (it
+    # predates the reservation); `:NAME` always means the pseudo-profile.
+    if [ "$pseudo" = "$profile" ] \
+         && "${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" >/dev/null 2>&1; then
+      pseudo=""
+    fi
     case "$pseudo" in
       (*-daemon)
         pseudo="${pseudo%-daemon}"

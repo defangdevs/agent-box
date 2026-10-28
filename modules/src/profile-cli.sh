@@ -328,7 +328,9 @@ case "$cmd" in
     case "$name" in
       (*-daemon)
         for _h in $HARNESSES; do
-          if [ "$name" = "$_h-daemon" ]; then
+          # Only a NEW profile is refused: an existing file of that name keeps
+          # working and stays editable until its owner renames it.
+          if [ "$name" = "$_h-daemon" ] && [ ! -f "$(file_for "$name")" ]; then
             echo "'$name' is reserved for the $name pseudo-profile (agent-box-session add --profile $name); pick another name" >&2
             exit 2
           fi

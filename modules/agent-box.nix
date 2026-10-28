@@ -7111,6 +7111,12 @@ case "$cmd" in
     # Any HARNESS-daemon name works, so a harness that grows daemon support
     # needs no change here; the check below refuses one that has none.
     pseudo="''${profile#:}"
+    # A file profile that already has the name keeps resolving as itself (it
+    # predates the reservation); `:NAME` always means the pseudo-profile.
+    if [ "$pseudo" = "$profile" ] \
+         && "''${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" >/dev/null 2>&1; then
+      pseudo=""
+    fi
     case "$pseudo" in
       (*-daemon)
         pseudo="''${pseudo%-daemon}"
@@ -8265,7 +8271,9 @@ case "$cmd" in
     case "$name" in
       (*-daemon)
         for _h in $HARNESSES; do
-          if [ "$name" = "$_h-daemon" ]; then
+          # Only a NEW profile is refused: an existing file of that name keeps
+          # working and stays editable until its owner renames it.
+          if [ "$name" = "$_h-daemon" ] && [ ! -f "$(file_for "$name")" ]; then
             echo "'$name' is reserved for the $name pseudo-profile (agent-box-session add --profile $name); pick another name" >&2
             exit 2
           fi
@@ -33119,7 +33127,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     assignments.append((key, value))
                 else:
                     drop.append(key)
-            if name.endswith("-daemon") and name[:-len("-daemon")] in AGENTS:
+            if (name.endswith("-daemon") and name[:-len("-daemon")] in AGENTS
+                    and not os.path.lexists(profile_path(name))):
                 # Reserved: `agent-box-session add --profile` resolves these
                 # itself (issue #942), so a file by that name is shadowed.
                 self._send_html(
