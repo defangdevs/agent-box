@@ -758,7 +758,6 @@ if [ -n "${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "${LOCAL_WEBHOOK_SPAWN_KEY:-}" 
   lease_object="$("$JQ" -rn --argjson meta "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
     '(($meta.number // "" | tostring) | if test("^[0-9]+$") then . else "" end)' \
     2>/dev/null)" || lease_object=""
-  lease_create "$name" "$own" "$lease_object"
 fi
 
 # An assignment is a work request, not a triage request (#253), and the
@@ -838,6 +837,12 @@ fi
 # for inspection exactly as before -- and every surface now says the agent
 # is gone instead of reporting the post-mortem shell as a running session.
 start_hook_session() {
+  # One lease generation per ATTEMPT. An immediate exec failure makes
+  # agent-box-session delete the dead registration and return 75; the
+  # hibernation/retry arm below may then retry this same deterministic name
+  # before the receiver re-offers it. Resetting here prevents the first
+  # pane's died:127 outcome from being inherited by the successful retry.
+  [ -z "$own" ] || lease_create "$name" "$own" "$lease_object"
   "$SESSION_BIN" add "$name" "${pflag[@]+"${pflag[@]}"}" --ephemeral \
     --origin webhook --hook "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
 
@@ -846,6 +851,13 @@ $PROMPT" -- "${extra[@]}"
 
 rc=0
 start_hook_session || rc=$?
+if [ "$rc" = 76 ]; then
+  # The agent died at exec (126/127) and its registration is gone. That is
+  # not capacity pressure: evicting an idle session or recording a refusal
+  # would be wrong, so hand the receiver its retry status directly.
+  echo "agent-box-webhook-spawn: session failed during startup; receiver will retry" >&2
+  exit 75
+fi
 if [ "$rc" = 75 ]; then
   # Capacity pressure is the only reason to evict an idle runtime. The
   # session CLI proves quiescence, revalidates it under the registry lock,
