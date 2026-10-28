@@ -385,6 +385,33 @@ is "the app-server-daemon mirror links codex-code-mode-host beside codex" \
    "$HOME/store/bin/codex-code-mode-host" \
    "$(readlink "$HOME/.codex/packages/app-server-daemon/current/bin/codex-code-mode-host")"
 
+# issue #949: a managed daemon still running an older codex build keeps
+# handing its command runner a store path that is gone, so mirroring the
+# current codex stops it, and leaves one on the current codex alone.
+setup codexmirror_stale_daemon
+mkdir -p "$HOME/old" "$HOME/store/bin"
+cp "$BASH_BIN" "$HOME/old/codex"
+cp "$BASH_BIN" "$HOME/store/bin/codex"
+"$HOME/old/codex" -c 'sleep 30; :' x app-server --managed-daemon &
+_stale_pid=$!
+"$HOME/store/bin/codex" -c 'sleep 30; :' x app-server --managed-daemon &
+_cur_pid=$!
+sleep 0.2
+mirror_codex_standalone "$HOME/store/bin/codex"
+sleep 0.2
+if kill -0 "$_stale_pid" 2>/dev/null; then
+  no "mirroring stops a managed daemon running a different codex"
+else
+  ok "mirroring stops a managed daemon running a different codex"
+fi
+if kill -0 "$_cur_pid" 2>/dev/null; then
+  ok "mirroring leaves a daemon on the mirrored codex running"
+else
+  no "mirroring leaves a daemon on the mirrored codex running"
+fi
+kill "$_cur_pid" 2>/dev/null || true
+wait 2>/dev/null || true
+
 # --- resolve_codex_home's precedence -------------------------------------
 # The same precedence env-exec.py applies at spawn (box store, then the
 # named profile on top), so the supervisor's own guess agrees with what

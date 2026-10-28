@@ -8886,6 +8886,22 @@ mirror_codex_standalone() {
       ln -sfn "$_mcs_sib" "$cxhome/packages/standalone/agent-box-current/$(basename "$_mcs_sib")"
       ln -sfn "$_mcs_sib" "$cxhome/packages/app-server-daemon/agent-box-current/bin/$(basename "$_mcs_sib")"
     done
+    # A running managed daemon keeps the binary it started from, and hands
+    # that store path to its command runner. After an upgrade, or a build
+    # that lacked the helpers, it still names a build that is gone or
+    # incomplete: "failed to spawn code-mode host /nix/store/<old>/bin/
+    # codex-code-mode-host" (issue #949), and restarting the session does
+    # not touch it. Stop any of this user's daemons that run a different
+    # codex than the one just mirrored; the next client starts a fresh one.
+    for _mcs_p in /proc/[0-9]*; do
+      [ -O "$_mcs_p" ] || continue
+      _mcs_exe="$(readlink "$_mcs_p/exe" 2>/dev/null)" || continue
+      case "''${_mcs_exe##*/}" in (codex) ;; (*) continue ;; esac
+      [ "$_mcs_exe" != "$_mcs_real" ] || continue
+      case "$(tr '\0' ' ' < "$_mcs_p/cmdline" 2>/dev/null)" in
+        (*" app-server "*"--managed-daemon"*) kill "''${_mcs_p#/proc/}" 2>/dev/null || true ;;
+      esac
+    done
   fi
 }
 
@@ -16573,6 +16589,22 @@ esac
           [ -f "$_mcs_sib" ] && [ "$_mcs_sib" != "$_mcs_real" ] || continue
           ln -sfn "$_mcs_sib" "$cxhome/packages/standalone/agent-box-current/$(basename "$_mcs_sib")"
           ln -sfn "$_mcs_sib" "$cxhome/packages/app-server-daemon/agent-box-current/bin/$(basename "$_mcs_sib")"
+        done
+        # A running managed daemon keeps the binary it started from, and hands
+        # that store path to its command runner. After an upgrade, or a build
+        # that lacked the helpers, it still names a build that is gone or
+        # incomplete: "failed to spawn code-mode host /nix/store/<old>/bin/
+        # codex-code-mode-host" (issue #949), and restarting the session does
+        # not touch it. Stop any of this user's daemons that run a different
+        # codex than the one just mirrored; the next client starts a fresh one.
+        for _mcs_p in /proc/[0-9]*; do
+          [ -O "$_mcs_p" ] || continue
+          _mcs_exe="$(readlink "$_mcs_p/exe" 2>/dev/null)" || continue
+          case "''${_mcs_exe##*/}" in (codex) ;; (*) continue ;; esac
+          [ "$_mcs_exe" != "$_mcs_real" ] || continue
+          case "$(tr '\0' ' ' < "$_mcs_p/cmdline" 2>/dev/null)" in
+            (*" app-server "*"--managed-daemon"*) kill "''${_mcs_p#/proc/}" 2>/dev/null || true ;;
+          esac
         done
       fi
     }
