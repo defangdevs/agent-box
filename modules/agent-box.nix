@@ -33735,6 +33735,13 @@ if __name__ == "__main__":
       ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
       isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
       webDomainIsIpv4 = isIpv4 cfg.web.domain;
+      # The 401 page's portal link (issue #937): the issuer's origin only,
+      # and nothing at all for a value that is not a plain http(s) origin.
+      portalHint =
+        let m = builtins.match "(https?://[A-Za-z0-9.-]+(:[0-9]+)?)([/?#].*)?"
+                  cfg.web.portalIssuer;
+        in if m == null then "" else
+          "<p style='margin:12px 0 0;font-size:14px'><a href='${builtins.head m}' style='color:#58a6ff'>Open this box from your portal page</a></p>";
       webAliases = lib.optional (cfg.web.alias != "") cfg.web.alias ++ cfg.web.aliases;
 
       # Prefix every non-blank line — Nix indented strings strip the common
@@ -34163,11 +34170,12 @@ if __name__ == "__main__":
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" ]
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
           caddyReloadCmd
           (if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
-          (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "") ] ''
+          (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "")
+          portalHint ] ''
         # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
         # the next @APPLY_CMD@. To add your own virtual host,
         # drop a *.caddy snippet into ~/sites/ (which is a symlink into
@@ -34290,11 +34298,13 @@ if __name__ == "__main__":
           # With nosniff above, browsers offer that response as a download when
           # the user cancels the password dialog (issue #746). Keep the Basic
           # challenge that basic_auth already set, and make the refusal renderable.
+          # The page links to the portal's origin when web.portalIssuer is set
+          # (issue #937), for a user who arrived without a login.
           handle_errors {
             @auth_error expression {http.error.status_code} == 401
             handle @auth_error {
               header Content-Type "text/html; charset=utf-8"
-              respond "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p></section></main></body></html>" 401
+              respond "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p>@PORTAL_HINT@</section></main></body></html>" 401
             }
           }
           # This fragment ends INSIDE the block on purpose: the module appends one

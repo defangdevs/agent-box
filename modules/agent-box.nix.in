@@ -3890,6 +3890,13 @@ in
       ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
       isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
       webDomainIsIpv4 = isIpv4 cfg.web.domain;
+      # The 401 page's portal link (issue #937): the issuer's origin only,
+      # and nothing at all for a value that is not a plain http(s) origin.
+      portalHint =
+        let m = builtins.match "(https?://[A-Za-z0-9.-]+(:[0-9]+)?)([/?#].*)?"
+                  cfg.web.portalIssuer;
+        in if m == null then "" else
+          "<p style='margin:12px 0 0;font-size:14px'><a href='${builtins.head m}' style='color:#58a6ff'>Open this box from your portal page</a></p>";
       webAliases = lib.optional (cfg.web.alias != "") cfg.web.alias ++ cfg.web.aliases;
 
       # Prefix every non-blank line — Nix indented strings strip the common
@@ -3985,11 +3992,12 @@ in
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" ]
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
           caddyReloadCmd
           (if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
-          (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "") ] ''
+          (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "")
+          portalHint ] ''
         @@include:src/caddyfile-header.caddy@@
       ''
       + lib.concatMapStringsSep "\n"
