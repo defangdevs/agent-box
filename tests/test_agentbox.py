@@ -3584,6 +3584,27 @@ class SelfUpdateLogicTest(unittest.TestCase):
         self.assertLess(self.calls.index(removes[0]),
                         self.calls.index(installs[0]))
 
+    def test_the_live_profile_never_loses_its_runtime_during_a_switch(self):
+        """Issue #957: the supervisor reads <profile>/bin while we update.
+
+        remove + install on the live profile left it empty between the two,
+        so sleep and flock vanished. The edits belong on a staging profile;
+        the live one may only be moved by the single closing `--set`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self._source("2" * 40)
+            with self.quiet(), self.assertRaises(self.mod.UpdateError):
+                self.mod.cmd_update(self._args(prof))
+        live = str(prof)
+        for call in self.calls:
+            if "remove" in call or "install" in call:
+                self.assertNotIn(live, call, call)
+        touching = [c for c in self.calls
+                    if c[:3] == ["nix-env", "--profile", live]]
+        self.assertEqual(len(touching), 1, touching)
+        self.assertIn("--set", touching[0])
+
     def test_a_failed_build_is_reported_and_leaves_the_profile_alone(self):
         """`main` catches ConfigError and UpdateError — nothing else.
 
