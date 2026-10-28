@@ -475,6 +475,18 @@ mirror_codex_standalone() {
   # uses that file in place and copies nothing.
   _mcs_swap "$cxhome/packages/standalone" agent-box-current "$cbin" codex
   _mcs_swap "$cxhome/packages/app-server-daemon" agent-box-current "$cbin" bin/codex
+  # codex finds its helpers (codex-code-mode-host, logs_client) NEXT TO the
+  # path it was started from, without resolving the symlink above. Mirror
+  # them beside each link, or the daemon's codex dies with
+  # "codex-code-mode-host is missing" (issue #946).
+  _mcs_real="$(readlink -f "$cbin" 2>/dev/null)" || _mcs_real=
+  if [ -n "$_mcs_real" ]; then
+    for _mcs_sib in "$(dirname "$_mcs_real")"/*; do
+      [ -f "$_mcs_sib" ] && [ "$_mcs_sib" != "$_mcs_real" ] || continue
+      ln -sfn "$_mcs_sib" "$cxhome/packages/standalone/agent-box-current/$(basename "$_mcs_sib")"
+      ln -sfn "$_mcs_sib" "$cxhome/packages/app-server-daemon/agent-box-current/bin/$(basename "$_mcs_sib")"
+    done
+  fi
 }
 
 # Point $1/$2/$4 at $3 and swap $1/current to $2.
