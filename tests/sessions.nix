@@ -577,7 +577,19 @@ in
 
     # Exercise every daemon-only supervisor branch through the canonical
     # marker, without relying on the legacy Codex remoteControl=true encoding.
+    # tmux existence only means the pane was created. Do not interrupt daemon
+    # startup, or let its asynchronous HUP cleanup stop the replacement daemon.
+    machine.wait_until_succeeds(
+        as_agent("codex app-server daemon version"), timeout=60
+    )
+    helper_pane_pid = machine.succeed(
+        tmux('display-message -p -t "=helper:" "#{pane_pid}"')
+    ).strip()
     machine.succeed(as_agent("agent-box-session stop helper"))
+    machine.wait_until_fails(f"pgrep -g {helper_pane_pid}", timeout=60)
+    machine.wait_until_fails(
+        as_agent("codex app-server daemon version"), timeout=60
+    )
     machine.succeed(as_agent(
         "jq '.sessions.helper.remoteControl = false' "
         f"{sfile} > {sfile}.t && mv {sfile}.t {sfile}"
@@ -619,9 +631,20 @@ in
     # pgrep runs as ROOT (not via as_agent): `-u agent` then filters out the
     # invoking shell, whose own command line contains the pattern — as the
     # agent it self-matched and "succeeded" with the wrapper long dead.
-    helper_cmdline = machine.wait_until_succeeds(
-        "pgrep -u agent -af agent-box-codex-remote-control", timeout=60
-    )
+    try:
+        helper_cmdline = machine.wait_until_succeeds(
+            "pgrep -u agent -af agent-box-codex-remote-control", timeout=60
+        )
+    except Exception:
+        # A live tmux pane can be the post-mortem shell. Preserve the actual
+        # startup error before the VM is torn down instead of only a timeout.
+        print(machine.execute(tmux('capture-pane -p -S -100 -t "=helper:"'))[1])
+        print(machine.execute(f"jq '.sessions.helper' {sfile}")[1])
+        print(machine.execute(
+            "tail -100 /home/agent/.codex/app-server-daemon/app-server.stderr.log"
+        )[1])
+        print(machine.execute("ps -u agent -o pid,ppid,args")[1])
+        raise
     assert "-c approval_policy=never" in helper_cmdline, helper_cmdline
     assert "-c sandbox_mode=danger-full-access" in helper_cmdline, helper_cmdline
     assert "--dangerously-bypass-approvals-and-sandbox" not in helper_cmdline, helper_cmdline
