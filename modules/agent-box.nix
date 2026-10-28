@@ -34449,6 +34449,8 @@ if __name__ == "__main__":
           # Do NOT replace this with `admin off`: that would also disable the reload
           # path, and ~/sites depends on it.
           admin unix//run/caddy/admin.sock
+          # Automatic redirects bypass header handlers, including the fallback below.
+          auto_https disable_redirects
         @DEFAULT_SNI@
         }
 
@@ -34469,7 +34471,33 @@ if __name__ == "__main__":
           }
         }
 
+        # Preserve HTTP-to-HTTPS redirects for every hostname, including imported
+        # sites, while stripping implementation identifiers before writing responses.
+        http:// {
+          header {
+            -Server
+            -Via
+          }
+          redir https://{host}{uri} 308
+        }
+
+        # Unknown Host values must not fall through to Caddy's default response.
+        # Named management/alias sites and imported sites take precedence.
+        https:// {
+          header {
+            -Server
+            -Via
+          }
+          respond 404
+        }
+
         @DOMAIN@ {
+          # Delete separately: adding this to the block below would defer all of its
+          # headers and override the downloads route's stricter CSP.
+          header {
+            -Server
+            -Via
+          }
           # Access log to the journal — the fail2ban jail counts 401s here.
           log
           import @TLS_POLICY@
@@ -34522,6 +34550,10 @@ if __name__ == "__main__":
           # The page links to the portal's origin when web.portalIssuer is set
           # (issue #937), for a user who arrived without a login.
           handle_errors {
+            header {
+              -Server
+              -Via
+            }
             @auth_error expression {http.error.status_code} == 401
             handle @auth_error {
               header Content-Type "text/html; charset=utf-8"
@@ -34550,6 +34582,16 @@ if __name__ == "__main__":
           # otherwise fail with a 301 the moment the IP became the primary address.
           # Everything else redirects, which keeps browser cookies on one origin.
           @ALIAS@ {
+            header {
+              -Server
+              -Via
+            }
+            handle_errors {
+              header {
+                -Server
+                -Via
+              }
+            }
             tls {
               issuer acme {
                 disable_http_challenge

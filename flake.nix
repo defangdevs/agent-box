@@ -962,6 +962,53 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               printf 'public receiver and authenticated bounded upload API present\n' > "$out"
             '';
 
+          # Exercise both rendered backends with real HTTP/TLS requests. A
+          # byte-only fixture cannot catch Caddy bypassing header handlers on
+          # automatic redirects, error routes or upstream responses (#962).
+          caddy-server-header =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "box.test";
+                        aliases = [ "alias.test" ];
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-caddy-server-header" {
+              nativeBuildInputs = [ pkgs.python3 pkgs.caddy ];
+              caddyfile = sys.config.services.caddy.configFile;
+              repo = builtins.path {
+                path = ./.;
+                name = "agent-box-src";
+                filter = path: type:
+                  let base = builtins.baseNameOf path; in
+                  base != "result" && base != ".git";
+              };
+            } ''
+              cp -rT --no-preserve=mode,ownership "$repo" repo
+              cd repo
+              python3 tests/test-caddy-server-header.py "$caddyfile" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Every Basic-auth bypass cookie must be host-only (issue #813).
           # Boxes commonly sit below shared sslip.io or domainstation.com
           # suffixes, so a Domain attribute would send one box's credential
