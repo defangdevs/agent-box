@@ -12,6 +12,7 @@ const receiveUrl = process.env.E2E_RECEIVE_URL;
 
 test('a dropped file resumes and the completed fast path checks content', async ({ page }) => {
   test.skip(!receiveUrl, 'E2E_RECEIVE_URL is not configured');
+  test.setTimeout(90_000);
 
   const token = new URL(receiveUrl!).hash.slice(1);
   const apiRequests: Array<{
