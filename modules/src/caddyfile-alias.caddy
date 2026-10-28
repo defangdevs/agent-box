@@ -5,6 +5,16 @@
 # otherwise fail with a 301 the moment the IP became the primary address.
 # Everything else redirects, which keeps browser cookies on one origin.
 @ALIAS@ {
+  header {
+    -Server
+    -Via
+  }
+  handle_errors {
+    header {
+      -Server
+      -Via
+    }
+  }
   tls {
     issuer acme {
       disable_http_challenge
