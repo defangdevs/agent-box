@@ -44,6 +44,8 @@ test('a dropped file resumes and the completed fast path checks content', async 
   const navigation = await page.goto(receiveUrl!);
   expect(navigation?.status()).toBe(200);
   expect(navigation?.url()).not.toContain(token);
+  await expect(page.getByRole('button', { name: 'Upload file', exact: true }))
+    .toHaveCount(0);
   const drop = page.locator('#drop');
   const dropFile = async (
     fill: number,
@@ -66,13 +68,31 @@ test('a dropped file resumes and the completed fast path checks content', async 
     await dataTransfer.dispose();
     await expect(drop).not.toHaveClass(/dragging/);
     await expect(page.locator('#prompt')).toHaveText('browser-resume.bin');
-    await expect(page.locator('#status')).toHaveText(
-      'Ready to upload browser-resume.bin.');
-    await expect(page.locator('#send')).toBeEnabled();
   };
 
+  // A multi-file drop must not bind the single-file link or send requests.
+  const multipleFiles = await page.evaluateHandle(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(['first'], 'first.txt'));
+    transfer.items.add(new File(['second'], 'second.txt'));
+    return transfer;
+  });
+  await drop.dispatchEvent('drop', { dataTransfer: multipleFiles });
+  await multipleFiles.dispose();
+  await expect(page.locator('#status')).toHaveText('Choose exactly one file.');
+  expect(apiRequests).toHaveLength(0);
+
   await dropFile(0x5a);
-  await page.locator('#send').click();
+  await expect(page.locator('#file')).toBeDisabled();
+  // A second drop during the interrupted transfer must be ignored.
+  const extraFile = await page.evaluateHandle(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(['extra'], 'extra.txt'));
+    return transfer;
+  });
+  await drop.dispatchEvent('drop', { dataTransfer: extraFile });
+  await extraFile.dispose();
+  await expect(page.locator('#prompt')).toHaveText('browser-resume.bin');
   await expect(page.locator('#status')).toHaveText(
     'Upload complete. You may close this page.', { timeout: 30_000 });
 
@@ -85,8 +105,11 @@ test('a dropped file resumes and the completed fast path checks content', async 
   const patchCount = apiRequests.filter(
     request => request.method === 'PATCH').length;
   await page.reload();
-  await dropFile(0x5a, 1_700_000_000_001);
-  await page.locator('#send').click();
+  await page.locator('#file').setInputFiles({
+    name: 'browser-resume.bin',
+    mimeType: 'application/octet-stream',
+    buffer: Buffer.alloc(10 << 20, 0x5a),
+  });
   await expect(page.locator('#status')).toHaveText(
     'Upload complete. You may close this page.', { timeout: 30_000 });
   expect(apiRequests.filter(request => request.method === 'PATCH').length)
@@ -96,7 +119,6 @@ test('a dropped file resumes and the completed fast path checks content', async 
   // inherit the completed state merely because name, size, and mtime match.
   await page.reload();
   await dropFile(0x5b);
-  await page.locator('#send').click();
   await expect(page.locator('#status')).toHaveText(
     'This link is already bound to a different file.', { timeout: 30_000 });
   expect(apiRequests.filter(request => request.method === 'PATCH').length)
@@ -105,6 +127,28 @@ test('a dropped file resumes and the completed fast path checks content', async 
   expect(conditionalHeads).toHaveLength(2);
   expect(conditionalHeads.every(request => request.method === 'HEAD')).toBe(true);
   expect(conditionalHeads[0].ifMatch).not.toBe(conditionalHeads[1].ifMatch);
+
+  // Errors unlock the picker and permit an immediate retry without a reload.
+  await expect(page.locator('#file')).toBeEnabled();
+  await expect(drop).not.toHaveClass(/disabled/);
+  await page.locator('#file').setInputFiles({
+    name: 'browser-resume.bin',
+    mimeType: 'application/octet-stream',
+    buffer: Buffer.alloc(10 << 20, 0x5b),
+  });
+  await expect(page.locator('#status')).toHaveText(
+    'This link is already bound to a different file.', { timeout: 30_000 });
+  await expect(page.locator('#file')).toBeEnabled();
+  await expect(page.locator('#file')).toHaveValue('');
+  await page.locator('#file').setInputFiles({
+    name: 'browser-resume.bin',
+    mimeType: 'application/octet-stream',
+    buffer: Buffer.alloc(10 << 20, 0x5a),
+  });
+  await expect(page.locator('#status')).toHaveText(
+    'Upload complete. You may close this page.', { timeout: 30_000 });
+  expect(apiRequests.filter(request => request.method === 'PATCH').length)
+    .toBe(patchCount);
 
   for (const request of apiRequests) {
     expect(request.auth).toBe('Bearer ' + token);
