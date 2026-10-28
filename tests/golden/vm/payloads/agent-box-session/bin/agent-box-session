@@ -1607,7 +1607,7 @@ case "$cmd" in
     pseudo="${profile#:}"
     # A file profile that already has the name keeps resolving as itself (it
     # predates the reservation); `:NAME` always means the pseudo-profile.
-    if [ "$pseudo" = "$profile" ] \
+    if [ "$pseudo" = "$profile" ] && [ "${pseudo%-daemon}" != "$pseudo" ] \
          && "${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" >/dev/null 2>&1; then
       pseudo=""
     fi
