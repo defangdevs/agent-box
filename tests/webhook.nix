@@ -958,7 +958,7 @@
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
-        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/elsewhere"
+        " AGENT_BOX_START_WAIT_TICKS=0 LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/elsewhere"
         " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
         f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
     )
@@ -1529,7 +1529,7 @@
     def prompt_for(line, key="defangdevs/assigned-probe"):
         machine.succeed(
             "sudo -u agent env HOME=/home/agent"
-            f" LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY={key}"
+            f" AGENT_BOX_START_WAIT_TICKS=0 LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY={key}"
             " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
             f" {sw}/sh -c '{sw}/printf \"%s\\n\" \"{line}\" | {spawn_cmd}'"
         )
