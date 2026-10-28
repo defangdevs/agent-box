@@ -84,8 +84,8 @@ usage() {
   echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
   echo "With neither --profile nor --harness, the default profile is used when"
   echo "one is set (agent-box-profile default)."
-  echo "--profile claude-daemon and --profile codex-daemon are pseudo-profiles for"
-  echo "--harness claude|codex --daemon. They are not files and never the default."
+  echo "--profile HARNESS-daemon (claude-daemon, codex-daemon) is a pseudo-profile for"
+  echo "--harness HARNESS --daemon. They are not files and never the default."
   echo "(--agent is the old name for --harness and still works. It is"
   echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
   echo "which is this box's --profile, so the two meanings collided.)"
@@ -923,16 +923,23 @@ case "$cmd" in
     # CLI twin of the settings picker's `:claude-daemon` / `:codex-daemon`
     # entries. They are not files: a daemon is not one worker, so there is no
     # model or effort to carry. They mean `--harness X --daemon`.
-    case "$profile" in
-      (claude-daemon|:claude-daemon|codex-daemon|:codex-daemon)
-        pseudo="${profile#:}"; pseudo="${pseudo%-daemon}"
-        if [ "$has_harness" = 1 ] && [ "$harness" != "$pseudo" ]; then
-          echo "--profile ${profile#:}-daemon means --harness $pseudo, not '$harness'" >&2
-          exit 2
-        fi
-        harness="$pseudo"; has_harness=1
-        remote_control_daemon=true; daemon_option=true
-        profile=""
+    # Any HARNESS-daemon name works, so a harness that grows daemon support
+    # needs no change here; the check below refuses one that has none.
+    pseudo="${profile#:}"
+    case "$pseudo" in
+      (*-daemon)
+        pseudo="${pseudo%-daemon}"
+        case " $AGENTS " in
+          (*" $pseudo "*)
+            if [ "$has_harness" = 1 ] && [ "$harness" != "$pseudo" ]; then
+              echo "--profile $pseudo-daemon means --harness $pseudo, not '$harness'" >&2
+              exit 2
+            fi
+            harness="$pseudo"; has_harness=1
+            remote_control_daemon=true; daemon_option=true
+            profile=""
+            ;;
+        esac
         ;;
     esac
     # Canonicalize --cwd the same way the settings page's add-session form

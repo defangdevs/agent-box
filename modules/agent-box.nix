@@ -6269,8 +6269,8 @@ usage() {
   echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
   echo "With neither --profile nor --harness, the default profile is used when"
   echo "one is set (agent-box-profile default)."
-  echo "--profile claude-daemon and --profile codex-daemon are pseudo-profiles for"
-  echo "--harness claude|codex --daemon. They are not files and never the default."
+  echo "--profile HARNESS-daemon (claude-daemon, codex-daemon) is a pseudo-profile for"
+  echo "--harness HARNESS --daemon. They are not files and never the default."
   echo "(--agent is the old name for --harness and still works. It is"
   echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
   echo "which is this box's --profile, so the two meanings collided.)"
@@ -7108,16 +7108,23 @@ case "$cmd" in
     # CLI twin of the settings picker's `:claude-daemon` / `:codex-daemon`
     # entries. They are not files: a daemon is not one worker, so there is no
     # model or effort to carry. They mean `--harness X --daemon`.
-    case "$profile" in
-      (claude-daemon|:claude-daemon|codex-daemon|:codex-daemon)
-        pseudo="''${profile#:}"; pseudo="''${pseudo%-daemon}"
-        if [ "$has_harness" = 1 ] && [ "$harness" != "$pseudo" ]; then
-          echo "--profile ''${profile#:}-daemon means --harness $pseudo, not '$harness'" >&2
-          exit 2
-        fi
-        harness="$pseudo"; has_harness=1
-        remote_control_daemon=true; daemon_option=true
-        profile=""
+    # Any HARNESS-daemon name works, so a harness that grows daemon support
+    # needs no change here; the check below refuses one that has none.
+    pseudo="''${profile#:}"
+    case "$pseudo" in
+      (*-daemon)
+        pseudo="''${pseudo%-daemon}"
+        case " $AGENTS " in
+          (*" $pseudo "*)
+            if [ "$has_harness" = 1 ] && [ "$harness" != "$pseudo" ]; then
+              echo "--profile $pseudo-daemon means --harness $pseudo, not '$harness'" >&2
+              exit 2
+            fi
+            harness="$pseudo"; has_harness=1
+            remote_control_daemon=true; daemon_option=true
+            profile=""
+            ;;
+        esac
         ;;
     esac
     # Canonicalize --cwd the same way the settings page's add-session form
@@ -8256,9 +8263,13 @@ case "$cmd" in
     # Reserved for the daemon pseudo-profiles `agent-box-session add --profile`
     # resolves itself (issue #942); a file by that name would be shadowed.
     case "$name" in
-      (claude-daemon|codex-daemon)
-        echo "'$name' is reserved for the $name pseudo-profile (agent-box-session add --profile $name); pick another name" >&2
-        exit 2 ;;
+      (*-daemon)
+        for _h in $HARNESSES; do
+          if [ "$name" = "$_h-daemon" ]; then
+            echo "'$name' is reserved for the $name pseudo-profile (agent-box-session add --profile $name); pick another name" >&2
+            exit 2
+          fi
+        done ;;
     esac
     [ $# -gt 0 ] || { usage >&2; exit 2; }
     # Validate every assignment BEFORE writing any of them: a `set` that
@@ -33108,7 +33119,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     assignments.append((key, value))
                 else:
                     drop.append(key)
-            if name in ("claude-daemon", "codex-daemon"):
+            if name.endswith("-daemon") and name[:-len("-daemon")] in AGENTS:
                 # Reserved: `agent-box-session add --profile` resolves these
                 # itself (issue #942), so a file by that name is shadowed.
                 self._send_html(

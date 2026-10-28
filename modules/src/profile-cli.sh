@@ -326,9 +326,13 @@ case "$cmd" in
     # Reserved for the daemon pseudo-profiles `agent-box-session add --profile`
     # resolves itself (issue #942); a file by that name would be shadowed.
     case "$name" in
-      (claude-daemon|codex-daemon)
-        echo "'$name' is reserved for the $name pseudo-profile (agent-box-session add --profile $name); pick another name" >&2
-        exit 2 ;;
+      (*-daemon)
+        for _h in $HARNESSES; do
+          if [ "$name" = "$_h-daemon" ]; then
+            echo "'$name' is reserved for the $name pseudo-profile (agent-box-session add --profile $name); pick another name" >&2
+            exit 2
+          fi
+        done ;;
     esac
     [ $# -gt 0 ] || { usage >&2; exit 2; }
     # Validate every assignment BEFORE writing any of them: a `set` that
