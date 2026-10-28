@@ -41,6 +41,7 @@ fi
 wake_thread=$1; shift
 wake_prompt=$1; shift
 codex=$1; shift
+@@include:lib/codex-stop.sh@@
 # An older CLI, run from packages/standalone, records its app-server in the
 # legacy app-server.pid. Once packages/app-server-daemon/current exists (the
 # mirror seeds it, issue #788) a current CLI reads daemon.pid instead, so its
@@ -65,12 +66,7 @@ stop_legacy_app_server() {
     *codex*" app-server"*) ;;
     *) return 0 ;;
   esac
-  kill -TERM "$_lpid" 2>/dev/null || return 0
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    kill -0 "$_lpid" 2>/dev/null || return 0
-    sleep 0.5
-  done
-  kill -KILL "$_lpid" 2>/dev/null || true
+  stop_codex_pid "$_lpid"
 }
 stop() {
   "$codex" app-server daemon stop >/dev/null 2>&1 || true

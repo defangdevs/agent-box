@@ -17,7 +17,17 @@ export CODEX_HOME="$TEST_ROOT/codex-home"
 state="$CODEX_HOME/app-server-daemon"
 mkdir -p "$state"
 
-sed -n '/^stop_legacy_app_server() {$/,/^}$/p' "$WRAPPER" > "$TEST_ROOT/function.sh"
+# The wrapper carries an @@include marker for the shared stop helper (a path
+# relative to modules/src); expand it as the assembler does.
+resolved="$TEST_ROOT/wrapper.sh"
+src="$(cd "$(dirname "$WRAPPER")" && pwd)"
+while IFS= read -r l || [ -n "$l" ]; do
+  case "$l" in
+    @@include:*@@) p=${l#@@include:}; cat "$src/${p%@@}" ;;
+    *) printf '%s\n' "$l" ;;
+  esac
+done < "$WRAPPER" > "$resolved"
+sed -n -e '/^stop_codex_pid() {$/,/^}$/p' -e '/^stop_legacy_app_server() {$/,/^}$/p' "$resolved" > "$TEST_ROOT/function.sh"
 [ -s "$TEST_ROOT/function.sh" ] || { echo "stop_legacy_app_server not found" >&2; exit 1; }
 # shellcheck source=/dev/null
 . "$TEST_ROOT/function.sh"

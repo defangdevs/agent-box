@@ -21,11 +21,26 @@ LIB=${1:?usage: test-jit-agents.sh PATH/TO/lib/agents.sh}
 [ -f "$LIB" ] || { echo "no such lib: $LIB" >&2; exit 2; }
 LIB=$(cd "$(dirname "$LIB")" && pwd)/$(basename "$LIB")
 
+# The sources carry @@include markers the assembler resolves; expand them the
+# same way so the test sees the finished file. Markers sit alone on a line
+# and name a path relative to the file that carries them.
+resolve_includes() { # resolve_includes FILE SRCDIR
+  while IFS= read -r _l || [ -n "$_l" ]; do
+    case "$_l" in
+      @@include:*@@) _p=${_l#@@include:}; cat "$2/${_p%@@}" ;;
+      *) printf '%s\n' "$_l" ;;
+    esac
+  done < "$1"
+}
+_src=$(dirname "$LIB")
+
 BASH_BIN=$(command -v bash)
 [ -n "$BASH_BIN" ] || { echo "no bash on PATH" >&2; exit 2; }
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+resolve_includes "$LIB" "$_src" > "$work/agents.sh"
+LIB=$work/agents.sh
 
 fails=0
 ok() { printf 'ok   %s\n' "$1"; }
@@ -387,29 +402,39 @@ is "the app-server-daemon mirror links codex-code-mode-host beside codex" \
 
 # issue #949: a managed daemon still running an older codex build keeps
 # handing its command runner a store path that is gone, so mirroring the
-# current codex stops it, and leaves one on the current codex alone.
+# current codex stops it. Daemons that are not that - the mirrored codex's
+# own, another profile's, or a TUI whose prompt merely mentions the flag -
+# are left alone.
 setup codexmirror_stale_daemon
-mkdir -p "$HOME/old" "$HOME/store/bin"
+mkdir -p "$HOME/old" "$HOME/store/bin" "$HOME/w"
 cp "$BASH_BIN" "$HOME/old/codex"
+cp "$BASH_BIN" "$HOME/gone-codex" && mkdir -p "$HOME/gone" && mv "$HOME/gone-codex" "$HOME/gone/codex"
 cp "$BASH_BIN" "$HOME/store/bin/codex"
-"$HOME/old/codex" -c 'sleep 30; :' x app-server --managed-daemon &
-_stale_pid=$!
-"$HOME/store/bin/codex" -c 'sleep 30; :' x app-server --managed-daemon &
-_cur_pid=$!
-sleep 0.2
+printf 'sleep 30; :\n' > "$HOME/w/app-server"
+printf 'sleep 30; :\n' > "$HOME/w/tui-script"
+cd "$HOME/w"
+"$HOME/old/codex" app-server --managed-daemon & _stale=$!
+"$HOME/gone/codex" app-server --managed-daemon & _deleted=$!
+"$HOME/store/bin/codex" app-server --managed-daemon & _cur=$!
+CODEX_HOME="$HOME/other-home" "$HOME/old/codex" app-server --managed-daemon & _other=$!
+"$HOME/old/codex" tui-script "app-server --managed-daemon" & _tui=$!
+cd "$work"
+sleep 0.3
+rm -f "$HOME/gone/codex"
 mirror_codex_standalone "$HOME/store/bin/codex"
-sleep 0.2
-if kill -0 "$_stale_pid" 2>/dev/null; then
-  no "mirroring stops a managed daemon running a different codex"
-else
-  ok "mirroring stops a managed daemon running a different codex"
-fi
-if kill -0 "$_cur_pid" 2>/dev/null; then
-  ok "mirroring leaves a daemon on the mirrored codex running"
-else
-  no "mirroring leaves a daemon on the mirrored codex running"
-fi
-kill "$_cur_pid" 2>/dev/null || true
+sleep 0.3
+alive() { kill -0 "$1" 2>/dev/null; }
+if alive "$_stale"; then no "mirroring stops a managed daemon running a different codex"
+else ok "mirroring stops a managed daemon running a different codex"; fi
+if alive "$_deleted"; then no "mirroring stops a daemon whose executable was deleted"
+else ok "mirroring stops a daemon whose executable was deleted"; fi
+if alive "$_cur"; then ok "mirroring leaves a daemon on the mirrored codex running"
+else no "mirroring leaves a daemon on the mirrored codex running"; fi
+if alive "$_other"; then ok "mirroring leaves another CODEX_HOME's daemon running"
+else no "mirroring leaves another CODEX_HOME's daemon running"; fi
+if alive "$_tui"; then ok "mirroring leaves a TUI whose prompt mentions the flag running"
+else no "mirroring leaves a TUI whose prompt mentions the flag running"; fi
+kill "$_cur" "$_other" "$_tui" 2>/dev/null || true
 wait 2>/dev/null || true
 
 # --- resolve_codex_home's precedence -------------------------------------

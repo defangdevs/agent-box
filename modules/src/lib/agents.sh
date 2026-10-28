@@ -458,6 +458,48 @@ agent_upgrade() {
 # for. resolve_codex_home is what start_session passes instead, so the
 # layout lands where that session's app-server daemon will actually look
 # for it.
+@@include:codex-stop.sh@@
+
+# Stop this user's managed codex daemons that run a different build than $1
+# and whose CODEX_HOME is $2 (issue #949).
+#
+# A running daemon keeps the binary it started from and hands that store
+# path to its command runner. After an upgrade, or a build that lacked the
+# helpers, it still names a build that is gone or incomplete: "failed to
+# spawn code-mode host /nix/store/<old>/bin/codex-code-mode-host", and
+# restarting the session does not touch it. The next client starts a fresh
+# daemon.
+#
+# Identify it by its real argv, not a flattened string (a TUI whose prompt
+# text mentions the flag must survive): argv[1] is `app-server` and some
+# argument is exactly `--managed-daemon`. A binary that the swap removed
+# reads as "... (deleted)" in /proc/PID/exe, and is stale by definition.
+# Another profile's daemon (a different CODEX_HOME) is left alone, since
+# only this session's mirror was updated.
+_mcs_stop_stale_daemons() {
+  _sd_real=$1 _sd_home=$2
+  for _sd_p in /proc/[0-9]*; do
+    [ -O "$_sd_p" ] || continue
+    _sd_exe="$(readlink "$_sd_p/exe" 2>/dev/null)" || continue
+    _sd_exe=${_sd_exe% (deleted)}
+    case "${_sd_exe##*/}" in (codex) ;; (*) continue ;; esac
+    [ "$_sd_exe" != "$_sd_real" ] || continue
+    _sd_n=0 _sd_sub= _sd_flag=
+    while IFS= read -r -d '' _sd_a; do
+      [ "$_sd_n" -ne 1 ] || _sd_sub=$_sd_a
+      [ "$_sd_a" != --managed-daemon ] || _sd_flag=1
+      _sd_n=$((_sd_n + 1))
+    done 2>/dev/null < "$_sd_p/cmdline"
+    [ "$_sd_sub" = app-server ] && [ -n "$_sd_flag" ] || continue
+    _sd_dh=
+    while IFS= read -r -d '' _sd_e; do
+      case "$_sd_e" in (CODEX_HOME=*) _sd_dh=${_sd_e#CODEX_HOME=} ;; esac
+    done 2>/dev/null < "$_sd_p/environ"
+    [ "${_sd_dh:-$HOME/.codex}" = "$_sd_home" ] || continue
+    stop_codex_pid "${_sd_p#/proc/}"
+  done
+}
+
 mirror_codex_standalone() {
   if [ -n "${1:-}" ]; then
     cbin=$1
@@ -486,22 +528,7 @@ mirror_codex_standalone() {
       ln -sfn "$_mcs_sib" "$cxhome/packages/standalone/agent-box-current/$(basename "$_mcs_sib")"
       ln -sfn "$_mcs_sib" "$cxhome/packages/app-server-daemon/agent-box-current/bin/$(basename "$_mcs_sib")"
     done
-    # A running managed daemon keeps the binary it started from, and hands
-    # that store path to its command runner. After an upgrade, or a build
-    # that lacked the helpers, it still names a build that is gone or
-    # incomplete: "failed to spawn code-mode host /nix/store/<old>/bin/
-    # codex-code-mode-host" (issue #949), and restarting the session does
-    # not touch it. Stop any of this user's daemons that run a different
-    # codex than the one just mirrored; the next client starts a fresh one.
-    for _mcs_p in /proc/[0-9]*; do
-      [ -O "$_mcs_p" ] || continue
-      _mcs_exe="$(readlink "$_mcs_p/exe" 2>/dev/null)" || continue
-      case "${_mcs_exe##*/}" in (codex) ;; (*) continue ;; esac
-      [ "$_mcs_exe" != "$_mcs_real" ] || continue
-      case "$(tr '\0' ' ' < "$_mcs_p/cmdline" 2>/dev/null)" in
-        (*" app-server "*"--managed-daemon"*) kill "${_mcs_p#/proc/}" 2>/dev/null || true ;;
-      esac
-    done
+    _mcs_stop_stale_daemons "$_mcs_real" "$cxhome"
   fi
 }
 
