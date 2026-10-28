@@ -121,6 +121,8 @@ golden.example.org {
   # With nosniff above, browsers offer that response as a download when
   # the user cancels the password dialog (issue #746). Keep the Basic
   # challenge that basic_auth already set, and make the refusal renderable.
+  # The page links to the portal's origin when web.portalIssuer is set
+  # (issue #937), for a user who arrived without a login.
   handle_errors {
     @auth_error expression {http.error.status_code} == 401
     handle @auth_error {

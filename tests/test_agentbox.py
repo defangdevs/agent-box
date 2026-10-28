@@ -4486,6 +4486,32 @@ class PortalHandoff(unittest.TestCase):
         self.assertIn("handle /agent/auth/*",
                       files["/etc/agent-box/Caddyfile"])
 
+    def test_the_401_page_links_the_portal_only_when_an_issuer_is_set(self):
+        """Issue #937: a hint for users who arrive without a login."""
+        hint = "Open this box from your portal page"
+        with_issuer = self._render({"agent": dict(self.MAPPED)},
+                                   self.PORTAL_WEB)["/etc/agent-box/Caddyfile"]
+        self.assertIn("<a href='https://station.example.com'", with_issuer)
+        self.assertIn(hint, with_issuer)
+        without = self._render({"agent": {"root": True}})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertNotIn(hint, without)
+        self.assertNotIn("@PORTAL_HINT@", without)
+        # Only the origin is linked, and a value that is not a plain origin
+        # renders no link rather than a broken string.
+        odd = self._render({"agent": {"root": True}},
+                           {"portalIssuer": "https://x.test/a?b=1"})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertIn("href='https://x.test'", odd)
+        v6 = self._render({"agent": {"root": True}},
+                          {"portalIssuer": "https://[2001:db8::1]:8443/x"})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertIn("href='https://[2001:db8::1]:8443'", v6)
+        bad = self._render({"agent": {"root": True}},
+                           {"portalIssuer": "https://x.test'\"{"})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertNotIn(hint, bad)
+
     def test_the_jwks_url_is_passed_only_when_overridden(self):
         """Keys are FETCHED, so there is nothing to configure per rotation.
 

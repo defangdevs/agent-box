@@ -3768,6 +3768,22 @@ class Renderer:
                     and self.spec.portal_issuer
                     and u.portal_user)
 
+    def portal_hint(self):
+        """HTML for the 401 page's portal link, or "" (issue #937).
+
+        Only the issuer's scheme+host[:port] is linked, and only when it
+        has no character that could break out of the Caddy string or the
+        attribute; anything else renders no hint rather than a broken page.
+        """
+        m = re.fullmatch(r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?)"
+                         r"(?:[/?#].*)?",
+                         self.spec.portal_issuer)
+        if not m:
+            return ""
+        return ("<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
+                "style='color:#58a6ff'>Open this box from your portal "
+                "page</a></p>" % m.group(1))
+
     def caddy(self, t):
         """Bind the shared Caddyfile fragments.
 
@@ -3796,6 +3812,7 @@ class Renderer:
                     "@DEFAULT_SNI@",
                     f"  default_sni {self.spec.domain}"
                     if isinstance(ip, ipaddress.IPv4Address) else "")
+            text = text.replace("@PORTAL_HINT@", self.portal_hint())
             text = text.replace("@MANAGED_BY@", "agentbox apply")
             text = text.replace("@APPLY_CMD@", "agentbox apply")
             text = text.replace("@RELOAD_CMD@", CADDY_RELOAD_CMD)
