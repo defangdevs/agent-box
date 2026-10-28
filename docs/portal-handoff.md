@@ -338,6 +338,7 @@ cookie it was handed, and the browser never talks to the box.
 |---|---|---|
 | `GET` | `/connect` | `{"ok": true, "flows": [...]}` — every card this box offers |
 | `GET` | `/connect?flow=<id>` | `{"ok": true, "flow": {...}}` — one card |
+| `GET` | `/resources` | CPU, available memory/disk, session slot usage and sample time; unavailable readings are `null` |
 | `GET` | `/env` | `{"ok": true, "keys": [...]}` — env key **names** |
 | `GET` | `/status` | `{"rev", "sessions", "connect_fp"}` — a change fingerprint |
 | `POST` | `/connect/start` | `flow=<id>` → `303`, or `409` + a page it could not begin |
@@ -511,3 +512,17 @@ box provisioned for handover but not yet assigned one (`from` the empty
 string) is a legitimate use of this same operation. A box with no portal
 integration at all serves no `/auth/portal-user` route, exactly as it
 serves no `/auth/handoff` route.
+
+### Live resource readings
+
+`GET /<user>/settings/resources` returns `ok`, `sampled_at` (UTC ISO timestamp), and
+nullable `cpu`, `memory`, `disk`, `sessions` readings. CPU has `busy_percent` (0-100).
+Memory and disk have `available_bytes` and `total_bytes`; disk measures the filesystem
+containing the owner's home and excludes reserved blocks. Memory uses `MemAvailable`.
+Sessions has `used` and `limit`, from the same policy that admits new workers.
+
+CPU requires two samples at least one second apart; the first read or one after more
+than 30 seconds without sampling is null. The sampler never sleeps in an HTTP request.
+An unavailable source does not erase the other readings. Responses are authenticated by
+the existing settings auth block and have `Cache-Control: no-store`. No process names,
+session metadata, filesystem paths, environment values or raw errors are returned.

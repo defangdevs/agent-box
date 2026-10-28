@@ -4379,6 +4379,9 @@ def session_counts():
     }
 
 
+@@include:lib/resources.py@@
+
+
 def status_payload():
     """Compact JSON the settings page long-polls for restart/update
     progress, and connectPoll checks before fetching the full page.
@@ -9590,6 +9593,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if not self._under_base(parsed.path):
             self._send_html("<h1>404</h1>", status=404)
+            return
+        if parsed.path.rstrip("/") == BASE + "/resources":
+            self._send_json(resources_payload())
             return
         # Progress feed the page long-polls after a restart/update
         # (read-only, same auth block as the page it lives under).
