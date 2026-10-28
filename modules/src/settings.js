@@ -768,7 +768,8 @@
         // xterm paints its own selection; window.getSelection alone misses
         // it. ttyd exposes the terminal as window.term.
         return (win.term && win.term.hasSelection()) ||
-          String(win.getSelection()).length > 0;
+          String(win.getSelection()).length > 0 ||
+          String(window.getSelection()).length > 0;
       }
       doc.addEventListener("mousemove", function (e) {
         point = { x: e.clientX, y: e.clientY };
@@ -776,7 +777,7 @@
       });
       doc.addEventListener("keydown", function (e) {
         var key = e.key.toLowerCase();
-        var shortcut = (key === "c" || key === "v") &&
+        var shortcut = (key === "c" || key === "v" || e.code === "KeyC" || e.code === "KeyV") &&
           (copyHintMac ? e.metaKey : e.ctrlKey);
         var command = copyHintMac && key === "meta" && !e.shiftKey;
         var field = e.target.closest && e.target.closest("input,textarea,select,[contenteditable]");

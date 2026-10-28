@@ -108,6 +108,11 @@ for (const platform of ['Linux x86_64', 'Win32']) {
     await expect(hint).toBeVisible();
     await terminalKey(frame, 'a', { ctrlKey: true });
     await expect(hint).toBeHidden();
+    for (const [key, code] of [['\u0441', 'KeyC'], ['\u043c', 'KeyV']]) {
+      expect(await terminalKey(frame, key, { code, ctrlKey: true })).toBe(true);
+      await expect(hint).toBeVisible();
+      await terminalKey(frame, 'Escape');
+    }
     await terminalKey(frame, 'c', { ctrlKey: true, altKey: true });
     await expect(hint).toBeHidden();
     await page.context().close();
@@ -127,6 +132,24 @@ test('selection hint respects xterm selection and clears when dragging starts', 
   await terminalKey(frame, 'Meta', { metaKey: true });
   await expect(page.locator('#terminal-copy-hint')).toBeHidden();
   await frame.evaluate(() => (window as any).term.clearSelection());
+  // Parent and iframe DOM selections are independent of xterm's selection.
+  for (const target of [page, frame]) {
+    await target.evaluate(() => {
+      const text = document.createElement('span');
+      text.id = 'selection-hint-fixture';
+      text.textContent = 'Selected browser text';
+      document.body.appendChild(text);
+      const range = document.createRange();
+      range.selectNodeContents(text);
+      window.getSelection()!.addRange(range);
+    });
+    await terminalKey(frame, 'Meta', { metaKey: true });
+    await expect(page.locator('#terminal-copy-hint')).toBeHidden();
+    await target.evaluate(() => {
+      window.getSelection()!.removeAllRanges();
+      document.getElementById('selection-hint-fixture')!.remove();
+    });
+  }
   await terminalKey(frame, 'Meta', { metaKey: true });
   await expect(page.locator('#terminal-copy-hint')).toBeVisible();
   await frame.locator('.xterm').dispatchEvent('mousedown');
@@ -151,7 +174,10 @@ test('selection hint follows the pointer, fits the viewport, and survives iframe
   expect(box.y + box.height).toBeLessThan(rect.y + rect.height - 4);
   await page.mouse.move(rect.x + 60, rect.y + 60);
   expect((await hint.boundingBox())!.x).toBeCloseTo(rect.x + 74, 0);
-  await frame.evaluate(() => window.location.reload());
+  await Promise.all([
+    frame.waitForNavigation({ waitUntil: 'load' }),
+    frame.evaluate(() => window.location.reload()),
+  ]);
   frame = await hintTerminal(page);
   await expect(hint).toBeHidden();
   await terminalKey(frame, 'Meta', { metaKey: true });
@@ -163,10 +189,13 @@ test('selection hint also attaches to dynamically mounted grid panes', async ({ 
   const page = await authedPage(browser, 'MacIntel');
   await page.goto('/');
   await hintTerminal(page);
-  const names = await tabNames(page);
-  test.skip(names.length < 2, 'Needs two live sessions to exercise a newly mounted iframe');
+  const initial = await page.locator('#panes iframe.pane').first().getAttribute('data-pane');
   await page.locator('#tab-bar a.viewtog').click();
-  const pane = page.locator('#panes iframe.pane').last();
+  const pane = page.locator(`#panes iframe.pane:not([data-pane="${initial}"])`).first();
+  if (await pane.count() === 0) {
+    await page.context().close();
+    test.skip(true, 'Needs a second live session to exercise a newly mounted iframe');
+  }
   const frame = await (await pane.elementHandle())!.contentFrame();
   await expect(frame!.locator('.xterm')).toBeVisible({ timeout: 30_000 });
   await terminalKey(frame!, 'Meta', { metaKey: true });
