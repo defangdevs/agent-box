@@ -39,7 +39,7 @@ _jit_lock="$_jit_dir/install.lock"
 _jit_pin_file() { printf '%s' "$_jit_dir/$1.pin"; }
 
 agent_bin() {
-  # agent_bin NAME — resolve an agent (or "shell") to its binary via
+  # agent_bin NAME [stable] — resolve an agent (or "shell") to its binary via
   # the unit's AGENT_BOX_AGENT_BINS ("name=/path ..." pairs; store and
   # shell paths never contain whitespace, so word-splitting is safe).
   #
@@ -85,6 +85,16 @@ agent_bin() {
   # store path stays valid, because the old generation roots it. The flip
   # can also land between the -x test and the resolve, so retry that pair
   # once; a harness that is simply not installed still fails at once.
+  #
+  # A long-lived consumer (the WhatsApp bridge reads the path once and keeps
+  # it for its lifetime) passes "stable" instead: it wants the profile path,
+  # which follows upgrades, because a store path it holds can be garbage
+  # collected after the next one.
+  if [ "${2:-}" = stable ]; then
+    [ -x "$HOME/.nix-profile/bin/$1" ] || return 1
+    printf '%s\n' "$HOME/.nix-profile/bin/$1"
+    return 0
+  fi
   for _ab_try in 1 2; do
     [ -x "$HOME/.nix-profile/bin/$1" ] || return 1
     _ab_real="$(readlink -f "$HOME/.nix-profile/bin/$1" 2>/dev/null)" || _ab_real=""

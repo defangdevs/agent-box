@@ -206,6 +206,10 @@ is "a resolved harness path is not the mutable profile symlink" \
 if [ -x "$raced" ]; then ok "the resolved path still execs after the profile flip"
 else no "the resolved path still execs after the profile flip" "$raced is gone"; fi
 
+ln -s "$HOME/store1/claude" "$HOME/.nix-profile/bin/claude"
+is "a long-lived consumer can ask for the stable profile path" \
+   "$HOME/.nix-profile/bin/claude" "$(agent_bin claude stable)"
+
 # --- a registry name can never become a path ----------------------------
 setup hostile
 mkdir -p "$HOME/evil"
