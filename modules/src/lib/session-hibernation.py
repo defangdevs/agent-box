@@ -257,6 +257,19 @@ def _hibernate_codex_transcript(name, entry):
     if launch is None:
         return None
     root = _hibernate_codex_home(entry)
+    # SessionStart is authoritative for prompt-less sessions and /new.
+    # Never park an older completed segment while its replacement is active.
+    try:
+        live = (_hibernate_home() / ".local/state/agent-box/live-session-id"
+                / launch).read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        live = None
+    except (OSError, UnicodeDecodeError):
+        return None
+    if live is not None:
+        native = _hibernate_uuid(live)
+        path = _hibernate_codex_exact(root, native) if native else None
+        return (native, path, state_path) if path else None
     # A resumed Codex thread can produce a newer rollout carrying the same
     # stable Agentbox launch marker. Resolve that first; the persisted native
     # pointer is the fallback for prompt-less sessions whose rollout has no

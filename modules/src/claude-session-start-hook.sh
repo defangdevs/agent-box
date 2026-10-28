@@ -1,5 +1,8 @@
 set -u
-# SessionStart hook for supervisor-spawned claude sessions (issue #223).
+# SessionStart hook for supervisor-spawned Claude and Codex sessions
+# (issues #223, #825). Codex's system config also uses this recorder: its
+# native id cannot be chosen up front, and a prompt-less session has no
+# launch marker in its conversation. Both hook payloads carry session_id.
 # A clear, a compact or a resume rotates claude's live session id
 # mid-process: the running process keeps its Remote Control registration but
 # opens a NEW transcript under a new uuid, while the supervisor still holds

@@ -926,6 +926,27 @@ codex_rollout_uuid() {
   printf '%s' "${b: -36}"
 }
 
+codex_live_thread() {
+  # SessionStart records the native conversation even without a kickoff
+  # prompt. Follow /new and /resume before considering an older marker.
+  local thread=""
+  case "$1" in
+    (*[!0-9a-fA-F-]*|"") return 0 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 0 ;;
+  esac
+  read -r thread < "$HOME/.local/state/agent-box/live-session-id/$1" 2>/dev/null \
+    || thread=""
+  case "$thread" in
+    (*[!0-9a-fA-F-]*|"") return 0 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 0 ;;
+  esac
+  [ -n "$($FIND "${2:-$HOME/.codex}"/sessions \
+      -name "rollout-*-$thread.jsonl" 2>/dev/null | head -n1)" ] || return 0
+  printf '%s' "$thread"
+}
+
 codex_native_thread() {
   # Accept a persisted native pointer only while that exact rollout remains
   # on disk. Empty is the safe answer: the caller can still derive a target
@@ -1048,14 +1069,9 @@ sync_codex_threads() {
       fi
       session_watches_events "$_name" && _thread="$(codex_wake_thread "$_name")"
     else
-      _source="$($JQ -r --arg s "$_name" '.[$s].source // empty' \
-        "$HOME/.local/state/local-whatsapp/codex-threads.json" 2>/dev/null)" || _source=""
-      if [ "$_source" = agent-box ] \
-        && [ -n "$(codex_registered_thread "$_name" "$_cxhome")" ]; then
-        continue
-      fi
       _launch="$(session_launch_id "$_name")"
-      _thread="$(codex_rollout_uuid "$_launch" "$_cxhome")"
+      _thread="$(codex_live_thread "$_launch" "$_cxhome")"
+      [ -n "$_thread" ] || _thread="$(codex_rollout_uuid "$_launch" "$_cxhome")"
     fi
     if [ -n "$_thread" ]; then
       codex_publish_thread "$_name" "$_thread"
@@ -1237,7 +1253,9 @@ start_session() {
       fi
     else
       cxhome="$(resolve_codex_home "$sprofile")"
-      codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"
+      codex_target="$(codex_live_thread "$bid" "$cxhome")"
+      [ -n "$codex_target" ] \
+        || codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"
       [ -n "$codex_target" ] \
         || codex_target="$(codex_native_thread "$sname" "$cxhome")"
       [ -n "$codex_target" ] \
@@ -1328,6 +1346,7 @@ start_session() {
   # without it codex's own defaults (which depend on project trust) are the
   # right answer and pinning would change them.
   codex_autonomy() {
+    [ -z "${codex_local_arg:-}" ] || cmd="$cmd $codex_local_arg"
     if [ "$skip" = true ]; then
       cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
     elif [ -n "${AGENT_BOX_CODEX_FULL_ACCESS:-}" ]; then
@@ -1422,6 +1441,15 @@ start_session() {
       # inside the pane, so the supervisor's own environment cannot see a
       # profile's override here.
       mirror_codex_standalone "$bin" "$(resolve_codex_home "$sprofile")"
+      # Newer Codex TUIs can delegate to a shared server whose launch
+      # environment belongs to another session. Keep ordinary terminal
+      # sessions local so SessionStart sees this pane's launch id. Older
+      # versions already run locally and do not recognize this flag.
+      codex_local_arg=""
+      if [ "$rcdaemon" != true ] && "$bin" --help 2>/dev/null \
+          | $GREP -F -- '--no-daemon' >/dev/null; then
+        codex_local_arg=--no-daemon
+      fi
       if [ "$rcdaemon" = true ]; then
         # Codex remote control uses a dedicated app-server daemon, not a
         # TUI flag (issue 103), whereas claude takes a

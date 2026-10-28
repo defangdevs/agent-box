@@ -4,12 +4,15 @@
 set -euo pipefail
 
 SUPERVISOR=${1:?usage: test-codex-registered-thread.sh PATH/TO/supervisor.sh}
+HOOK=${2:-$(dirname "$SUPERVISOR")/claude-session-start-hook.sh}
 TEST_ROOT="$(mktemp -d)"
 trap 'rm -rf "$TEST_ROOT"' EXIT
 
 export HOME="$TEST_ROOT/home"
 JQ=jq
 FIND=find
+sed -n '/^codex_live_thread() {$/,/^}$/p' "$SUPERVISOR" > "$TEST_ROOT/live.sh"
+. "$TEST_ROOT/live.sh"
 state="$HOME/.local/state/local-whatsapp"
 sessions="$HOME/.codex/sessions/2026/10/03"
 mkdir -p "$state" "$sessions"
@@ -96,6 +99,50 @@ grep -qF '|| codex_target="$(codex_registered_thread "$sname" "$cxhome")"' "$SUP
   || { echo "FAIL: start_session no longer falls back to codex_registered_thread" >&2; exit 1; }
 grep -qF '  sync_codex_threads' "$SUPERVISOR" \
   || { echo "FAIL: reconcile loop no longer publishes Codex threads" >&2; exit 1; }
+
+# Exercise Codex's actual SessionStart payload through the shared recorder,
+# then run start_session's actual target-selection block. No kickoff prompt
+# or WhatsApp registration is needed to resume the right conversation.
+launch=11111111-1111-4111-8111-111111111111
+custom_cxhome=$cxhome
+sibling_launch=22222222-2222-4222-8222-222222222222
+record_start() {
+  printf '{"hook_event_name":"SessionStart","source":"%s","session_id":"%s"}\n' "$3" "$2" \
+    | AGENT_BOX_SESSION_ID="$1" bash "$HOOK"
+}
+record_start "$launch" "$live" startup
+record_start "$sibling_launch" "$marked" startup
+[ "$(codex_live_thread "$launch")" = "$live" ]
+[ "$(codex_live_thread "$sibling_launch")" = "$marked" ]
+[ -z "$(codex_live_thread ../escape)" ]
+
+# A rotated thread wins even if the old transcript still has our marker.
+printf 'agent-box session %s\n' "$launch" >> "$sessions/rollout-2026-10-03T20-00-00-$marked.jsonl"
+sed -n '/^  codex_target=""$/,/^  # Resume on every respawn/p' "$SUPERVISOR" \
+  | sed '$d' > "$TEST_ROOT/target.sh"
+codex_native_thread() { :; }
+resolve_codex_home() { printf '%s' "${test_cxhome:-$HOME/.codex}"; }
+agent=codex hasrun=true rcdaemon=false sprofile="" sname=unregistered bid=$launch
+. "$TEST_ROOT/target.sh"
+[ "$codex_target" = "$live" ] \
+  || { echo "FAIL: prompt-less session did not resume its recorded native id" >&2; exit 1; }
+record_start "$launch" "$marked" resume
+. "$TEST_ROOT/target.sh"
+[ "$codex_target" = "$marked" ] \
+  || { echo "FAIL: the hook's new conversation was not adopted" >&2; exit 1; }
+
+# A custom CODEX_HOME is honored and a missing rollout is never accepted.
+record_start "$launch" "$gone" startup
+[ -z "$(codex_live_thread "$launch")" ]
+[ "$(codex_live_thread "$launch" "$custom_cxhome")" = "$gone" ]
+test_cxhome=$custom_cxhome
+. "$TEST_ROOT/target.sh"
+[ "$codex_target" = "$gone" ]
+unset test_cxhome
+record_start "$launch" ../bad startup
+[ "$(cat "$HOME/.local/state/agent-box/live-session-id/$launch")" = "$gone" ]
+printf '../bad\n' > "$HOME/.local/state/agent-box/live-session-id/$launch"
+[ -z "$(codex_live_thread "$launch")" ]
 
 # The resume arm must use the filtering helper rather than appending a
 # persisted `resume ID` after its own (#845).
@@ -184,6 +231,7 @@ session_watches_events() { [ "$1" = remote ] || [ "$1" = manual-remote ]; }
 codex_wake_thread() { printf '%s' 01a10362-0000-7000-8000-000000000003; }
 resolve_codex_home() { printf '%s' "$TEST_ROOT/home-for-${1:-default}"; }
 session_launch_id() { printf '%s' launch-for-"$1"; }
+codex_live_thread() { :; }
 codex_rollout_uuid() {
   case "$1" in
     launch-for-tui) _resolved=01a10363-0000-7000-8000-000000000004 ;;

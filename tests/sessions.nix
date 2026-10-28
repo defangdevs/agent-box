@@ -1427,6 +1427,40 @@ in
         assert "--dangerously-bypass-approvals-and-sandbox" not in careful_cmd, careful_cmd
         machine.succeed(as_agent("agent-box-session rm careful"))
 
+    with subtest("codex: prompt-less restart follows its SessionStart record"):
+        # Exercise the installed system hook and supervisor without network
+        # inference. Two sessions in one cwd must keep distinct native ids.
+        hook = machine.succeed(
+            "python3 -c 'import tomllib; "
+            "print(tomllib.load(open(\"/etc/codex/config.toml\", \"rb\"))"
+            "[\"hooks\"][\"SessionStart\"][0][\"hooks\"][0][\"command\"])'"
+        ).strip()
+        for name, native in [
+            ("resume-codex-a", "11111111-1111-4111-8111-111111111111"),
+            ("resume-codex-b", "22222222-2222-4222-8222-222222222222"),
+        ]:
+            machine.succeed(as_agent(f"agent-box-session add {name} --harness codex"))
+            machine.wait_until_succeeds(tmux(f"has-session -t ={name}"), timeout=60)
+            quiesce_harness(name)
+            launch = machine.succeed(
+                f"jq -r .launchSessionId /home/agent/.local/state/agent-box/session/{name}.json"
+            ).strip()
+            payload = json.dumps({"session_id": native, "source": "startup",
+                                  "hook_event_name": "SessionStart"})
+            machine.succeed(as_agent(
+                f"printf %s {shlex.quote(payload)} | AGENT_BOX_SESSION_ID={launch} {hook}"
+            ))
+            machine.succeed(
+                "install -D -o agent /dev/null /home/agent/.codex/sessions/2026/10/28/"
+                f"rollout-2026-10-28T00-00-00-{native}.jsonl"
+            )
+            machine.succeed(as_agent(f"agent-box-session restart {name}"))
+            machine.wait_until_succeeds(
+                tmux(f'list-panes -t "={name}" -F "#{{pane_start_command}}"')
+                + f" | grep -- ' resume .* -- {native}' >/dev/null", timeout=60
+            )
+            machine.succeed(as_agent(f"agent-box-session rm {name}"))
+
     # --- segment rotation: respawn follows the recorded live id -----------
     with subtest("segment rotation: respawn resumes the recorded live id"):
         # A clear, a compact or a resume rotates claude's live session id

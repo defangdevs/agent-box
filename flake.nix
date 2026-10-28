@@ -2628,6 +2628,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 slackSupervisorTests = ./tests/test-slack-supervisor.sh;
                 sessionTmpTests = ./tests/test-session-tmp.sh;
                 codexResumeTests = ./tests/test-codex-registered-thread.sh;
+                sessionStartHook = ./modules/src/claude-session-start-hook.sh;
               } ''
               install -d repo/modules/src repo/tests
               cp "$cli" repo/modules/src/whatsapp-cli.py
@@ -2648,7 +2649,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 cat log
                 exit 1
               }
-              bash "$codexResumeTests" "$supervisor" >> log 2>&1 || {
+              bash "$codexResumeTests" "$supervisor" "$sessionStartHook" >> log 2>&1 || {
                 cat log
                 exit 1
               }
