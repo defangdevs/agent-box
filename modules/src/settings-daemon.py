@@ -8066,17 +8066,14 @@ overflow-wrap:anywhere}.drop span{margin-top:.25rem;color:#8b949e}.drop.dragging
 border-color:#58a6ff;background:#1f6feb26}.drop:focus-within{outline:2px solid
 #58a6ff;outline-offset:2px}.drop.disabled{opacity:.6;cursor:not-allowed}
 #file{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;
-clip-path:inset(50%);white-space:nowrap;border:0}button{font:inherit;
-padding:.55rem 1rem;border:0;
-border-radius:6px;background:#238636;color:white;font-weight:600}button:disabled{
-opacity:.5}progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
+clip-path:inset(50%);white-space:nowrap;border:0}
+progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
 </style></head><body data-slot="__SLOT__"><main class="card">
 <h1>Send one file to __USER__</h1>
 <p>This private link accepts one resumable upload. It does not grant access
 to the terminal or any existing files.</p>
 <label id="drop" class="drop" for="file"><strong id="prompt">Drop a file here</strong>
 <span>or tap to choose one</span><input id="file" type="file"></label>
-<button id="send" disabled>Upload file</button>
 <progress id="progress" aria-label="Upload progress" value="0" max="1"></progress>
 <p id="status" role="status"></p>
 </main><script nonce="__NONCE__">
@@ -8087,10 +8084,8 @@ to the terminal or any existing files.</p>
   const drop = document.getElementById('drop');
   const input = document.getElementById('file');
   const prompt = document.getElementById('prompt');
-  const button = document.getElementById('send');
   const progress = document.getElementById('progress');
   const status = document.getElementById('status');
-  let selectedFile = null;
   let uploading = false;
   const collection = location.pathname.replace(/\/?$/, '/') + 'files';
   const resource = collection + '/upload';
@@ -8211,20 +8206,27 @@ to the terminal or any existing files.</p>
   if (!validToken) {
     status.textContent = 'This upload link is incomplete.';
   } else {
-    const selectFile = files => {
+    const selectFile = async files => {
       if (uploading) return;
       if (files.length !== 1) {
-        selectedFile = null;
         input.value = '';
         prompt.textContent = 'Drop a file here';
-        button.disabled = true;
         status.textContent = 'Choose exactly one file.';
         return;
       }
-      selectedFile = files[0];
-      prompt.textContent = selectedFile.name;
-      status.textContent = 'Ready to upload ' + selectedFile.name + '.';
-      button.disabled = false;
+      const file = files[0];
+      prompt.textContent = file.name;
+      uploading = true;
+      input.disabled = true;
+      drop.classList.add('disabled');
+      try { await upload(file); }
+      catch (error) {
+        uploading = false;
+        input.disabled = false;
+        input.value = '';
+        drop.classList.remove('disabled');
+        status.textContent = error.message;
+      }
     };
     const stopDrag = event => {
       event.preventDefault();
@@ -8250,22 +8252,6 @@ to the terminal or any existing files.</p>
       selectFile(event.dataTransfer.files);
     });
     input.addEventListener('change', () => selectFile(input.files));
-    button.addEventListener('click', async () => {
-      const file = selectedFile;
-      if (!file || uploading) return;
-      uploading = true;
-      button.disabled = true;
-      input.disabled = true;
-      drop.classList.add('disabled');
-      try { await upload(file); }
-      catch (error) {
-        uploading = false;
-        input.disabled = false;
-        drop.classList.remove('disabled');
-        status.textContent = error.message;
-        button.disabled = false;
-      }
-    });
   }
 })();
 </script></body></html>'''
