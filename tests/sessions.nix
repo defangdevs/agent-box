@@ -577,7 +577,19 @@ in
 
     # Exercise every daemon-only supervisor branch through the canonical
     # marker, without relying on the legacy Codex remoteControl=true encoding.
+    # tmux existence only means the pane was created. Do not interrupt daemon
+    # startup, or let its asynchronous HUP cleanup stop the replacement daemon.
+    machine.wait_until_succeeds(
+        as_agent("codex app-server daemon version"), timeout=60
+    )
+    helper_pane_pid = machine.succeed(
+        tmux('display-message -p -t "=helper:" "#{pane_pid}"')
+    ).strip()
     machine.succeed(as_agent("agent-box-session stop helper"))
+    machine.wait_until_fails(f"pgrep -g {helper_pane_pid}", timeout=60)
+    machine.wait_until_fails(
+        as_agent("codex app-server daemon version"), timeout=60
+    )
     machine.succeed(as_agent(
         "jq '.sessions.helper.remoteControl = false' "
         f"{sfile} > {sfile}.t && mv {sfile}.t {sfile}"
