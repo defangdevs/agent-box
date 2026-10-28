@@ -851,6 +851,13 @@ $PROMPT" -- "${extra[@]}"
 
 rc=0
 start_hook_session || rc=$?
+if [ "$rc" = 76 ]; then
+  # The agent died at exec (126/127) and its registration is gone. That is
+  # not capacity pressure: evicting an idle session or recording a refusal
+  # would be wrong, so hand the receiver its retry status directly.
+  echo "agent-box-webhook-spawn: session failed during startup; receiver will retry" >&2
+  exit 75
+fi
 if [ "$rc" = 75 ]; then
   # Capacity pressure is the only reason to evict an idle runtime. The
   # session CLI proves quiescence, revalidates it under the registry lock,

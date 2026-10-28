@@ -1856,7 +1856,7 @@ case "$cmd" in
             case "$_sw_line" in
               (agent-box-env-exec:*) _sw_error="$_sw_line" ;;
             esac
-          done < <(t capture-pane -p -t "=$name" -S -20 2>/dev/null || true)
+          done < <(t capture-pane -p -t "=$name:" -S -20 2>/dev/null || true)
 
           # Delete only the exact launch this add minted. A concurrent remove
           # and name reuse must not let an old startup observation kill the
@@ -1891,7 +1891,9 @@ case "$cmd" in
             prune_session_state "$name"
             echo "agent-box-session: '$name' failed during startup (exit $_sw_died); removed so its caller can retry" >&2
             [ -z "$_sw_error" ] || echo "$_sw_error" >&2
-            exit 75
+            # Not EX_TEMPFAIL: that means capacity. The webhook spawn wrapper
+            # maps 76 to the receiver's retry status without evicting anyone.
+            exit 76
           fi
           ;;
       esac

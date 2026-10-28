@@ -7362,7 +7362,7 @@ case "$cmd" in
             case "$_sw_line" in
               (agent-box-env-exec:*) _sw_error="$_sw_line" ;;
             esac
-          done < <(t capture-pane -p -t "=$name" -S -20 2>/dev/null || true)
+          done < <(t capture-pane -p -t "=$name:" -S -20 2>/dev/null || true)
 
           # Delete only the exact launch this add minted. A concurrent remove
           # and name reuse must not let an old startup observation kill the
@@ -7397,7 +7397,9 @@ case "$cmd" in
             prune_session_state "$name"
             echo "agent-box-session: '$name' failed during startup (exit $_sw_died); removed so its caller can retry" >&2
             [ -z "$_sw_error" ] || echo "$_sw_error" >&2
-            exit 75
+            # Not EX_TEMPFAIL: that means capacity. The webhook spawn wrapper
+            # maps 76 to the receiver's retry status without evicting anyone.
+            exit 76
           fi
           ;;
       esac
@@ -13475,6 +13477,13 @@ $PROMPT" -- "''${extra[@]}"
 
 rc=0
 start_hook_session || rc=$?
+if [ "$rc" = 76 ]; then
+  # The agent died at exec (126/127) and its registration is gone. That is
+  # not capacity pressure: evicting an idle session or recording a refusal
+  # would be wrong, so hand the receiver its retry status directly.
+  echo "agent-box-webhook-spawn: session failed during startup; receiver will retry" >&2
+  exit 75
+fi
 if [ "$rc" = 75 ]; then
   # Capacity pressure is the only reason to evict an idle runtime. The
   # session CLI proves quiescence, revalidates it under the registry lock,

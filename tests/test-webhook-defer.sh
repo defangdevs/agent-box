@@ -220,6 +220,31 @@ else
   jq -c . "$REGISTRY" 2>/dev/null | sed 's/^/     /'
 fi
 
+# A startup failure (add exits 76) is not capacity pressure: no idle runtime
+# may be hibernated for it and no refusal recorded; the receiver still gets 75.
+cat > "$work/bin/startfail-session" <<EOF
+#!$BASH_BIN
+case "\$1" in
+  peers) echo 'No other session is live on this box.' ;;
+  hibernate) echo hibernate >> "$work/startfail.log"; exit 1 ;;
+  add) echo add >> "$work/startfail.log"; exit 76 ;;
+  capacity) echo capacity >> "$work/startfail.log"; echo '{}' ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$work/bin/startfail-session"
+SAVED_SESSION_BIN=$AGENT_BOX_SESSION_BIN
+export AGENT_BOX_SESSION_BIN="$work/bin/startfail-session"
+: > "$work/startfail.log"
+rc=$(spawn defangdevs/startfail 2)
+if [ "$rc" = 75 ] && [ "$(cat "$work/startfail.log")" = add ]; then
+  ok "a startup failure defers without hibernating or recording a refusal"
+else
+  fail "a startup failure defers without hibernating - exit $rc"
+  sed 's/^/     /' "$work/startfail.log"
+fi
+export AGENT_BOX_SESSION_BIN=$SAVED_SESSION_BIN
+
 # At capacity, one safely hibernated resident runtime is retried immediately;
 # the accepted event does not wait for the dispatcher's next re-offer window.
 real_session_bin=$AGENT_BOX_SESSION_BIN
