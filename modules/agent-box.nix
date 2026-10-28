@@ -7311,6 +7311,97 @@ case "$cmd" in
                        + (if $eph == "1" then {ephemeral: true} else {} end))' \
       --args -- "''${sargs[@]}"
     registry_unlock
+
+    # A dispatched spawn has a caller that can RETRY it: local-webhook keeps
+    # a batch when its spawn command exits EX_TEMPFAIL (75). Do not turn an
+    # infrastructure failure before the harness starts into a post-mortem
+    # shell that owns the event forever (issue #938). The supervisor records
+    # hasRun immediately after tmux accepted the pane; give the pane one more
+    # short window after that publication to report the exec-shaped statuses
+    # 126/127 through mark-stopped. Any other status, or the same status after
+    # this startup window, is an ordinary agent crash and keeps the inspectable
+    # post-mortem behavior.
+    #
+    # Bounded on both sides: the supervisor normally reconciles within ~2s,
+    # but a first-use harness fetch can take minutes and must not hold the
+    # webhook dispatcher's spawn process for its whole download. The tick
+    # overrides are test seams, not user-facing settings.
+    if [ "$origin" = webhook ]; then
+      _sw_wait_ticks="''${AGENT_BOX_START_WAIT_TICKS:-50}"
+      _sw_grace_ticks="''${AGENT_BOX_START_GRACE_TICKS:-10}"
+      case "$_sw_wait_ticks:$_sw_grace_ticks" in
+        (*[!0-9:]*|:*|*:) _sw_wait_ticks=50; _sw_grace_ticks=10 ;;
+      esac
+      _sw_tick=0; _sw_grace=-1; _sw_died=""
+      while [ "$_sw_tick" -lt "$_sw_wait_ticks" ]; do
+        _sw_state="$($JQ -r --arg n "$name" \
+          '(.sessions[$n] // {}) as $s
+           | [($s.hasRun == true), ($s.died // "")] | @tsv' \
+          "$REGISTRY_FILE" 2>/dev/null)" || _sw_state=""
+        IFS=$'\t' read -r _sw_started _sw_died <<<"$_sw_state"
+        case "$_sw_died" in (126|127) break ;; esac
+        if [ "$_sw_started" = true ]; then
+          if [ "$_sw_grace" -lt 0 ]; then
+            _sw_grace=$_sw_grace_ticks
+          elif [ "$_sw_grace" -eq 0 ]; then
+            break
+          else
+            _sw_grace=$((_sw_grace - 1))
+          fi
+        fi
+        _sw_tick=$((_sw_tick + 1))
+        sleep 0.1
+      done
+
+      case "$_sw_died" in
+        (126|127)
+          # Preserve the useful line before killing the post-mortem pane, but
+          # never echo arbitrary pane contents into the receiver journal.
+          _sw_error=""
+          while IFS= read -r _sw_line; do
+            case "$_sw_line" in
+              (agent-box-env-exec:*) _sw_error="$_sw_line" ;;
+            esac
+          done < <(t capture-pane -p -t "=$name" -S -20 2>/dev/null || true)
+
+          # Delete only the exact launch this add minted. A concurrent remove
+          # and name reuse must not let an old startup observation kill the
+          # replacement. mark-stopped has already published died under this
+          # same lock, so the normal path takes it on the first attempt.
+          _sw_removed=false
+          _sw_lock_try=0
+          while [ "$_sw_lock_try" -lt 3 ]; do
+            if registry_lock 2>/dev/null; then
+              if "$JQ" -e --arg n "$name" --arg b "$bid" \
+                   '(.sessions[$n] // {}) as $s
+                    | ($s.boxSessionId == $b
+                       and (($s.died == 126) or ($s.died == 127)))' \
+                   "$REGISTRY_FILE" >/dev/null 2>&1; then
+                registry_edit --arg n "$name" --arg b "$bid" \
+                  'if (.sessions[$n] // {}) as $s
+                       | ($s.boxSessionId == $b
+                          and (($s.died == 126) or ($s.died == 127)))
+                   then del(.sessions[$n]) else . end'
+                _sw_removed=true
+              fi
+              registry_unlock
+              break
+            fi
+            _sw_lock_try=$((_sw_lock_try + 1))
+            sleep 0.1
+          done
+          if [ "$_sw_removed" = true ]; then
+            kill_session "$name" || exit 1
+            # A retry at the same deterministic hook name must be a FIRST
+            # spawn again, with its kickoff prompt and a fresh launch id.
+            prune_session_state "$name"
+            echo "agent-box-session: '$name' failed during startup (exit $_sw_died); removed so its caller can retry" >&2
+            [ -z "$_sw_error" ] || echo "$_sw_error" >&2
+            exit 75
+          fi
+          ;;
+      esac
+    fi
     # The mascot (issue #185) marks the closest thing this CLI has to
     # "an agent just started". Small on purpose: this runs in webhook
     # spawns and scripts too, and nothing parses the lines below it.
@@ -13291,7 +13382,6 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
   lease_object="$("$JQ" -rn --argjson meta "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
     '(($meta.number // "" | tostring) | if test("^[0-9]+$") then . else "" end)' \
     2>/dev/null)" || lease_object=""
-  lease_create "$name" "$own" "$lease_object"
 fi
 
 # An assignment is a work request, not a triage request (#253), and the
@@ -13371,6 +13461,12 @@ fi
 # for inspection exactly as before -- and every surface now says the agent
 # is gone instead of reporting the post-mortem shell as a running session.
 start_hook_session() {
+  # One lease generation per ATTEMPT. An immediate exec failure makes
+  # agent-box-session delete the dead registration and return 75; the
+  # hibernation/retry arm below may then retry this same deterministic name
+  # before the receiver re-offers it. Resetting here prevents the first
+  # pane's died:127 outcome from being inherited by the successful retry.
+  [ -z "$own" ] || lease_create "$name" "$own" "$lease_object"
   "$SESSION_BIN" add "$name" "''${pflag[@]+"''${pflag[@]}"}" --ephemeral \
     --origin webhook --hook "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" --prompt "$preamble
 

@@ -61,6 +61,36 @@ mkdir -p "$work/bin"
 # Run real CLI admission, recording only successful adds.
 cat > "$work/bin/session" <<EOF
 #!$BASH_BIN
+# Stand in for the supervisor after a successful registry admission. The real
+# one publishes hasRun as soon as tmux accepts the pane, then mark-stopped may
+# publish an immediate startup failure. A bounded watcher leaves capacity
+# refusals (which create no entry) alone.
+if [ "\$1" = add ]; then
+  _name=\$2
+  (
+    _n=0
+    while [ "\$_n" -lt 100 ]; do
+      if jq -e --arg n "\$_name" '.sessions | has(\$n)' "$REGISTRY" >/dev/null 2>&1; then
+        flock "$REGISTRY.lock" python3 -c '
+import json, os, sys
+name, path = sys.argv[1:]
+with open(path) as handle:
+    value = json.load(handle)
+entry = value["sessions"][name]
+entry["hasRun"] = True
+if name.startswith("hook-defangdevs-execfail-"):
+    entry["died"] = 127
+tmp = path + ".supervisor"
+with open(tmp, "w") as handle:
+    json.dump(value, handle)
+os.replace(tmp, path)
+' "\$_name" "$REGISTRY"
+        exit
+      fi
+      _n=\$((_n + 1)); sleep 0.01
+    done
+  ) &
+fi
 "$BASH_BIN" "$work/session.sh" "\$@"
 rc=\$?
 if [ "\$rc" = 0 ] && [ "\$1" = add ]; then
@@ -79,6 +109,12 @@ export AGENT_BOX_ENVSTORE_BIN="$work/bin/envstore"
 # No live panes, but non-stopped registrations still reserve capacity.
 cat > "$work/bin/tmux" <<EOF
 #!$BASH_BIN
+case "\$*" in
+  (*capture-pane*)
+    echo 'agent-box-env-exec: cannot exec /missing/claude: [Errno 2] No such file or directory'
+    exit 0
+    ;;
+esac
 echo 'no server running' >&2
 exit 1
 EOF
@@ -88,6 +124,10 @@ export AGENT_BOX_CAPACITY_BIN="$work/capacity"
 export AGENT_BOX_SESSION_LIMIT_FILE="$work/limit"
 export AGENT_BOX_AGENTS=claude AGENT_BOX_DEFAULT_AGENT=claude
 export AGENT_BOX_FLOCK_BIN="$(command -v flock)"
+# Keep the production wait (up to five seconds for the supervisor) out of a
+# unit rig whose stub above publishes synchronously. The one post-start tick
+# still exercises the failure grace window.
+export AGENT_BOX_START_WAIT_TICKS=20 AGENT_BOX_START_GRACE_TICKS=1
 
 fails=0
 ok()   { printf 'ok   %s\n' "$1"; }
@@ -157,6 +197,27 @@ if [ "$rc" = 0 ] && grep -q 'add hook-defangdevs-free-' "$work/session.log"; the
 else
   fail "a slot below the cap spawns — exit $rc"
   sed 's/^/     /' "$work/spawn.out"
+fi
+
+# A pane that cannot exec its harness is not an accepted event. The real
+# env-exec prints this line, returns 127, and mark-stopped publishes died=127;
+# add must remove that dead registration and hand EX_TEMPFAIL back through the
+# wrapper so the dispatcher keeps the batch. The wrapper makes one immediate
+# retry when the failed pane freed a slot, so both attempts are asserted.
+hook_registry 0
+: > "$work/session.log"
+rc=$(spawn defangdevs/execfail 2)
+if [ "$rc" = 75 ] \
+   && ! jq -e '.sessions | keys[] | select(startswith("hook-defangdevs-execfail-"))' \
+        "$REGISTRY" >/dev/null 2>&1 \
+   && grep 'failed during startup (exit 127)' "$work/spawn.out" >/dev/null \
+   && grep 'agent-box-env-exec: cannot exec /missing/claude:' \
+        "$work/spawn.out" >/dev/null; then
+  ok "an immediate exec failure is removed and deferred for retry"
+else
+  fail "an immediate exec failure is removed and deferred for retry — exit $rc"
+  sed 's/^/     /' "$work/spawn.out"
+  jq -c . "$REGISTRY" 2>/dev/null | sed 's/^/     /'
 fi
 
 # At capacity, one safely hibernated resident runtime is retried immediately;
