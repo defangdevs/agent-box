@@ -370,6 +370,21 @@ else
   ok "an explicit CODEX_HOME leaves \$HOME/.codex untouched"
 fi
 
+# issue #946: codex looks for codex-code-mode-host beside the path it was
+# started from, so every mirrored `codex` link needs its siblings next to it.
+setup codexmirror_siblings
+mkdir -p "$HOME/store/bin"
+printf '#!%s\n' "$BASH_BIN" > "$HOME/store/bin/codex"
+: > "$HOME/store/bin/codex-code-mode-host"
+chmod +x "$HOME/store/bin/codex"
+mirror_codex_standalone "$HOME/store/bin/codex"
+is "the standalone mirror links codex-code-mode-host beside codex" \
+   "$HOME/store/bin/codex-code-mode-host" \
+   "$(readlink "$HOME/.codex/packages/standalone/current/codex-code-mode-host")"
+is "the app-server-daemon mirror links codex-code-mode-host beside codex" \
+   "$HOME/store/bin/codex-code-mode-host" \
+   "$(readlink "$HOME/.codex/packages/app-server-daemon/current/bin/codex-code-mode-host")"
+
 # --- resolve_codex_home's precedence -------------------------------------
 # The same precedence env-exec.py applies at spawn (box store, then the
 # named profile on top), so the supervisor's own guess agrees with what
