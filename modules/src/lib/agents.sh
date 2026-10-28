@@ -39,7 +39,7 @@ _jit_lock="$_jit_dir/install.lock"
 _jit_pin_file() { printf '%s' "$_jit_dir/$1.pin"; }
 
 agent_bin() {
-  # agent_bin NAME — resolve an agent (or "shell") to its binary via
+  # agent_bin NAME [stable] — resolve an agent (or "shell") to its binary via
   # the unit's AGENT_BOX_AGENT_BINS ("name=/path ..." pairs; store and
   # shell paths never contain whitespace, so word-splitting is safe).
   #
@@ -78,10 +78,31 @@ agent_bin() {
   # Only ever a harness name we know; never an arbitrary string off the
   # registry turned into a path.
   agent_attr "$1" >/dev/null 2>&1 || return 1
-  if [ -x "$HOME/.nix-profile/bin/$1" ]; then
+  # Return the immutable store path, not the profile symlink. A harness
+  # upgrade is a `nix profile remove` then `add`, so for one generation
+  # ~/.nix-profile/bin/NAME does not exist; a launch holding that path
+  # between this check and exec would die with exit 127 (issue #938). The
+  # store path stays valid, because the old generation roots it. The flip
+  # can also land between the -x test and the resolve, so retry that pair
+  # once; a harness that is simply not installed still fails at once.
+  #
+  # A long-lived consumer (the WhatsApp bridge reads the path once and keeps
+  # it for its lifetime) passes "stable" instead: it wants the profile path,
+  # which follows upgrades, because a store path it holds can be garbage
+  # collected after the next one.
+  if [ "${2:-}" = stable ]; then
+    [ -x "$HOME/.nix-profile/bin/$1" ] || return 1
     printf '%s\n' "$HOME/.nix-profile/bin/$1"
     return 0
   fi
+  for _ab_try in 1 2; do
+    [ -x "$HOME/.nix-profile/bin/$1" ] || return 1
+    _ab_real="$(readlink -f "$HOME/.nix-profile/bin/$1" 2>/dev/null)" || _ab_real=""
+    if [ -n "$_ab_real" ] && [ -x "$_ab_real" ]; then
+      printf '%s\n' "$_ab_real"
+      return 0
+    fi
+  done
   return 1
 }
 

@@ -1797,7 +1797,7 @@ supervise_whatsapp() {
   [ "$((now - whatsapp_last_start))" -ge 10 ] || return
   whatsapp_last_start="$now"
   session_cli="$(command -v agent-box-session)" || return
-  codex_cli="$(agent_bin codex 2>/dev/null)" || codex_cli=""
+  codex_cli="$(agent_bin codex stable 2>/dev/null)" || codex_cli=""
   if [ -n "$codex_cli" ]; then
     LOCAL_WHATSAPP_SESSION_BIN="$session_cli" \
       LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$whatsapp" serve &
