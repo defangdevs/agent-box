@@ -481,9 +481,12 @@ _mcs_stop_stale_daemons() {
   for _sd_p in /proc/[0-9]*; do
     [ -O "$_sd_p" ] || continue
     _sd_exe="$(readlink "$_sd_p/exe" 2>/dev/null)" || continue
-    _sd_exe=${_sd_exe% (deleted)}
+    _sd_del=
+    case "$_sd_exe" in (*" (deleted)") _sd_del=1 _sd_exe=${_sd_exe% (deleted)} ;; esac
     case "${_sd_exe##*/}" in (codex) ;; (*) continue ;; esac
-    [ "$_sd_exe" != "$_sd_real" ] || continue
+    # A deleted exe is stale even at the mirrored path: the file there now
+    # is a replacement, not the build this daemon runs.
+    [ -n "$_sd_del" ] || [ "$_sd_exe" != "$_sd_real" ] || continue
     _sd_n=0 _sd_sub= _sd_flag=
     while IFS= read -r -d '' _sd_a; do
       [ "$_sd_n" -ne 1 ] || _sd_sub=$_sd_a

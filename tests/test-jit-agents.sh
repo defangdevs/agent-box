@@ -437,6 +437,25 @@ else no "mirroring leaves a TUI whose prompt mentions the flag running"; fi
 kill "$_cur" "$_other" "$_tui" 2>/dev/null || true
 wait 2>/dev/null || true
 
+# The same pathname, replaced: the old daemon's exe reads "... (deleted)" and
+# equals the mirrored path once the suffix is gone, but it is still stale.
+setup codexmirror_same_path_swap
+mkdir -p "$HOME/swap" "$HOME/w"
+cp "$BASH_BIN" "$HOME/swap/codex"
+printf 'sleep 30; :\n' > "$HOME/w/app-server"
+cd "$HOME/w"
+"$HOME/swap/codex" app-server --managed-daemon & _swapped=$!
+cd "$work"
+sleep 0.3
+rm -f "$HOME/swap/codex"
+cp "$BASH_BIN" "$HOME/swap/codex"
+mirror_codex_standalone "$HOME/swap/codex"
+sleep 0.3
+if alive "$_swapped"; then no "mirroring stops a daemon whose executable was replaced at the same path"
+else ok "mirroring stops a daemon whose executable was replaced at the same path"; fi
+kill "$_swapped" 2>/dev/null || true
+wait 2>/dev/null || true
+
 # --- resolve_codex_home's precedence -------------------------------------
 # The same precedence env-exec.py applies at spawn (box store, then the
 # named profile on top), so the supervisor's own guess agrees with what
