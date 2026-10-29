@@ -34,6 +34,7 @@ import pathlib
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -99,6 +100,80 @@ class SettingsJsonRoutesTest(unittest.TestCase):
     def get(self, path):
         with urllib.request.urlopen(self.base + path, timeout=10) as answer:
             return answer.status, answer.headers, answer.read().decode("utf-8")
+
+    def test_resources_are_bounded_readings_without_secrets(self):
+        reading = {"available_bytes": 4096, "total_bytes": 8192}
+        with mock.patch.object(self.daemon, "resource_memory", return_value=reading), \
+                mock.patch.object(self.daemon, "resource_disk", return_value=reading):
+            status, headers, body = self.get("/resources")
+        data = json.loads(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(set(data), {"ok", "sampled_at", "cpu", "memory", "disk", "sessions"})
+        self.assertTrue(data["ok"])
+        for name in ("memory", "disk"):
+            self.assertGreater(data[name]["total_bytes"], 0)
+            self.assertGreaterEqual(data[name]["available_bytes"], 0)
+            self.assertLessEqual(data[name]["available_bytes"], data[name]["total_bytes"])
+        self.assertNotIn(SECRET, body)
+        self.assertNotIn(self.env_file, body)
+
+    def test_a_failed_source_keeps_other_readings(self):
+        with mock.patch.object(self.daemon, "resource_memory", side_effect=OSError(SECRET)), \
+                mock.patch.object(self.daemon, "resource_disk", return_value={"available_bytes": 1, "total_bytes": 2}):
+            data = json.loads(self.get("/resources")[2])
+        self.assertIsNone(data["memory"])
+        self.assertIsNotNone(data["disk"])
+        self.assertNotIn(SECRET, json.dumps(data))
+
+    def test_resources_use_the_admission_policy_including_queued_workers(self):
+        entries = {"running": {"agent": "claude"}, "queued": {"agent": "codex"},
+                   "stopped": {"agent": "claude", "stopped": True},
+                   "died": {"agent": "codex", "died": 1},
+                   "shell": {"agent": "shell"}}
+        with mock.patch.object(self.daemon, "load_sessions", return_value=(entries, None)), \
+                mock.patch.object(self.daemon, "capacity_live_checked", return_value={"running", "died", "shell"}), \
+                mock.patch.object(self.daemon, "capacity_limit", return_value=2):
+            data = json.loads(self.get("/resources")[2])
+        self.assertEqual(data["sessions"], {"used": 2, "limit": 2})
+
+    def test_cpu_samples_deltas_and_ignores_double_counted_guest_time(self):
+        sampler = self.daemon.ResourceSampler()
+        real_monotonic = self.daemon.time.monotonic
+        test_thread = threading.get_ident()
+        scripted = iter([1, 1.1, 6, 11, 50])
+
+        def clock():
+            # Other threads, such as the running server, get the real clock.
+            if threading.get_ident() != test_thread:
+                return real_monotonic()
+            return next(scripted)
+
+        with mock.patch.object(self.daemon.time, "monotonic", side_effect=clock), \
+                mock.patch.object(self.daemon, "open", create=True, side_effect=[
+                    mock.mock_open(read_data="cpu  100 0 0 100 0 0 0 0 90 0\n")(),
+                    mock.mock_open(read_data="cpu  125 0 0 175 0 0 0 0 115 0\n")(),
+                    mock.mock_open(read_data="cpu  1 0 0 1 0 0 0 0 0 0\n")(),
+                    mock.mock_open(read_data="cpu  25 0 0 75 0 0 0 0 0 0\n")(),
+                ]):
+            self.assertIsNone(sampler.cpu())
+            self.assertIsNone(sampler.cpu())  # Concurrent callers reuse the baseline.
+            self.assertEqual(sampler.cpu(), 25)
+            self.assertIsNone(sampler.cpu())  # Reset counters are not negative load.
+            self.assertIsNone(sampler.cpu())  # A stale baseline is not current load.
+
+    def test_memory_uses_available_instead_of_free(self):
+        with mock.patch.object(self.daemon, "open", create=True,
+                               new=mock.mock_open(read_data="MemTotal: 8192 kB\nMemFree: 100 kB\nMemAvailable: 4096 kB\n")):
+            self.assertEqual(self.daemon.resource_memory(),
+                             {"available_bytes": 4096 * 1024, "total_bytes": 8192 * 1024})
+
+    def test_disk_uses_space_available_to_the_user_on_the_home_filesystem(self):
+        usage = mock.Mock(f_bavail=10, f_bfree=20, f_frsize=4096, f_blocks=100)
+        with mock.patch.object(self.daemon.os, "statvfs", return_value=usage) as statvfs:
+            self.assertEqual(self.daemon.resource_disk(),
+                             {"available_bytes": 40960, "total_bytes": 409600})
+        statvfs.assert_called_once_with(os.path.expanduser("~"))
 
     def test_env_lists_key_names(self):
         status, headers, body = self.get("/env")
