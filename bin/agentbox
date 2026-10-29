@@ -53,6 +53,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -5083,9 +5084,8 @@ def rollback_to(profile, generation):
     """Walk the profile back to `generation`. True when it got there.
 
     One `nix profile rollback` at a time rather than a jump, because a
-    failed switch can leave the profile one OR two generations ahead: the
-    remove-then-install below is two operations, so `rollback` (which knows
-    only "the previous one") has to be repeated. The step is bounded and
+    failed switch can leave the profile more than one generation ahead, so
+    `rollback` (which knows only "the previous one") has to be repeated. The step is bounded and
     stops the moment a rollback stops moving, so a profile that cannot go
     further reports failure instead of spinning.
     """
@@ -5102,6 +5102,45 @@ def rollback_to(profile, generation):
         if profile_generation(profile) == current:
             return False
     return False
+
+
+def clear_staging(stage):
+    """Remove a staging profile's symlinks (never the store paths)."""
+    stage = Path(stage)
+    for link in stage.parent.glob(stage.name + "*"):
+        if link == stage or re.fullmatch(
+                re.escape(stage.name) + r"-\d+-link", link.name):
+            try:
+                link.unlink()
+            except OSError:
+                pass
+
+
+def switch_profile(profile, name, flake):
+    """Replace the runtime element without the profile ever lacking one.
+
+    Services resolve their tools through <profile>/bin while an update runs
+    (issue #957), so `nix profile remove` + `install` on the live profile
+    briefly deleted sleep and flock from under the supervisor. The remove
+    and install happen on a staging copy instead, and the live profile
+    moves once, to the finished generation, with `nix-env --set` (a new
+    generation and an atomic symlink flip). Remove-then-install is still
+    the right edit: a bare install over the existing entry fails with "An
+    existing package already provides the following file" and can leave
+    the OLD profile in place (issue #358).
+    """
+    # Unique per call: a fixed name would let a second update, or a sibling
+    # profile of that name, have its links cleared underneath it.
+    stage = f"{profile}-staging-{uuid.uuid4().hex}"
+    try:
+        run(["nix-env", "--profile", stage, "--set",
+             os.path.realpath(str(profile))])
+        run(nix_cmd("profile", "remove", "--profile", stage, name))
+        run(nix_cmd("profile", "install", "--profile", stage, flake))
+        run(["nix-env", "--profile", str(profile), "--set",
+             os.path.realpath(stage)])
+    finally:
+        clear_staging(stage)
 
 
 # What a profile swap invalidates, in restart order. Sessions are separate
@@ -5295,10 +5334,9 @@ def cmd_update(args):
     # BEFORE the profile is touched — so a box that cannot fetch or build
     # the new release must not have been told its services were going down.
     wall(f"fetching {repo}@{target[:12]} — nothing has changed yet.")
-    # Realize the new closure BEFORE touching the profile, so the window in
-    # which the profile has no runtime element (between the remove and the
-    # install) is a symlink flip rather than a multi-minute download that
-    # can fail halfway.
+    # Realize the new closure BEFORE touching the profile, so the staged
+    # install below is a symlink shuffle rather than a multi-minute download
+    # that can fail halfway.
     try:
         run(nix_cmd("build", "--no-link", flake))
     except subprocess.CalledProcessError as e:
@@ -5308,14 +5346,7 @@ def cmd_update(args):
 
     generation = profile_generation(profile)
     try:
-        # Remove-then-install, not a bare install: installing over the
-        # existing entry fails with "An existing package already provides
-        # the following file" and — this is the trap — leaves the OLD
-        # profile in place while a following `apply` reports "0 change(s)",
-        # so the box looks updated and is not (verified by hand on a live
-        # native box, issue #358).
-        run(nix_cmd("profile", "remove", "--profile", str(profile), name))
-        run(nix_cmd("profile", "install", "--profile", str(profile), flake))
+        switch_profile(profile, name, flake)
     except subprocess.CalledProcessError as e:
         rollback_to(profile, generation)
         wall(f"update to {target[:12]} FAILED at the profile switch — "
