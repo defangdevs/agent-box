@@ -4899,10 +4899,21 @@ auth_rejected() {
 # deliberately logs out and starts device auth again. Match both the status and
 # the server's exact reason so an unrelated 403 keeps the ordinary retry path.
 mfa_required() {
-  case "$1" in
-    *"HTTP 403"*"Multi-factor authentication required"*) return 0 ;;
-  esac
-  return 1
+  printf '%s' "$1" | python3 -c '
+import sys
+
+# Shared by the terminal wrapper and the settings API. Keep provider-text
+# matching here; API consumers use the stable code, never transport prose.
+def codex_pairing_error_code(error):
+    """Classify the explicit account-policy rejection, not unrelated 403s."""
+    error = str(error or "")
+    if (error and "HTTP 403" in error
+            and "Multi-factor authentication required" in error):
+        return "mfa_required"
+    return None
+
+sys.exit(0 if codex_pairing_error_code(sys.stdin.read()) == "mfa_required" else 1)
+'
 }
 # The only part of the JSON-RPC blob worth showing a human is the server's
 # own message; the URL, cf-ray and status code belong in a bug report.
@@ -24398,8 +24409,23 @@ def codex_redact(text):
     return CONNECT_SECRET_RE.sub("[redacted]", text)[:CODEX_ERROR_MAX]
 
 
+# Shared by the terminal wrapper and the settings API. Keep provider-text
+# matching here; API consumers use the stable code, never transport prose.
+def codex_pairing_error_code(error):
+    """Classify the explicit account-policy rejection, not unrelated 403s."""
+    error = str(error or "")
+    if (error and "HTTP 403" in error
+            and "Multi-factor authentication required" in error):
+        return "mfa_required"
+    return None
+
+
 class CodexRpcError(Exception):
     """A control-socket call that failed. str() is already redacted."""
+
+    def __init__(self, message):
+        self.error_code = codex_pairing_error_code(message)
+        super().__init__(codex_redact(message) or "request failed")
 
 
 def _codex_recv_exact(sock, count):
@@ -24495,9 +24521,9 @@ def codex_rc_rpc(socket_path, method, params=None, timeout=10):
                     continue    # a notification, not our answer
                 if "error" in reply:
                     detail = reply["error"]
-                    raise CodexRpcError(codex_redact(
+                    raise CodexRpcError(
                         detail.get("message") if isinstance(detail, dict)
-                        else detail) or "request failed")
+                        else detail)
                 return reply.get("result")
 
         call(1, "initialize", {
@@ -24519,7 +24545,7 @@ def codex_rc_rpc(socket_path, method, params=None, timeout=10):
 _codex_lock = threading.Lock()
 _codex_pairing = {
     "manual_code": None, "environment_id": None, "expires_at": None,
-    "claimed": False, "error": None, "started_at": None,
+    "claimed": False, "error": None, "error_code": None, "started_at": None,
     "last_start": 0.0, "last_poll": 0.0,
     # Bumped by every start and cancel. A start holds no lock while it waits
     # for the daemon, so it only writes its result if nothing superseded it:
@@ -24560,7 +24586,7 @@ def codex_cached(slot, fetch):
 
 
 def codex_status(flow):
-    """("ok", status dict) | ("down", None) | ("error", message)."""
+    """("ok", status dict) | ("down", None) | ("error", CodexRpcError)."""
     def fetch():
         sock = codex_control_socket(flow)
         if sock is None:
@@ -24568,7 +24594,7 @@ def codex_status(flow):
         try:
             return ("ok", codex_rc_rpc(sock, "remoteControl/status/read"), sock)
         except CodexRpcError as exc:
-            return ("error", str(exc), sock)
+            return ("error", exc, sock)
     return codex_cached("status", fetch)
 
 
@@ -24604,7 +24630,7 @@ def codex_pairing_state(flow):
     status = connect_status(flow) if flow["bin"] else (False, "")
     signed_in = bool(status and status[0])
     out = {"state": "signed_out", "server_name": None, "code": None,
-           "expires_at": None, "error": None, "devices": [],
+           "expires_at": None, "error": None, "error_code": None, "devices": [],
            "devices_error": None}
     if status is None:
         out["state"] = "starting"
@@ -24621,9 +24647,10 @@ def codex_pairing_state(flow):
             out["devices"], out["devices_error"] = codex_devices(sock, env_id)
     now = time.time()
     if rec["error"]:
-        out.update(state="failed", error=rec["error"])
+        out.update(state="failed", error=rec["error"],
+                   error_code=rec["error_code"])
     elif kind == "error":
-        out.update(state="failed", error=info)
+        out.update(state="failed", error=str(info), error_code=info.error_code)
     elif kind == "down":
         began = rec["started_at"]
         if began is not None and time.monotonic() - began > CODEX_STARTING_GRACE:
@@ -24686,6 +24713,7 @@ def codex_pairing_start(flow):
         _codex_pairing["last_start"] = time.monotonic()
         _codex_pairing.update(manual_code=None, environment_id=None,
                               expires_at=None, claimed=False, error=None,
+                              error_code=None,
                               started_at=time.monotonic())
         _codex_pairing["gen"] += 1
         gen = _codex_pairing["gen"]
@@ -24735,6 +24763,7 @@ def codex_pairing_start(flow):
         with _codex_lock:
             if _codex_pairing["gen"] == gen:
                 _codex_pairing["error"] = str(exc)
+                _codex_pairing["error_code"] = exc.error_code
         return 303, ""
     code = (result or {}).get("manualPairingCode")
     with _codex_lock:
@@ -24766,7 +24795,7 @@ def codex_pairing_cancel():
         _codex_pairing["gen"] += 1
         _codex_pairing.update(manual_code=None, environment_id=None,
                               expires_at=None, claimed=False, error=None,
-                              started_at=None)
+                              error_code=None, started_at=None)
 
 
 def codex_device_revoke(flow, client_id):
