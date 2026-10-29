@@ -2051,10 +2051,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-jit-agents"
               {
                 nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
-                lib = ./modules/src/lib/agents.sh;
+                src = ./modules/src;
                 tests = ./tests/test-jit-agents.sh;
               } ''
-              bash "$tests" "$lib" > log 2>&1 || {
+              bash "$tests" "$src/lib/agents.sh" > log 2>&1 || {
                 cat log
                 exit 1
               }
@@ -2606,10 +2606,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-codex-legacy-app-server"
               {
                 nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnused pkgs.procps ];
-                wrapper = ./modules/src/codex-remote-control.sh;
+                src = ./modules/src;
                 tests = ./tests/test-codex-legacy-app-server.sh;
               } ''
-              bash "$tests" "$wrapper" > log 2>&1 || {
+              bash "$tests" "$src/codex-remote-control.sh" > log 2>&1 || {
                 cat log
                 exit 1
               }
