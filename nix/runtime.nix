@@ -347,6 +347,11 @@ let
     (payload "agent-box-harness-bare" "harness-cli.sh")
     # Needs no env wrapper: it resolves its token from gh at runtime.
     (payload "agent-box-upload" "upload-cli.sh")
+    # Speech to text for voice notes (issue #970). Fetches its prebuilt
+    # engine on first use; nothing here is compiled.
+    (pkgs.writers.writePython3Bin "agent-box-transcribe" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "transcribe-cli.py"))
     receiveCli
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-bare" "webhook-cli.sh")

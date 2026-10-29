@@ -777,7 +777,7 @@ let
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli
+    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli transcribeCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -1013,6 +1013,14 @@ let
     flakeIgnore = [ "E501" "E302" "E305" "E402" "F811" ];
   } ''
 @@include:src/receive-cli.py@@
+  '';
+
+  # Speech to text for voice notes (issue #970): the audio is decoded on the
+  # box, with an engine fetched prebuilt on first use, never compiled.
+  transcribeCli = pkgs.writers.writePython3Bin "agent-box-transcribe" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/transcribe-cli.py@@
   '';
 
   # Bootstraps and re-aligns the shipped checkout (issue #242). On the
