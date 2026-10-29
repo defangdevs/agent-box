@@ -1583,13 +1583,15 @@ class RenderTest(unittest.TestCase):
         self.assertIn('approval_policy = "never"', toml)
         # Both keys, or the box opens the filesystem and still stops to ask.
         self.assertIn('sandbox_mode = "danger-full-access"', toml)
+        self.assertIn('[[hooks.SessionStart.hooks]]', toml)
+        self.assertIn('command = "@PROFILE@/bin/agent-box-claude-session-start-hook codex"', toml)
         for user in ("agent", "robot"):
             env = (FIXTURE / "etc/agent-box/units" / f"{user}.env").read_text()
             self.assertIn("AGENT_BOX_CLAUDE_SETTINGS="
                           "/etc/agent-box/claude-hook-settings.json", env)
             self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env)
 
-    def test_turning_codex_full_access_off_removes_the_file(self):
+    def test_turning_codex_full_access_off_keeps_only_the_hook(self):
         """The dangerous transition, applied to ONE root.
 
         A box rendered with codexFullAccess: true and later false kept
@@ -1625,8 +1627,10 @@ class RenderTest(unittest.TestCase):
             for user in ("agent", "robot"):
                 self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env_text(user))
             apply(False)
-            self.assertFalse(conf.exists(),
+            self.assertNotIn("danger-full-access", conf.read_text(),
                              "stale full-access config survived the flip")
+            self.assertNotIn('approval_policy = "never"', conf.read_text())
+            self.assertIn('[[hooks.SessionStart.hooks]]', conf.read_text())
             for user in ("agent", "robot"):
                 self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env_text(user),
                                  "stale full-access flag survived the flip")
@@ -1678,6 +1682,23 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(mod.GENERATED_HEADER + "x = 1\n",
                              elsewhere.read_text())
 
+    def test_codex_hook_preserves_foreign_restricted_configuration(self):
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["codexFullAccess"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "root"
+            conf = out / "etc/codex/config.toml"
+            conf.parent.mkdir(parents=True)
+            content = 'model = "custom-model"\n'
+            conf.write_text(content)
+            renderer = mod.Renderer(mod.Spec(config, prof), prof, root=out)
+            tree = renderer.render()
+            self.assertNotIn(str(conf), tree.files)
+            self.assertEqual(conf.read_text(), content)
+            self.assertTrue(any("SessionStart" in note for note in renderer.notes))
+
     def test_codex_full_access_is_file_and_flag_together(self):
         """Never the flag without the file. supervisor.sh reads the flag as
         evidence the file exists, so setting one alone would make a
@@ -1692,10 +1713,12 @@ class RenderTest(unittest.TestCase):
                 spec = mod.Spec(config, prof)
                 rend = mod.Renderer(spec, prof, root=Path(tmp) / f"o{want}")
                 tree = rend.render()
-                toml = [f for f in tree.files if f.endswith("codex/config.toml")]
+                toml = [text for path, (text, _) in tree.files.items()
+                        if path.endswith("codex/config.toml")][0]
                 env = [text for path, (text, _) in tree.files.items()
                        if path.endswith("/agent.env")][0]
-                self.assertEqual(want, bool(toml))
+                self.assertEqual(want, 'sandbox_mode = "danger-full-access"' in toml)
+                self.assertIn('[[hooks.SessionStart.hooks]]', toml)
                 self.assertEqual(want, "AGENT_BOX_CODEX_FULL_ACCESS" in env)
 
     def test_a_quoted_false_does_not_turn_codex_loose(self):
@@ -1721,9 +1744,10 @@ class RenderTest(unittest.TestCase):
             config["codexFullAccess"] = None
             spec = mod.Spec(config, prof)
             tree = mod.Renderer(spec, prof, root=Path(tmp) / "null").render()
-            self.assertFalse(
-                [f for f in tree.files if f.endswith("codex/config.toml")],
-                "codexFullAccess: null rendered the full-access file")
+            toml = [text for path, (text, _) in tree.files.items()
+                    if path.endswith("codex/config.toml")][0]
+            self.assertNotIn('sandbox_mode = "danger-full-access"', toml,
+                             "codexFullAccess: null rendered full-access defaults")
             env = [text for path, (text, _) in tree.files.items()
                    if path.endswith("/agent.env")][0]
             self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env)

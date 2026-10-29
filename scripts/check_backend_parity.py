@@ -105,6 +105,8 @@ INTERNAL = {
                          "supervisor it spawns",
     "AGENT_BOX_REGISTRY_LOCK_FD": "registry.sh passes its open lock fd down",
     "AGENT_BOX_CODEX_UTS": "codex-remote-control.sh re-execs itself",
+    "AGENT_BOX_CODEX_PID": "the shared supervisor's exec wrapper passes "
+                           "the runtime owner pid to its SessionStart hook",
 }
 
 # Divergences that are CORRECT. Each needs a reason a reader can check -

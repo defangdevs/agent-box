@@ -329,6 +329,33 @@ class Hibernation(unittest.TestCase):
         self.assertIsNone(capacity.hibernation_candidate(
             {"unknown": {"agent": "claude"}}))
 
+    def test_codex_hook_overrides_old_marker_when_hibernating(self):
+        launch = "11111111-1111-4111-8111-111111111111"
+        old = "22222222-2222-4222-8222-222222222222"
+        current = "33333333-3333-4333-8333-333333333333"
+        self.state("codex-idle", launch, old)
+        root = self.home / ".codex/sessions/2026/10/16"
+        root.mkdir(parents=True)
+        (root / ("rollout-x-" + old + ".jsonl")).write_text(
+            json.dumps({"message": "[agent-box session %s]" % launch}) + "\n"
+            + json.dumps({"type": "event_msg", "payload": {
+                "type": "task_complete"}}) + "\n")
+        hook = self.home / ".local/state/agent-box/live-session-id" / launch
+        hook.parent.mkdir(parents=True)
+        hook.write_text(current + "\n")
+        self.live.write_text("codex-idle\n")
+        sessions = {"codex-idle": {"agent": "codex", "remoteControl": False}}
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        rollout = root / ("rollout-x-" + current + ".jsonl")
+        rollout.write_text(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_started"}}) + "\n")
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        rollout.write_text(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete"}}) + "\n")
+        self.assertEqual(capacity.hibernation_candidate(sessions)["nativeSessionId"], current)
+        hook.write_text("../bad\n")
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
 
 class Cli(unittest.TestCase):
     def setUp(self):

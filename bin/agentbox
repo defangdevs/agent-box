@@ -1498,21 +1498,29 @@ class Renderer:
             t.file(self.p(CLAUDE_SETTINGS),
                    json.dumps(settings, indent=2, sort_keys=True) + "\n")
         codex_conf = self.p("/etc/codex/config.toml")
-        if self.spec.codex_full_access:
+        if "codex" in self.spec.agents:
+            if not self.spec.codex_full_access and foreign_file(codex_conf):
+                self.notes.append(
+                    f"{codex_conf}: not written by agentbox - left alone; "
+                    "add the Agentbox SessionStart recorder to enable "
+                    "prompt-less Codex resume")
+                return
             t.dir(self.p("/etc/codex"), 0o755)
-            t.file(codex_conf,
-                   GENERATED_HEADER
-                   + 'approval_policy = "never"\n'
-                   'sandbox_mode = "danger-full-access"\n')
+            content = GENERATED_HEADER
+            if self.spec.codex_full_access:
+                content += ('approval_policy = "never"\n'
+                            'sandbox_mode = "danger-full-access"\n')
+            # System hooks are managed by the box; keep user hooks intact
+            # and record prompt-less TUI conversations without a model turn.
+            hook = str(self.bin / "agent-box-claude-session-start-hook") + " codex"
+            content += ('[[hooks.SessionStart]]\n'
+                        '[[hooks.SessionStart.hooks]]\n'
+                        'type = "command"\n'
+                        'command = ' + json.dumps(hook) + '\n')
+            t.file(codex_conf, content)
         else:
-            # Turning the option OFF has to take the file with it. apply
-            # never deletes what a render stops emitting, so without this
-            # a box flipped from true to false kept
-            # sandbox_mode = "danger-full-access" on disk while
-            # AGENT_BOX_CODEX_FULL_ACCESS disappeared — full access still
-            # in force, and the flag a session uses to pin the restricted
-            # values back gone with it. Exactly the contract this pair
-            # exists to keep, inverted.
+            # Dropping Codex must also remove its managed defaults. apply
+            # otherwise leaves files that a render stops emitting on disk.
             t.gone(codex_conf)
 
     # -- memory protection ---------------------------------------------------
