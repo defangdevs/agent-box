@@ -12358,11 +12358,11 @@ from Hugging Face, each pinned and checked. The first run downloads about
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
-import urllib.parse
 import urllib.request
 import zipfile
 
@@ -12413,19 +12413,20 @@ def die(msg):
     sys.exit(1)
 
 
-WHEEL_HOSTS = ('files.pythonhosted.org',)
-HOSTS = WHEEL_HOSTS + ('huggingface.co',)
+# Only these two hosts, over https, and a plain file name in the cache.
+URL_OK = re.compile(r'https://(files\.pythonhosted\.org/packages/[0-9a-f/]+/[A-Za-z0-9._+-]+\.whl|'
+                    r'huggingface\.co/ggerganov/whisper\.cpp/resolve/main/ggml-[a-z.]+\.bin)')
+NAME_OK = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*')
 
 
 def fetch(url, dest, sha256, size_cap):
     """Download to dest.part, check the hash, rename. Skips a present file."""
-    u = urllib.parse.urlsplit(url)
-    if u.scheme != 'https' or u.hostname not in HOSTS:
+    if not URL_OK.fullmatch(url):
         die('refusing to download from %s' % url)
-    if os.path.dirname(os.path.realpath(dest)) not in (os.path.realpath(CACHE),
-                                                       os.path.realpath(os.path.join(CACHE, 'wheels'))):
+    name = os.path.basename(dest)
+    if not NAME_OK.fullmatch(name) or os.path.dirname(dest) not in (CACHE, os.path.join(CACHE, 'wheels')):
         die('refusing to write outside the cache: %s' % dest)
-    if os.path.exists(dest):
+    if os.path.isfile(dest):
         return dest
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     part = dest + '.part'
@@ -12506,7 +12507,11 @@ def ensure_wheels(python):
 
 
 def to_pcm(ffmpeg, src, out):
-    r = subprocess.run([ffmpeg, '-nostdin', '-loglevel', 'error', '-y', '-t', str(MAX_SECONDS), '-i', os.path.abspath(src),
+    # The clip is copied to a name this program chose, so nothing the sender or
+    # the caller named ever reaches ffmpeg's argument list.
+    local = os.path.join(os.path.dirname(out), 'input.bin')
+    shutil.copyfile(src, local)
+    r = subprocess.run([ffmpeg, '-nostdin', '-loglevel', 'error', '-y', '-t', str(MAX_SECONDS), '-i', local,
                         '-vn', '-f', 'f32le', '-ac', '1', '-ar', '16000', out], capture_output=True, text=True)
     if r.returncode != 0 or not os.path.getsize(out):
         die('could not decode %s as audio: %s' % (src, r.stderr.strip()[-300:]))
