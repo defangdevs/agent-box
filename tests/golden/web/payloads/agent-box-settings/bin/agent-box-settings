@@ -13042,6 +13042,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     assignments.append((key, value))
                 else:
                     drop.append(key)
+            if (name.endswith("-daemon") and name[:-len("-daemon")] in AGENTS
+                    and not os.path.lexists(profile_path(name))):
+                # Reserved: `agent-box-session add --profile` resolves these
+                # itself (issue #942), so a file by that name is shadowed.
+                self._send_html(
+                    render_page("'%s' is reserved for the daemon "
+                                "pseudo-profile. Pick another name." % name,
+                                kind="error"),
+                    status=400)
+                return
             harness = dict(assignments).get("HARNESS", "")
             # Required, not optional (issue #493): there is no box-wide
             # default harness left to fall back to, and the resolver refuses

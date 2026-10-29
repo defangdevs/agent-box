@@ -6269,6 +6269,8 @@ usage() {
   echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
   echo "With neither --profile nor --harness, the default profile is used when"
   echo "one is set (agent-box-profile default)."
+  echo "--profile HARNESS-daemon (claude-daemon, codex-daemon) is a pseudo-profile for"
+  echo "--harness HARNESS --daemon. They are not files and never the default."
   echo "(--agent is the old name for --harness and still works. It is"
   echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
   echo "which is this box's --profile, so the two meanings collided.)"
@@ -7102,6 +7104,35 @@ case "$cmd" in
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
     done
+    # `claude-daemon` and `codex-daemon` are pseudo-profiles (issue #942), the
+    # CLI twin of the settings picker's `:claude-daemon` / `:codex-daemon`
+    # entries. They are not files: a daemon is not one worker, so there is no
+    # model or effort to carry. They mean `--harness X --daemon`.
+    # Any HARNESS-daemon name works, so a harness that grows daemon support
+    # needs no change here; the check below refuses one that has none.
+    pseudo="''${profile#:}"
+    # A file profile that already has the name keeps resolving as itself (it
+    # predates the reservation); `:NAME` always means the pseudo-profile.
+    if [ "$pseudo" = "$profile" ] && [ "''${pseudo%-daemon}" != "$pseudo" ] \
+         && "''${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" >/dev/null 2>&1; then
+      pseudo=""
+    fi
+    case "$pseudo" in
+      (*-daemon)
+        pseudo="''${pseudo%-daemon}"
+        case " $AGENTS " in
+          (*" $pseudo "*)
+            if [ "$has_harness" = 1 ] && [ "$harness" != "$pseudo" ]; then
+              echo "--profile $pseudo-daemon means --harness $pseudo, not '$harness'" >&2
+              exit 2
+            fi
+            harness="$pseudo"; has_harness=1
+            remote_control_daemon=true; daemon_option=true
+            profile=""
+            ;;
+        esac
+        ;;
+    esac
     # Canonicalize --cwd the same way the settings page's add-session form
     # already does (resolve_session_cwd/resolve_browse_dir in
     # settings-daemon.py) — issue #597. Stored verbatim, a relative path, a
@@ -8235,6 +8266,19 @@ case "$cmd" in
   set)
     name="''${1:-}"; shift || true
     valid_name "$name" || { echo "invalid profile name '$name' (letters, digits, '_' and '-', at most $NAME_MAX characters)" >&2; exit 2; }
+    # Reserved for the daemon pseudo-profiles `agent-box-session add --profile`
+    # resolves itself (issue #942); a file by that name would be shadowed.
+    case "$name" in
+      (*-daemon)
+        for _h in $HARNESSES; do
+          # Only a NEW profile is refused: an existing file of that name keeps
+          # working and stays editable until its owner renames it.
+          if [ "$name" = "$_h-daemon" ] && [ ! -f "$(file_for "$name")" ]; then
+            echo "'$name' is reserved for the $name pseudo-profile (agent-box-session add --profile $name); pick another name" >&2
+            exit 2
+          fi
+        done ;;
+    esac
     [ $# -gt 0 ] || { usage >&2; exit 2; }
     # Validate every assignment BEFORE writing any of them: a `set` that
     # stored the first two of three pairs and then failed would leave a
@@ -33069,6 +33113,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     assignments.append((key, value))
                 else:
                     drop.append(key)
+            if (name.endswith("-daemon") and name[:-len("-daemon")] in AGENTS
+                    and not os.path.lexists(profile_path(name))):
+                # Reserved: `agent-box-session add --profile` resolves these
+                # itself (issue #942), so a file by that name is shadowed.
+                self._send_html(
+                    render_page("'%s' is reserved for the daemon "
+                                "pseudo-profile. Pick another name." % name,
+                                kind="error"),
+                    status=400)
+                return
             harness = dict(assignments).get("HARNESS", "")
             # Required, not optional (issue #493): there is no box-wide
             # default harness left to fall back to, and the resolver refuses
