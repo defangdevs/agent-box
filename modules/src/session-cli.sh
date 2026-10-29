@@ -595,7 +595,7 @@ case "$cmd" in
         meta="$("$JQ" -r --arg n "$n" '
           if (.sessions | has($n)) then
             [(.sessions[$n].agent // "-"),
-             (.sessions[$n].workingDirectory // "-"),
+             ((.sessions[$n].workingDirectory // "-") | if . == "" then "-" else . end),
              "managed",
              (.sessions[$n].died // "-" | tostring),
              (.sessions[$n].remoteControl // false | tostring)] | @tsv
@@ -614,7 +614,7 @@ case "$cmd" in
         [ -n "$cwd" ] || cwd="-"
         [ -n "$unmanaged" ] || unmanaged="managed"
         [ -n "$dead" ] || dead="-"
-      [ -n "$rc" ] || rc="false"
+        [ -n "$rc" ] || rc="false"
         # No recorded working directory means the supervisor starts it in
         # $HOME — say that, rather than a dash a reader has to interpret. It
         # is where the session STARTED either way: an agent can cd anywhere,
