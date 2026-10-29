@@ -3605,6 +3605,20 @@ class SelfUpdateLogicTest(unittest.TestCase):
         self.assertEqual(len(touching), 1, touching)
         self.assertIn("--set", touching[0])
 
+    def test_each_switch_stages_on_its_own_profile_name(self):
+        """A fixed `<profile>-staging` let concurrent updates (or a sibling
+        profile of that name) clear each other's links."""
+        stages = []
+        for _ in range(2):
+            self.calls.clear()
+            with tempfile.TemporaryDirectory() as tmp:
+                prof = build_fake_profile(tmp)
+                self.mod.switch_profile(prof, "agent-box", "flake")
+            stages.append(self.calls[0][2])
+        self.assertNotEqual(stages[0], stages[1])
+        for stage in stages:
+            self.assertIn("-staging-", stage)
+
     def test_a_failed_build_is_reported_and_leaves_the_profile_alone(self):
         """`main` catches ConfigError and UpdateError — nothing else.
 

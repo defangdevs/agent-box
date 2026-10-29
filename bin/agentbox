@@ -53,6 +53,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -5128,8 +5129,9 @@ def switch_profile(profile, name, flake):
     existing package already provides the following file" and can leave
     the OLD profile in place (issue #358).
     """
-    stage = f"{profile}-staging"
-    clear_staging(stage)
+    # Unique per call: a fixed name would let a second update, or a sibling
+    # profile of that name, have its links cleared underneath it.
+    stage = f"{profile}-staging-{uuid.uuid4().hex}"
     try:
         run(["nix-env", "--profile", stage, "--set",
              os.path.realpath(str(profile))])
