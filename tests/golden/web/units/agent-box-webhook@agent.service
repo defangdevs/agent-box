@@ -4,6 +4,7 @@
 Environment="AGENT_BOX_TMUX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tmux-3.7c/bin/tmux"
 Environment="CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
 Environment="LOCALE_ARCHIVE=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-glibc-locales-2.42-84/lib/locale/locale-archive"
+Environment="LOCAL_WEBHOOK_ACK_CMD=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-ack/bin/agent-box-webhook-ack"
 Environment="LOCAL_WEBHOOK_SPAWN_CMD=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook-spawn/bin/agent-box-webhook-spawn"
 Environment="NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt"
 Environment="NODE_OPTIONS=--use-openssl-ca"

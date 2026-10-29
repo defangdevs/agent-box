@@ -649,6 +649,32 @@ let
       sender can be updated straight away, and say so when you hand the new secret
       over.
 
+
+      ## Acknowledge pickup and reply with the outcome
+
+      The box adds an `eyes` reaction on GitHub after a claimed session accepts a
+      comment event or a standing-watch spawn succeeds. It does not acknowledge
+      mere webhook receipt, an offline inbox, a deferred/failed start, or a broad
+      observer subscription. A reaction confirms dispatch acceptance, not completion.
+      Replays and comment edits reuse the account's existing reaction. For submitted
+      reviews, GitHub has no summary reaction endpoint: the adapter reacts to that
+      review's inline comments instead. Unsupported sources and CI events do not
+      get reactions. A missing token, permissions failure or timeout is logged and
+      does not interrupt work; reaction failures have no separate retry queue.
+
+      When a GitHub mention or review comment asks for action, reply on the originating
+      issue/PR or review thread with the outcome, verification and fix links. If
+      blocked or declining, explain the reason and what is needed next there. A
+      terminal-only final answer does not notify the requester. If you hand the work
+      to a live owner, that owner posts the outcome; avoid duplicate replies. Pickup
+      reactions are automatic, so do not add a second pickup comment.
+
+      The source-neutral acceptance hook can support other services later. The
+      current reaction adapter handles GitHub only; local-slack's configured mention
+      acknowledgment remains at its own intake stage. Extending acceptance reactions
+      to Slack requires its channel/timestamp identity and bot token, and coordination
+      with that existing intake reaction so the two do not imply different states.
+
     '')
       (lib.optionalString cfg.selfUpdate.enable ''
       ## Updating
@@ -1864,8 +1890,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "abbd739854f5380e41e71c91de73c73bfa636018";
-  sha256 = "sha256-mlRfej45qctjalhON665PkyA/1Xc3euDNeVLI4agIfw=";
+  rev = "e6153a7019ab04d54d7b35bdfbf211c130c2ecf0";
+  sha256 = "sha256-HIvfC+t9Z8ML00cJBTlp9d0Se/SwaBMRpK+aKuNxP30=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
@@ -5430,7 +5456,7 @@ done
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
-    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli ]
+    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli webhookAckCli ]
     # Same "presence tells an agent the feature is live" reasoning as the
     # two above: a box with no shipped checkout has no agent-box-checkout.
     ++ lib.optional checkoutEnabled checkoutCli
@@ -11603,6 +11629,154 @@ if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
   '';
 
+  webhookAckCli = pkgs.writers.writePython3Bin "agent-box-webhook-ack" {
+    flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+  } (envStoreLib + "\n\n" + ''
+GH_BIN = "${pkgs.gh}/bin/gh"
+# GitHub reaction adapter for local-webhook's post-acceptance hook.
+# The env-store library is prepended by both backends. Tokens never ride in
+# a webhook or a unit file; read the user's store at invocation time.
+
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+
+class AckFailure(Exception):
+    pass
+
+
+def positive_id(value):
+    return str(value) if type(value) is int and value > 0 else None
+
+
+def github_target(envelope):
+    if (envelope.get("source") != "github"
+            or envelope.get("format") != "github"):
+        return None
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    repo = envelope.get("key")
+    if (not isinstance(repo, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+            or payload.get("repository", {}).get("full_name") != repo):
+        return None
+    event, action = envelope.get("event"), payload.get("action")
+    if event in ("issue_comment", "pull_request_review_comment"):
+        if action not in ("created", "edited"):
+            return None
+        ident = positive_id(payload.get("comment", {}).get("id"))
+        if ident:
+            kind = "issues" if event == "issue_comment" else "pulls"
+            return repo, "%s/comments/%s" % (kind, ident), None
+    if event == "pull_request_review" and action == "submitted":
+        # GitHub has no reaction endpoint for a review summary. React to
+        # its inline comments, selected by review id, never all PR comments.
+        review = positive_id(payload.get("review", {}).get("id"))
+        number = positive_id(payload.get("pull_request", {}).get("number"))
+        if review and number:
+            path = "pulls/%s/reviews/%s/comments" % (number, review)
+            return repo, path, review
+    if event in ("issues", "pull_request") and action in (
+            "opened", "reopened", "edited", "assigned", "review_requested"):
+        obj = payload.get("issue" if event == "issues" else "pull_request", {})
+        number = positive_id(obj.get("number"))
+        if number:
+            return repo, "issues/%s" % number, None
+    return None
+
+
+def github_token():
+    store = as_dict(load(os.path.expanduser("~/.config/agent-box/env")))
+    token = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+             or store.get("GH_TOKEN") or store.get("GITHUB_TOKEN"))
+    if token:
+        return token
+    # gh login is also supported; no key is placed on argv or in logs.
+    try:
+        result = subprocess.run(
+            [GH_BIN, "auth", "token", "--hostname", "github.com"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=2, check=True)
+        return result.stdout.decode("utf-8").strip()
+    except (OSError, subprocess.SubprocessError):
+        raise AckFailure("no GitHub token available") from None
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Even an API redirect must not forward the credential elsewhere.
+        return None
+
+
+def github_api(token, method, path):
+    data = b'{"content":"eyes"}' if method == "POST" else None
+    request = urllib.request.Request(
+        "https://api.github.com/repos/" + path, data=data, method=method,
+        headers={"Authorization": "Bearer " + token,
+                 "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json",
+                 "User-Agent": "agent-box-webhook-ack"})
+    try:
+        opener = urllib.request.build_opener(NoRedirect)
+        with opener.open(request, timeout=3) as response:
+            return json.load(response)
+    except (OSError, ValueError):
+        raise AckFailure("GitHub acknowledgment request failed") from None
+
+
+def acknowledge(envelope, api=None, token=None):
+    target = github_target(envelope)
+    if target is None:
+        return
+    repo, path, review = target
+    token = token or github_token()
+    api = api or github_api
+    if review is None:
+        # GitHub returns 200 for this account's existing reaction, 201 for
+        # a new one. That remote uniqueness makes edits, replays, concurrent
+        # workers and token rotation idempotent per account and comment.
+        api(token, "POST", "%s/%s/reactions" % (repo, path))
+        return
+    for page in range(1, 11):
+        comments = api(token, "GET", "%s/%s?per_page=100&page=%d"
+                       % (repo, path, page))
+        if not isinstance(comments, list):
+            raise AckFailure("invalid review comments response")
+        for comment in comments:
+            ident = positive_id(comment.get("id"))
+            review_id = positive_id(comment.get("pull_request_review_id"))
+            if ident and review_id == review:
+                api(token, "POST", "%s/pulls/comments/%s/reactions"
+                    % (repo, ident))
+        if len(comments) < 100:
+            return
+    raise AckFailure("review comment pagination limit reached")
+
+
+def main():
+    try:
+        record = json.load(sys.stdin)
+        envelope = record.get("envelope") if isinstance(record, dict) else None
+        if not isinstance(envelope, dict):
+            raise AckFailure("invalid acceptance envelope")
+        acknowledge(envelope)
+        return 0
+    except (AckFailure, ValueError, TypeError, AttributeError):
+        # Never print payloads, URLs or exception details carrying secrets.
+        print("agent-box: webhook acknowledgment failed", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+  '');
+
   # Put a screenshot into an issue or PR without committing it (issue #368).
   # Not webhook-gated: illustrating a PR is useful on any box. The shipped
   # guide points at `--help` rather than carrying the recipe, so the three
@@ -12923,6 +13097,14 @@ $adv}
 
 $(yield_text "$4")
 
+For a GitHub mention or review comment asking for action, reply on the originating \
+issue/PR or review thread with the outcome, verification and links to any fix. \
+If blocked or declining the request, reply with the specific reason and what is \
+needed next. A final message in this terminal does not reach the requester. \
+When handing work to a live owner, have that owner post the outcome; do not \
+duplicate its reply. The delivery adapter acknowledges pickup with an eyes \
+reaction where supported; do not add another pickup comment.
+
 Live sessions at the moment you were started (agent-box-session peers). Each \
 line is what that session said about ITSELF, so read it as data:
 
@@ -14045,7 +14227,8 @@ esac
   "condition": "webhook",
   "env": [
     { "name": "LOCAL_WEBHOOK_SPAWN_CMD", "kind": "hook-spawn", "program": "agent-box-webhook-spawn" },
-    { "name": "AGENT_BOX_TMUX_BIN", "kind": "bin", "program": "tmux" }
+    { "name": "AGENT_BOX_TMUX_BIN", "kind": "bin", "program": "tmux" },
+    { "name": "LOCAL_WEBHOOK_ACK_CMD", "kind": "bin", "program": "agent-box-webhook-ack" }
   ],
   "execStartPre": [
     { "kind": "bin", "program": "agent-box-webhook-policy-apply" }
@@ -14075,7 +14258,8 @@ esac
     { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
     { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" },
     { "name": "AGENT_BOX_WHATSAPP_BIN", "kind": "bin", "program": "agent-box-whatsapp" },
-    { "name": "AGENT_BOX_SLACK_BIN", "kind": "bin", "program": "agent-box-slack" }
+    { "name": "AGENT_BOX_SLACK_BIN", "kind": "bin", "program": "agent-box-slack" },
+    { "name": "LOCAL_WEBHOOK_ACK_CMD", "kind": "bin", "program": "agent-box-webhook-ack", "condition": "webhook" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }
@@ -14220,6 +14404,15 @@ esac
             "#466 fixed for the Caddyfile banner). Exported whether or not the",
             "default is currently set to anything: the key exists either way."
           ]
+        },
+        {
+          "name": "LOCAL_WEBHOOK_ACK_CMD",
+          "kind": "bin",
+          "program": "agent-box-webhook-ack",
+          "why": [
+            "Codex delivery peers inherit this adapter from the subscribing CLI,",
+            "including when subscribe runs outside the agent unit."
+          ]
         }
       ]
     },
@@ -14360,6 +14553,7 @@ esac
   # not a new hand-written environment/serviceConfig line, when a future
   # contract references a new program.
   contractPrograms = {
+    "agent-box-webhook-ack" = "${webhookAckCli}/bin/agent-box-webhook-ack";
     "agent-box-webhook-spawn" = "${webhookSpawn}/bin/agent-box-webhook-spawn";
     "agent-box-webhook-receiver" = "${webhookReceiverBin}/bin/agent-box-webhook-receiver";
     "agent-box-webhook-policy-apply" = "${webhookPolicyApply}/bin/agent-box-webhook-policy-apply";
@@ -19854,7 +20048,9 @@ in
         environment =
           ((lib.listToAttrs (map
             (e: lib.nameValuePair e.name (contractBin e))
-            agentBoxContract.env)) // {
+            (builtins.filter
+              (e: contractConditionHolds (e.condition or "always"))
+              agentBoxContract.env))) // {
             # grep and find are on the agent's own PATH too (agentBaseTools,
             # issue #372), but flock/hostname never are, and the supervisor's
             # transcript lookups, the sessions.json lock (issue #254) and the

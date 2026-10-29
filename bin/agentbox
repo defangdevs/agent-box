@@ -3028,6 +3028,7 @@ class Renderer:
         ] + [
             f'Environment="{e["name"]}={self.contract_bin(e)}"'
             for e in agent_box_contract["env"]
+            if e.get("condition", "always") == "always" or self.spec.webhook_enable
         ] + [
             f'ExecSearchPath={path}',
             "ExecStart=",
