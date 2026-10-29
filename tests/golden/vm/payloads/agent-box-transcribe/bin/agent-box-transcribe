@@ -78,9 +78,9 @@ def fetch(url, dest, sha256, size_cap):
     name = os.path.basename(dest)
     if not NAME_OK.fullmatch(name) or os.path.dirname(dest) not in (CACHE, os.path.join(CACHE, 'wheels')):
         die('refusing to write outside the cache: %s' % dest)
-    if os.path.isfile(dest):
-        return dest
     os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if name in os.listdir(os.path.dirname(dest)):
+        return dest
     part = dest + '.part'
     h = hashlib.sha256()
     req = urllib.request.Request(url, headers={'User-Agent': 'agent-box-transcribe'})
