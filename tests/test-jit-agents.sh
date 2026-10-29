@@ -446,7 +446,11 @@ printf 'sleep 30; :\n' > "$HOME/w/app-server"
 cd "$HOME/w"
 "$HOME/swap/codex" app-server --managed-daemon & _swapped=$!
 cd "$work"
-sleep 0.3
+# Wait until the original binary is the running image before replacing it.
+for _i in $(seq 50); do
+  [ "$(readlink "/proc/$_swapped/exe" 2>/dev/null)" = "$HOME/swap/codex" ] && break
+  sleep 0.1
+done
 rm -f "$HOME/swap/codex"
 cp "$BASH_BIN" "$HOME/swap/codex"
 mirror_codex_standalone "$HOME/swap/codex"
