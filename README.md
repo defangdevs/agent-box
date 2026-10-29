@@ -391,7 +391,7 @@ codex prompt.
 Station) pairs the Codex apps without opening the pane. On the settings daemon,
 under `/<user>/settings` and admitted like `/connect`:
 `GET /codex/pairing` answers `{"ok": true, "pairing": {state, server_name, code,
-expires_at, error, devices, devices_error}}` (`state` is `signed_out`,
+expires_at, error, error_code, devices, devices_error}}` (`state` is `signed_out`,
 `starting`, `ready`, `waiting`, `claimed`, `expired` or `failed`; `claimed` is
 sticky until the next start or cancel). `POST /codex/pairing/start` makes sure
 one remote-control Codex session exists and mints a manual code (409 signed
@@ -401,6 +401,12 @@ out, 429 within 5 s of the last start, 503 at the session limit, else 303),
 never written to disk, never in the pane, and only the manual code is exposed.
 Codex's own control socket carries the calls, and those methods are
 experimental upstream. The Connections card only SIGNS IN; it pairs nothing.
+`error_code` is nullable: `mfa_required` identifies the explicit HTTP 403 MFA
+enrollment rejection. The terminal wrapper and API share this classifier,
+which runs before redaction removes transport details from `error`. Portals
+should use the code for recovery guidance, keep `error` as diagnostic detail,
+and treat missing or unknown codes as generic failures. Starting or cancelling
+pairing clears the previous code. Older runtimes omit this field.
 To have a finished Codex sign-in start the remote-control session instead of a
 TUI, and to stop the pane minting a second code at startup, run
 `agent-box-session env set AGENT_BOX_CODEX_SESSION_DEFAULT daemon`

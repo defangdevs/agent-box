@@ -147,10 +147,13 @@ auth_rejected() {
 # deliberately logs out and starts device auth again. Match both the status and
 # the server's exact reason so an unrelated 403 keeps the ordinary retry path.
 mfa_required() {
-  case "$1" in
-    *"HTTP 403"*"Multi-factor authentication required"*) return 0 ;;
-  esac
-  return 1
+  printf '%s' "$1" | python3 -c '
+import sys
+
+@@include:lib/codex-pairing-errors.py@@
+
+sys.exit(0 if codex_pairing_error_code(sys.stdin.read()) == "mfa_required" else 1)
+'
 }
 # The only part of the JSON-RPC blob worth showing a human is the server's
 # own message; the URL, cf-ray and status code belong in a bug report.
