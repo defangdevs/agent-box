@@ -8,8 +8,8 @@ import tempfile
 from urllib.request import urlopen
 
 
-REV = "b480a36f291acf3c817a3729c1a24fe4553f69c2"
-SHA256 = "e02755df0116aa39cba52db1e37ca67ecce394cc91b66d5de80ec5ecbf991e6b"
+REV = "68ef1496ac000ac8e2b1d5bb703d87c14c032ea5"
+SHA256 = "2a6c7f15ad37e14785fb417b84cd2006ce222ba778e139857e1633a206746993"
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-slack"
 SCRIPT = RUNTIME / "slack.py"
