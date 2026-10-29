@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -64,8 +65,18 @@ def die(msg):
     sys.exit(1)
 
 
+WHEEL_HOSTS = ('files.pythonhosted.org',)
+HOSTS = WHEEL_HOSTS + ('huggingface.co',)
+
+
 def fetch(url, dest, sha256, size_cap):
     """Download to dest.part, check the hash, rename. Skips a present file."""
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != 'https' or u.hostname not in HOSTS:
+        die('refusing to download from %s' % url)
+    if os.path.dirname(os.path.realpath(dest)) not in (os.path.realpath(CACHE),
+                                                       os.path.realpath(os.path.join(CACHE, 'wheels'))):
+        die('refusing to write outside the cache: %s' % dest)
     if os.path.exists(dest):
         return dest
     os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -135,16 +146,19 @@ def ensure_wheels(python):
         cand = [f for f in meta['urls'] if all(w in f['filename'] for w in want)]
         if not cand:
             die('no prebuilt %s %s wheel for %s on %s' % (name, ver, tag, machine))
-        whl = fetch(cand[0]['url'], os.path.join(CACHE, 'wheels', cand[0]['filename']),
+        whl = fetch(cand[0]['url'], os.path.join(CACHE, 'wheels', os.path.basename(cand[0]['filename'])),
                     cand[0]['digests']['sha256'], 100 << 20)
         with zipfile.ZipFile(whl) as z:
+            for n in z.namelist():
+                if os.path.isabs(n) or '..' in n.split('/'):
+                    die('%s holds an unsafe path: %s' % (whl, n))
             z.extractall(dest)
     open(os.path.join(dest, '.ok'), 'w').close()
     return dest
 
 
 def to_pcm(ffmpeg, src, out):
-    r = subprocess.run([ffmpeg, '-nostdin', '-loglevel', 'error', '-y', '-t', str(MAX_SECONDS), '-i', src,
+    r = subprocess.run([ffmpeg, '-nostdin', '-loglevel', 'error', '-y', '-t', str(MAX_SECONDS), '-i', os.path.abspath(src),
                         '-vn', '-f', 'f32le', '-ac', '1', '-ar', '16000', out], capture_output=True, text=True)
     if r.returncode != 0 or not os.path.getsize(out):
         die('could not decode %s as audio: %s' % (src, r.stderr.strip()[-300:]))
@@ -181,8 +195,10 @@ def main(argv):
         if a in ('-h', '--help'):
             print('usage: agent-box-transcribe [--model %s] [--lang CODE|auto] FILE\n\n%s'
                   % ('|'.join(MODELS), __doc__.strip()))
-            return 0
-        if a == '--model':
+            sys.exit(0)
+        if a == '--':
+            args.extend(it)
+        elif a == '--model':
             model_name = next(it, '')
         elif a == '--lang':
             lang = next(it, '')
@@ -195,6 +211,8 @@ def main(argv):
         die('%s is not a file' % src)
     # An .en model only knows English; the others detect the language.
     lang = lang or ('en' if model_name.endswith('.en') else 'auto')
+    if not (lang == 'auto' or (lang.isalpha() and lang.islower() and len(lang) in (2, 3))):
+        die('--lang must be auto or a language code such as en')
     ffmpeg = ensure_ffmpeg()
     model = fetch(MODEL_URL % model_name, os.path.join(CACHE, 'ggml-%s.bin' % model_name),
                   MODELS[model_name], 600 << 20)
@@ -209,8 +227,7 @@ def main(argv):
         text = run_cli(cli, model, pcm, lang) if cli else run_wheel(python, ensure_wheels(python), model, pcm, lang)
     # Words from a stranger's voice note: data, not instructions.
     print(text)
-    return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main(sys.argv[1:]))
+    main(sys.argv[1:])
