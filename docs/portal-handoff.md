@@ -518,7 +518,8 @@ serves no `/auth/handoff` route.
 `GET /<user>/settings/resources` returns `ok`, `sampled_at` (UTC ISO timestamp), and
 nullable `cpu`, `memory`, `disk`, `sessions` readings. CPU has `busy_percent` (0-100).
 Memory and disk have `available_bytes` and `total_bytes`; disk measures the filesystem
-containing the owner's home and excludes reserved blocks. Memory uses `MemAvailable`.
+containing the owner's home. `available_bytes` excludes reserved blocks, while
+`total_bytes` reports the full filesystem size. Memory uses `MemAvailable`.
 Sessions has `used` and `limit`, from the same policy that admits new workers.
 
 CPU requires two samples at least one second apart; the first read or one after more

@@ -139,7 +139,17 @@ class SettingsJsonRoutesTest(unittest.TestCase):
 
     def test_cpu_samples_deltas_and_ignores_double_counted_guest_time(self):
         sampler = self.daemon.ResourceSampler()
-        with mock.patch.object(self.daemon.time, "monotonic", side_effect=[1, 1.1, 6, 11, 50]), \
+        real_monotonic = self.daemon.time.monotonic
+        test_thread = threading.get_ident()
+        scripted = iter([1, 1.1, 6, 11, 50])
+
+        def clock():
+            # Other threads, such as the running server, get the real clock.
+            if threading.get_ident() != test_thread:
+                return real_monotonic()
+            return next(scripted)
+
+        with mock.patch.object(self.daemon.time, "monotonic", side_effect=clock), \
                 mock.patch.object(self.daemon, "open", create=True, side_effect=[
                     mock.mock_open(read_data="cpu  100 0 0 100 0 0 0 0 90 0\n")(),
                     mock.mock_open(read_data="cpu  125 0 0 175 0 0 0 0 115 0\n")(),
