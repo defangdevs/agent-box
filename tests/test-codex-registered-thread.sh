@@ -123,14 +123,14 @@ record_start() {
 }
 record_start "$launch" "$live" startup
 record_start "$sibling_launch" "$marked" startup
-[ "$(codex_live_thread "$launch")" = "$live" ]
-[ "$(codex_live_thread "$sibling_launch")" = "$marked" ]
-[ -z "$(codex_live_thread ../escape)" ]
+[[ "$(codex_live_thread "$launch")" = "$live" ]]
+[[ "$(codex_live_thread "$sibling_launch")" = "$marked" ]]
+[[ -z "$(codex_live_thread ../escape)" ]]
 record_start "$launch" "$marked" startup nested
-[ "$(codex_live_thread "$launch")" = "$live" ] \
+[[ "$(codex_live_thread "$launch")" = "$live" ]] \
   || { echo "FAIL: a nested Codex overwrote its parent's conversation" >&2; exit 1; }
 codex_live_thread 33333333-3333-4333-8333-333333333333 2> "$TEST_ROOT/missing.err"
-[ ! -s "$TEST_ROOT/missing.err" ] \
+[[ ! -s "$TEST_ROOT/missing.err" ]] \
   || { echo "FAIL: an absent hook record wrote to stderr" >&2; exit 1; }
 
 # A wrapper or test harness may ignore --help. A capability probe must not
