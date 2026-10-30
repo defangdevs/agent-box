@@ -29,6 +29,7 @@ def github_target(envelope):
     repo = envelope.get("key")
     if (not isinstance(repo, str)
             or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+            or any(part in (".", "..") for part in repo.split("/"))
             or payload.get("repository", {}).get("full_name") != repo):
         return None
     event, action = envelope.get("event"), payload.get("action")

@@ -42,7 +42,7 @@ class TestAcknowledgment(unittest.TestCase):
     def test_target_ids_and_repo_are_strictly_validated(self):
         for ident in (True, -1, 0, '1/reactions', '$(echo 1)', 1.5, None):
             self.assertIsNone(ACK.github_target(envelope(comment={'id': ident})))
-        for repo in ('../o/r', 'o/r?x=1', 'o/r\n', 'o/r/../other', 'o/%2e%2e'):
+        for repo in ('../o/r', 'o/r?x=1', 'o/r\n', 'o/r/../other', 'o/%2e%2e', '../..', 'o/..', './.'):
             e = envelope(comment={'id': 1})
             e['key'] = e['payload']['repository']['full_name'] = repo
             self.assertIsNone(ACK.github_target(e))

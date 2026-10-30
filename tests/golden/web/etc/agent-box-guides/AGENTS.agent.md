@@ -830,13 +830,12 @@ issue/PR or review thread with the outcome, verification and fix links. If
 blocked or declining, explain the reason and what is needed next there. A
 terminal-only final answer does not notify the requester. If you hand the work
 to a live owner, that owner posts the outcome; avoid duplicate replies. Pickup
-reactions are automatic, so do not add a second pickup comment.
+reactions are automatic, so do not add a second pickup comment. Session peers
+need local-webhook 0.36.0 or later and a restart before their deliveries get
+reactions; if none appear, check the version and restart the session.
 
-The source-neutral acceptance hook can support other services later. The
-current reaction adapter handles GitHub only; local-slack's configured mention
-acknowledgment remains at its own intake stage. Extending acceptance reactions
-to Slack requires its channel/timestamp identity and bot token, and coordination
-with that existing intake reaction so the two do not imply different states.
+The reaction adapter handles GitHub only; local-slack's configured mention
+acknowledgment remains at its own intake stage.
 
 ## Receiving a large file from the user
 
