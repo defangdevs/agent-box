@@ -350,6 +350,11 @@ let
     receiveCli
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-bare" "webhook-cli.sh")
+    (pkgs.writers.writePython3Bin "agent-box-webhook-ack" {
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (envStoreLib + "\n\n" + ''
+GH_BIN = "${pkgs.gh}/bin/gh"
+    '' + readSrc "webhook-ack.py"))
     # Ingress liveness and delivery recovery (issue #605). Needs no env
     # wrapper for the same reason agent-box-upload does not: it resolves its
     # token from gh at runtime, and the one box value it reads

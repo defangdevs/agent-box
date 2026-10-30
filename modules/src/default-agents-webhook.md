@@ -387,3 +387,28 @@ exactly one secret per source - so deliveries signed with the old secret are
 answered 401 from that moment and GitHub does not retry them. Rotate when the
 sender can be updated straight away, and say so when you hand the new secret
 over.
+
+
+## Acknowledge pickup and reply with the outcome
+
+The box adds an `eyes` reaction on GitHub after a claimed session accepts a
+comment event or a standing-watch spawn succeeds. It does not acknowledge
+mere webhook receipt, an offline inbox, a deferred/failed start, or a broad
+observer subscription. A reaction confirms dispatch acceptance, not completion.
+Replays and comment edits reuse the account's existing reaction. For submitted
+reviews, GitHub has no summary reaction endpoint: the adapter reacts to that
+review's inline comments instead. Unsupported sources and CI events do not
+get reactions. A missing token, permissions failure or timeout is logged and
+does not interrupt work; reaction failures have no separate retry queue.
+
+When a GitHub mention or review comment asks for action, reply on the originating
+issue/PR or review thread with the outcome, verification and fix links. If
+blocked or declining, explain the reason and what is needed next there. A
+terminal-only final answer does not notify the requester. If you hand the work
+to a live owner, that owner posts the outcome; avoid duplicate replies. Pickup
+reactions are automatic, so do not add a second pickup comment. Session peers
+need local-webhook 0.36.0 or later and a restart before their deliveries get
+reactions; if none appear, check the version and restart the session.
+
+The reaction adapter handles GitHub only; local-slack's configured mention
+acknowledgment remains at its own intake stage.

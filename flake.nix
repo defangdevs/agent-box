@@ -2119,6 +2119,22 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # environment variable and Linux caps that at 128 KiB
           # (MAX_ARG_STRLEN): the driver stopped building with "Argument
           # list too long" before any VM booted.
+          webhook-ack = pkgs.runCommand "agent-box-webhook-ack-tests" {
+            nativeBuildInputs = [ pkgs.python3 ];
+            src = ./modules/src;
+            tests = ./tests/test-webhook-ack.py;
+          } ''
+            mkdir -p repo/modules repo/tests
+            cp -r "$src" repo/modules/src
+            cp "$tests" repo/tests/test-webhook-ack.py
+            python3 repo/tests/test-webhook-ack.py > log 2>&1 || {
+              cat log
+              exit 1
+            }
+            cat log
+            cp log "$out"
+          '';
+
           webhook-spawn-claim =
             pkgs.runCommand "agent-box-webhook-spawn-claim"
               {

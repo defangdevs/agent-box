@@ -781,7 +781,7 @@ let
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
-    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli ]
+    ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli webhookAckCli ]
     # Same "presence tells an agent the feature is live" reasoning as the
     # two above: a box with no shipped checkout has no agent-box-checkout.
     ++ lib.optional checkoutEnabled checkoutCli
@@ -994,6 +994,13 @@ let
 @@include:src/webhook-backfill.py@@
   '';
 
+  webhookAckCli = pkgs.writers.writePython3Bin "agent-box-webhook-ack" {
+    flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+  } (envStoreLib + "\n\n" + ''
+GH_BIN = "${pkgs.gh}/bin/gh"
+@@include:src/webhook-ack.py@@
+  '');
+
   # Put a screenshot into an issue or PR without committing it (issue #368).
   # Not webhook-gated: illustrating a PR is useful on any box. The shipped
   # guide points at `--help` rather than carrying the recipe, so the three
@@ -1161,6 +1168,7 @@ let
   # not a new hand-written environment/serviceConfig line, when a future
   # contract references a new program.
   contractPrograms = {
+    "agent-box-webhook-ack" = "${webhookAckCli}/bin/agent-box-webhook-ack";
     "agent-box-webhook-spawn" = "${webhookSpawn}/bin/agent-box-webhook-spawn";
     "agent-box-webhook-receiver" = "${webhookReceiverBin}/bin/agent-box-webhook-receiver";
     "agent-box-webhook-policy-apply" = "${webhookPolicyApply}/bin/agent-box-webhook-policy-apply";
@@ -3321,7 +3329,9 @@ in
         environment =
           ((lib.listToAttrs (map
             (e: lib.nameValuePair e.name (contractBin e))
-            agentBoxContract.env)) // {
+            (builtins.filter
+              (e: contractConditionHolds (e.condition or "always"))
+              agentBoxContract.env))) // {
             # grep and find are on the agent's own PATH too (agentBaseTools,
             # issue #372), but flock/hostname never are, and the supervisor's
             # transcript lookups, the sessions.json lock (issue #254) and the

@@ -11,7 +11,8 @@
     { "name": "AGENT_BOX_CAPACITY_BIN", "kind": "bin", "program": "agent-box-session-capacity" },
     { "name": "AGENT_BOX_ENVSTORE_BIN", "kind": "bin", "program": "agent-box-envstore" },
     { "name": "AGENT_BOX_WHATSAPP_BIN", "kind": "bin", "program": "agent-box-whatsapp" },
-    { "name": "AGENT_BOX_SLACK_BIN", "kind": "bin", "program": "agent-box-slack" }
+    { "name": "AGENT_BOX_SLACK_BIN", "kind": "bin", "program": "agent-box-slack" },
+    { "name": "LOCAL_WEBHOOK_ACK_CMD", "kind": "bin", "program": "agent-box-webhook-ack", "condition": "webhook" }
   ],
   "execStart": [
     { "kind": "bin", "program": "agent-box-supervisor" }

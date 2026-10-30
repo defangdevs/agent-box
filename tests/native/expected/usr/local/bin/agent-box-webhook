@@ -15,4 +15,7 @@ export AGENT_BOX_WEBHOOK_SCRIPT=/etc/agent-box/webhook.py
 # #466 fixed for the Caddyfile banner). Exported whether or not the
 # default is currently set to anything: the key exists either way.
 export AGENT_BOX_HOOK_ARGS_OPTION_NAME='webhook.hookSessionArgs in @CONFIG@'
+# Codex delivery peers inherit this adapter from the subscribing CLI,
+# including when subscribe runs outside the agent unit.
+export LOCAL_WEBHOOK_ACK_CMD=@PROFILE@/bin/agent-box-webhook-ack
 exec @PROFILE@/bin/agent-box-webhook-bare "$@"

@@ -86,6 +86,15 @@
             "#466 fixed for the Caddyfile banner). Exported whether or not the",
             "default is currently set to anything: the key exists either way."
           ]
+        },
+        {
+          "name": "LOCAL_WEBHOOK_ACK_CMD",
+          "kind": "bin",
+          "program": "agent-box-webhook-ack",
+          "why": [
+            "Codex delivery peers inherit this adapter from the subscribing CLI,",
+            "including when subscribe runs outside the agent unit."
+          ]
         }
       ]
     },
