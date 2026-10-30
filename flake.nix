@@ -301,6 +301,13 @@
           # tests/native/config.json by `nix run .#update-native-config`.
           native-config = nativeConfigFor system;
 
+          # Buzz's desktop app starts this helper beside every ACP agent. It
+          # carries the embedded `buzz` CLI that signs and publishes the
+          # agent's response, so a remote ACP worker needs a Linux build even
+          # though Buzz itself remains on the operator's desktop (#878).
+          buzz-dev-mcp = nixpkgs.legacyPackages.${system}.callPackage
+            ./nix/buzz-dev-mcp.nix { };
+
           # The runtime profile a non-NixOS host installs instead of a system
           # closure (issue #154 Phase 4):
           #   nix profile install github:defangdevs/agent-box/<rev>#runtime

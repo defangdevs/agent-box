@@ -995,12 +995,22 @@ let
     reuse; the endpoint pins one Agentbox profile and one remote working directory.
     It does not attach to a tmux session or select an old native conversation.
 
+    For Codex, install the matching Buzz helper on the box first. Buzz launches
+    this MCP server beside the agent because its embedded `buzz` command signs and
+    publishes the response; an ACP final message by itself is not sent to the
+    channel. The flake package is built from the pinned Buzz desktop v0.5.28 source
+    and is intentionally not part of the default runtime closure:
+
+        nix profile add github:defangdevs/agent-box#buzz-dev-mcp
+
     Check a binding on the box before putting it in an SSH key's forced command:
 
         agent-box-acp check --local --profile devops \
           --adapter /absolute/path/to/codex-acp \
           --native /absolute/path/to/codex \
-          --cwd /home/agent/project
+          --cwd /home/agent/project \
+          --map-mcp-command \
+            buzz-dev-mcp=/home/agent/.nix-profile/bin/buzz-dev-mcp
 
     Then use the same binding arguments after `agent-box-acp serve` in a dedicated
     `authorized_keys` entry with OpenSSH's `restrict,command="..."` options, but
@@ -1020,11 +1030,15 @@ let
     and composes Claude model/effort/appended instructions through ACP metadata.
     Codex gets the profile's native arguments literally and keeps AGENTS.md as its
     instruction path. Non-empty MCP server definitions are refused by default,
-    because a local executable path does not become a remote one over SSH. Add
-    `--allow-mcp` only after every command and path in the request is already valid
-    on the box. This first endpoint also does not copy Buzz-local Git credentials,
-    helper binaries or skill files; install the equivalents on the box or leave
-    features that require them disabled.
+    because a local executable path does not become a remote one over SSH.
+    `--map-mcp-command CLIENT=REMOTE` matches only the client command's basename,
+    replaces it with a validated absolute executable on the box, and leaves that
+    server's arguments and environment intact. Repeat it for each trusted helper.
+    Every unmapped server is still refused; add `--allow-mcp` only after every
+    remaining command and path in the request is already valid on the box. The
+    endpoint does not copy Buzz-local Git credentials, helper binaries or skill
+    files; install the equivalents on the box or leave features that require them
+    disabled.
 
     One worker per profile is allowed; one worker can hold several Buzz sessions.
     Remote ACP workers do not consume tmux session slots, so keep the number of
@@ -2628,6 +2642,25 @@ def executable(path, label):
     return resolved
 
 
+def parse_mcp_command_maps(items):
+    result = {}
+    for item in items:
+        client, separator, remote = item.partition("=")
+        if (
+            not separator
+            or not re.fullmatch(r"[A-Za-z0-9._+-]+", client)
+            or not remote
+        ):
+            raise AcpLaunchError(
+                "MCP command maps must be CLIENT=REMOTE, where CLIENT is "
+                "one command basename"
+            )
+        if client in result:
+            raise AcpLaunchError(f"duplicate MCP command map for {client!r}")
+        result[client] = executable(remote, f"mapped MCP command {client!r}")
+    return result
+
+
 def remote_cwd(path):
     try:
         resolved = Path(path).resolve(strict=True)
@@ -2809,7 +2842,34 @@ def rewrite_prompt_paths(params, source_cwds, target):
             block["text"] = replace_path(block["text"], source, target)
 
 
-def rewrite_message(message, harness, values, cwd, allow_mcp, source_cwds):
+def rewrite_mcp_servers(params, allow_mcp, command_maps):
+    servers = params.get("mcpServers", [])
+    if not isinstance(servers, list):
+        raise AcpLaunchError("session/new mcpServers must be a list")
+    if not servers:
+        return
+    for server in servers:
+        if not isinstance(server, dict):
+            raise AcpLaunchError("session/new MCP server must be an object")
+        command = server.get("command")
+        if not isinstance(command, str) or not command:
+            raise AcpLaunchError("session/new MCP server command must be text")
+        # Buzz supplies an absolute command inside its macOS or Windows app.
+        # The forced command maps only its basename to an already-validated
+        # Linux executable, so no client-supplied host path is trusted.
+        basename = re.split(r"[/\\]", command)[-1]
+        if basename in command_maps:
+            server["command"] = str(command_maps[basename])
+        elif not allow_mcp:
+            raise AcpLaunchError(
+                "session/new contains MCP servers with unmapped remote paths; "
+                "configure --map-mcp-command or pass --allow-mcp"
+            )
+
+
+def rewrite_message(
+    message, harness, values, cwd, allow_mcp, command_maps, source_cwds
+):
     method = message.get("method")
     if method not in ("session/new", "session/prompt"):
         return message
@@ -2826,12 +2886,7 @@ def rewrite_message(message, harness, values, cwd, allow_mcp, source_cwds):
     if isinstance(source, str) and source:
         source_cwds.add(source)
     params["cwd"] = target
-    servers = params.get("mcpServers", [])
-    if servers and not allow_mcp:
-        raise AcpLaunchError(
-            "session/new contains MCP servers with unmapped remote paths; "
-            "configure valid remote paths and pass --allow-mcp"
-        )
+    rewrite_mcp_servers(params, allow_mcp, command_maps)
     meta = params.get("_meta")
     if isinstance(meta, dict):
         prompt = meta.get("systemPrompt")
@@ -2953,6 +3008,7 @@ async def proxy(config, launch, values):
                 values,
                 config.cwd,
                 config.allow_mcp,
+                config.mcp_command_map,
                 source_cwds,
             )
             if rewritten is message:
@@ -3046,6 +3102,13 @@ def parser():
         command.add_argument("--expected-command")
         command.add_argument("--allow-mcp", action="store_true")
         command.add_argument(
+            "--map-mcp-command",
+            action="append",
+            default=[],
+            metavar="CLIENT=REMOTE",
+            help="map one client command basename to a remote executable",
+        )
+        command.add_argument(
             "--local",
             action="store_true",
             help="test without SSH forced-command validation",
@@ -3061,11 +3124,18 @@ def main(argv):
     args.adapter = executable(args.adapter, "ACP adapter")
     args.native = executable(args.native, "native harness")
     args.cwd = remote_cwd(args.cwd)
+    args.mcp_command_map = parse_mcp_command_maps(args.map_mcp_command)
     expected = args.expected_command or EXPECTED_COMMAND[launch["harness"]]
     if not expected or any(char.isspace() for char in expected):
         raise AcpLaunchError("expected command must be one shell word")
     validate_original_command(expected, args.local)
     if args.command == "check":
+        if args.allow_mcp:
+            mcp_policy = (
+                "mapped+pass-through" if args.mcp_command_map else "pass-through"
+            )
+        else:
+            mcp_policy = "mapped" if args.mcp_command_map else "refuse"
         print(json.dumps({
             "profile": args.profile,
             "harness": launch["harness"],
@@ -3073,7 +3143,10 @@ def main(argv):
             "cwd": str(args.cwd),
             "adapter": str(args.adapter),
             "native": str(args.native),
-            "mcpPolicy": "pass-through" if args.allow_mcp else "refuse",
+            "mcpPolicy": mcp_policy,
+            "mcpCommandMap": {
+                name: str(path) for name, path in args.mcp_command_map.items()
+            },
         }, indent=2, sort_keys=True))
         return 0
     env_ready(args.profile, argv)
