@@ -245,14 +245,14 @@ else
 fi
 export AGENT_BOX_SESSION_BIN=$SAVED_SESSION_BIN
 
-# At capacity, one safely hibernated resident runtime is retried immediately;
+# At capacity, one safely hibernated hook runtime is retried immediately;
 # the accepted event does not wait for the dispatcher's next re-offer window.
 real_session_bin=$AGENT_BOX_SESSION_BIN
 cat > "$work/bin/hibernate-session" <<EOF
 #!$BASH_BIN
 case "\$1" in
   peers) echo 'No other session is live on this box.' ;;
-  hibernate) printf '%s\n' '{"name":"idle","harness":"claude"}' ;;
+  hibernate) printf '%s\n' '{"name":"hook-idle","harness":"claude"}' ;;
   add)
     n=0; [ ! -s "$work/add-attempts" ] || read -r n < "$work/add-attempts"
     n=\$((n + 1)); printf '%s\n' "\$n" > "$work/add-attempts"
@@ -269,7 +269,7 @@ export AGENT_BOX_SESSION_BIN="$work/bin/hibernate-session"
 : > "$work/add-attempts"
 rc=$(spawn defangdevs/hibernate 2)
 if [ "$rc" = 0 ] && [ "$(cat "$work/add-attempts")" = 2 ] \
-   && grep 'hibernated idle session' "$work/spawn.out" >/dev/null; then
+   && grep 'hibernated idle hook session' "$work/spawn.out" >/dev/null; then
   ok "a capacity-blocked watch hibernates one idle runtime and retries"
 else
   fail "a capacity-blocked watch hibernates one idle runtime and retries - exit $rc"
