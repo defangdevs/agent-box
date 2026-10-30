@@ -117,6 +117,60 @@
       .then(function (r) { if (!r.ok) { throw new Error(); } return r.json(); })
       .catch(function () { return null; });
   }
+  function resourceUsage() {
+    var section = document.querySelector("[data-resources-url]");
+    if (!section) { return; }
+    var pending = false;
+    function space(reading, available) {
+      if (!reading) { return "Unavailable"; }
+      var total = reading.total_bytes;
+      var amount = available ? reading.available_bytes : total - reading.available_bytes;
+      var units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      var unit = 0;
+      while (total >= 1024 && unit < units.length - 1) {
+        total /= 1024;
+        amount /= 1024;
+        unit += 1;
+      }
+      return amount.toFixed(1) + " / " + total.toFixed(1) + " " + units[unit]
+        + (available ? " available" : " used");
+    }
+    function show(s) {
+      s = s && s.ok ? s : {};
+      var values = {
+        cpu: s.cpu ? s.cpu.busy_percent + "% busy" : "Unavailable",
+        memory: space(s.memory),
+        disk: space(s.disk, true),
+        sessions: s.sessions ? s.sessions.used + " / " + s.sessions.limit + " in use" : "Unavailable"
+      };
+      Object.keys(values).forEach(function (name) {
+        section.querySelector('[data-resource="' + name + '"]').textContent = values[name];
+      });
+    }
+    function refresh() {
+      if (document.hidden || pending) { return; }
+      pending = true;
+      var controller = new AbortController();
+      var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
+      fetch(section.getAttribute("data-resources-url"), {
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+        signal: controller.signal
+      }).then(function (r) {
+        if (!r.ok) { throw new Error(); }
+        return r.json();
+      }).then(show).catch(function () {
+        show(null);
+      }).finally(function () {
+        window.clearTimeout(timeout);
+        pending = false;
+      });
+    }
+    refresh();
+    window.setInterval(refresh, 5000);
+    document.addEventListener("visibilitychange", refresh);
+  }
+
   // The daemon can decide the current URL is no longer the right page:
   // /<user>/ redirects to the settings page once the last session is gone.
   // Splicing fragments out of THAT answer patches nothing — applyDoc skips an
@@ -1512,6 +1566,7 @@
   });
 
   checkForUpdate();
+  resourceUsage();
   liveUpdates();
   connectPoll();
   // Land in the terminal: focus the server-selected tab's pane.
