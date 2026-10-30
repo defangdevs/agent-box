@@ -2262,7 +2262,7 @@
 
     # The production wrapper delegates admission to the shared session CLI.
     # Pure count/restart races and actual dispatcher retry are native checks;
-    # this proves the installed programs share a limit with interactive work.
+    # this proves only hook work consumes the installed programs' budget.
     machine.succeed("echo 1 > /tmp/session-limit; chmod 644 /tmp/session-limit")
     drop_env = (
         "sudo -u agent env HOME=/home/agent"
@@ -2270,6 +2270,10 @@
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/cap"
         f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent "
+        "agent-box-session add hook-cap-full --origin webhook"
     )
     rc, refusal_log = machine.execute(drop_env)
     assert rc == 75, (rc, refusal_log)

@@ -476,58 +476,55 @@ class LockRefusal(RouteCase):
 
 
 class CapacityRoutes(RouteCase):
-    def test_concurrent_ui_adds_share_pending_capacity(self):
-        self.write_raw(json.dumps({"version": 1, "sessions": {}}))
-        module, _ = self.serve()
-        module.capacity_limit = lambda: 2
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            results = list(pool.map(lambda _: self.post("/sessions/add", agent="claude")[0], range(6)))
-        self.assertEqual(sorted(results), [303, 303, 503, 503, 503, 503])
-        self.assertEqual(len(self.document()["sessions"]), 2)
-
-
-    def test_add_refuses_at_capacity_without_writing(self):
-        self.write_raw(json.dumps({"version": 1, "sessions": {"a": {}}}))
+    def test_concurrent_ui_adds_bypass_full_hook_capacity(self):
+        self.write_raw(json.dumps({"version": 1, "sessions": {
+            "hook-full": {"origin": "webhook", "agent": "claude"}}}))
         module, _ = self.serve()
         module.capacity_limit = lambda: 1
-        before = self.raw()
-        status, _ = self.post("/sessions/add", agent="claude")
-        self.assertEqual(status, 503)
-        self.assertEqual(self.raw(), before)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda _: self.post("/sessions/add", agent="claude")[0], range(6)))
+        self.assertEqual(results, [303] * 6)
+        self.assertEqual(len(self.document()["sessions"]), 7)
+        for name, entry in self.document()["sessions"].items():
+            if name != "hook-full":
+                self.assertEqual(entry["origin"], "user")
 
-    def test_shell_add_bypasses_a_full_agent_capacity(self):
+    def test_shell_add_bypasses_a_full_hook_capacity(self):
         self.write_raw(json.dumps({"version": 1, "sessions": {
-            "worker": {"agent": "claude"}}}))
+            "worker": {"agent": "claude", "origin": "webhook"}}}))
         module, _ = self.serve()
         module.capacity_limit = lambda: 1
         status, _ = self.post("/sessions/add", agent="shell")
         self.assertEqual(status, 303)
         self.assertEqual(self.document()["sessions"]["shell"]["agent"], "shell")
         status, _ = self.post("/sessions/add", agent="claude")
-        self.assertEqual(status, 503)
+        self.assertEqual(status, 303)
 
-    def test_restart_stopped_refuses_but_running_restart_succeeds(self):
+    def test_manual_restart_bypasses_limit_but_stopped_hook_does_not(self):
         self.write_raw(json.dumps({"version": 1, "sessions": {
-            "a": {}, "b": {"stopped": True}}}))
+            "a": {"origin": "webhook"}, "b": {"stopped": True},
+            "hook-stopped": {"origin": "webhook", "stopped": True}}}))
         module, _ = self.serve()
         module.capacity_limit = lambda: 1
         module.kill_session = lambda name: None
         before = self.raw()
-        status, _ = self.post("/sessions/restart", name="b")
+        status, _ = self.post("/sessions/restart", name="hook-stopped")
         self.assertEqual(status, 503)
         self.assertEqual(self.raw(), before)
+        status, _ = self.post("/sessions/restart", name="b")
+        self.assertEqual(status, 303)
+        self.assertNotIn("stopped", self.document()["sessions"]["b"])
         status, _ = self.post("/sessions/restart", name="a")
         self.assertEqual(status, 303)
 
-    def test_signin_stays_successful_and_records_autostart_notice(self):
-        self.write_raw(json.dumps({"version": 1, "sessions": {"a": {"agent": "codex"}}}))
+    def test_signin_starts_manual_session_at_full_hook_capacity(self):
+        self.write_raw(json.dumps({"version": 1, "sessions": {
+            "a": {"agent": "codex", "origin": "webhook"}}}))
         module, _ = self.serve()
         module.capacity_limit = lambda: 1
-        before = self.raw()
-        message = module.ensure_harness_session("claude", True)
-        self.assertIn("Signed in; session not started", message)
-        self.assertEqual(module._session_start_notices["claude"], message)
-        self.assertEqual(self.raw(), before)
+        self.assertIsNone(module.ensure_harness_session("claude", True))
+        self.assertNotIn("claude", module._session_start_notices)
+        self.assertEqual(self.document()["sessions"]["claude"]["origin"], "sign_in")
 
 
 if __name__ == "__main__":

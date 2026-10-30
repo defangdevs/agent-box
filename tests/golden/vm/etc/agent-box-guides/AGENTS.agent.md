@@ -120,22 +120,22 @@ plainly rather than handing it back.
   the value out of the command line, the shell history and `ps`). Such a
   value is stored double-quoted, which is the one thing to preserve if you
   ever hand-edit the file.
-- Agent session starts share one limit across the CLI, settings page and
-  webhooks. Shell panes are operator terminals and do not use a slot. The
-  limit defaults to about one session per GiB of physical RAM and can be
-  overridden by `sessionLimit` in the box configuration. Pending starts reserve
-  slots too. Stop a session to free capacity; restarting a stopped session
-  needs a free slot. `restart --all` refuses without changing anything if it
-  would exceed the limit. When a new runtime is refused at the limit,
-  Agentbox may hibernate the oldest conservatively idle Claude or Codex TUI
-  session: its process exits, its stable name and native conversation ID stay
-  recorded, and a later routed message transparently resumes that exact
-  conversation. It never hibernates merely because a session is idle. An open
-  turn, unresolved assignment, webhook subscription, pending delivery,
-  unknown transcript state, shell, hook session, or Claude/Codex Remote
-  Control server remains resident. `sessionHibernationGraceSeconds` sets the
-  minimum age of the completed turn (30 seconds by default). This is overload
-  control, not a memory guarantee.
+- Hook session starts share one limit, defaulting to about one hook per GiB
+  of physical RAM and overridable by `sessionLimit` in the box configuration.
+  Running and pending hooks reserve slots. User-created sessions, including
+  manual CLI/UI adds, sign-in and pairing sessions, bypass the cap and are
+  never hibernated. Shell panes do not use a slot either. Restarting a stopped
+  hook needs a free slot; `restart --all` refuses without changing anything if
+  its hook starts would exceed the limit. When a new hook is refused at the
+  limit, Agentbox may hibernate the oldest conservatively idle Claude or Codex
+  hook: its process exits, its stable name and native conversation ID stay
+  recorded, and a later routed message resumes that exact conversation through
+  the hook capacity gate. It never hibernates merely because a hook is idle.
+  An open turn, unresolved assignment, webhook subscription, pending delivery,
+  unknown transcript state, or Claude/Codex Remote Control server remains
+  resident. `sessionHibernationGraceSeconds` sets the minimum age of the
+  completed turn (30 seconds by default). This is overload control, not a
+  memory guarantee.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
   plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -

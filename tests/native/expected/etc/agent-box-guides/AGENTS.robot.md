@@ -157,22 +157,22 @@ plainly rather than handing it back.
   the value out of the command line, the shell history and `ps`). Such a
   value is stored double-quoted, which is the one thing to preserve if you
   ever hand-edit the file.
-- Agent session starts share one limit across the CLI, settings page and
-  webhooks. Shell panes are operator terminals and do not use a slot. The
-  limit defaults to about one session per GiB of physical RAM and can be
-  overridden by `sessionLimit` in the box configuration. Pending starts reserve
-  slots too. Stop a session to free capacity; restarting a stopped session
-  needs a free slot. `restart --all` refuses without changing anything if it
-  would exceed the limit. When a new runtime is refused at the limit,
-  Agentbox may hibernate the oldest conservatively idle Claude or Codex TUI
-  session: its process exits, its stable name and native conversation ID stay
-  recorded, and a later routed message transparently resumes that exact
-  conversation. It never hibernates merely because a session is idle. An open
-  turn, unresolved assignment, webhook subscription, pending delivery,
-  unknown transcript state, shell, hook session, or Claude/Codex Remote
-  Control server remains resident. `sessionHibernationGraceSeconds` sets the
-  minimum age of the completed turn (30 seconds by default). This is overload
-  control, not a memory guarantee.
+- Hook session starts share one limit, defaulting to about one hook per GiB
+  of physical RAM and overridable by `sessionLimit` in the box configuration.
+  Running and pending hooks reserve slots. User-created sessions, including
+  manual CLI/UI adds, sign-in and pairing sessions, bypass the cap and are
+  never hibernated. Shell panes do not use a slot either. Restarting a stopped
+  hook needs a free slot; `restart --all` refuses without changing anything if
+  its hook starts would exceed the limit. When a new hook is refused at the
+  limit, Agentbox may hibernate the oldest conservatively idle Claude or Codex
+  hook: its process exits, its stable name and native conversation ID stay
+  recorded, and a later routed message resumes that exact conversation through
+  the hook capacity gate. It never hibernates merely because a hook is idle.
+  An open turn, unresolved assignment, webhook subscription, pending delivery,
+  unknown transcript state, or Claude/Codex Remote Control server remains
+  resident. `sessionHibernationGraceSeconds` sets the minimum age of the
+  completed turn (30 seconds by default). This is overload control, not a
+  memory guarantee.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
   plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
@@ -726,16 +726,17 @@ Green checks are not authority to take that decision.
 
 A hook session is spawned `--ephemeral`, so it delists ITSELF: whatever parks
 it - the agent quitting, or `agent-box-session stop` - the supervisor drops the
-entry on its next tick, and the transcript stays on disk. Its prompt still asks
+entry on its next tick, and the transcript stays on disk. Hibernation keeps
+the entry and native conversation mapping for exact resumption. Its prompt still asks
 it to `agent-box-session rm NAME` when done, which is the same end reached
 sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
 never parked, so it stays listed and attachable for you to read - `rm` it once
 you have. That cleanup is load-bearing: one RAM-sized limit (about one session
-per GiB by default, overridable with `sessionLimit`) bounds all agent sessions
-running or queued to start, including CLI/UI sessions but not operator shell panes,
+per GiB by default, overridable with `sessionLimit`) bounds hook sessions
+running or queued to start. User-created sessions and shell panes bypass it,
 and once that ceiling is reached EVERY
 watch first asks the session manager to hibernate one conservatively idle,
-exactly resumable interactive runtime. That runtime keeps its Agentbox name
+exactly resumable hook runtime. That runtime keeps its Agentbox name
 and native Claude/Codex conversation ID; a later routed message activates it
 through the same capacity gate. Sessions with a live webhook subscription are
 not candidates, because accepted peer delivery is not yet durably spooled. If

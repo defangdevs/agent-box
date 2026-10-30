@@ -363,7 +363,7 @@ Those app-created conversations are native Claude sessions, not separate
 agent-box rows: they do not consume additional agent-box session slots and do
 not have agent-box transcript downloads, kickoff/resume prompts, webhook or
 WhatsApp routing, or individual tmux panes. The server row itself does consume
-one slot and is never hibernated. Its `--name` uses the same
+no hook slot and is never hibernated. Its `--name` uses the same
 `<user>-<session>@<host>` derivation as the older mirrored TUI. Append server
 flags after `--`, for example `-- --spawn same-dir --capacity 8`.
 
@@ -395,7 +395,8 @@ expires_at, error, error_code, devices, devices_error}}` (`state` is `signed_out
 `starting`, `ready`, `waiting`, `claimed`, `expired` or `failed`; `claimed` is
 sticky until the next start or cancel). `POST /codex/pairing/start` makes sure
 one remote-control Codex session exists and mints a manual code (409 signed
-out, 429 within 5 s of the last start, 503 at the session limit, else 303),
+out, 429 within 5 s of the last start, else 303; pairing sessions bypass
+the hook session cap),
 `POST /codex/pairing/cancel` forgets it, and `POST /codex/devices/revoke`
 (`client_id`) unpairs a device. The code is held in memory only: never logged,
 never written to disk, never in the pane, and only the manual code is exposed.
@@ -823,8 +824,8 @@ All under `services.agent-box`:
 | `agent` | `"claude"` | Default **harness**: `"claude"` or `"codex"`. |
 | `package` | selected agent default | Override package to run for every agent user. |
 | `installAgents` | all supported | Harnesses installed on the box (independent of what sessions run). |
-| `sessionLimit` | `null` (automatic) | Maximum running or queued sessions. Null derives roughly one slot per GiB of physical RAM; a positive integer overrides it. |
-| `sessionHibernationGraceSeconds` | `30` | Minimum age of a completed native turn before capacity pressure may hibernate that runtime. This never parks sessions while capacity remains. |
+| `sessionLimit` | `null` (automatic) | Maximum running or queued hook sessions. Null derives roughly one hook slot per GiB of physical RAM; a positive integer overrides it. Manual sessions bypass the cap. |
+| `sessionHibernationGraceSeconds` | `30` | Minimum age of a completed native turn before hook capacity pressure may hibernate that hook. User-created sessions are never hibernated. |
 | `codexFullAccess` | `true` | Run codex with no approval prompts and no sandbox, box-wide, via `/etc/codex/config.toml`. The box is the sandbox. That file is codex's *system* config layer, so a user's own `~/.codex/config.toml` still overrides it — and it is the only path that reaches the app-server daemon behind a remote-controlled codex session. Opting a TUI session out (`skipPermissions = false`) switches it to codex's own bubblewrap sandbox, where setuid tools such as `sudo` are unavailable. The built-in Caddy reload uses polkit instead (issue #726). |
 | `restartNotice` | `"auto"` | Whether a resumed Claude or Codex session gets the built-in "you were interrupted and automatically restarted" prompt. `"auto"` sends it for an unresolved hook lease, a webhook subscription filter, or a Claude turn cut mid-turn; `"always"` sends it whenever there is a concrete resume target; `"never"` never does. A Codex TUI uses its exact rollout target. Remote-controlled Codex can be targeted only after an app task creates a session subscription; the restarted daemon wakes that task with `codex queue`. A per-session `resumePrompt` overrides the built-in text. |
 | `remoteControlHost` | `fqdnOrHostName` | Host label for the `@<host>` suffix of auto-derived Remote Control names. Empty -> falls back to the public `web.domain`, then the live kernel hostname. The AWS image sets it to the box's public sslip.io host. |
