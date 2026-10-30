@@ -254,16 +254,17 @@ Green checks are not authority to take that decision.
 
 A hook session is spawned `--ephemeral`, so it delists ITSELF: whatever parks
 it - the agent quitting, or `agent-box-session stop` - the supervisor drops the
-entry on its next tick, and the transcript stays on disk. Its prompt still asks
+entry on its next tick, and the transcript stays on disk. Hibernation keeps
+the entry and native conversation mapping for exact resumption. Its prompt still asks
 it to `agent-box-session rm NAME` when done, which is the same end reached
 sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
 never parked, so it stays listed and attachable for you to read - `rm` it once
 you have. That cleanup is load-bearing: one RAM-sized limit (about one session
-per GiB by default, overridable with `sessionLimit`) bounds all agent sessions
-running or queued to start, including CLI/UI sessions but not operator shell panes,
+per GiB by default, overridable with `sessionLimit`) bounds hook sessions
+running or queued to start. User-created sessions and shell panes bypass it,
 and once that ceiling is reached EVERY
 watch first asks the session manager to hibernate one conservatively idle,
-exactly resumable interactive runtime. That runtime keeps its Agentbox name
+exactly resumable hook runtime. That runtime keeps its Agentbox name
 and native Claude/Codex conversation ID; a later routed message activates it
 through the same capacity gate. Sessions with a live webhook subscription are
 not candidates, because accepted peer delivery is not yet durably spooled. If

@@ -526,16 +526,17 @@ let
 
       A hook session is spawned `--ephemeral`, so it delists ITSELF: whatever parks
       it - the agent quitting, or `agent-box-session stop` - the supervisor drops the
-      entry on its next tick, and the transcript stays on disk. Its prompt still asks
+      entry on its next tick, and the transcript stays on disk. Hibernation keeps
+      the entry and native conversation mapping for exact resumption. Its prompt still asks
       it to `agent-box-session rm NAME` when done, which is the same end reached
       sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
       never parked, so it stays listed and attachable for you to read - `rm` it once
       you have. That cleanup is load-bearing: one RAM-sized limit (about one session
-      per GiB by default, overridable with `sessionLimit`) bounds all agent sessions
-      running or queued to start, including CLI/UI sessions but not operator shell panes,
+      per GiB by default, overridable with `sessionLimit`) bounds hook sessions
+      running or queued to start. User-created sessions and shell panes bypass it,
       and once that ceiling is reached EVERY
       watch first asks the session manager to hibernate one conservatively idle,
-      exactly resumable interactive runtime. That runtime keeps its Agentbox name
+      exactly resumable hook runtime. That runtime keeps its Agentbox name
       and native Claude/Codex conversation ID; a later routed message activates it
       through the same capacity gate. Sessions with a live webhook subscription are
       not candidates, because accepted peer delivery is not yet durably spooled. If
@@ -909,22 +910,22 @@ let
       the value out of the command line, the shell history and `ps`). Such a
       value is stored double-quoted, which is the one thing to preserve if you
       ever hand-edit the file.
-    - Agent session starts share one limit across the CLI, settings page and
-      webhooks. Shell panes are operator terminals and do not use a slot. The
-      limit defaults to about one session per GiB of physical RAM and can be
-      overridden by `sessionLimit` in the box configuration. Pending starts reserve
-      slots too. Stop a session to free capacity; restarting a stopped session
-      needs a free slot. `restart --all` refuses without changing anything if it
-      would exceed the limit. When a new runtime is refused at the limit,
-      Agentbox may hibernate the oldest conservatively idle Claude or Codex TUI
-      session: its process exits, its stable name and native conversation ID stay
-      recorded, and a later routed message transparently resumes that exact
-      conversation. It never hibernates merely because a session is idle. An open
-      turn, unresolved assignment, webhook subscription, pending delivery,
-      unknown transcript state, shell, hook session, or Claude/Codex Remote
-      Control server remains resident. `sessionHibernationGraceSeconds` sets the
-      minimum age of the completed turn (30 seconds by default). This is overload
-      control, not a memory guarantee.
+    - Hook session starts share one limit, defaulting to about one hook per GiB
+      of physical RAM and overridable by `sessionLimit` in the box configuration.
+      Running and pending hooks reserve slots. User-created sessions, including
+      manual CLI/UI adds, sign-in and pairing sessions, bypass the cap and are
+      never hibernated. Shell panes do not use a slot either. Restarting a stopped
+      hook needs a free slot; `restart --all` refuses without changing anything if
+      its hook starts would exceed the limit. When a new hook is refused at the
+      limit, Agentbox may hibernate the oldest conservatively idle Claude or Codex
+      hook: its process exits, its stable name and native conversation ID stay
+      recorded, and a later routed message resumes that exact conversation through
+      the hook capacity gate. It never hibernates merely because a hook is idle.
+      An open turn, unresolved assignment, webhook subscription, pending delivery,
+      unknown transcript state, or Claude/Codex Remote Control server remains
+      resident. `sessionHibernationGraceSeconds` sets the minimum age of the
+      completed turn (30 seconds by default). This is overload control, not a
+      memory guarantee.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
       plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
@@ -3113,7 +3114,7 @@ if __name__ == "__main__":
 
 # Shared admission policy for the single-user v1 box (issue #662).
 # Callers hold the sessions.json sidecar lock through this check AND their
-# registry write / tmux spawn. Non-stopped entries reserve pending starts.
+# registry write / tmux spawn. Non-stopped hook entries reserve pending starts.
 import os as capacity_os
 import subprocess as capacity_subprocess
 
@@ -3204,14 +3205,37 @@ def capacity_live_checked():
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
 
 
+def capacity_is_hook(name, entry=None):
+    """Use recorded provenance, with a name fallback for older hook sessions."""
+    entry = entry if isinstance(entry, dict) else {}
+    origin = entry.get("origin")
+    return origin == "webhook" or (not origin and name.startswith("hook-"))
+
+
+def capacity_unmetered(sessions, names=()):
+    """Manual sessions, shells and post-mortem panes never use hook slots."""
+    def exempt(name):
+        entry = sessions.get(name)
+        if not capacity_is_hook(name, entry):
+            return True
+        if not isinstance(entry, dict):
+            return False
+        died = entry.get("died")
+        return (entry.get("agent") == "shell" or died is True
+                or (isinstance(died, int) and not isinstance(died, bool)))
+
+    return {name for name in set(sessions) | set(names) if exempt(name)}
+
+
 def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
                    exempt=()):
-    """Admit new/revived targets, or one supervisor spawn.
+    """Admit new/revived hooks, or one supervisor spawn.
 
     On boot or after a limit reduction, an overfull registry is a queue:
     keep live panes and admit pending names in sorted order up to the limit.
-    Existing panes are never killed. Ordinary adds cannot jump that queue.
-    `exempt` is for an unmetered target that is not in the registry yet.
+    Existing panes are never killed. User-created sessions bypass the cap.
+    New targets are hook reservations unless the caller includes them in
+    `exempt`; registered targets use their recorded provenance.
     """
     try:
         limit = capacity_limit() if limit is None else limit
@@ -3220,11 +3244,6 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     live = capacity_live_checked() if live is None else set(live)
     pending = {name for name, entry in sessions.items()
                if isinstance(entry, dict) and entry.get("stopped") is not True}
-    # A shell pane is an operator terminal rather than an agent worker. It
-    # shares the registry so it can be listed, stopped and resumed like other
-    # sessions, but must not consume an agent worker slot (issue #795).
-    shells = {name for name, entry in sessions.items()
-              if isinstance(entry, dict) and entry.get("agent") == "shell"}
     # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
     # stays in `pending` -- it must remain its own candidate for revival by
     # `agent-box-session restart`, or a stale flag on a session that already
@@ -3238,15 +3257,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     # Same rule as the settings daemon's crashed_status(): True or an int
     # exit status is a crash, anything else (False, null) is not.
 
-    def crashed(entry):
-        value = entry.get("died") if isinstance(entry, dict) else None
-        if isinstance(value, bool):
-            return value
-        return isinstance(value, int)
-
-    died = {name for name, entry in sessions.items() if crashed(entry)}
-    exempt = set(exempt)
-    unmetered = died | shells | exempt
+    unmetered = capacity_unmetered(sessions, live) | set(exempt)
     used = (live | pending) - unmetered
     targets = set(targets)
     if spawning:
@@ -3263,7 +3274,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     if not allowed:
         raise SessionCapacityError(
             "Session limit reached (%d running or queued, limit %d). "
-            "Stop a session before starting another." % (len(used), limit))
+            "Stop a hook session before starting another hook." % (len(used), limit))
     return {"used": len(used), "max": limit}
   '';
 
@@ -3272,7 +3283,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
   } ''
 # Shared admission policy for the single-user v1 box (issue #662).
 # Callers hold the sessions.json sidecar lock through this check AND their
-# registry write / tmux spawn. Non-stopped entries reserve pending starts.
+# registry write / tmux spawn. Non-stopped hook entries reserve pending starts.
 import os as capacity_os
 import subprocess as capacity_subprocess
 
@@ -3363,14 +3374,37 @@ def capacity_live_checked():
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
 
 
+def capacity_is_hook(name, entry=None):
+    """Use recorded provenance, with a name fallback for older hook sessions."""
+    entry = entry if isinstance(entry, dict) else {}
+    origin = entry.get("origin")
+    return origin == "webhook" or (not origin and name.startswith("hook-"))
+
+
+def capacity_unmetered(sessions, names=()):
+    """Manual sessions, shells and post-mortem panes never use hook slots."""
+    def exempt(name):
+        entry = sessions.get(name)
+        if not capacity_is_hook(name, entry):
+            return True
+        if not isinstance(entry, dict):
+            return False
+        died = entry.get("died")
+        return (entry.get("agent") == "shell" or died is True
+                or (isinstance(died, int) and not isinstance(died, bool)))
+
+    return {name for name in set(sessions) | set(names) if exempt(name)}
+
+
 def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
                    exempt=()):
-    """Admit new/revived targets, or one supervisor spawn.
+    """Admit new/revived hooks, or one supervisor spawn.
 
     On boot or after a limit reduction, an overfull registry is a queue:
     keep live panes and admit pending names in sorted order up to the limit.
-    Existing panes are never killed. Ordinary adds cannot jump that queue.
-    `exempt` is for an unmetered target that is not in the registry yet.
+    Existing panes are never killed. User-created sessions bypass the cap.
+    New targets are hook reservations unless the caller includes them in
+    `exempt`; registered targets use their recorded provenance.
     """
     try:
         limit = capacity_limit() if limit is None else limit
@@ -3379,11 +3413,6 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     live = capacity_live_checked() if live is None else set(live)
     pending = {name for name, entry in sessions.items()
                if isinstance(entry, dict) and entry.get("stopped") is not True}
-    # A shell pane is an operator terminal rather than an agent worker. It
-    # shares the registry so it can be listed, stopped and resumed like other
-    # sessions, but must not consume an agent worker slot (issue #795).
-    shells = {name for name, entry in sessions.items()
-              if isinstance(entry, dict) and entry.get("agent") == "shell"}
     # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
     # stays in `pending` -- it must remain its own candidate for revival by
     # `agent-box-session restart`, or a stale flag on a session that already
@@ -3397,15 +3426,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     # Same rule as the settings daemon's crashed_status(): True or an int
     # exit status is a crash, anything else (False, null) is not.
 
-    def crashed(entry):
-        value = entry.get("died") if isinstance(entry, dict) else None
-        if isinstance(value, bool):
-            return value
-        return isinstance(value, int)
-
-    died = {name for name, entry in sessions.items() if crashed(entry)}
-    exempt = set(exempt)
-    unmetered = died | shells | exempt
+    unmetered = capacity_unmetered(sessions, live) | set(exempt)
     used = (live | pending) - unmetered
     targets = set(targets)
     if spawning:
@@ -3422,7 +3443,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     if not allowed:
         raise SessionCapacityError(
             "Session limit reached (%d running or queued, limit %d). "
-            "Stop a session before starting another." % (len(used), limit))
+            "Stop a hook session before starting another hook." % (len(used), limit))
     return {"used": len(used), "max": limit}
 
 # Conservative harness quiescence for capacity-pressure hibernation (#858).
@@ -3814,9 +3835,8 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
     harness = entry.get("agent")
     if harness not in ("claude", "codex"):
         return None
-    if ((entry.get("stopped") is True and not parked)
-            or entry.get("ephemeral") is True
-            or entry.get("origin") == "webhook" or name.startswith("hook-")
+    if (not capacity_is_hook(name, entry)
+            or (entry.get("stopped") is True and not parked)
             or _hibernate_crashed(entry)):
         return None
     # These panes own a daemon, not one resumable conversation. Recognize
@@ -6289,8 +6309,8 @@ kill_session() {
 
 usage() {
   echo "usage: agent-box-session ls | capacity"
-  echo "Starts share one RAM-sized limit (about one/GiB by default); sessionLimit overrides it."
-  echo "Stop a session to free a slot. A refused start exits 75; retry is safe."
+  echo "Hook starts share one RAM-sized limit (about one/GiB); manual sessions bypass it."
+  echo "Stop a hook session to free a slot. A refused start exits 75; retry is safe."
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
   echo "                             [--cwd DIR] [--remote-control true|false] [--daemon]"
@@ -6347,8 +6367,8 @@ usage() {
   echo "check its pane or worktree; nothing here retries the work for you."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
-  echo "hibernate is demand-driven: only at the session limit, park the oldest"
-  echo "conservatively quiescent resumable runtime to free one slot."
+  echo "hibernate is demand-driven: only at the hook limit, park the oldest"
+  echo "conservatively quiescent resumable hook. User sessions are never hibernated."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
 # The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
@@ -7351,9 +7371,9 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
-    # Shell panes are operator terminals, not agent workers, so only worker
-    # harnesses go through the shared agent-session admission cap (issue #795).
-    if [ "$harness" != shell ]; then
+    # Only event-created workers reserve capacity. Manual adds must remain
+    # available even when all hook slots are occupied.
+    if [ "$origin" = webhook ] && [ "$harness" != shell ]; then
       "''${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
     fi
     # The id this session's FIRST spawn is launched with (Claude
@@ -9358,9 +9378,10 @@ _hc_main "$@"
                              claim over any watch, GitHub or not.
                              A spawned session is subscribed to the event's own
                              repo for it, so its own CI spawns no sibling.
-                             THERE IS A CEILING: all sessions running or queued
+                             THERE IS A CEILING: hook sessions running or queued
                              share a RAM-sized limit (about one/GiB by default),
-                             which sessionLimit can override. Hook sessions are
+                             which sessionLimit can override. Manual sessions bypass
+                             it and are never hibernated. Hook sessions are
                              removed by the agent they start, so enough of them
                              still running stall every watch on the box. A batch
                              that arrives then is QUEUED, not dropped: the spawn
@@ -9706,12 +9727,12 @@ _hc_main "$@"
         return 0
       fi
       [ "$1" -ge "$2" ] || return 0
-      printf '%s' "$1 of at most $2 sessions are running or queued, so every \
+      printf '%s' "$1 of at most $2 hook sessions are running or queued, so every \
     standing watch is stalled: a matching event batch starts nothing now. The \
     spawn wrapper DECLINES it (exit 75) and the receiver holds it, re-offering it \
     as slots free and dropping it only once the wait outlasts \
     LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix. Free \
-    a slot (agent-box-session ls, then agent-box-session stop NAME, or \
+    a hook slot (agent-box-session ls, then agent-box-session stop NAME, or \
     agent-box-session rm NAME to delist it for good), or raise \
     sessionLimit in the box configuration."
     }
@@ -13282,7 +13303,7 @@ record_refusal() {
       --arg topic "''${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the shared session admission refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: sessions running or queued at the post-refusal snapshot (agent-box#662). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
+      '{"//": "Written by agent-box-webhook-spawn when the shared session admission refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: hook sessions running or queued at the post-refusal snapshot (agent-box#662). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then
@@ -13663,7 +13684,7 @@ if [ "$rc" = 76 ]; then
   exit 75
 fi
 if [ "$rc" = 75 ]; then
-  # Capacity pressure is the only reason to evict an idle runtime. The
+  # Hook capacity pressure is the only reason to evict an idle hook runtime. The
   # session CLI proves quiescence, revalidates it under the registry lock,
   # parks exactly one resumable conversation and refuses without mutation if
   # a slot became free meanwhile. A lock/configuration failure or a box with
@@ -13672,7 +13693,7 @@ if [ "$rc" = 75 ]; then
   if hibernated="$($SESSION_BIN hibernate 2>/dev/null)"; then
     parked="$(printf '%s' "$hibernated" | "$JQ" -r '.name // empty')"
     [ -z "$parked" ] \
-      || echo "agent-box-webhook-spawn: hibernated idle session '$parked' for this event" >&2
+      || echo "agent-box-webhook-spawn: hibernated idle hook session '$parked' for this event" >&2
     rc=0
     start_hook_session || rc=$?
   fi
@@ -18245,9 +18266,13 @@ esac
     # which is what makes the name reusable; sweep_session_state (above) then
     # reclaims the launch id on this same tick, so the next holder of the name
     # cannot inherit this one's transcript.
+    # Hibernation preserves even an ephemeral hook: its name and exact native
+    # conversation are needed by a later activation. Explicit stop clears that
+    # marker and returns the entry to the ordinary one-shot cleanup path.
     reap_ephemeral() {
       _cand="$($JQ -r '.sessions | to_entries[]
-                       | select(.value.ephemeral == true and .value.stopped == true)
+                       | select(.value.ephemeral == true and .value.stopped == true
+                                and .value.hibernatedAt == null)
                        | .key' "$REGISTRY_FILE" 2>/dev/null)" || return 0
       [ -n "$_cand" ] || return 0
       _gone=""
@@ -18265,7 +18290,8 @@ esac
         # between the candidate scan and here must not be delisted by a decision
         # taken before it came back.
         $JQ -e --arg s "$_n" \
-          '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true' \
+          '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true
+           and .sessions[$s].hibernatedAt == null' \
           "$REGISTRY_FILE" >/dev/null 2>&1 || continue
         registry_edit --arg s "$_n" 'del(.sessions[$s])'
         _gone=1
@@ -18412,9 +18438,11 @@ in
       type = lib.types.nullOr lib.types.ints.positive;
       default = null;
       description = ''
-        Maximum running or queued sessions for the single-user v1 box.
+        Maximum running or queued hook sessions for the single-user v1 box.
+        User-created sessions do not count toward this limit and can always
+        be added or restarted.
         Null derives the limit from kernel-reported physical RAM at roughly
-        one session per GiB, rounded up so kernel reservations do not turn a
+        one hook session per GiB, rounded up so kernel reservations do not turn a
         nominal 4 GiB VM into three slots. Set a positive integer to override
         that automatic budget. This is overload control, not a memory
         guarantee or a cross-user quota.
@@ -18425,10 +18453,11 @@ in
       type = lib.types.ints.unsigned;
       default = 30;
       description = ''
-        Minimum age of a harness's terminal turn record before a full box
-        may hibernate that quiescent runtime to admit another one. Zero is
+        Minimum age of a hook harness's terminal turn record before a full
+        hook budget may hibernate that quiescent hook to admit another one. Zero is
         useful for tests. This is not an idle reaper: no session is parked
-        while the shared session limit has room.
+        while the hook session limit has room. User-created sessions are never
+        hibernated.
       '';
     };
 
@@ -22256,10 +22285,6 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
         # ensured profile remains available as the default for normal workers.
         profile, args = None, []
     try:
-        # Read before the lock (issue #748): capacity_check's tmux spawn must
-        # not run while holding sessions_lock(), or a slow/contended tmux
-        # starves every other writer waiting on the same lock.
-        live = capacity_live_checked()
         with sessions_lock():
             sessions, version = load_sessions()
             if only_rc:
@@ -22281,8 +22306,6 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                      for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
-            capacity_check(sessions, [name], live=live,
-                           exempt=[name] if agent == "shell" else ())
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -25777,10 +25800,9 @@ def session_list_payload():
     limit = capacity["max"]
     pending = {n for n, e in sessions.items() if e.get("stopped") is not True}
     died = {n for n, e in sessions.items() if crashed_status(e) is not None}
-    shells = {n for n, e in sessions.items() if e.get("agent") == "shell"}
     # The same admission order capacity_check's spawn branch uses: a pending
     # name past the free slots is queued, not starting.
-    unmetered = died | shells
+    unmetered = capacity_unmetered(sessions, live)
     admitted = live | unmetered | set(
         sorted(pending - live - unmetered)[
             :max(0, limit - len(live - unmetered))])
@@ -26799,12 +26821,12 @@ BODY = """<main>
   <div id="msg-slot">{message}</div>
   <section aria-labelledby="resource-usage" data-resources-url="{base}/resources">
     <h2 id="resource-usage">Resource usage<a class="heading-anchor" href="#resource-usage" aria-label="Copy link to Resource usage" title="Copy link to Resource usage"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
-    <p class="note">Box CPU, memory and disk; your session slots. Refreshes every 5 seconds.</p>
+    <p class="note">Box CPU, memory and disk; hook session slots. Manual sessions bypass the limit. Refreshes every 5 seconds.</p>
     <dl class="resource-grid">
       <div><dt>CPU</dt><dd data-resource="cpu">Loading...</dd></div>
       <div><dt>Memory</dt><dd data-resource="memory">Loading...</dd></div>
       <div><dt>Disk</dt><dd data-resource="disk">Loading...</dd></div>
-      <div><dt>Sessions</dt><dd data-resource="sessions">Loading...</dd></div>
+      <div><dt>Hook sessions</dt><dd data-resource="sessions">Loading...</dd></div>
     </dl>
     <noscript><p class="note">Enable JavaScript to view resource usage.</p></noscript>
   </section>
@@ -33794,11 +33816,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # second thread, or the CLI — could pick the same free name, and
             # the later rename would drop the earlier session outright.
             try:
-                # Read before the lock (issue #748): capacity_check's tmux
-                # spawn must not run while holding sessions_lock(), or a
-                # slow/contended tmux starves every other writer waiting on
-                # the same lock.
-                live = capacity_live_checked()
                 with sessions_lock():
                     sessions, version = load_sessions()
                     # The name is always auto-derived: there is no name field
@@ -33809,8 +33826,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
-                    capacity_check(sessions, [name], live=live,
-                                   exempt=[name] if agent == "shell" else ())
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,

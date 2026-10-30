@@ -478,7 +478,7 @@ record_refusal() {
       --arg topic "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg key "${LOCAL_WEBHOOK_SPAWN_KEY:-}" \
       --argjson live "$1" --argjson max "$MAX" --argjson count "$((prev + 1))" \
-      '{"//": "Written by agent-box-webhook-spawn when the shared session admission refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: sessions running or queued at the post-refusal snapshot (agent-box#662). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
+      '{"//": "Written by agent-box-webhook-spawn when the shared session admission refused a standing-watch batch (agent-box#170). `deferred` records the ANSWER this wrapper gave that batch: 75, which local-webhook >= 0.16.0 reads as declined-for-retry rather than a failure that drops it (agent-box#301). It is history and is never rewritten, so it stays true after the batch starts or after the receiver gives up on it at LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S; its absence means the batch was dropped outright. `live` is the capacity in use: hook sessions running or queued at the post-refusal snapshot (agent-box#662). Cumulative since firstAt; agent-box-webhook status reads it.", at: $at, firstAt: $first, count: $count, live: $live, max: $max, deferred: true}
        + (if $topic == "" then {} else {topic: $topic} end)
        + (if $key == "" then {} else {key: $key} end)' \
       > "$REFUSED.$$" 2>/dev/null; then
@@ -859,7 +859,7 @@ if [ "$rc" = 76 ]; then
   exit 75
 fi
 if [ "$rc" = 75 ]; then
-  # Capacity pressure is the only reason to evict an idle runtime. The
+  # Hook capacity pressure is the only reason to evict an idle hook runtime. The
   # session CLI proves quiescence, revalidates it under the registry lock,
   # parks exactly one resumable conversation and refuses without mutation if
   # a slot became free meanwhile. A lock/configuration failure or a box with
@@ -868,7 +868,7 @@ if [ "$rc" = 75 ]; then
   if hibernated="$($SESSION_BIN hibernate 2>/dev/null)"; then
     parked="$(printf '%s' "$hibernated" | "$JQ" -r '.name // empty')"
     [ -z "$parked" ] \
-      || echo "agent-box-webhook-spawn: hibernated idle session '$parked' for this event" >&2
+      || echo "agent-box-webhook-spawn: hibernated idle hook session '$parked' for this event" >&2
     rc=0
     start_hook_session || rc=$?
   fi

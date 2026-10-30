@@ -127,7 +127,9 @@ class SettingsJsonRoutesTest(unittest.TestCase):
         self.assertNotIn(SECRET, json.dumps(data))
 
     def test_resources_use_the_admission_policy_including_queued_workers(self):
-        entries = {"running": {"agent": "claude"}, "queued": {"agent": "codex"},
+        entries = {"running": {"agent": "claude", "origin": "webhook"},
+                   "queued": {"agent": "codex", "origin": "webhook"},
+                   "manual": {"agent": "claude", "origin": "user"},
                    "stopped": {"agent": "claude", "stopped": True},
                    "died": {"agent": "codex", "died": 1},
                    "shell": {"agent": "shell"}}

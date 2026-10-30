@@ -387,9 +387,8 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
     harness = entry.get("agent")
     if harness not in ("claude", "codex"):
         return None
-    if ((entry.get("stopped") is True and not parked)
-            or entry.get("ephemeral") is True
-            or entry.get("origin") == "webhook" or name.startswith("hook-")
+    if (not capacity_is_hook(name, entry)
+            or (entry.get("stopped") is True and not parked)
             or _hibernate_crashed(entry)):
         return None
     # These panes own a daemon, not one resumable conversation. Recognize

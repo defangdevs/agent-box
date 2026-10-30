@@ -58,8 +58,8 @@ kill_session() {
 
 usage() {
   echo "usage: agent-box-session ls | capacity"
-  echo "Starts share one RAM-sized limit (about one/GiB by default); sessionLimit overrides it."
-  echo "Stop a session to free a slot. A refused start exits 75; retry is safe."
+  echo "Hook starts share one RAM-sized limit (about one/GiB); manual sessions bypass it."
+  echo "Stop a hook session to free a slot. A refused start exits 75; retry is safe."
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
   echo "                             [--cwd DIR] [--remote-control true|false] [--daemon]"
@@ -116,8 +116,8 @@ usage() {
   echo "check its pane or worktree; nothing here retries the work for you."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
-  echo "hibernate is demand-driven: only at the session limit, park the oldest"
-  echo "conservatively quiescent resumable runtime to free one slot."
+  echo "hibernate is demand-driven: only at the hook limit, park the oldest"
+  echo "conservatively quiescent resumable hook. User sessions are never hibernated."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
 # The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
@@ -1120,9 +1120,9 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
-    # Shell panes are operator terminals, not agent workers, so only worker
-    # harnesses go through the shared agent-session admission cap (issue #795).
-    if [ "$harness" != shell ]; then
+    # Only event-created workers reserve capacity. Manual adds must remain
+    # available even when all hook slots are occupied.
+    if [ "$origin" = webhook ] && [ "$harness" != shell ]; then
       "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
     fi
     # The id this session's FIRST spawn is launched with (Claude

@@ -69,11 +69,11 @@ class Policy(unittest.TestCase):
 
     def test_pending_and_unregistered_live_names_hold_slots(self):
         with self.assertRaises(capacity.SessionCapacityError):
-            capacity.capacity_check({"pending": {}}, ["new"],
-                                    live={"unregistered"}, limit=2)
+            capacity.capacity_check({"pending": {"origin": "webhook"}}, ["new"],
+                                    live={"hook-unregistered"}, limit=2)
 
     def test_stopped_is_free_only_after_pane_exits(self):
-        sessions = {"stopped": {"stopped": True}}
+        sessions = {"stopped": {"stopped": True, "origin": "webhook"}}
         capacity.capacity_check(sessions, ["new"], live=set(), limit=1)
         with self.assertRaises(capacity.SessionCapacityError):
             capacity.capacity_check(sessions, ["new"], live={"stopped"}, limit=1)
@@ -84,7 +84,7 @@ class Policy(unittest.TestCase):
         # never gets `stopped` either -- before this fix that meant a died
         # session held its slot for good (issue #523), unlike a stopped one
         # which frees its slot once the pane actually exits.
-        sessions = {"crashed": {"died": 1}}
+        sessions = {"crashed": {"died": 1, "origin": "webhook"}}
         capacity.capacity_check(sessions, ["new"], live=set(), limit=1)
         capacity.capacity_check(sessions, ["new"], live={"crashed"}, limit=1)
 
@@ -97,7 +97,7 @@ class Policy(unittest.TestCase):
         # against everyone else, made `agent-box-session restart` on a died
         # session hang forever, because the one name being spawned was never
         # a candidate for its own slot.
-        sessions = {"revived": {"died": 99}}
+        sessions = {"revived": {"died": 99, "origin": "webhook"}}
         capacity.capacity_check(sessions, ["revived"], spawning=True,
                                 live=set(), limit=1)
 
@@ -107,19 +107,19 @@ class Policy(unittest.TestCase):
                                          live={"terminal"}, limit=1)
         self.assertEqual(result["used"], 0)
 
-        capacity.capacity_check({"worker": {}, **sessions}, ["terminal"],
+        capacity.capacity_check({"worker": {"origin": "webhook"}, **sessions}, ["terminal"],
                                 spawning=True, live={"worker"}, limit=1)
 
     def test_new_shell_is_exempt_before_its_registry_entry_exists(self):
-        capacity.capacity_check({"worker": {}}, ["terminal"],
+        capacity.capacity_check({"worker": {"origin": "webhook"}}, ["terminal"],
                                 live={"worker"}, limit=1,
                                 exempt={"terminal"})
 
     def test_restart_does_not_need_a_second_slot(self):
-        capacity.capacity_check({"a": {}, "b": {}}, ["a"], live={"a"}, limit=1)
+        capacity.capacity_check({"a": {"origin": "webhook"}, "b": {"origin": "webhook"}}, ["a"], live={"a"}, limit=1)
 
     def test_boot_queue_respects_limit_without_deadlocking(self):
-        sessions = {"a": {}, "b": {}, "c": {}}
+        sessions = {"a": {"origin": "webhook"}, "b": {"origin": "webhook"}, "c": {"origin": "webhook"}}
         capacity.capacity_check(sessions, ["a"], spawning=True, live=set(), limit=2)
         capacity.capacity_check(sessions, ["b"], spawning=True, live={"a"}, limit=2)
         with self.assertRaises(capacity.SessionCapacityError):
@@ -128,7 +128,23 @@ class Policy(unittest.TestCase):
         capacity.capacity_check(sessions, ["c"], spawning=True, live={"b"}, limit=2)
 
     def test_running_and_pending_are_not_double_counted(self):
-        result = capacity.capacity_check({"a": {}}, ["b"], live={"a"}, limit=2)
+        result = capacity.capacity_check({"a": {"origin": "webhook"}}, ["b"], live={"a"}, limit=2)
+        self.assertEqual(result["used"], 1)
+
+    def test_manual_sessions_are_unmetered_even_at_boot_and_above_limit(self):
+        sessions = {"hook-full": {"origin": "webhook"},
+                    "manual": {"origin": "user"}, "legacy": {},
+                    "hook-manual": {"origin": "user"}}
+        live = {"hook-full", "unregistered-manual"}
+        for name in ("manual", "legacy", "hook-manual"):
+            result = capacity.capacity_check(sessions, [name], spawning=True,
+                                             live=live, limit=1)
+            self.assertEqual(result["used"], 1)
+        with self.assertRaises(capacity.SessionCapacityError):
+            capacity.capacity_check(sessions, ["hook-new"], live=live, limit=1)
+
+    def test_legacy_hook_names_reserve_capacity(self):
+        result = capacity.capacity_check({"hook-old": {}}, live=set(), limit=1)
         self.assertEqual(result["used"], 1)
 
     def test_capacity_live_excludes_connect_flow_panes(self):
@@ -191,7 +207,7 @@ class Hibernation(unittest.TestCase):
                   {"type": "user", "message": {"content": "work"}})
         transcript.write_text(json.dumps(record, separators=(",", ":")) + "\n")
         self.live.write_text(name + "\n")
-        return {name: {"agent": "claude"}}, transcript
+        return {name: {"agent": "claude", "origin": "webhook"}}, transcript
 
     def test_closed_claude_turn_is_stable_candidate(self):
         sessions, transcript = self.claude()
@@ -235,7 +251,7 @@ class Hibernation(unittest.TestCase):
         live_id.parent.mkdir(parents=True, exist_ok=True)
         live_id.write_text(current + "\n")
         self.live.write_text("idle\n")
-        sessions = {"idle": {"agent": "claude"}}
+        sessions = {"idle": {"agent": "claude", "origin": "webhook"}}
         self.assertIsNone(capacity.hibernation_candidate(sessions))
 
     def test_outstanding_routing_state_excludes_claude(self):
@@ -275,7 +291,7 @@ class Hibernation(unittest.TestCase):
             {"type": "event_msg", "payload": {"type": "thread_settings_applied"}},
         ]) + "\n")
         self.live.write_text("codex-idle\n")
-        sessions = {"codex-idle": {"agent": "codex", "remoteControl": False}}
+        sessions = {"codex-idle": {"agent": "codex", "origin": "webhook", "remoteControl": False}}
         selected = capacity.hibernation_candidate(sessions)
         self.assertEqual(selected["nativeSessionId"], native)
         with rollout.open("a") as handle:
@@ -312,22 +328,31 @@ class Hibernation(unittest.TestCase):
         ]) + "\n")
         os.utime(new, (time.time() + 1, time.time() + 1))
         self.live.write_text("codex-idle\n")
-        sessions = {"codex-idle": {"agent": "codex", "remoteControl": False}}
+        sessions = {"codex-idle": {"agent": "codex", "origin": "webhook", "remoteControl": False}}
         self.assertIsNone(capacity.hibernation_candidate(sessions))
 
-    def test_shell_ephemeral_hook_and_unmapped_sessions_are_ineligible(self):
+    def test_manual_shell_stopped_crashed_and_unmapped_sessions_are_ineligible(self):
         sessions, _ = self.claude()
         for update in [
                 {"agent": "shell"},
-                {"ephemeral": True},
-                {"origin": "webhook"},
+                {"origin": "user"},
+                {"origin": "agent", "ephemeral": True},
+                {"origin": None},
                 {"stopped": True},
                 {"died": 1}]:
-            entry = {"agent": "claude", **update}
+            entry = {"agent": "claude", "origin": "webhook", **update}
             self.assertIsNone(capacity.hibernation_candidate({"idle": entry}))
         self.live.write_text("unknown\n")
         self.assertIsNone(capacity.hibernation_candidate(
-            {"unknown": {"agent": "claude"}}))
+            {"unknown": {"agent": "claude", "origin": "webhook"}}))
+
+    def test_ephemeral_hook_is_eligible_but_manual_session_never_is(self):
+        sessions, _ = self.claude()
+        sessions["idle"]["ephemeral"] = True
+        self.assertEqual(capacity.hibernation_candidate(sessions)["name"], "idle")
+        for origin in ("user", "agent", "sign_in", "pairing", None):
+            sessions["idle"]["origin"] = origin
+            self.assertIsNone(capacity.hibernation_candidate(sessions))
 
     def test_codex_hook_overrides_old_marker_when_hibernating(self):
         launch = "11111111-1111-4111-8111-111111111111"
@@ -344,7 +369,7 @@ class Hibernation(unittest.TestCase):
         hook.parent.mkdir(parents=True)
         hook.write_text(current + "\n")
         self.live.write_text("codex-idle\n")
-        sessions = {"codex-idle": {"agent": "codex", "remoteControl": False}}
+        sessions = {"codex-idle": {"agent": "codex", "origin": "webhook", "remoteControl": False}}
         self.assertIsNone(capacity.hibernation_candidate(sessions))
         rollout = root / ("rollout-x-" + current + ".jsonl")
         rollout.write_text(json.dumps({"type": "event_msg", "payload": {
@@ -393,25 +418,40 @@ class Cli(unittest.TestCase):
                               env=self.env, capture_output=True, text=True,
                               timeout=15)
 
+    def add_hook(self, name):
+        return self.run_cli("add", name, "--origin", "webhook")
+
+    def test_concurrent_manual_adds_bypass_full_hook_capacity(self):
+        for name in ("hook-a", "hook-b"):
+            self.assertEqual(self.add_hook(name).returncode, 0)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda i: self.run_cli("add", "manual%d" % i), range(8)))
+        self.assertTrue(all(r.returncode == 0 for r in results),
+                        [(r.returncode, r.stderr) for r in results])
+        self.assertEqual(len(json.loads(self.registry.read_text())["sessions"]), 10)
+        self.assertEqual(self.add_hook("hook-c").returncode, 75)
+        self.assertEqual(self.run_cli("restart", "--all").returncode, 0)
+
     def test_concurrent_adds_reserve_exactly_two_slots(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            results = list(pool.map(lambda i: self.run_cli("add", "s%d" % i), range(8)))
+            results = list(pool.map(lambda i: self.add_hook("s%d" % i), range(8)))
         self.assertEqual(sorted(r.returncode for r in results), [0, 0] + [75] * 6,
                          [(r.returncode, r.stderr) for r in results])
         self.assertEqual(len(json.loads(self.registry.read_text())["sessions"]), 2)
 
     def test_shell_add_does_not_consume_or_need_capacity(self):
         for name in ["a", "b"]:
-            self.assertEqual(self.run_cli("add", name).returncode, 0)
+            self.assertEqual(self.add_hook(name).returncode, 0)
         result = self.run_cli("add", "terminal", "--harness", "shell")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.run_cli("add", "worker").returncode, 75)
+        self.assertEqual(self.add_hook("worker").returncode, 75)
         self.assertEqual(json.loads(self.registry.read_text())["sessions"]["terminal"]["agent"],
                          "shell")
 
     def test_restart_all_refuses_without_partial_mutation(self):
         self.registry.write_text(json.dumps({"version": 1, "sessions": {
-            "a": {}, "b": {}, "c": {"stopped": True}}}))
+            "a": {"origin": "webhook"}, "b": {"origin": "webhook"},
+            "c": {"stopped": True, "origin": "webhook"}}}))
         before = self.registry.read_bytes()
         result = self.run_cli("restart", "--all")
         self.assertEqual(result.returncode, 75, result.stderr)
@@ -420,22 +460,22 @@ class Cli(unittest.TestCase):
 
     def test_stop_frees_capacity_and_restart_rechecks(self):
         for name in ["a", "b"]:
-            self.assertEqual(self.run_cli("add", name).returncode, 0)
+            self.assertEqual(self.add_hook(name).returncode, 0)
         self.assertEqual(self.run_cli("stop", "a").returncode, 0)
-        self.assertEqual(self.run_cli("add", "c").returncode, 0)
+        self.assertEqual(self.add_hook("c").returncode, 0)
         self.assertEqual(self.run_cli("restart", "a").returncode, 75)
         self.assertEqual(self.run_cli("restart", "b").returncode, 0)
 
     def test_unavailable_probe_fails_closed(self):
         self.env["AGENT_BOX_TMUX_BIN"] = str(self.work / "missing")
         before = self.registry.read_bytes()
-        self.assertEqual(self.run_cli("add", "a").returncode, 75)
+        self.assertEqual(self.add_hook("a").returncode, 75)
         self.assertEqual(self.registry.read_bytes(), before)
 
     def test_invalid_limit_fails_closed(self):
         for value in ["0", "-1", "abc", "AUTO"]:
             self.limit.write_text(value)
-            self.assertEqual(self.run_cli("add", "a").returncode, 75)
+            self.assertEqual(self.add_hook("a").returncode, 75)
 
     def test_capacity_verb_does_not_create_the_registry(self):
         # A read-only check must never be what CREATES the registry: a
@@ -489,7 +529,7 @@ class Cli(unittest.TestCase):
         self.env["AGENT_BOX_TMUX_BIN"] = str(tmux)
         self.env["TEST_LIVE_FILE"] = str(live)
         self.registry.write_text(json.dumps({"version": 1, "sessions": {
-            name: {"agent": "claude", "hasRun": True,
+            name: {"agent": "claude", "origin": "webhook", "ephemeral": True, "hasRun": True,
                    "boxSessionId": launch}}}))
         return live
 
@@ -519,6 +559,37 @@ class Cli(unittest.TestCase):
         self.assertNotIn("stopped", entry)
         self.assertNotIn("hibernatedAt", entry)
         self.assertNotIn("hibernationGeneration", entry)
+
+    def test_ephemeral_cleanup_keeps_hibernated_hooks_until_explicit_stop(self):
+        self.registry.write_text(json.dumps({"version": 1, "sessions": {
+            "parked": {"origin": "webhook", "ephemeral": True,
+                       "stopped": True, "hibernatedAt": "2026-10-30T00:00:00Z"},
+            "finished": {"origin": "webhook", "ephemeral": True, "stopped": True},
+            "manual": {"stopped": True}}}))
+        supervisor = (SRC / "supervisor.sh").read_text()
+        function = re.search(r"^reap_ephemeral\(\) \{.*?^\}", supervisor, re.M | re.S)[0]
+        script = self.work / "reap.sh"
+        script.write_text(function + "\n" + '''
+JQ=jq
+TMUX=false
+registry_lock() { :; }
+registry_unlock() { :; }
+registry_edit() {
+  jq "$@" "$REGISTRY_FILE" > "$REGISTRY_FILE.next" && mv "$REGISTRY_FILE.next" "$REGISTRY_FILE"
+}
+sweep_orphan_filters() { :; }
+reap_ephemeral
+''')
+        env = {**self.env, "REGISTRY_FILE": str(self.registry)}
+
+        def reap():
+            result = subprocess.run([shutil.which("bash"), str(script)], env=env,
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(self.registry.read_text())["sessions"]
+        self.assertEqual(set(reap()), {"parked", "manual"})
+        self.assertEqual(self.run_cli("stop", "parked").returncode, 0)
+        self.assertEqual(set(reap()), {"manual"})
 
     def test_hibernate_respects_exclusion(self):
         self.make_live_claude()

@@ -168,9 +168,10 @@ Two delivery shapes:
                          claim over any watch, GitHub or not.
                          A spawned session is subscribed to the event's own
                          repo for it, so its own CI spawns no sibling.
-                         THERE IS A CEILING: all sessions running or queued
+                         THERE IS A CEILING: hook sessions running or queued
                          share a RAM-sized limit (about one/GiB by default),
-                         which sessionLimit can override. Hook sessions are
+                         which sessionLimit can override. Manual sessions bypass
+                         it and are never hibernated. Hook sessions are
                          removed by the agent they start, so enough of them
                          still running stall every watch on the box. A batch
                          that arrives then is QUEUED, not dropped: the spawn
@@ -516,12 +517,12 @@ hook_capacity_warning() {
     return 0
   fi
   [ "$1" -ge "$2" ] || return 0
-  printf '%s' "$1 of at most $2 sessions are running or queued, so every \
+  printf '%s' "$1 of at most $2 hook sessions are running or queued, so every \
 standing watch is stalled: a matching event batch starts nothing now. The \
 spawn wrapper DECLINES it (exit 75) and the receiver holds it, re-offering it \
 as slots free and dropping it only once the wait outlasts \
 LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix. Free \
-a slot (agent-box-session ls, then agent-box-session stop NAME, or \
+a hook slot (agent-box-session ls, then agent-box-session stop NAME, or \
 agent-box-session rm NAME to delist it for good), or raise \
 sessionLimit in the box configuration."
 }

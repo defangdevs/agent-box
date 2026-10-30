@@ -1055,10 +1055,6 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
         # ensured profile remains available as the default for normal workers.
         profile, args = None, []
     try:
-        # Read before the lock (issue #748): capacity_check's tmux spawn must
-        # not run while holding sessions_lock(), or a slow/contended tmux
-        # starves every other writer waiting on the same lock.
-        live = capacity_live_checked()
         with sessions_lock():
             sessions, version = load_sessions()
             if only_rc:
@@ -1080,8 +1076,6 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                      for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
-            capacity_check(sessions, [name], live=live,
-                           exempt=[name] if agent == "shell" else ())
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
@@ -4477,10 +4471,9 @@ def session_list_payload():
     limit = capacity["max"]
     pending = {n for n, e in sessions.items() if e.get("stopped") is not True}
     died = {n for n, e in sessions.items() if crashed_status(e) is not None}
-    shells = {n for n, e in sessions.items() if e.get("agent") == "shell"}
     # The same admission order capacity_check's spawn branch uses: a pending
     # name past the free slots is queued, not starting.
-    unmetered = died | shells
+    unmetered = capacity_unmetered(sessions, live)
     admitted = live | unmetered | set(
         sorted(pending - live - unmetered)[
             :max(0, limit - len(live - unmetered))])
@@ -4974,12 +4967,12 @@ BODY = """<main>
   <div id="msg-slot">{message}</div>
   <section aria-labelledby="resource-usage" data-resources-url="{base}/resources">
     <h2 id="resource-usage">Resource usage<a class="heading-anchor" href="#resource-usage" aria-label="Copy link to Resource usage" title="Copy link to Resource usage"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
-    <p class="note">Box CPU, memory and disk; your session slots. Refreshes every 5 seconds.</p>
+    <p class="note">Box CPU, memory and disk; hook session slots. Manual sessions bypass the limit. Refreshes every 5 seconds.</p>
     <dl class="resource-grid">
       <div><dt>CPU</dt><dd data-resource="cpu">Loading...</dd></div>
       <div><dt>Memory</dt><dd data-resource="memory">Loading...</dd></div>
       <div><dt>Disk</dt><dd data-resource="disk">Loading...</dd></div>
-      <div><dt>Sessions</dt><dd data-resource="sessions">Loading...</dd></div>
+      <div><dt>Hook sessions</dt><dd data-resource="sessions">Loading...</dd></div>
     </dl>
     <noscript><p class="note">Enable JavaScript to view resource usage.</p></noscript>
   </section>
@@ -10383,11 +10376,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # second thread, or the CLI — could pick the same free name, and
             # the later rename would drop the earlier session outright.
             try:
-                # Read before the lock (issue #748): capacity_check's tmux
-                # spawn must not run while holding sessions_lock(), or a
-                # slow/contended tmux starves every other writer waiting on
-                # the same lock.
-                live = capacity_live_checked()
                 with sessions_lock():
                     sessions, version = load_sessions()
                     # The name is always auto-derived: there is no name field
@@ -10398,8 +10386,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
-                    capacity_check(sessions, [name], live=live,
-                                   exempt=[name] if agent == "shell" else ())
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,

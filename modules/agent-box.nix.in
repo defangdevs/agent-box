@@ -1779,9 +1779,11 @@ in
       type = lib.types.nullOr lib.types.ints.positive;
       default = null;
       description = ''
-        Maximum running or queued sessions for the single-user v1 box.
+        Maximum running or queued hook sessions for the single-user v1 box.
+        User-created sessions do not count toward this limit and can always
+        be added or restarted.
         Null derives the limit from kernel-reported physical RAM at roughly
-        one session per GiB, rounded up so kernel reservations do not turn a
+        one hook session per GiB, rounded up so kernel reservations do not turn a
         nominal 4 GiB VM into three slots. Set a positive integer to override
         that automatic budget. This is overload control, not a memory
         guarantee or a cross-user quota.
@@ -1792,10 +1794,11 @@ in
       type = lib.types.ints.unsigned;
       default = 30;
       description = ''
-        Minimum age of a harness's terminal turn record before a full box
-        may hibernate that quiescent runtime to admit another one. Zero is
+        Minimum age of a hook harness's terminal turn record before a full
+        hook budget may hibernate that quiescent hook to admit another one. Zero is
         useful for tests. This is not an idle reaper: no session is parked
-        while the shared session limit has room.
+        while the hook session limit has room. User-created sessions are never
+        hibernated.
       '';
     };
 

@@ -3255,9 +3255,13 @@ sweep_lease_state() {
 # which is what makes the name reusable; sweep_session_state (above) then
 # reclaims the launch id on this same tick, so the next holder of the name
 # cannot inherit this one's transcript.
+# Hibernation preserves even an ephemeral hook: its name and exact native
+# conversation are needed by a later activation. Explicit stop clears that
+# marker and returns the entry to the ordinary one-shot cleanup path.
 reap_ephemeral() {
   _cand="$($JQ -r '.sessions | to_entries[]
-                   | select(.value.ephemeral == true and .value.stopped == true)
+                   | select(.value.ephemeral == true and .value.stopped == true
+                            and .value.hibernatedAt == null)
                    | .key' "$REGISTRY_FILE" 2>/dev/null)" || return 0
   [ -n "$_cand" ] || return 0
   _gone=""
@@ -3275,7 +3279,8 @@ reap_ephemeral() {
     # between the candidate scan and here must not be delisted by a decision
     # taken before it came back.
     $JQ -e --arg s "$_n" \
-      '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true' \
+      '.sessions[$s].ephemeral == true and .sessions[$s].stopped == true
+       and .sessions[$s].hibernatedAt == null' \
       "$REGISTRY_FILE" >/dev/null 2>&1 || continue
     registry_edit --arg s "$_n" 'del(.sessions[$s])'
     _gone=1

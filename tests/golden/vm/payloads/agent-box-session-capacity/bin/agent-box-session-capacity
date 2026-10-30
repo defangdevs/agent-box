@@ -1,7 +1,7 @@
 #! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
 # Shared admission policy for the single-user v1 box (issue #662).
 # Callers hold the sessions.json sidecar lock through this check AND their
-# registry write / tmux spawn. Non-stopped entries reserve pending starts.
+# registry write / tmux spawn. Non-stopped hook entries reserve pending starts.
 import os as capacity_os
 import subprocess as capacity_subprocess
 
@@ -92,14 +92,37 @@ def capacity_live_checked():
         raise SessionCapacityError("Cannot check session capacity: %s" % exc) from exc
 
 
+def capacity_is_hook(name, entry=None):
+    """Use recorded provenance, with a name fallback for older hook sessions."""
+    entry = entry if isinstance(entry, dict) else {}
+    origin = entry.get("origin")
+    return origin == "webhook" or (not origin and name.startswith("hook-"))
+
+
+def capacity_unmetered(sessions, names=()):
+    """Manual sessions, shells and post-mortem panes never use hook slots."""
+    def exempt(name):
+        entry = sessions.get(name)
+        if not capacity_is_hook(name, entry):
+            return True
+        if not isinstance(entry, dict):
+            return False
+        died = entry.get("died")
+        return (entry.get("agent") == "shell" or died is True
+                or (isinstance(died, int) and not isinstance(died, bool)))
+
+    return {name for name in set(sessions) | set(names) if exempt(name)}
+
+
 def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
                    exempt=()):
-    """Admit new/revived targets, or one supervisor spawn.
+    """Admit new/revived hooks, or one supervisor spawn.
 
     On boot or after a limit reduction, an overfull registry is a queue:
     keep live panes and admit pending names in sorted order up to the limit.
-    Existing panes are never killed. Ordinary adds cannot jump that queue.
-    `exempt` is for an unmetered target that is not in the registry yet.
+    Existing panes are never killed. User-created sessions bypass the cap.
+    New targets are hook reservations unless the caller includes them in
+    `exempt`; registered targets use their recorded provenance.
     """
     try:
         limit = capacity_limit() if limit is None else limit
@@ -108,11 +131,6 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     live = capacity_live_checked() if live is None else set(live)
     pending = {name for name, entry in sessions.items()
                if isinstance(entry, dict) and entry.get("stopped") is not True}
-    # A shell pane is an operator terminal rather than an agent worker. It
-    # shares the registry so it can be listed, stopped and resumed like other
-    # sessions, but must not consume an agent worker slot (issue #795).
-    shells = {name for name, entry in sessions.items()
-              if isinstance(entry, dict) and entry.get("agent") == "shell"}
     # A crash is flagged `died`, not `stopped` (issue #516), so a died entry
     # stays in `pending` -- it must remain its own candidate for revival by
     # `agent-box-session restart`, or a stale flag on a session that already
@@ -126,15 +144,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     # Same rule as the settings daemon's crashed_status(): True or an int
     # exit status is a crash, anything else (False, null) is not.
 
-    def crashed(entry):
-        value = entry.get("died") if isinstance(entry, dict) else None
-        if isinstance(value, bool):
-            return value
-        return isinstance(value, int)
-
-    died = {name for name, entry in sessions.items() if crashed(entry)}
-    exempt = set(exempt)
-    unmetered = died | shells | exempt
+    unmetered = capacity_unmetered(sessions, live) | set(exempt)
     used = (live | pending) - unmetered
     targets = set(targets)
     if spawning:
@@ -151,7 +161,7 @@ def capacity_check(sessions, targets=(), spawning=False, live=None, limit=None,
     if not allowed:
         raise SessionCapacityError(
             "Session limit reached (%d running or queued, limit %d). "
-            "Stop a session before starting another." % (len(used), limit))
+            "Stop a hook session before starting another hook." % (len(used), limit))
     return {"used": len(used), "max": limit}
 
 # Conservative harness quiescence for capacity-pressure hibernation (#858).
@@ -543,9 +553,8 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
     harness = entry.get("agent")
     if harness not in ("claude", "codex"):
         return None
-    if ((entry.get("stopped") is True and not parked)
-            or entry.get("ephemeral") is True
-            or entry.get("origin") == "webhook" or name.startswith("hook-")
+    if (not capacity_is_hook(name, entry)
+            or (entry.get("stopped") is True and not parked)
             or _hibernate_crashed(entry)):
         return None
     # These panes own a daemon, not one resumable conversation. Recognize
