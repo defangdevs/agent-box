@@ -434,10 +434,13 @@ class Pairing(unittest.TestCase):
         self.assertEqual(self.post("/codex/pairing/start")[0], 303)
         self.assertEqual(self.post("/codex/pairing/start")[0], 429)
 
-    def test_a_full_box_answers_503(self):
-        self.module.capacity_limit = lambda: 0
+    def test_pairing_bypasses_a_full_hook_budget(self):
+        self.module.capacity_limit = lambda: 1
+        self.write_sessions({"hook-full": {"agent": "claude", "origin": "webhook"}})
         status, _ = self.post("/codex/pairing/start")
-        self.assertEqual(status, 503)
+        self.assertEqual(status, 303)
+        self.assertEqual(self.sessions()["codex"]["origin"], "pairing")
+        self.assertEqual(self.sessions()["hook-full"]["origin"], "webhook")
 
     def test_codex_not_yet_installed_is_signed_out_and_start_is_409(self):
         """The card exists wherever codex is installable, so the GET is not
