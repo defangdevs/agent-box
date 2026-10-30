@@ -134,6 +134,18 @@
       }
       return used.toFixed(1) + " / " + total.toFixed(1) + " " + units[unit] + " used";
     }
+    function show(s) {
+      s = s && s.ok ? s : {};
+      var values = {
+        cpu: s.cpu ? s.cpu.busy_percent + "% busy" : "Unavailable",
+        memory: space(s.memory),
+        disk: space(s.disk),
+        sessions: s.sessions ? s.sessions.used + " / " + s.sessions.limit + " in use" : "Unavailable"
+      };
+      Object.keys(values).forEach(function (name) {
+        section.querySelector('[data-resource="' + name + '"]').textContent = values[name];
+      });
+    }
     function refresh() {
       if (document.hidden || pending) { return; }
       pending = true;
@@ -146,17 +158,9 @@
       }).then(function (r) {
         if (!r.ok) { throw new Error(); }
         return r.json();
-      }).catch(function () { return null; }).then(function (s) {
-        s = s && s.ok ? s : {};
-        var values = {
-          cpu: s.cpu ? s.cpu.busy_percent + "% busy" : "Unavailable",
-          memory: space(s.memory),
-          disk: space(s.disk),
-          sessions: s.sessions ? s.sessions.used + " / " + s.sessions.limit + " in use" : "Unavailable"
-        };
-        Object.keys(values).forEach(function (name) {
-          section.querySelector('[data-resource="' + name + '"]').textContent = values[name];
-        });
+      }).then(show).catch(function () {
+        show(null);
+      }).finally(function () {
         window.clearTimeout(timeout);
         pending = false;
       });
