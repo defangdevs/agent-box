@@ -38,6 +38,7 @@ cat > "$work/bin/python3" <<EOF
 #!$BASH_BIN
 shift            # the webhook.py path
 printf '%s\n' "\$@"
+exit "\${CLAIM_TEST_EXIT:-0}"
 EOF
 chmod +x "$work/bin/python3"
 PATH="$work/bin:$PATH"; export PATH
@@ -114,8 +115,8 @@ else no "the push ref claim is fully qualified" \
 
 # --- the shape the guide tells you to use --------------------------------
 # A PR is claimed with the BARE number, not pr:N. GitHub reports a comment
-# on a PR as issue_comment with issue.number, so pr:N alone leaves reviews
-# and comments on your own PR unclaimed — which is the #417 collision.
+# on a PR as issue_comment with issue.number, so pr:N alone leaves discussion
+# comments on your own PR unclaimed - which is the #417 collision.
 # Assert the documented example covers both spellings.
 for p in pull_request.number issue.number; do
   covers "the documented PR claim covers $p" "$p" \
@@ -150,6 +151,75 @@ else ok "commit status is left unclaimed, not guessed at"; fi
 n=$(include_of defangdevs/agent-box --all-events --claim=pr:42 | jq '.any | length')
 [ "$n" = 1 ] && ok "--claim=SPEC is accepted too" \
   || no "--claim=SPEC is accepted too" "got $n"
+
+# --- coverage hints advise without widening the claim -------------------
+out=$(run defangdevs/agent-box --claim branch:fix/42 --events actionable)
+if grep -q 'claim hint: a branch claim' "$work/err" \
+   && grep -q -- '--claim <PR number> and --claim <issue number>' "$work/err" \
+   && printf '%s\n' "$out" | awk '/^--include$/ { getline; print; exit }' \
+      | jq -e '[.all[0].any[].path] | all(endswith(".number") | not)' >/dev/null; then
+  ok "a branch-only hint suggests numbered claims without inferring 42"
+else
+  no "a branch-only hint suggests numbered claims without inferring 42" "$(cat "$work/err")"
+fi
+
+run defangdevs/agent-box --claim=42 --events actionable >/dev/null
+if grep -q 'claim hint: numbered claims do not cover branch CI' "$work/err" \
+   && grep -q 'different numbers need their own --claim' "$work/err" \
+   && ! grep -q 'misses PR discussion comments' "$work/err"; then
+  ok "a bare number gets CI and linked-item hints, without a narrow-PR warning"
+else
+  no "a bare number gets CI and linked-item hints, without a narrow-PR warning" "$(cat "$work/err")"
+fi
+
+run defangdevs/agent-box --claim pr:42 --claim issue:41 --events actionable >/dev/null
+if grep -q -- '--claim pr:42 misses PR discussion comments' "$work/err" \
+   && grep -q -- 'use --claim 42 to cover those too' "$work/err"; then
+  ok "a different issue number does not cover PR 42 discussion comments"
+else
+  no "a different issue number does not cover PR 42 discussion comments" "$(cat "$work/err")"
+fi
+
+for extra in 42 issue:42; do
+  run defangdevs/agent-box --claim pr:42 --claim "$extra" \
+      --claim branch:fix/42 --events actionable >/dev/null
+  if grep -q 'misses PR discussion comments\|numbered claims do not cover branch CI\|a branch claim' "$work/err"; then
+    no "paired $extra and branch claims get no missing-coverage hints" "$(cat "$work/err")"
+  else
+    ok "paired $extra and branch claims get no missing-coverage hints"
+  fi
+done
+
+hint_sha=0123456789abcdef0123456789abcdef01234567
+run defangdevs/agent-box --claim issue:41 --claim "sha:$hint_sha" \
+    --events actionable >/dev/null
+if grep -q 'numbered claims do not cover branch CI' "$work/err"; then
+  no "a commit claim already supplies CI scope" "$(cat "$work/err")"
+else
+  ok "a commit claim already supplies CI scope"
+fi
+
+for mode in observer commit watch non-github; do
+  case "$mode" in
+    (observer) run defangdevs/agent-box --events actionable >/dev/null ;;
+    (commit) run defangdevs/agent-box --claim "sha:$hint_sha" --events terminal-ci >/dev/null ;;
+    (watch) run defangdevs/agent-box --claim pr:42 --deliver-to subagent --all-events >/dev/null ;;
+    (non-github) run gitlab:group/project --claim pr:42 --events actionable >/dev/null ;;
+  esac
+  if grep -q 'claim hint:' "$work/err"; then
+    no "$mode gets no GitHub session coverage hints" "$(cat "$work/err")"
+  else
+    ok "$mode gets no GitHub session coverage hints"
+  fi
+done
+
+CLAIM_TEST_EXIT=7 run defangdevs/agent-box --claim 42 --events actionable >/dev/null
+st=$?
+if [ "$st" -eq 7 ] && ! grep -q 'claim hint:' "$work/err"; then
+  ok "a failed subscription preserves its status and gets no coverage hints"
+else
+  no "a failed subscription preserves its status and gets no coverage hints" "status $st: $(cat "$work/err")"
+fi
 
 # --- the flag never reaches webhook.py ----------------------------------
 if run defangdevs/agent-box --all-events --claim pr:42 --note hi | grep -qx -- --claim
