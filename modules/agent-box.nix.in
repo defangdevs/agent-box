@@ -3271,10 +3271,15 @@ in
     # fixed argv and never sees the supervisor's -c overrides. Both keys are
     # required — default_permissions = ":danger-full-access" opens the
     # filesystem and the network but leaves approval_policy at "on-request".
-    // lib.optionalAttrs codexFullAccess {
-      "codex/config.toml".text = ''
+    // lib.optionalAttrs (builtins.elem "codex" cfg.installAgents) {
+      "codex/config.toml".text = lib.optionalString codexFullAccess ''
         approval_policy = "never"
         sandbox_mode = "danger-full-access"
+      '' + ''
+        [[hooks.SessionStart]]
+        [[hooks.SessionStart.hooks]]
+        type = "command"
+        command = "${claudeSessionStartHook} codex"
       '';
     };
 

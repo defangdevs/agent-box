@@ -3683,6 +3683,19 @@ def _hibernate_codex_transcript(name, entry):
     if launch is None:
         return None
     root = _hibernate_codex_home(entry)
+    # SessionStart is authoritative for prompt-less sessions and /new.
+    # Never park an older completed segment while its replacement is active.
+    try:
+        live = (_hibernate_home() / ".local/state/agent-box/live-session-id"
+                / launch).read_text(encoding="ascii").strip()
+    except FileNotFoundError:
+        live = None
+    except (OSError, UnicodeDecodeError):
+        return None
+    if live is not None:
+        native = _hibernate_uuid(live)
+        path = _hibernate_codex_exact(root, native) if native else None
+        return (native, path, state_path) if path else None
     # A resumed Codex thread can produce a newer rollout carrying the same
     # stable Agentbox launch marker. Resolve that first; the persisted native
     # pointer is the fallback for prompt-less sessions whose rollout has no
@@ -6804,7 +6817,7 @@ case "$cmd" in
       [ -n "$n" ] || continue
       [ "$n" != "$me" ] || continue
       peers=$((peers + 1))
-      harness="-"; cwd="-"; unmanaged="managed"; dead="-"
+      harness="-"; cwd="-"; unmanaged="managed"; dead="-"; rc="false"
       if [ -s "$REGISTRY_FILE" ]; then
         # One read per session, and a session tmux knows but the registry
         # does not is reported as `unmanaged` rather than skipped: it is
@@ -6812,10 +6825,11 @@ case "$cmd" in
         meta="$("$JQ" -r --arg n "$n" '
           if (.sessions | has($n)) then
             [(.sessions[$n].agent // "-"),
-             (.sessions[$n].workingDirectory // "-"),
+             ((.sessions[$n].workingDirectory // "-") | if . == "" then "-" else . end),
              "managed",
-             (.sessions[$n].died // "-" | tostring)] | @tsv
-          else "-\t-\tunmanaged\t-" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+             (.sessions[$n].died // "-" | tostring),
+             (.sessions[$n].remoteControl // false | tostring)] | @tsv
+          else "-\t-\tunmanaged\t-\tfalse" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
         # EVERY field carries a non-empty sentinel, and that is load-bearing
         # rather than tidy: tab is an IFS WHITESPACE character, so bash `read`
         # folds a run of them into one delimiter and an empty field simply
@@ -6823,13 +6837,14 @@ case "$cmd" in
         # <TAB><TAB>`, whose empty third field collapsed — `unmanaged` took
         # the fourth, so every registered session read as "not in the
         # registry" and a crash never reported DIED (CodeRabbit on PR #522).
-        IFS="$(printf '\t')" read -r harness cwd unmanaged dead <<<"$meta"
+        IFS="$(printf '\t')" read -r harness cwd unmanaged dead rc <<<"$meta"
         # A jq that failed leaves all four empty; put the sentinels back, or
         # an unreadable registry reads as a corpse with no exit status.
         [ -n "$harness" ] || harness="-"
         [ -n "$cwd" ] || cwd="-"
         [ -n "$unmanaged" ] || unmanaged="managed"
         [ -n "$dead" ] || dead="-"
+        [ -n "$rc" ] || rc="false"
         # No recorded working directory means the supervisor starts it in
         # $HOME — say that, rather than a dash a reader has to interpret. It
         # is where the session STARTED either way: an agent can cd anywhere,
@@ -6845,6 +6860,19 @@ case "$cmd" in
       kind="interactive"
       case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
       [ "$unmanaged" = "managed" ] || kind="$kind, not in the registry"
+      # A codex session with remote control is the app-server pairing daemon,
+      # not a TUI: it hosts app-created threads, and the filter file below is
+      # keyed by this tmux name while the claim belongs to ONE thread inside
+      # it. Say so, and name the thread the daemon registered, so a reader
+      # does not take the daemon for the worker or message the wrong name.
+      if [ "$harness" = codex ] && [ "$rc" = true ]; then
+        kind="$kind, Codex Remote Control daemon: its claims below are held by a thread it hosts, not by this tmux session"
+        tf="$sd/codex/$user-$n.json"
+        if [ -s "$tf" ]; then
+          th="$("$JQ" -r '.thread // empty' "$tf" 2>/dev/null)" || th=""
+          [ -z "$th" ] || kind="$kind (thread $th)"
+        fi
+      fi
       # A session whose agent CRASHED is still a live tmux session, because
       # the pane it left behind is a post-mortem shell (issue #516). Nobody
       # is working in it, so it is not a peer to yield to — and yielding to
@@ -17154,6 +17182,27 @@ esac
       printf '%s' "''${b: -36}"
     }
 
+    codex_live_thread() {
+      # SessionStart records the native conversation even without a kickoff
+      # prompt. Follow /new and /resume before considering an older marker.
+      local thread=""
+      case "$1" in
+        (*[!0-9a-fA-F-]*|"") return 0 ;;
+        (????????-????-????-????-????????????) ;;
+        (*) return 0 ;;
+      esac
+      read -r thread 2>/dev/null < "$HOME/.local/state/agent-box/live-session-id/$1" \
+        || thread=""
+      case "$thread" in
+        (*[!0-9a-fA-F-]*|"") return 0 ;;
+        (????????-????-????-????-????????????) ;;
+        (*) return 0 ;;
+      esac
+      [ -n "$($FIND "''${2:-$HOME/.codex}"/sessions \
+          -name "rollout-*-$thread.jsonl" 2>/dev/null | head -n1)" ] || return 0
+      printf '%s' "$thread"
+    }
+
     codex_native_thread() {
       # Accept a persisted native pointer only while that exact rollout remains
       # on disk. Empty is the safe answer: the caller can still derive a target
@@ -17249,10 +17298,9 @@ esac
 
     codex_sync_last=0
     sync_codex_threads() {
-      # Resolve newly-started Codex sessions after their rollout appears. Codex
-      # does expose the UUID to SessionStart hooks, but releases 0.148 through
-      # 0.161 can time out before a hook command body runs; the supervisor already
-      # owns all inputs needed to resolve the same id without that lifecycle race.
+      # Publish newly-started Codex sessions after their rollout appears. The
+      # SessionStart record supplies the native id even without a kickoff
+      # prompt; the launch marker remains the fallback for older sessions.
       # Ten seconds bounds the scan cost for the selected prompt-less session
       # while staying below local-whatsapp's normal retry interval.
       [ -f "$HOME/.local/state/local-whatsapp/ready" ] || return 0
@@ -17276,14 +17324,9 @@ esac
           fi
           session_watches_events "$_name" && _thread="$(codex_wake_thread "$_name")"
         else
-          _source="$($JQ -r --arg s "$_name" '.[$s].source // empty' \
-            "$HOME/.local/state/local-whatsapp/codex-threads.json" 2>/dev/null)" || _source=""
-          if [ "$_source" = agent-box ] \
-            && [ -n "$(codex_registered_thread "$_name" "$_cxhome")" ]; then
-            continue
-          fi
           _launch="$(session_launch_id "$_name")"
-          _thread="$(codex_rollout_uuid "$_launch" "$_cxhome")"
+          _thread="$(codex_live_thread "$_launch" "$_cxhome")"
+          [ -n "$_thread" ] || _thread="$(codex_rollout_uuid "$_launch" "$_cxhome")"
         fi
         if [ -n "$_thread" ]; then
           codex_publish_thread "$_name" "$_thread"
@@ -17465,7 +17508,9 @@ esac
           fi
         else
           cxhome="$(resolve_codex_home "$sprofile")"
-          codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"
+          codex_target="$(codex_live_thread "$bid" "$cxhome")"
+          [ -n "$codex_target" ] \
+            || codex_target="$(codex_rollout_uuid "$bid" "$cxhome")"
           [ -n "$codex_target" ] \
             || codex_target="$(codex_native_thread "$sname" "$cxhome")"
           [ -n "$codex_target" ] \
@@ -17556,6 +17601,7 @@ esac
       # without it codex's own defaults (which depend on project trust) are the
       # right answer and pinning would change them.
       codex_autonomy() {
+        [ -z "''${codex_local_arg:-}" ] || cmd="$cmd $codex_local_arg"
         if [ "$skip" = true ]; then
           cmd="$cmd --dangerously-bypass-approvals-and-sandbox"
         elif [ -n "''${AGENT_BOX_CODEX_FULL_ACCESS:-}" ]; then
@@ -17650,6 +17696,15 @@ esac
           # inside the pane, so the supervisor's own environment cannot see a
           # profile's override here.
           mirror_codex_standalone "$bin" "$(resolve_codex_home "$sprofile")"
+          # Newer Codex TUIs can delegate to a shared server whose launch
+          # environment belongs to another session. Keep ordinary terminal
+          # sessions local so SessionStart sees this pane's launch id. Older
+          # versions already run locally and do not recognize this flag.
+          codex_local_arg=""
+          if [ "$rcdaemon" != true ] && timeout --kill-after=1s 2s "$bin" --help 2>/dev/null \
+              | $GREP -F -- '--no-daemon' >/dev/null; then
+            codex_local_arg=--no-daemon
+          fi
           if [ "$rcdaemon" = true ]; then
             # Codex remote control uses a dedicated app-server daemon, not a
             # TUI flag (issue 103), whereas claude takes a
@@ -17722,6 +17777,11 @@ esac
             if [ -n "$prompt" ]; then
               cmd="$cmd -- $(printf '%q' "[agent-box session $bid] $prompt")"
             fi
+          fi
+          if [ "$rcdaemon" != true ]; then
+            # env-exec loads the profile before this wrapper sets the actual
+            # Codex owner pid. Nested CLIs inherit it and the hook rejects them.
+            cmd="$(printf '%q' "$BASH") -c $(printf '%q' 'export AGENT_BOX_CODEX_PID=$$; exec "$@"') agent-box-codex $cmd"
           fi
           ;;
         shell)
@@ -18263,7 +18323,10 @@ esac
   # atomically with the supervisor that consumes the records.
   claudeSessionStartHook = pkgs.writeShellScript "agent-box-claude-session-start-hook" ''
     set -u
-    # SessionStart hook for supervisor-spawned claude sessions (issue #223).
+    # SessionStart hook for supervisor-spawned Claude and Codex sessions
+    # (issues #223, #825). Codex's system config also uses this recorder: its
+    # native id cannot be chosen up front, and a prompt-less session has no
+    # launch marker in its conversation. Both hook payloads carry session_id.
     # A clear, a compact or a resume rotates claude's live session id
     # mid-process: the running process keeps its Remote Control registration but
     # opens a NEW transcript under a new uuid, while the supervisor still holds
@@ -18287,10 +18350,42 @@ esac
       esac
       return 1
     }
+    codex_process_matches() {
+      # Tool shells inherit the launch id. Only the nearest Codex owner may
+      # update it; a nested `codex exec` has its own pid and must not replace
+      # the terminal's conversation. exec-server is a transport child, not a
+      # conversation owner. The launch wrapper sets the pid just before exec.
+      local expected="''${AGENT_BOX_CODEX_PID:-}" parent=$PPID next key value rest n binary
+      local -a args
+      case "$expected" in (""|*[!0-9]*) return 1 ;; esac
+      for ((n = 0; n < 64; n++)); do
+        [ "$parent" -gt 1 ] || return 1
+        mapfile -d ''' -t args 2>/dev/null < "/proc/$parent/cmdline" || return 1
+        binary="''${args[0]:-}"
+        case "''${binary##*/}" in
+          codex|.codex-wrapped)
+            if [ "''${args[1]:-}" != exec-server ]; then
+              [ "$parent" = "$expected" ]
+              return
+            fi
+            ;;
+        esac
+        next=""
+        while read -r key value rest; do
+          if [ "$key" = PPid: ]; then next=$value; break; fi
+        done 2>/dev/null < "/proc/$parent/status"
+        case "$next" in (""|*[!0-9]*) return 1 ;; esac
+        parent=$next
+      done
+      return 1
+    }
     # Drain stdin BEFORE any gate can exit (the #220/#222 lesson): claude is
     # still writing the payload, and an early exit would slam the pipe shut
     # under it. Unreachable-in-practice gates are exactly the ones that bite.
     payload="$(cat 2>/dev/null)" || payload=""
+    if [ "''${1:-}" = codex ]; then
+      codex_process_matches || exit 0
+    fi
     box="''${AGENT_BOX_SESSION_ID:-}"
     valid_uuid "$box" || exit 0
     sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)" || exit 0
@@ -19819,10 +19914,15 @@ in
     # fixed argv and never sees the supervisor's -c overrides. Both keys are
     # required — default_permissions = ":danger-full-access" opens the
     # filesystem and the network but leaves approval_policy at "on-request".
-    // lib.optionalAttrs codexFullAccess {
-      "codex/config.toml".text = ''
+    // lib.optionalAttrs (builtins.elem "codex" cfg.installAgents) {
+      "codex/config.toml".text = lib.optionalString codexFullAccess ''
         approval_policy = "never"
         sandbox_mode = "danger-full-access"
+      '' + ''
+        [[hooks.SessionStart]]
+        [[hooks.SessionStart.hooks]]
+        type = "command"
+        command = "${claudeSessionStartHook} codex"
       '';
     };
 
