@@ -336,10 +336,17 @@ let
 
       Use the BARE number for a PR, as above. GitHub reports a PR comment as an
       `issue_comment` carrying `issue.number`, not `pull_request.number` - so
-      `--claim pr:42` claims the PR itself and leaves comments and reviews ON it
-      unclaimed, which is the one event a reviewer is most likely to generate. A
-      bare `42` claims both spellings. `pr:42` and `issue:42` exist for when you
-      deliberately want only one.
+      `--claim pr:42` claims the PR and its reviews but leaves those discussion
+      comments unclaimed. A bare `42` claims both spellings. `pr:42` and `issue:42`
+      exist for when you deliberately want only one payload path.
+
+      The CLI prints coverage hints after a successful session claim. A branch
+      claim needs the PR's number to cover discussion comments; a numbered claim
+      needs a branch or commit claim for CI. Linked issues and PRs with different
+      numbers each need their own claim: `--claim 42` does not cover comments on
+      linked issue #41 or PR #43. No association is inferred from a branch name.
+      Branch claims also miss commit-status events; add the full current commit
+      SHA for coverage across all CI event shapes for that commit.
 
       Use it rather than hand-writing `--include`. A claim only covers the payload
       paths it names, and a watch spawns on terminal CI failure reported through six
@@ -9478,9 +9485,15 @@ _hc_main "$@"
 
     Use the BARE number for a PR. GitHub reports a PR comment as an
     issue_comment carrying issue.number, not pull_request.number, so pr:42
-    claims the PR and leaves the comments and reviews ON it unclaimed — the
-    one event a reviewer is most likely to generate. pr:/issue: are for when
-    you deliberately want only one.
+    claims the PR and its reviews but leaves those discussion comments
+    unclaimed. pr:/issue: are for when you deliberately want only one path.
+
+    Successful session claims print coverage hints. A branch claim needs the
+    PR's number to cover its discussion comments; a numbered claim needs a
+    branch or commit claim for CI. Linked issues and PRs with DIFFERENT numbers
+    each need their own claim: a claim does not follow those associations.
+    Branch claims miss commit-status events; add the full current commit SHA
+    for coverage across all CI event shapes for that commit.
 
     Prefer this to hand-writing --include. A claim only covers the payload
     paths it names, and CI reports terminal failure under six event shapes —
@@ -10026,7 +10039,7 @@ _hc_main "$@"
     #   --claim branch:fix/42      everything CI reports against that branch
     #   --claim sha:<40 hex>       everything CI reports against that ONE commit
     #
-    # Repeatable, and the clauses OR together — `--claim pr:42 --claim
+    # Repeatable, and the clauses OR together - `--claim 42 --claim
     # branch:fix/42-thing` is the normal shape for picking up a PR.
     claim_clauses() {
       # claim_clauses SPEC — the JSON clauses for one spec, as a JSON array.
@@ -10083,8 +10096,8 @@ _hc_main "$@"
         # always know whether the events it will see call it an issue or a PR —
         # GitHub itself uses both for the same object (a PR comment arrives as
         # issue_comment with issue.number). This is why the documented example
-        # uses a bare number for a PR: `pr:42` alone leaves every comment and
-        # review ON that PR unclaimed, which is the #417 collision exactly.
+        # uses a bare number for a PR: `pr:42` alone leaves its discussion
+        # comments unclaimed, which is the #417 collision exactly.
         (number) "$JQ" -nc --argjson n "$_cl_val" \
                    '[{path:"pull_request.number", "in":[$n]},
                      {path:"issue.number", "in":[$n]}]' ;;
@@ -10127,6 +10140,38 @@ _hc_main "$@"
                      {path:"pull_request.head.ref", "in":[$b]},
                      {path:"ref", "in":["refs/heads/" + $b]}]' ;;
       esac
+    }
+
+    claim_coverage_hints() {
+      # Inspect the generated scope, so paired narrow claims count just like a
+      # bare number. Hints neither resolve associations nor change ownership.
+      case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        (github:*) ;;
+        (*:*) return 0 ;;
+        (*/*) ;;
+        (*) return 0 ;;
+      esac
+      printf '%s' "$2" | "$JQ" -r '
+        .any as $scope
+        | [$scope[] | select(.path == "pull_request.number") | .in[]] | unique as $prs
+        | [$scope[] | select(.path == "issue.number") | .in[]] | unique as $issues
+        | ($prs + $issues | length > 0) as $numbered
+        | ($scope | any(.path == "workflow_run.head_branch")) as $branch
+        | ($scope | any(.path == "workflow_run.head_sha")) as $commit
+        | (($prs - $issues)[] as $n
+           | "agent-box-webhook: claim hint: --claim pr:\($n) misses PR discussion comments sent as issue.number; use --claim \($n) to cover those too."),
+          (if $branch and ($numbered | not) then
+             "agent-box-webhook: claim hint: a branch claim does not cover PR discussion comments or linked issue comments; add --claim <PR number> and --claim <issue number> for the items you own."
+           elif $numbered and (($branch or $commit) | not) then
+             "agent-box-webhook: claim hint: numbered claims do not cover branch CI; if this is PR work, add --claim branch:<topic branch> or --claim sha:<full commit> for one commit."
+           else empty end),
+          (if $branch and ($commit | not) then
+             "agent-box-webhook: claim hint: branch claims miss commit-status events; add --claim sha:<full current commit> to cover all CI event shapes for that commit."
+           else empty end),
+          (if $numbered then
+             "agent-box-webhook: claim hint: linked issues or PRs with different numbers need their own --claim; associations are not followed automatically."
+           else empty end)
+      ' >&2
     }
 
     cmd="''${1:-}"; shift || true
@@ -10486,14 +10531,16 @@ _hc_main "$@"
           fi
         fi
         "$PY" "$SCRIPT" "$cmd" "$@" || exit $?
+        if [ "$deliver_to" = session ] && [ -n "''${claims:-}" ]; then
+          claim_coverage_hints "$topic" "$claim_any"
+        fi
         # Said after the subscription exists, so it never describes one that was
         # refused. The boundary is real and invisible: a numbered claim ends at
         # the merge, and the obvious next move — claiming the branch the work
         # merged onto — is the one this CLI now refuses (issue #706).
         if [ -n "''${merge_note:-}" ] && [ "$deliver_to" = session ]; then
-          echo "agent-box-webhook: that claim covers the PR or issue itself, its" \
-               "comments and its reviews, while it is open. POST-MERGE CI IS NOT" \
-               "COVERED — the work moves onto the default branch, and a default" \
+          echo "agent-box-webhook: if this claim is for a PR, POST-MERGE CI IS NOT COVERED." \
+               "The work moves onto the default branch, and a default" \
                "branch cannot be claimed. When it merges, re-subscribe with" \
                "--claim sha:<merge commit> (gh pr view N --json mergeCommit --jq" \
                ".mergeCommit.oid), never --claim branch:<default>." >&2

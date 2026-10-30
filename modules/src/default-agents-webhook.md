@@ -64,10 +64,17 @@ across with the commit instead:
 
 Use the BARE number for a PR, as above. GitHub reports a PR comment as an
 `issue_comment` carrying `issue.number`, not `pull_request.number` - so
-`--claim pr:42` claims the PR itself and leaves comments and reviews ON it
-unclaimed, which is the one event a reviewer is most likely to generate. A
-bare `42` claims both spellings. `pr:42` and `issue:42` exist for when you
-deliberately want only one.
+`--claim pr:42` claims the PR and its reviews but leaves those discussion
+comments unclaimed. A bare `42` claims both spellings. `pr:42` and `issue:42`
+exist for when you deliberately want only one payload path.
+
+The CLI prints coverage hints after a successful session claim. A branch
+claim needs the PR's number to cover discussion comments; a numbered claim
+needs a branch or commit claim for CI. Linked issues and PRs with different
+numbers each need their own claim: `--claim 42` does not cover comments on
+linked issue #41 or PR #43. No association is inferred from a branch name.
+Branch claims also miss commit-status events; add the full current commit
+SHA for coverage across all CI event shapes for that commit.
 
 Use it rather than hand-writing `--include`. A claim only covers the payload
 paths it names, and a watch spawns on terminal CI failure reported through six
