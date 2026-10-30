@@ -25,17 +25,20 @@ test('resource readings refresh independently and fit on a phone', async ({ page
   const value = (name: string) => page.locator(`[data-resource="${name}"]`);
   await expect(value('cpu')).toHaveText('Unavailable');
   await expect(value('memory')).toHaveText('1.0 / 4.0 GiB used');
-  await expect(value('disk')).toHaveText('20.0 / 60.0 GiB used');
+  await expect(value('disk')).toHaveText('40.0 / 60.0 GiB available');
   await expect(value('sessions')).toHaveText('0 / 4 in use');
   const grid = page.locator('.resource-grid');
-  expect(await grid.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  for (const width of [390, 195]) {
+    await page.setViewportSize({ width, height: 844 });
+    expect(await grid.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  }
 
   reading = { ...sample, cpu: { busy_percent: 0 }, memory: null,
     sessions: { used: 5, limit: 4 } };
   await page.clock.runFor(5000);
   await expect(value('cpu')).toHaveText('0% busy');
   await expect(value('memory')).toHaveText('Unavailable');
-  await expect(value('disk')).toHaveText('20.0 / 60.0 GiB used');
+  await expect(value('disk')).toHaveText('40.0 / 60.0 GiB available');
   await expect(value('sessions')).toHaveText('5 / 4 in use');
 });
 

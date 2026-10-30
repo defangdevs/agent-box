@@ -121,25 +121,26 @@
     var section = document.querySelector("[data-resources-url]");
     if (!section) { return; }
     var pending = false;
-    function space(reading) {
+    function space(reading, available) {
       if (!reading) { return "Unavailable"; }
       var total = reading.total_bytes;
-      var used = total - reading.available_bytes;
+      var amount = available ? reading.available_bytes : total - reading.available_bytes;
       var units = ["B", "KiB", "MiB", "GiB", "TiB"];
       var unit = 0;
       while (total >= 1024 && unit < units.length - 1) {
         total /= 1024;
-        used /= 1024;
+        amount /= 1024;
         unit += 1;
       }
-      return used.toFixed(1) + " / " + total.toFixed(1) + " " + units[unit] + " used";
+      return amount.toFixed(1) + " / " + total.toFixed(1) + " " + units[unit]
+        + (available ? " available" : " used");
     }
     function show(s) {
       s = s && s.ok ? s : {};
       var values = {
         cpu: s.cpu ? s.cpu.busy_percent + "% busy" : "Unavailable",
         memory: space(s.memory),
-        disk: space(s.disk),
+        disk: space(s.disk, true),
         sessions: s.sessions ? s.sessions.used + " / " + s.sessions.limit + " in use" : "Unavailable"
       };
       Object.keys(values).forEach(function (name) {
