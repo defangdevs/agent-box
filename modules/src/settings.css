@@ -14,6 +14,11 @@ h2:hover .heading-anchor, h2:focus-within .heading-anchor,
 .heading-anchor:focus { opacity: 1; }
 .heading-anchor:hover { color: #58a6ff; }
 section { margin: 28px 0; }
+.resource-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                 gap: 12px; margin: 12px 0 0; padding: 12px 16px;
+                 border: 1px solid #30363d; border-radius: 8px; }
+.resource-grid dt { color: #8b949e; font-size: 13px; }
+.resource-grid dd { margin: 4px 0 0; font-variant-numeric: tabular-nums; }
 .sec-head { display: flex; align-items: center; justify-content: space-between;
             gap: 12px; }
 .repo { position: fixed; top: 16px; right: 16px; display: inline-flex;

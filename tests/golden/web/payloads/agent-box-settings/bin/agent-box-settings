@@ -5667,6 +5667,11 @@ STYLE = """<style>
   .heading-anchor:focus { opacity: 1; }
   .heading-anchor:hover { color: #58a6ff; }
   section { margin: 28px 0; }
+  .resource-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                   gap: 12px; margin: 12px 0 0; padding: 12px 16px;
+                   border: 1px solid #30363d; border-radius: 8px; }
+  .resource-grid dt { color: #8b949e; font-size: 13px; }
+  .resource-grid dd { margin: 4px 0 0; font-variant-numeric: tabular-nums; }
   .sec-head { display: flex; align-items: center; justify-content: space-between;
               gap: 12px; }
   .repo { position: fixed; top: 16px; right: 16px; display: inline-flex;
@@ -6466,6 +6471,17 @@ BODY = """<main>
   <a class="back" href="{term_home}">&larr; workspace</a>
   <h1><span class="mark">{mark}</span>Settings</h1>
   <div id="msg-slot">{message}</div>
+  <section aria-labelledby="resource-usage" data-resources-url="{base}/resources">
+    <h2 id="resource-usage">Resource usage<a class="heading-anchor" href="#resource-usage" aria-label="Copy link to Resource usage" title="Copy link to Resource usage"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
+    <p class="note">Box CPU, memory and disk; your session slots. Refreshes every 5 seconds.</p>
+    <dl class="resource-grid">
+      <div><dt>CPU</dt><dd data-resource="cpu">Loading...</dd></div>
+      <div><dt>Memory</dt><dd data-resource="memory">Loading...</dd></div>
+      <div><dt>Disk</dt><dd data-resource="disk">Loading...</dd></div>
+      <div><dt>Sessions</dt><dd data-resource="sessions">Loading...</dd></div>
+    </dl>
+    <noscript><p class="note">Enable JavaScript to view resource usage.</p></noscript>
+  </section>
   {connect_section}
   {sessions_section}
   {profiles_section}
@@ -6853,6 +6869,55 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       .then(function (r) { if (!r.ok) { throw new Error(); } return r.json(); })
       .catch(function () { return null; });
   }
+  function resourceUsage() {
+    var section = document.querySelector("[data-resources-url]");
+    if (!section) { return; }
+    var pending = false;
+    function space(reading) {
+      if (!reading) { return "Unavailable"; }
+      var total = reading.total_bytes;
+      var used = total - reading.available_bytes;
+      var units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      var unit = 0;
+      while (total >= 1024 && unit < units.length - 1) {
+        total /= 1024;
+        used /= 1024;
+        unit += 1;
+      }
+      return used.toFixed(1) + " / " + total.toFixed(1) + " " + units[unit] + " used";
+    }
+    function refresh() {
+      if (document.hidden || pending) { return; }
+      pending = true;
+      var controller = new AbortController();
+      var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
+      fetch(section.getAttribute("data-resources-url"), {
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+        signal: controller.signal
+      }).then(function (r) {
+        if (!r.ok) { throw new Error(); }
+        return r.json();
+      }).catch(function () { return null; }).then(function (s) {
+        s = s && s.ok ? s : {};
+        var values = {
+          cpu: s.cpu ? s.cpu.busy_percent + "% busy" : "Unavailable",
+          memory: space(s.memory),
+          disk: space(s.disk),
+          sessions: s.sessions ? s.sessions.used + " / " + s.sessions.limit + " in use" : "Unavailable"
+        };
+        Object.keys(values).forEach(function (name) {
+          section.querySelector('[data-resource="' + name + '"]').textContent = values[name];
+        });
+        window.clearTimeout(timeout);
+        pending = false;
+      });
+    }
+    refresh();
+    window.setInterval(refresh, 5000);
+    document.addEventListener("visibilitychange", refresh);
+  }
+
   // The daemon can decide the current URL is no longer the right page:
   // /<user>/ redirects to the settings page once the last session is gone.
   // Splicing fragments out of THAT answer patches nothing — applyDoc skips an
@@ -8248,6 +8313,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   });
 
   checkForUpdate();
+  resourceUsage();
   liveUpdates();
   connectPoll();
   // Land in the terminal: focus the server-selected tab's pane.
