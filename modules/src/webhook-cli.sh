@@ -240,6 +240,8 @@ Successful session claims print coverage hints. A branch claim needs the
 PR's number to cover its discussion comments; a numbered claim needs a
 branch or commit claim for CI. Linked issues and PRs with DIFFERENT numbers
 each need their own claim: a claim does not follow those associations.
+Branch claims miss commit-status events; add the full current commit SHA
+for coverage across all CI event shapes for that commit.
 
 Prefer this to hand-writing --include. A claim only covers the payload
 paths it names, and CI reports terminal failure under six event shapes —
@@ -891,7 +893,7 @@ claim_clauses() {
 claim_coverage_hints() {
   # Inspect the generated scope, so paired narrow claims count just like a
   # bare number. Hints neither resolve associations nor change ownership.
-  case "$1" in
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
     (github:*) ;;
     (*:*) return 0 ;;
     (*/*) ;;
@@ -910,6 +912,9 @@ claim_coverage_hints() {
          "agent-box-webhook: claim hint: a branch claim does not cover PR discussion comments or linked issue comments; add --claim <PR number> and --claim <issue number> for the items you own."
        elif $numbered and (($branch or $commit) | not) then
          "agent-box-webhook: claim hint: numbered claims do not cover branch CI; if this is PR work, add --claim branch:<topic branch> or --claim sha:<full commit> for one commit."
+       else empty end),
+      (if $branch and ($commit | not) then
+         "agent-box-webhook: claim hint: branch claims miss commit-status events; add --claim sha:<full current commit> to cover all CI event shapes for that commit."
        else empty end),
       (if $numbered then
          "agent-box-webhook: claim hint: linked issues or PRs with different numbers need their own --claim; associations are not followed automatically."

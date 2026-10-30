@@ -156,12 +156,22 @@ n=$(include_of defangdevs/agent-box --all-events --claim=pr:42 | jq '.any | leng
 out=$(run defangdevs/agent-box --claim branch:fix/42 --events actionable)
 if grep -q 'claim hint: a branch claim' "$work/err" \
    && grep -q -- '--claim <PR number> and --claim <issue number>' "$work/err" \
+   && grep -q 'branch claims miss commit-status events' "$work/err" \
    && printf '%s\n' "$out" | awk '/^--include$/ { getline; print; exit }' \
       | jq -e '[.all[0].any[].path] | all(endswith(".number") | not)' >/dev/null; then
   ok "a branch-only hint suggests numbered claims without inferring 42"
 else
   no "a branch-only hint suggests numbered claims without inferring 42" "$(cat "$work/err")"
 fi
+
+for topic in github:defangdevs/agent-box GitHub:defangdevs/agent-box GITHUB:defangdevs/agent-box; do
+  run "$topic" --claim pr:42 --events actionable >/dev/null
+  if grep -q -- '--claim pr:42 misses PR discussion comments' "$work/err"; then
+    ok "$topic receives GitHub coverage hints"
+  else
+    no "$topic receives GitHub coverage hints" "$(cat "$work/err")"
+  fi
+done
 
 run defangdevs/agent-box --claim=42 --events actionable >/dev/null
 if grep -q 'claim hint: numbered claims do not cover branch CI' "$work/err" \
@@ -184,16 +194,21 @@ for extra in 42 issue:42; do
   run defangdevs/agent-box --claim pr:42 --claim "$extra" \
       --claim branch:fix/42 --events actionable >/dev/null
   if grep -q 'misses PR discussion comments\|numbered claims do not cover branch CI\|a branch claim' "$work/err"; then
-    no "paired $extra and branch claims get no missing-coverage hints" "$(cat "$work/err")"
+    no "paired $extra and branch claims suppress number and branch-scope hints" "$(cat "$work/err")"
   else
-    ok "paired $extra and branch claims get no missing-coverage hints"
+    ok "paired $extra and branch claims suppress number and branch-scope hints"
+  fi
+  if grep -q 'branch claims miss commit-status events' "$work/err"; then
+    ok "paired $extra and branch claims still need a commit for status events"
+  else
+    no "paired $extra and branch claims still need a commit for status events" "$(cat "$work/err")"
   fi
 done
 
 hint_sha=0123456789abcdef0123456789abcdef01234567
 run defangdevs/agent-box --claim issue:41 --claim "sha:$hint_sha" \
-    --events actionable >/dev/null
-if grep -q 'numbered claims do not cover branch CI' "$work/err"; then
+    --claim branch:fix/42 --events actionable >/dev/null
+if grep -q 'numbered claims do not cover branch CI\|branch claims miss commit-status events' "$work/err"; then
   no "a commit claim already supplies CI scope" "$(cat "$work/err")"
 else
   ok "a commit claim already supplies CI scope"

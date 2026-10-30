@@ -545,6 +545,8 @@ claim needs the PR's number to cover discussion comments; a numbered claim
 needs a branch or commit claim for CI. Linked issues and PRs with different
 numbers each need their own claim: `--claim 42` does not cover comments on
 linked issue #41 or PR #43. No association is inferred from a branch name.
+Branch claims also miss commit-status events; add the full current commit
+SHA for coverage across all CI event shapes for that commit.
 
 Use it rather than hand-writing `--include`. A claim only covers the payload
 paths it names, and a watch spawns on terminal CI failure reported through six
