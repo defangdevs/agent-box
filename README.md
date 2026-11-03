@@ -869,6 +869,15 @@ stores still require their own updates. Existing processes must restart to
 inherit a changed policy; this does not rotate credentials or replace existing
 disks. Run `nix build .#checks.x86_64-linux.tls-trust` for the offline regression.
 
+CVE-2026-98432 temporary mitigation: the normal box update installs and activates
+an IPv4 TCP IP-options filter and disables new MPTCP sockets on existing native
+and NixOS installations. The update restarts Caddy to reopen its listeners as plain
+TCP; independently managed listeners need their own restart. The protection
+persists across reboots and preserves unrelated firewall rules. The filter takes
+effect during the update without replacing the VM or rebooting the OS. It reduces
+exposure; full remediation still requires installing and rebooting into a fixed
+kernel. The usual update can still restart agent sessions as described above.
+
 **What the module gives you:**
 
 - **Unprivileged agent user.** Not root. Agent autonomy is intentionally scoped

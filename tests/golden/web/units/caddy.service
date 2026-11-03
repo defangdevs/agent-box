@@ -1,7 +1,9 @@
 [Unit]
+After=agent-box-cve-2026-98432.service
 StartLimitBurst=10
 StartLimitIntervalSec=14400
 X-Reload-Triggers=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-X-Reload-Triggers-caddy
+X-Restart-Triggers=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-X-Restart-Triggers-caddy
 
 [Service]
 Environment="CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"

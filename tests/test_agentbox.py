@@ -79,7 +79,7 @@ def profile_payload_names(webhook=True):
 # names in every case.
 FAKE_TOOLS = [
     "claude", "codex", "tmux", "ttyd", "caddy", "grep", "find", "flock",
-    "hostname", "fail2ban-server", "fail2ban-client", "nft",
+    "hostname", "fail2ban-server", "fail2ban-client", "nft", "sysctl",
 ]
 FAKE_BINS = sorted(profile_payload_names() | set(FAKE_TOOLS))
 
@@ -141,6 +141,8 @@ def build_fake_profile(root):
     (share / "contract").mkdir()
     for j in (SRC / "contract").glob("*.json"):
         shutil.copy(j, share / "contract" / j.name)
+    shutil.copy(SRC / "cve-2026-98432.nft", share / "cve-2026-98432.nft")
+    shutil.copy(SRC / "cve-2026-98432.sysctl", share / "cve-2026-98432.sysctl")
     shutil.copy(SRC / "tmux.conf", share / "tmux.conf")
     # The pinned local-webhook the profile ships (issue #425), and the pin it
     # came from. A box needs no webhook config because these are here — so a
@@ -3947,6 +3949,28 @@ class ApplyActivationTest(unittest.TestCase):
         self.assertNotIn("apply FAILED", err)
 
     # -- phase 4: activation -------------------------------------------------
+
+    def test_existing_apply_activates_and_refreshes_tcp_mitigation(self):
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        unit = self.mod.CVE_2026_98432_UNIT
+        self.assertIn(["systemctl", "enable", "--now", unit], self.calls)
+        self.assertIn(["systemctl", "reload-or-restart", unit], self.calls)
+        self.assertIn(["systemctl", "show", unit],
+                      [call[:3] for call in self.calls])
+
+    def test_invalid_tcp_mitigation_fails_before_activation(self):
+        self.extra_files[self.mod.CVE_2026_98432_RULES] = (
+            SRC / "cve-2026-98432.nft").read_text()
+        self.fail_when = ["nft --check --file"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "validate IPv4 TCP IP-options mitigation")
+        self.assertNotIn(["systemctl", "daemon-reload"], self.calls)
+
+    def test_tcp_mitigation_failure_fails_existing_apply(self):
+        self.fail_when = ["reload-or-restart agent-box-cve-2026-98432.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "refresh IPv4 TCP IP-options mitigation")
 
     def test_a_required_unit_that_will_not_start_fails_apply(self):
         self.fail_when = ["enable --now caddy.service"]
