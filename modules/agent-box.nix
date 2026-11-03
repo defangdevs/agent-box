@@ -5513,6 +5513,11 @@ done
     }
   '';
 
+  cve202698432Sysctl = pkgs.writeText "agent-box-cve-2026-98432.conf" ''
+    # Supplementary exposure reduction. A fixed running kernel is still required.
+    net.mptcp.enabled = 0
+  '';
+
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
     ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli
@@ -20135,6 +20140,7 @@ in
     # for users that opted out of seeding (agentsMd = null).
     environment.etc = {
       "agent-box/cve-2026-98432.nft".source = cve202698432Rules;
+      "sysctl.d/60-agent-box-cve-2026-98432.conf".source = cve202698432Sysctl;
       "agent-box/session-limit".text =
         "${if cfg.sessionLimit == null then "auto" else toString cfg.sessionLimit}\n";
     } // lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
@@ -20240,6 +20246,11 @@ in
     systemd.services =
     {
       nix-daemon.environment = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment;
+      caddy = lib.mkIf cfg.web.enable {
+        after = [ "agent-box-cve-2026-98432.service" ];
+        # The sysctl affects new sockets; reopen pre-update MPTCP listeners.
+        restartTriggers = [ cve202698432Sysctl ];
+      };
       # Normal updates activate this on existing hosts without an OS reboot.
       agent-box-cve-2026-98432 = {
         description = "Temporary IPv4 TCP IP-options mitigation for CVE-2026-98432";
@@ -20251,12 +20262,16 @@ in
         conflicts = [ "shutdown.target" ];
         unitConfig.DefaultDependencies = false;
         unitConfig.ReloadPropagatedFrom = "nftables.service";
-        restartTriggers = [ cve202698432Rules ];
+        restartTriggers = [ cve202698432Rules cve202698432Sysctl ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
+          ExecStartPre = "${pkgs.procps}/bin/sysctl --ignore --write net.mptcp.enabled=0";
           ExecStart = "${pkgs.nftables}/bin/nft --file /etc/agent-box/cve-2026-98432.nft";
-          ExecReload = "${pkgs.nftables}/bin/nft --file /etc/agent-box/cve-2026-98432.nft";
+          ExecReload = [
+            "${pkgs.procps}/bin/sysctl --ignore --write net.mptcp.enabled=0"
+            "${pkgs.nftables}/bin/nft --file /etc/agent-box/cve-2026-98432.nft"
+          ];
         };
       };
     } //

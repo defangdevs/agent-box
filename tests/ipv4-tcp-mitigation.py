@@ -1,4 +1,5 @@
 """Exercise the installed mitigation with real packets in a disposable VM."""
+import errno
 import json
 import socket
 import subprocess
@@ -25,6 +26,18 @@ def counter():
                 if "rule" in value for expr in value["rule"]["expr"]
                 if "counter" in expr)
 
+
+enabled = Path("/proc/sys/net/mptcp/enabled")
+if enabled.exists():
+    assert enabled.read_text().strip() == "0"
+try:
+    mptcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 262)
+except OSError as exc:
+    assert exc.errno in (errno.ENOPROTOOPT, errno.EPROTONOSUPPORT, errno.EINVAL)
+else:
+    mptcp.close()
+    raise AssertionError("MPTCP socket creation remains enabled")
+print("PASS: MPTCP socket creation is disabled")
 
 nft("add", "table", "ip", "unrelated_check")
 nft("add", "chain", "ip", "unrelated_check", "sentinel")

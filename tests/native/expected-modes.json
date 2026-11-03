@@ -36,6 +36,7 @@
   "etc/polkit-1/rules.d/50-agent-box-caddy-reload.rules": "0o644",
   "etc/profile.d/agent-box-tls.sh": "0o644",
   "etc/sudoers.d/agent-box": "0o440",
+  "etc/sysctl.d/60-agent-box-cve-2026-98432.conf": "0o644",
   "etc/sysctl.d/60-agent-box-memory.conf": "0o644",
   "etc/systemd/journald.conf.d/agent-box.conf": "0o644",
   "etc/systemd/system/agent-box-cve-2026-98432.service": "0o644",

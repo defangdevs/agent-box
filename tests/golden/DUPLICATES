@@ -8,11 +8,13 @@
 # A line DISAPPEARING is a behavior change, not a cleanup: those two paths no
 # longer render the same bytes, and the copy that diverged shows up as its own
 # file in the same diff.
+vm/payloads/agent-box-cve-2026-98432.conf -> vm/etc/sysctl.d/60-agent-box-cve-2026-98432.conf
 vm/payloads/agent-box-cve-2026-98432.nft -> vm/etc/agent-box/cve-2026-98432.nft
 web/etc/agent-box-guides/AGENTS.robot.md -> web/etc/agent-box-guides/AGENTS.agent.md
 web/etc/agent-box/cve-2026-98432.nft -> vm/etc/agent-box/cve-2026-98432.nft
 web/etc/agent-box/session-limit -> vm/etc/agent-box/session-limit
 web/etc/codex/config.toml -> vm/etc/codex/config.toml
+web/etc/sysctl.d/60-agent-box-cve-2026-98432.conf -> vm/etc/sysctl.d/60-agent-box-cve-2026-98432.conf
 web/payloads/X-Restart-Triggers-agent-box-cve-2026-98432 -> vm/payloads/X-Restart-Triggers-agent-box-cve-2026-98432
 web/payloads/agent-box-acp-bare -> vm/payloads/agent-box-acp-bare
 web/payloads/agent-box-acp/bin/agent-box-acp -> vm/payloads/agent-box-acp/bin/agent-box-acp
@@ -21,6 +23,7 @@ web/payloads/agent-box-agent-mark-stopped -> vm/payloads/agent-box-agent-mark-st
 web/payloads/agent-box-claude-hook-settings.json -> vm/payloads/agent-box-claude-hook-settings.json
 web/payloads/agent-box-claude-session-start-hook -> vm/payloads/agent-box-claude-session-start-hook
 web/payloads/agent-box-codex-remote-control -> vm/payloads/agent-box-codex-remote-control
+web/payloads/agent-box-cve-2026-98432.conf -> vm/etc/sysctl.d/60-agent-box-cve-2026-98432.conf
 web/payloads/agent-box-cve-2026-98432.nft -> vm/etc/agent-box/cve-2026-98432.nft
 web/payloads/agent-box-defang-cli-expr.nix -> vm/payloads/agent-box-defang-cli-expr.nix
 web/payloads/agent-box-env-exec -> vm/payloads/agent-box-env-exec

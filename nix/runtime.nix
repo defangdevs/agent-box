@@ -427,7 +427,7 @@ GH_BIN = "${pkgs.gh}/bin/gh"
     # module splices into agent-box-defang-cli-expr.nix, so both backends
     # resolve to one output path and share one binary cache hit.
     install -m444 ${src}/defang-cli.nix $out/share/agent-box/
-    install -m444 ${src}/cve-2026-98432.nft $out/share/agent-box/
+    install -m444 ${src}/cve-2026-98432.nft ${src}/cve-2026-98432.sysctl $out/share/agent-box/
     install -m444 ${src}/tmux.conf $out/share/agent-box/
     # The password helper is generated per user by `agentbox apply` (it
     # crosses sudo, so its paths must not come from env); the template it

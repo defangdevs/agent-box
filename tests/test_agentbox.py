@@ -79,7 +79,7 @@ def profile_payload_names(webhook=True):
 # names in every case.
 FAKE_TOOLS = [
     "claude", "codex", "tmux", "ttyd", "caddy", "grep", "find", "flock",
-    "hostname", "fail2ban-server", "fail2ban-client", "nft",
+    "hostname", "fail2ban-server", "fail2ban-client", "nft", "sysctl",
 ]
 FAKE_BINS = sorted(profile_payload_names() | set(FAKE_TOOLS))
 
@@ -142,6 +142,7 @@ def build_fake_profile(root):
     for j in (SRC / "contract").glob("*.json"):
         shutil.copy(j, share / "contract" / j.name)
     shutil.copy(SRC / "cve-2026-98432.nft", share / "cve-2026-98432.nft")
+    shutil.copy(SRC / "cve-2026-98432.sysctl", share / "cve-2026-98432.sysctl")
     shutil.copy(SRC / "tmux.conf", share / "tmux.conf")
     # The pinned local-webhook the profile ships (issue #425), and the pin it
     # came from. A box needs no webhook config because these are here — so a

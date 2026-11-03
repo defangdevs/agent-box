@@ -88,6 +88,7 @@ DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
 UPDATE_UNIT = "agent-box-update.service"
 CVE_2026_98432_UNIT = "agent-box-cve-2026-98432.service"
 CVE_2026_98432_RULES = "/etc/agent-box/cve-2026-98432.nft"
+CVE_2026_98432_SYSCTL = "/etc/sysctl.d/60-agent-box-cve-2026-98432.conf"
 # The update's own output, where an agent that triggered one can
 # read it back. See the unit for why the journal is not enough.
 UPDATE_LOG = "/var/log/agent-box-update.log"
@@ -2593,7 +2594,10 @@ class Renderer:
         """Install the temporary filter on first boot AND an existing update."""
         rules = (self.share / "cve-2026-98432.nft").read_text()
         t.file(self.p(CVE_2026_98432_RULES), rules)
+        t.file(self.p(CVE_2026_98432_SYSCTL),
+               (self.share / "cve-2026-98432.sysctl").read_text())
         command = f"{self.bin}/nft --file {CVE_2026_98432_RULES}"
+        mptcp = f"{self.bin}/sysctl --ignore --write net.mptcp.enabled=0"
         t.file(self.p("/etc/systemd/system", CVE_2026_98432_UNIT),
                GENERATED_HEADER + "\n".join([
                    "[Unit]",
@@ -2609,7 +2613,9 @@ class Renderer:
                    "[Service]",
                    "Type=oneshot",
                    "RemainAfterExit=yes",
+                   f"ExecStartPre={mptcp}",
                    f"ExecStart={command}",
+                   f"ExecReload={mptcp}",
                    f"ExecReload={command}",
                    "",
                    "[Install]",
@@ -2789,7 +2795,7 @@ class Renderer:
         return (
             "[Unit]\n"
             "Description=Caddy (agent-box web front door)\n"
-            "After=network-online.target\n"
+            "After=network-online.target agent-box-cve-2026-98432.service\n"
             "Wants=network-online.target\n"
             "\n"
             "[Service]\n"
