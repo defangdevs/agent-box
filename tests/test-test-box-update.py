@@ -118,6 +118,8 @@ class TrialTest(unittest.TestCase):
         self.calls.clear()
         self.assertEqual(self.invoke("status"), 0)
         self.assertEqual(self.calls, [])
+        self.assertTrue((self.state / "trial.json").exists())
+        self.assertTrue((self.state / "baseline").is_symlink())
 
     def test_missing_baseline_is_refused_without_erasing_record(self):
         self.invoke("install", "--pr", "923")

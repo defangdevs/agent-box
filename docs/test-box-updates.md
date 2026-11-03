@@ -56,6 +56,13 @@ the source tree. Retain the provider console or SSH recovery path. NixOS system
 generations require a different mechanism; this helper refuses a box without
 an identifiable native runtime profile.
 
+If a PR predates configuration fields enabled on the test box, its old renderer
+cannot apply the current configuration. Prepare an integration branch from the
+box's installed revision plus that PR's changes, review the diff, and select it
+with `--ref`. Record both commits in the test evidence: this exercises the PR's
+changes while keeping the box's existing configuration supported; it does not
+establish compatibility of the PR's original head with that configuration.
+
 ## Testing #922 / PR #923
 
 PR #923 currently supplies custody payloads and nine unit tests, without native
