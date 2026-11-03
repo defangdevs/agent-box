@@ -6534,7 +6534,7 @@ def render_connect_step(state):
                     + html.escape(state["detail"]) + '</p></div>')
         saved_phone = re.sub(
             r"\D", "", as_dict(load(ENV_FILE)).get("LOCAL_WHATSAPP_PHONE", ""))
-        required = "" if saved_phone else " required"
+        required = "" if 7 <= len(saved_phone) <= 15 else " required"
         return (
             f'<div class="conn-step"><form method="post" action="{base}/connect/start" '
             'class="row conn-form">'
