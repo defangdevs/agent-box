@@ -3331,7 +3331,8 @@ in
       # Normal updates activate this on existing hosts without an OS reboot.
       agent-box-cve-2026-98432 = {
         description = "Temporary IPv4 TCP IP-options mitigation for CVE-2026-98432";
-        wantedBy = [ "multi-user.target" ];
+        wantedBy = [ "multi-user.target" "nftables.service" ];
+        partOf = [ "nftables.service" ];
         after = [ "local-fs.target" "nftables.service" "firewall.service" ];
         before = [ "network-pre.target" "shutdown.target" ];
         wants = [ "network-pre.target" ];

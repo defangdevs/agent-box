@@ -2601,6 +2601,7 @@ class Renderer:
                    "DefaultDependencies=no",
                    "After=local-fs.target nftables.service",
                    "ReloadPropagatedFrom=nftables.service",
+                   "PartOf=nftables.service",
                    "Before=network-pre.target shutdown.target",
                    "Wants=network-pre.target",
                    "Conflicts=shutdown.target",
@@ -2612,7 +2613,7 @@ class Renderer:
                    f"ExecReload={command}",
                    "",
                    "[Install]",
-                   "WantedBy=multi-user.target",
+                   "WantedBy=multi-user.target nftables.service",
                    "",
                ]))
         # Required independently of web.enable or the distro's update policy:
