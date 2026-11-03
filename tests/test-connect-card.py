@@ -218,6 +218,14 @@ class WhatsAppConnectTest(unittest.TestCase):
                 'aria-label="WhatsApp country calling code" required', configured)
             self.assertNotIn(
                 'aria-label="WhatsApp national phone number" required', configured)
+            with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+                handle.write("LOCAL_WHATSAPP_PHONE=123\n")
+            short = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertIn(
+                'aria-label="WhatsApp country calling code" required', short)
+            self.assertIn(
+                'aria-label="WhatsApp national phone number" required', short)
         waiting = self.daemon.render_connect_card(
             base_state(id="whatsapp", state="waiting", code="7JVT986A"))
         self.assertIn("7JVT-986A", waiting)
