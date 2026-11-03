@@ -36,7 +36,7 @@
         };
         host = {
           jobs = 1;
-          checks = [ "containers" "memory-protection" "ttyd-isolation" "web-surface" "email" ];
+          checks = [ "ipv4-tcp-mitigation" "containers" "memory-protection" "ttyd-isolation" "web-surface" "email" ];
         };
       };
 
@@ -80,6 +80,9 @@
           # leans on hardest: with no docker installed the unit is a clean
           # "condition failed" rather than a restart loop, and the granted
           # `restart` alone picks a newly installed one up.
+          ipv4-tcp-mitigation = pkgs.testers.runNixOSTest
+            (import ./tests/ipv4-tcp-mitigation.nix { agent-box = self.nixosModules.agent-box; });
+
           containers = pkgs.testers.runNixOSTest
             (import ./tests/containers.nix { agent-box = self.nixosModules.agent-box; });
 
@@ -196,7 +199,7 @@
               # reads — the payload capture below only scans Nix-visible
               # `environment` attrs, so these plain-text files are the review
               # surface for what moved out of that attrset.
-              "agent-box-guides/.*|agent-box/session-limit|agent-box/units/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
+              "agent-box-guides/.*|agent-box/session-limit|agent-box/cve-2026-98432[.]nft|agent-box/units/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
               n != null;
           manifestOf = modules:
             let sys = nixpkgs.lib.nixosSystem { inherit system modules; }; in

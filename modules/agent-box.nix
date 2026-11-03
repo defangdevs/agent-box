@@ -5500,9 +5500,22 @@ done
     # listing it here would pull the Go build back into system.build.toplevel.
   ];
 
+  cve202698432Rules = pkgs.writeText "agent-box-cve-2026-98432.nft" ''
+    # Temporary exposure reduction for CVE-2026-98432. A fixed running kernel
+    # is still required for full remediation. Never flush another firewall table.
+    add table ip cve_2026_98432
+    flush table ip cve_2026_98432
+    table ip cve_2026_98432 {
+      chain prerouting {
+        type filter hook prerouting priority raw; policy accept;
+        ip protocol tcp ip hdrlength > 5 counter drop
+      }
+    }
+  '';
+
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli
+    ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli
          harnessCli ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -20121,6 +20134,7 @@ in
     # the seeded ~/AGENTS.md — which @imports this path — stays editable. Skipped
     # for users that opted out of seeding (agentsMd = null).
     environment.etc = {
+      "agent-box/cve-2026-98432.nft".source = cve202698432Rules;
       "agent-box/session-limit".text =
         "${if cfg.sessionLimit == null then "auto" else toString cfg.sessionLimit}\n";
     } // lib.listToAttrs (lib.concatLists (lib.mapAttrsToList (name: u:
@@ -20224,7 +20238,27 @@ in
     # drop-in — a real but acceptable price for something that actually
     # works.
     systemd.services =
-    { nix-daemon.environment = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment; } //
+    {
+      nix-daemon.environment = lib.mapAttrs (_: lib.mkDefault) tlsEnvironment;
+      # Normal updates activate this on existing hosts without an OS reboot.
+      agent-box-cve-2026-98432 = {
+        description = "Temporary IPv4 TCP IP-options mitigation for CVE-2026-98432";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "local-fs.target" "nftables.service" "firewall.service" ];
+        before = [ "network-pre.target" "shutdown.target" ];
+        wants = [ "network-pre.target" ];
+        conflicts = [ "shutdown.target" ];
+        unitConfig.DefaultDependencies = false;
+        unitConfig.ReloadPropagatedFrom = "nftables.service";
+        restartTriggers = [ cve202698432Rules ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+          ExecStart = "${pkgs.nftables}/bin/nft --file /etc/agent-box/cve-2026-98432.nft";
+          ExecReload = "${pkgs.nftables}/bin/nft --file /etc/agent-box/cve-2026-98432.nft";
+        };
+      };
+    } //
     (lib.mapAttrs' (name: u: lib.nameValuePair "agent-box@${name}" (
       { overrideStrategy = "asDropin";
         # NOTE: every optional env var below is merged INTO this one

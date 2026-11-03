@@ -86,6 +86,8 @@ DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
 # mismatch between any two of them is issue #353 all over again (a grant
 # that does not match the command asks for a password instead).
 UPDATE_UNIT = "agent-box-update.service"
+CVE_2026_98432_UNIT = "agent-box-cve-2026-98432.service"
+CVE_2026_98432_RULES = "/etc/agent-box/cve-2026-98432.nft"
 # The update's own output, where an agent that triggered one can
 # read it back. See the unit for why the journal is not enough.
 UPDATE_LOG = "/var/log/agent-box-update.log"
@@ -1371,6 +1373,7 @@ class Renderer:
         t = Tree()
         self.dirs(t)
         self.shared_units(t)
+        self.ipv4_tcp_mitigation(t)
         self.update_unit(t)
         self.nix_gc(t)
         self.nixpkgs_cache(t)
@@ -2585,6 +2588,36 @@ class Renderer:
             t.file(self.p("/etc/systemd/system/"
                           "agent-web-auth-secrets.service"),
                    self.auth_secrets_unit(), 0o444)
+
+    def ipv4_tcp_mitigation(self, t):
+        """Install the temporary filter on first boot AND an existing update."""
+        rules = (self.share / "cve-2026-98432.nft").read_text()
+        t.file(self.p(CVE_2026_98432_RULES), rules)
+        command = f"{self.bin}/nft --file {CVE_2026_98432_RULES}"
+        t.file(self.p("/etc/systemd/system", CVE_2026_98432_UNIT),
+               GENERATED_HEADER + "\n".join([
+                   "[Unit]",
+                   "Description=Temporary IPv4 TCP IP-options mitigation for CVE-2026-98432",
+                   "DefaultDependencies=no",
+                   "After=local-fs.target nftables.service",
+                   "ReloadPropagatedFrom=nftables.service",
+                   "Before=network-pre.target shutdown.target",
+                   "Wants=network-pre.target",
+                   "Conflicts=shutdown.target",
+                   "",
+                   "[Service]",
+                   "Type=oneshot",
+                   "RemainAfterExit=yes",
+                   f"ExecStart={command}",
+                   f"ExecReload={command}",
+                   "",
+                   "[Install]",
+                   "WantedBy=multi-user.target",
+                   "",
+               ]))
+        # Required independently of web.enable or the distro's update policy:
+        # SSH and user-published apps can also receive IPv4 TCP connections.
+        t.units.append(CVE_2026_98432_UNIT)
 
     def update_unit(self, t):
         """The on-demand self-update unit (issue #358).
@@ -4407,6 +4440,14 @@ def validate_render(spec, tree, act, profile):
             if Path(account.pw_dir) != Path(u.home):
                 act.failed("email home for " + u.name,
                            f"configured home {u.home} differs from passwd home {account.pw_dir}")
+    rules = tree.files.get(CVE_2026_98432_RULES)
+    if rules:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "cve-2026-98432.nft"
+            candidate.write_text(rules[0])
+            act.require("validate IPv4 TCP IP-options mitigation",
+                        [str(Path(profile) / "bin/nft"), "--check", "--file",
+                         str(candidate)], quiet=True)
     for path, (text, _mode) in sorted(tree.files.items()):
         if Path(path).parent == Path(SUDOERS_DIR):
             validate_sudoers(path, text, act)
@@ -4786,6 +4827,15 @@ def activate(spec, tree, removed, advisory, act):
                    else act.require(f"start {unit}", cmd))
         if not started:
             failed_starts.add(unit)
+    if (CVE_2026_98432_UNIT in tree.units
+            and CVE_2026_98432_UNIT not in failed_starts):
+        # enable --now does nothing for an active oneshot. Reload on every
+        # apply so an existing box receives changed rules, and a rule flushed
+        # outside this service is restored. nft commits the reload atomically.
+        if not act.require("refresh IPv4 TCP IP-options mitigation",
+                           ["systemctl", "reload-or-restart",
+                            CVE_2026_98432_UNIT]):
+            failed_starts.add(CVE_2026_98432_UNIT)
     if (spec.email_enable and getattr(tree, "email_restart", False)
             and "agent-box-email.service" not in failed_starts):
         # Re-render the OpenSMTPD config when domains/users/cert paths change;
