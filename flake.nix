@@ -2471,6 +2471,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # heard of) are worth more assertions than the happy path.
           # `origin` is a local repository, so there is no network here and
           # it runs natively on every architecture.
+          test-box-update =
+            pkgs.runCommand "agent-box-test-box-update"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                helper = ./scripts/test-box-update.py;
+                tests = ./tests/test-test-box-update.py;
+              } ''
+              mkdir -p scripts tests
+              cp "$helper" scripts/test-box-update.py
+              cp "$tests" tests/test-test-box-update.py
+              python3 tests/test-test-box-update.py > "$out" 2>&1 || {
+                cat "$out"
+                exit 1
+              }
+              cat "$out"
+            '';
+
           source-tree =
             pkgs.runCommand "agent-box-source-tree"
               {
