@@ -6532,6 +6532,9 @@ def render_connect_step(state):
         if state["detail"]:
             return ('<div class="conn-step"><p class="note">'
                     + html.escape(state["detail"]) + '</p></div>')
+        saved_phone = re.sub(
+            r"\D", "", as_dict(load(ENV_FILE)).get("LOCAL_WHATSAPP_PHONE", ""))
+        required = "" if saved_phone else " required"
         return (
             f'<div class="conn-step"><form method="post" action="{base}/connect/start" '
             'class="row conn-form">'
@@ -6539,16 +6542,17 @@ def render_connect_step(state):
             '<label class="field conn-field conn-country"><span class="note">Country code</span>'
             '<input type="tel" name="phone_country" autocomplete="tel-country-code" '
             'inputmode="tel" maxlength="4" pattern="\\+[0-9]{1,3}" '
-            'placeholder="+1" aria-label="WhatsApp country calling code"></label>'
+            f'placeholder="+1" aria-label="WhatsApp country calling code"{required}></label>'
             '<label class="field conn-field conn-national"><span class="note">WhatsApp '
             'number</span><input type="tel" name="phone" autocomplete="tel-national" '
             'inputmode="tel" enterkeyhint="go" placeholder="(555) 123-2435" '
-            'aria-label="WhatsApp national phone number"></label>'
+            f'aria-label="WhatsApp national phone number"{required}></label>'
             f'{render_whatsapp_profile_field()}'
             '<button type="submit" class="btn">Pair device</button></form>'
-            '<p class="note">Phone punctuation is accepted. Keep the country calling code '
-            'separate so browser autofill cannot remove it. Leave both fields blank to use '
-            '<code>LOCAL_WHATSAPP_PHONE</code> saved under Secrets.</p></div>'
+            '<p class="note">Enter a country code and phone number to pair a new number. '
+            'You can include punctuation. Keep the country code in its own field so '
+            'autofill leaves it in place. Leave both fields blank to use the number saved '
+            'under Secrets.</p></div>'
         )
     if state["state"] == "starting":
         verb = ("Installing" if not state["installed"]
