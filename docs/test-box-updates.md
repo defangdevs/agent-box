@@ -44,7 +44,12 @@ overridden. State defaults to `/var/lib/agent-box/test-update`, mode 0700.
 
 Only one trial can be recorded at a time. Failed installs and failed restores
 retain the baseline and recovery record. A successful restore removes the
-record and GC root. Recovery uses the pinned original updater executable, even
+record and GC root. If cleanup is interrupted, `status` reports a pending
+cleanup marker and rerunning `restore` finishes cleanup without another update.
+Status is read-only and can show the saved record even when the baseline CLI
+is missing; the current revision is null when profile metadata is unreadable.
+Failed writes before the trial record is published release the temporary pin.
+Recovery uses the pinned original updater executable, even
 if the candidate's helper interfaces change. Keep the standalone script until
 restoration is complete. Do not run normal updates or edit the configuration
 during a trial.
