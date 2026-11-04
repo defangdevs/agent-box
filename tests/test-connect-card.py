@@ -193,16 +193,39 @@ class WhatsAppConnectTest(unittest.TestCase):
         self.assertIsNone(self.daemon.connect_user_code("no code yet", "whatsapp"))
 
     def test_pairing_card_shows_phone_form_then_code(self):
-        idle = self.daemon.render_connect_card(base_state(id="whatsapp", state="idle"))
-        self.assertIn('name="phone"', idle)
-        self.assertIn('name="phone_country"', idle)
-        self.assertIn('type="tel"', idle)
-        self.assertIn('inputmode="tel"', idle)
-        self.assertIn('autocomplete="tel-country-code"', idle)
-        self.assertIn('autocomplete="tel-national"', idle)
-        self.assertNotIn('autocomplete="off"', idle)
-        self.assertIn("country calling code", idle)
-        self.assertIn("Pair device", idle)
+        with tempfile.TemporaryDirectory() as temp:
+            self.daemon.ENV_FILE = os.path.join(temp, "env")
+            idle = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertIn('name="phone"', idle)
+            self.assertIn('name="phone_country"', idle)
+            self.assertIn('aria-label="WhatsApp country calling code" required', idle)
+            self.assertIn('aria-label="WhatsApp national phone number" required', idle)
+            self.assertIn('type="tel"', idle)
+            self.assertIn('inputmode="tel"', idle)
+            self.assertIn('autocomplete="tel-country-code"', idle)
+            self.assertIn('autocomplete="tel-national"', idle)
+            self.assertNotIn('autocomplete="off"', idle)
+            self.assertIn("country calling code", idle)
+            self.assertIn("Enter a country code and phone number", idle)
+            self.assertIn("Pair device", idle)
+
+            with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+                handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+            configured = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertNotIn(
+                'aria-label="WhatsApp country calling code" required', configured)
+            self.assertNotIn(
+                'aria-label="WhatsApp national phone number" required', configured)
+            with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+                handle.write("LOCAL_WHATSAPP_PHONE=123\n")
+            short = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertIn(
+                'aria-label="WhatsApp country calling code" required', short)
+            self.assertIn(
+                'aria-label="WhatsApp national phone number" required', short)
         waiting = self.daemon.render_connect_card(
             base_state(id="whatsapp", state="waiting", code="7JVT986A"))
         self.assertIn("7JVT-986A", waiting)
