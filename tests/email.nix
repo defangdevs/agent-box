@@ -185,7 +185,7 @@
     ident = records[0]["id"]
     machine.succeed(f"su - agent -c 'agent-box-webhook read-content {ident}'")
     machine.succeed("runuser -u other -g smtpq -- python3 /etc/email-local-probe.py --signed")
-    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 3")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 5")
     machine.succeed("grep -l 'Local private body' /home/agent/.local/state/local-webhook/spool/content/new/* >/dev/null")
   '';
 }
