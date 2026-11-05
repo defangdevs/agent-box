@@ -10,6 +10,10 @@ on:
       - '.github/workflows/deploy-test.yml'
   workflow_dispatch:
     inputs:
+      diagnose_run:
+        description: Read the current ipv4 test instance journal for an existing run ID; create no resources
+        type: string
+        default: ''
       region:
         # The test account's SCP only allows us-west-2 — other choices are kept
         # for forks running against their own account.
@@ -46,15 +50,52 @@ on:
         default: false
 
 permissions:
-  id-token: write
   contents: read
 
 concurrency:
-  group: deploy-test-${{ inputs.region || 'us-west-2' }}
+  group: deploy-test-${{ inputs.diagnose_run && 'diagnose' || 'deploy' }}-${{ inputs.region || 'us-west-2' }}
   cancel-in-progress: false
 
 jobs:
+  diagnose:
+    permissions:
+      contents: read
+      id-token: write
+    if: inputs.diagnose_run != ''
+    runs-on: ubuntu-latest
+    environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
+    timeout-minutes: 5
+    env:
+      AWS_REGION: ${{ inputs.region || 'us-west-2' }}
+      ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      DIAGNOSE_RUN: ${{ inputs.diagnose_run }}
+    steps:
+      - name: Validate the test run ID
+        run: '[[ "$DIAGNOSE_RUN" =~ ^[0-9]+$ ]]'
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Read the existing test instance journal
+        timeout-minutes: 3
+        run: |
+          iid=$(aws cloudformation describe-stack-resources \
+            --stack-name "agent-box-e2e-ipv4-full-$DIAGNOSE_RUN" \
+            --logical-resource-id Instance \
+            --query 'StackResources[0].PhysicalResourceId' --output text)
+          cid=$(aws ssm send-command --instance-ids "$iid" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["journalctl -u amazon-init -n 100 -o cat --no-pager 2>&1 | tail -c 18000"]' \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$cid" --instance-id "$iid"
+          aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+            --query StandardOutputContent --output text
+
   deploy-test:
+    permissions:
+      contents: read
+      id-token: write
+    if: inputs.diagnose_run == ''
     runs-on: ubuntu-latest
     # Two legs run in PARALLEL:
     #  - ipv4-full: GH runners are IPv4-only, so this is the only leg that can
@@ -114,7 +155,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -214,7 +255,10 @@ jobs:
 
           # Pull whatever a FAILED-to-provision instance can still tell us,
           # BEFORE the stack (and the instance) is deleted — this evidence is
-          # otherwise destroyed. get-console-output only ever returns amazon-
+          # otherwise destroyed. SSM inline stdout is capped at 24 KB: keep
+          # the journal tail bounded so the derivation list cannot hide the
+          # actual build error when the response is truncated.
+          # get-console-output only ever returns amazon-
           # init's terminal "Failed to start ..." line (it logs journal-only,
           # deploy/aws/template.yaml:456,601), so the pre-switch journal itself —
           # where an IPv6-only DNS/resolver failure would actually show up —
@@ -237,7 +281,7 @@ jobs:
               --document-name AWS-RunShellScript \
               --parameters 'commands=[
                 "systemctl status amazon-init --no-pager -l 2>&1 || true",
-                "echo ---amazon-init-journal---; journalctl -u amazon-init --no-pager 2>&1 || true",
+                "echo ---amazon-init-journal-tail---; journalctl -u amazon-init -n 80 -o cat --no-pager 2>&1 | tail -c 12000 || true",
                 "echo ---resolvectl---; resolvectl status 2>&1 || true; cat /etc/resolv.conf 2>&1 || true",
                 "echo ---networkd-journal---; journalctl -u systemd-networkd -u systemd-resolved --no-pager 2>&1 | tail -100 || true",
                 "echo ---live-fetch-probe---; curl -6 -sSv --max-time 10 -o /dev/null https://raw.githubusercontent.com/ 2>&1 || true"
@@ -625,7 +669,7 @@ jobs:
           # whether `tmux attach` found a session. Attach for real and assert the
           # terminal isn't showing tmux's "no sessions". Retries because the
           # agent's claude session can take a moment to come up after boot.
-          python3 -m pip install --quiet websocket-client
+          python3 -m pip install --quiet --only-binary=:all: --require-hashes -r scripts/ws-smoke-requirements.txt
           url='${{ steps.outputs.outputs.web_url }}'
           for i in $(seq 1 12); do
             if python3 scripts/ws_smoke.py "$url" "$WEB_PASSWORD"; then

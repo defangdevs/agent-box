@@ -11,9 +11,15 @@
 let
   cfg = config.services.agent-box;
   # Include alternate cross-signing paths, including hosts on older nixpkgs.
-  tlsBlacklist = builtins.fromJSON ''
+  tlsBlacklist = (
+    @@include-verbatim:../nix/tls-blacklist.nix@@
+  ) {
+    inherit lib;
+    version = pkgs.cacert.version;
+    roots = builtins.fromJSON ''
 @@include:src/tls-roots.json@@
-  '';
+    '';
+  };
   tlsEnvironment = {
     SSL_CERT_FILE = "/etc/ssl/certs/ca-certificates.crt";
     SSL_CERT_DIR = "${pkgs.runCommand "agent-box-empty-ca-dir" { } "mkdir -p $out"}";
