@@ -460,9 +460,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           tlsCacert = pkgs.cacert.override { blacklist = tlsBlacklistFor pkgs.cacert.version; };
           # Exercise the root-store format on the failing 26.05 AMI without
           # replacing the flake's independent pin or its whole package set.
-          modernTlsCacert = (pkgs.cacert.override {
-            blacklist = tlsBlacklistFor "3.131.1";
-          }).overrideAttrs (_: {
+          modernCacertBase = pkgs.cacert.overrideAttrs (_: {
             version = "3.131.1";
             src = pkgs.fetchurl {
               name = "certdata.txt";
@@ -470,6 +468,26 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               hash = "sha256-PsK00kDcEsdH6vRQBh24SvdXxIO72jAvninOtdcL5RA=";
             };
           });
+
+          modernPkgs = pkgs // { cacert = modernCacertBase; };
+          modernRuntime = import ./nix/runtime.nix { pkgs = modernPkgs; };
+          modernModule = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.agent-box
+              {
+                nixpkgs.pkgs = modernPkgs;
+                # NixOS appends overlays to an externally supplied set;
+                # preserve the version override through that extension.
+                nixpkgs.overlays = [ (_final: _prev: { cacert = modernCacertBase; }) ];
+                services.agent-box = { enable = true; users.agent = { }; };
+                # The fixture asserts root absence as well as rejection, so
+                # use standard PEM rather than auxiliary distrust records.
+                security.pki.useCompatibleBundle = true;
+                system.stateVersion = "25.05";
+              }
+            ];
+          };
 
           # issue #154 Phase 3: "agent-box@" is the systemd %i template unit,
           # shipped verbatim via systemd.packages (not a systemd.services
@@ -1927,14 +1945,18 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             assert tlsBlacklistFor "3.126" == tlsRoots;
             assert tlsBlacklistFor "3.131.1" == [ "Comodo AAA Services root" ];
             assert tlsBlacklistFor "3.132" == [ "Comodo AAA Services root" ];
+            assert modernModule.config.security.pki.caCertificateBlacklist == [ "Comodo AAA Services root" ];
             pkgs.runCommand "agent-box-tls-trust-modern" {
               nativeBuildInputs = [ pkgs.python3 pkgs.openssl ];
             } ''
-              export SSL_CERT_FILE="${modernTlsCacert}/etc/ssl/certs/ca-no-trust-rules-bundle.crt"
-              export NIX_SSL_CERT_FILE="$SSL_CERT_FILE"
               mkdir empty-certs
               export SSL_CERT_DIR="$PWD/empty-certs"
-              python3 ${./tests}/check-tls-trust.py
+              for bundle in \
+                "${modernModule.config.environment.etc."ssl/certs/ca-certificates.crt".source}" \
+                "${modernRuntime}/etc/ssl/certs/ca-no-trust-rules-bundle.crt"; do
+                export SSL_CERT_FILE="$bundle" NIX_SSL_CERT_FILE="$bundle"
+                python3 ${./tests}/check-tls-trust.py
+              done
               touch "$out"
             '';
 
