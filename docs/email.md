@@ -125,9 +125,11 @@ Registry addresses are lowercase, matching the bus's case-insensitive topic
 identity; differently cased spellings cannot acquire separate handlers.
 
 A handler is installed before reception is enabled. Updating an existing
-address first disables reception; if saving its handler fails, it remains
-disabled until a successful save. Disable stops new SMTP recipients while
-preserving the watch for previously accepted mail. Saving again enables it.
+address first defers new reception with SMTP 451; if saving its handler
+fails, it keeps deferring until a successful save. This prevents a brief
+configuration change from permanently bouncing mail. Disable stops new SMTP
+recipients while preserving the watch for previously accepted mail. Saving
+again enables it.
 Another automatic rule for the same address must be removed first, preventing
 an earlier rule from silently taking its notifications. Managed address
 watches are edited through Email addresses, not the generic rule editor.

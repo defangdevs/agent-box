@@ -206,7 +206,7 @@ class PurposeAddresses(unittest.TestCase):
         def installed(argv, **kwargs):
             if argv[-1] == 'ls':
                 return SimpleNamespace(returncode=0, stdout=b'{"dispatch":{"topics":[]}}')
-            self.assertIn('550', mail.recipient_decision(self.cfg, self.address.encode()))
+            self.assertNotEqual(mail.recipient_decision(self.cfg, self.address.encode()), 'proceed')
             self.assertIn('email:' + self.address, argv)
             self.assertIn('profile=github', argv)
             self.assertEqual(argv[argv.index('--spawn-window') + 1], '120')
@@ -223,6 +223,8 @@ class PurposeAddresses(unittest.TestCase):
         with mock.patch.object(mail.subprocess, 'run', return_value=SimpleNamespace(returncode=1)):
             with self.assertRaises(OSError):
                 self.manage(purpose='New handler policy')
+        self.assertIn('451', mail.recipient_decision(self.cfg, self.address.encode()))
+        self.manage('disable')
         self.assertIn('550', mail.recipient_decision(self.cfg, self.address.encode()))
 
     def test_existing_rule_cannot_silently_steal_a_purpose_address(self):

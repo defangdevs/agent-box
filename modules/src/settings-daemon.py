@@ -6351,9 +6351,9 @@ def render_email_addresses():
         heading = (
             '<li class="foldrow prof-row"><details class="watch-editor" data-fold="email-%s">'
             '<summary><span class="nm"><code>%s</code></span><span class="meta">%s</span></summary>'
-        ) % (safe, safe, "Receiving" if route["enabled"] else "Disabled")
+        ) % (safe, safe, "Deferred" if route.get("pending") else "Receiving" if route["enabled"] else "Disabled")
         disable = ""
-        if route["enabled"]:
+        if route["enabled"] or route.get("pending"):
             disable = (
                 '<form method="post" action="%s/email/disable">' % esc(BASE)
                 + '<input type="hidden" name="address" value="%s">' % safe
@@ -6363,7 +6363,8 @@ def render_email_addresses():
     return ('<h3 id="email">Email addresses</h3>'
             '<p class="note">Only registered, enabled addresses receive mail. Each address has its own purpose '
             'and worker profile. The batching window groups notifications before starting a session. '
-            'Disabling reception keeps the handler for mail already accepted.</p>'
+            'Disabling reception keeps the handler for mail already accepted. '
+            'An incomplete handler update defers new mail until it is saved successfully.</p>'
             + '<ul class="tbl">' + ("".join(rows) or '<li class="empty">No email addresses registered.</li>')
             + '</ul><details class="watch-editor" data-fold="email-add"><summary>Add email address</summary>'
             + editor() + '</details>')

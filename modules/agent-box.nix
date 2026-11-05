@@ -243,6 +243,7 @@ let
                     or base not in [user + '@' + d.lower() for d in cfg["domains"]]):
                 raise ValueError("email address must belong to its configured Linux user and domain")
             if (not isinstance(route, dict) or type(route.get("enabled")) is not bool
+                    or type(route.get("pending", False)) is not bool
                     or not isinstance(route.get("purpose"), str) or not route["purpose"].strip()
                     or len(route["purpose"]) > 500
                     or any(ord(c) < 32 or ord(c) == 127 for c in route["purpose"])
@@ -330,6 +331,7 @@ let
                 if address not in data:
                     raise ValueError("email address is not registered")
                 data[address]["enabled"] = False
+                data[address].pop("pending", None)
             else:
                 if not PROFILE_NAME.fullmatch(args.profile):
                     raise ValueError("invalid email worker profile")
@@ -340,10 +342,11 @@ let
                 if address not in data and len(data) >= MAX_ADDRESSES:
                     raise ValueError("email address limit reached")
                 route = {"purpose": purpose, "profile": args.profile, "batchSeconds": args.batch_seconds, "enabled": True}
-                # Publish disabled first when editing an active route. A failed
-                # handler update must not leave it accepting against stale policy.
+                # Defer new mail while replacing its handler. A failed update
+                # stays closed without permanently bouncing a sender's retry.
                 if address in data:
                     data[address]["enabled"] = False
+                    data[address]["pending"] = True
                     write_addresses(user, data)
                 address_watch(cfg, user, address, route)
                 data[address] = route
@@ -363,6 +366,8 @@ let
             route = read_addresses(cfg, user).get(address.lower())
         except (OSError, ValueError, RecursionError, KeyError):
             return "reject|451 4.3.0 Recipient registry unavailable; retry later"
+        if route and route.get("pending"):
+            return "reject|451 4.3.0 Recipient handler update pending; retry later"
         if not route or not route["enabled"]:
             return "reject|550 5.1.1 Recipient is not registered"
         return "proceed"
@@ -1430,6 +1435,8 @@ let
       read-only (systemd ProtectSystem=strict) and writes there fail. The one
       exception is ~/sites, a symlink out to a caddy-readable dir (see "Serving
       a web app publicly").
+      When email is enabled, its per-user address registry is also writable
+      through `agent-box-email addresses` and Settings.
     - $HOME is SHARED by every one of your tmux sessions (same user, all start
       in $HOME unless `--cwd` sent them elsewhere), so two sessions in one clone
       edit the same files. Give yours a checkout of its own: ~/worktrees is
@@ -1645,8 +1652,9 @@ let
     disable user+github@hostname` stops new reception while preserving its
     handler for already accepted mail. Saving an address enables it again.
     A handler is installed before reception is enabled; an unsuccessful handler
-    update leaves that address disabled. Remove any older automatic rule for
-    the same exact address before registering its replacement.
+    update defers new mail with SMTP 451 until a successful save. Remove any
+    older automatic rule for the same exact address before registering its
+    replacement.
 
     Addresses such as `user+github@hostname` reach the same Linux user's bus
     with their full address as the topic (`email:user+github@hostname`). The
@@ -30667,9 +30675,9 @@ def render_email_addresses():
         heading = (
             '<li class="foldrow prof-row"><details class="watch-editor" data-fold="email-%s">'
             '<summary><span class="nm"><code>%s</code></span><span class="meta">%s</span></summary>'
-        ) % (safe, safe, "Receiving" if route["enabled"] else "Disabled")
+        ) % (safe, safe, "Deferred" if route.get("pending") else "Receiving" if route["enabled"] else "Disabled")
         disable = ""
-        if route["enabled"]:
+        if route["enabled"] or route.get("pending"):
             disable = (
                 '<form method="post" action="%s/email/disable">' % esc(BASE)
                 + '<input type="hidden" name="address" value="%s">' % safe
@@ -30679,7 +30687,8 @@ def render_email_addresses():
     return ('<h3 id="email">Email addresses</h3>'
             '<p class="note">Only registered, enabled addresses receive mail. Each address has its own purpose '
             'and worker profile. The batching window groups notifications before starting a session. '
-            'Disabling reception keeps the handler for mail already accepted.</p>'
+            'Disabling reception keeps the handler for mail already accepted. '
+            'An incomplete handler update defers new mail until it is saved successfully.</p>'
             + '<ul class="tbl">' + ("".join(rows) or '<li class="empty">No email addresses registered.</li>')
             + '</ul><details class="watch-editor" data-fold="email-add"><summary>Add email address</summary>'
             + editor() + '</details>')

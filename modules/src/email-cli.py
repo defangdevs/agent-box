@@ -183,6 +183,7 @@ def read_addresses(cfg, user):
                 or base not in [user + '@' + d.lower() for d in cfg["domains"]]):
             raise ValueError("email address must belong to its configured Linux user and domain")
         if (not isinstance(route, dict) or type(route.get("enabled")) is not bool
+                or type(route.get("pending", False)) is not bool
                 or not isinstance(route.get("purpose"), str) or not route["purpose"].strip()
                 or len(route["purpose"]) > 500
                 or any(ord(c) < 32 or ord(c) == 127 for c in route["purpose"])
@@ -270,6 +271,7 @@ def manage_addresses(cfg, args):
             if address not in data:
                 raise ValueError("email address is not registered")
             data[address]["enabled"] = False
+            data[address].pop("pending", None)
         else:
             if not PROFILE_NAME.fullmatch(args.profile):
                 raise ValueError("invalid email worker profile")
@@ -280,10 +282,11 @@ def manage_addresses(cfg, args):
             if address not in data and len(data) >= MAX_ADDRESSES:
                 raise ValueError("email address limit reached")
             route = {"purpose": purpose, "profile": args.profile, "batchSeconds": args.batch_seconds, "enabled": True}
-            # Publish disabled first when editing an active route. A failed
-            # handler update must not leave it accepting against stale policy.
+            # Defer new mail while replacing its handler. A failed update
+            # stays closed without permanently bouncing a sender's retry.
             if address in data:
                 data[address]["enabled"] = False
+                data[address]["pending"] = True
                 write_addresses(user, data)
             address_watch(cfg, user, address, route)
             data[address] = route
@@ -303,6 +306,8 @@ def recipient_decision(cfg, value):
         route = read_addresses(cfg, user).get(address.lower())
     except (OSError, ValueError, RecursionError, KeyError):
         return "reject|451 4.3.0 Recipient registry unavailable; retry later"
+    if route and route.get("pending"):
+        return "reject|451 4.3.0 Recipient handler update pending; retry later"
     if not route or not route["enabled"]:
         return "reject|550 5.1.1 Recipient is not registered"
     return "proceed"

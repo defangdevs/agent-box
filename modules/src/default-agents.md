@@ -31,6 +31,8 @@ plainly rather than handing it back.
   read-only (systemd ProtectSystem=strict) and writes there fail. The one
   exception is ~/sites, a symlink out to a caddy-readable dir (see "Serving
   a web app publicly").
+  When email is enabled, its per-user address registry is also writable
+  through `agent-box-email addresses` and Settings.
 - $HOME is SHARED by every one of your tmux sessions (same user, all start
   in $HOME unless `--cwd` sent them elsewhere), so two sessions in one clone
   edit the same files. Give yours a checkout of its own: ~/worktrees is
@@ -246,8 +248,9 @@ There is no implicit catch-all or triage address, including the untagged one.
 disable user+github@hostname` stops new reception while preserving its
 handler for already accepted mail. Saving an address enables it again.
 A handler is installed before reception is enabled; an unsuccessful handler
-update leaves that address disabled. Remove any older automatic rule for
-the same exact address before registering its replacement.
+update defers new mail with SMTP 451 until a successful save. Remove any
+older automatic rule for the same exact address before registering its
+replacement.
 
 Addresses such as `user+github@hostname` reach the same Linux user's bus
 with their full address as the topic (`email:user+github@hostname`). The
