@@ -52,7 +52,11 @@ let
   # Native hosts do not evaluate NixOS's security.pki module. Ship the same
   # distrust policy in the runtime, independent of the distro CA package.
   tlsCacert = pkgs.cacert.override {
-    blacklist = builtins.fromJSON (builtins.readFile ../modules/src/tls-roots.json);
+    blacklist = import ./tls-blacklist.nix {
+      inherit lib;
+      version = pkgs.cacert.version;
+      roots = builtins.fromJSON (builtins.readFile ../modules/src/tls-roots.json);
+    };
   };
   emptyCaDir = pkgs.runCommand "agent-box-empty-ca-dir" { } "mkdir -p $out/etc/agent-box/empty-ca-dir";
   src = ../modules/src;
@@ -326,6 +330,7 @@ let
   # generated wrapper prelude.
   cliPayloads = [
     (pkgs.writers.writePython3Bin "agent-box-email" {
+      libraries = with pkgs.python3Packages; [ dkimpy pyspf ];
       flakeIgnore = [ "E501" "E302" "E305" ];
     } (readSrc "email-cli.py"))
     (pkgs.writers.writePython3Bin "agent-box-whatsapp" {

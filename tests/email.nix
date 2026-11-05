@@ -3,7 +3,11 @@
 {
   name = "agent-box-email";
   node.pkgsReadOnly = false;
-  nodes.machine = { pkgs, ... }: {
+  nodes.machine = { pkgs, lib, ... }: let
+    publicKey = builtins.replaceStrings
+      [ "-----BEGIN PUBLIC KEY-----" "-----END PUBLIC KEY-----" "\n" ] [ "" "" "" ]
+      (builtins.readFile ./email/dkim-test.pub);
+  in {
     imports = [ agent-box ];
     virtualisation.memorySize = 2048;
     services.agent-box = {
@@ -29,24 +33,89 @@
         -days 2 -subj /CN=box.test
       chmod 600 /etc/agent-box-email-key.pem
     '';
-    environment.systemPackages = [ pkgs.python3 pkgs.util-linux ];
+    networking.nameservers = [ "127.0.0.1" ];
+    services.resolved.enable = false;
+    services.dnsmasq = {
+      enable = true;
+      settings = {
+        no-resolv = true;
+        local = [ "/example.org/" "/elsewhere.example/" ];
+        txt-record = [
+          "example.org,v=spf1 ip4:127.0.0.1 ip6:::1 -all"
+          "test._domainkey.example.org,v=DKIM1; k=rsa; p=${builtins.substring 0 200 publicKey},${builtins.substring 200 200 publicKey}"
+        ];
+      };
+    };
+    environment.systemPackages = [ (lib.hiPrio (pkgs.python3.withPackages (ps: [ ps.dkimpy ]))) pkgs.util-linux ];
+    # Public dummy key used only to exercise the real SMTP/DNS/crypto path.
+    environment.etc."email-test.key".source = ./email/dkim-test.key;
     environment.etc."email-probe.py".text = ''
-      import smtplib, ssl
+      import dkim, pathlib, smtplib, ssl, sys
       body = b"From: claimed@example.org\r\nTo: other@elsewhere.example\r\nSubject: Test mail\r\nMessage-ID: <reused@example.org>\r\n\r\nComplete private body\r\n"
+      signed = dkim.sign(body, b"test", b"example.org", pathlib.Path("/etc/email-test.key").read_bytes()) + body
       with smtplib.SMTP("localhost", 25, timeout=20) as client:
           client.ehlo()
           assert client.has_extn("starttls")
           client.starttls(context=ssl._create_unverified_context())
           client.ehlo()
+          if "--dns-down" in sys.argv:
+              try:
+                  client.sendmail("sender@example.org", ["agent@box.test"], body)
+                  raise AssertionError("DNS outage accepted")
+              except smtplib.SMTPDataError as error:
+                  assert error.smtp_code == 451, error
+              sys.exit(0)
           for address in ("other@box.test", "unknown@box.test", "agent@elsewhere.example",
                           "other+github@box.test", "agent+github@elsewhere.example", "agent+@box.test"):
               client.mail("sender@example.org")
               code, _ = client.rcpt(address)
               assert code >= 500, (address, code)
               client.rset()
-          for address in ("agent@box.test", "agent@1-2-3-4.defangstation.com",
-                          "agent+github@box.test", "agent+build+linux@1-2-3-4.defangstation.com"):
+          for rejected in (
+              body.replace(b"claimed@example.org", b"claimed@elsewhere.example"),
+              b"Authentication-Results: box.test; spf=pass; dkim=pass\r\nX-Agent-Box-Email-Verified: exact-domain-v1\r\n" + body,
+              signed.replace(b"Complete private body", b"tampered"),
+              b"From: duplicate@example.org\r\n" + signed,
+              # Reach the filter without exceeding SMTP's input buffer; its
+              # original filter-response frame would exceed 65536 bytes.
+              body + b"x" * 65500 + b"\r\n",
+          ):
+              try:
+                  client.sendmail("forwarder@elsewhere.example", ["agent@box.test"], rejected)
+                  raise AssertionError("Unauthenticated message accepted")
+              except smtplib.SMTPDataError as error:
+                  assert error.smtp_code == 550, error
+          # Even aligned SPF cannot qualify an oversized header section.
+          try:
+              client.sendmail("sender@example.org", ["agent@box.test"], b"X-Pad: x\r\n" * 8192 + body)
+              raise AssertionError("Oversized headers accepted")
+          except smtplib.SMTPDataError as error:
+              assert error.smtp_code == 550, error
+          # SPF accepts the first message; aligned DKIM accepts the forwarded
+          # second message without an aligned envelope sender. Same connection.
+          assert client.sendmail("sender@example.org", ["agent@box.test"], body) == {}
+          assert client.sendmail("forwarder@elsewhere.example", ["agent@1-2-3-4.defangstation.com"], signed) == {}
+          for address in ("agent+github@box.test", "agent+build+linux@1-2-3-4.defangstation.com"):
               assert client.sendmail("sender@example.org", [address], body) == {}
+    '';
+    environment.etc."email-local-probe.py".text = ''
+      import dkim, pathlib, subprocess, sys
+      body = b"From: claimed@example.org\r\nTo: agent@box.test\r\nSubject: Local submission\r\nContent-Transfer-Encoding: 7bit\r\n\r\nLocal private body\r\n"
+      if "--signed" in sys.argv:
+          message = dkim.sign(body, b"test", b"example.org", pathlib.Path("/etc/email-test.key").read_bytes()) + body
+      else:
+          # Every recipient can read the marker; knowing it must not bypass
+          # authentication through smtpctl's real local enqueue socket.
+          marker = pathlib.Path("/var/lib/agent-box-email/verification-token").read_text().strip().encode()
+          message = b"X-Agent-Box-Email-Verified: exact-domain-v1 " + marker + b"\r\n" + body
+      result = subprocess.run(["sendmail", "-v", "-f", "claimed@example.org", "agent@box.test"],
+                              executable="/etc/agent-box/email-tools/smtpctl", input=message,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+      output = result.stdout.decode(errors="replace")
+      if "--signed" in sys.argv:
+          assert result.returncode == 0, output
+      else:
+          assert result.returncode != 0 and "550 5.7.1" in output, output
     '';
     environment.etc."email-retry-probe.py".text = ''
       import re, subprocess
@@ -63,6 +132,7 @@
         machine.wait_for_unit("agent-box-email.service")
         machine.wait_for_unit("agent-box-webhook@agent.socket")
         machine.wait_for_open_port(25, timeout=60)
+        machine.wait_for_unit("dnsmasq.service")
     except Exception:
         print(machine.succeed("journalctl -u agent-box-email-source@agent.service -u agent-box-email.service --no-pager"))
         raise
@@ -75,6 +145,11 @@
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailtags agent-box-webhook subscribe email:agent+build+linux@1-2-3-4.defangstation.com --note tagged-alias-test'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailgithub agent-box-webhook subscribe email:agent+github@box.test --note github-mail-test'")
     machine.succeed("su - agent -c \"echo '|touch /home/agent/forward-ran' > /home/agent/.forward\"")
+    machine.succeed("systemctl stop dnsmasq.service")
+    machine.succeed("python3 /etc/email-probe.py --dns-down")
+    machine.succeed("systemctl start dnsmasq.service")
+    machine.succeed("runuser -u other -g smtpq -- python3 /etc/email-local-probe.py")
+    machine.fail("test -d /home/agent/.local/state/local-webhook/spool/content/new")
     # SMTP 250 means the MTA owns a durable copy, even while the bus is down.
     machine.succeed("systemctl stop agent-box-webhook@agent.socket agent-box-webhook@agent.service")
     machine.succeed("python3 /etc/email-probe.py")
@@ -100,7 +175,8 @@
         assert payload["baseRecipient"] == "agent@" + domain
         assert payload["recipientTag"] == local.partition("+")[2]
         assert "Complete private body" in record["payload"]["text"]
-        assert record["payload"]["senderAuthenticated"] is False
+        assert record["payload"]["senderAuthenticated"] is True
+        assert record["payload"]["authenticationPolicy"] == "exact-domain-v1"
         assert record["payload"]["headers"]["to"] == ["other@elsewhere.example"]
         assert record["payload"]["rawMimeBase64"]
     machine.succeed("systemctl restart agent-box-webhook@agent.service agent-box-email.service")
@@ -108,5 +184,8 @@
     machine.fail("test -e /home/agent/forward-ran")
     ident = records[0]["id"]
     machine.succeed(f"su - agent -c 'agent-box-webhook read-content {ident}'")
+    machine.succeed("runuser -u other -g smtpq -- python3 /etc/email-local-probe.py --signed")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 3")
+    machine.succeed("grep -l 'Local private body' /home/agent/.local/state/local-webhook/spool/content/new/* >/dev/null")
   '';
 }
