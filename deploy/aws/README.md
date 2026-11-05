@@ -610,7 +610,8 @@ with a static IP, waits for native activation, checks HTTPS authentication
 and the live browser terminal, then deletes the stack even on failure. It
 runs during promotion and on explicit test dispatches, rather than on every
 push. The test role needs the Lightsail create/read/delete permissions for
-the instance and static IP, plus CloudFormation list/describe/create/delete
+the instance and static IP (including attaching and detaching the static
+IP), plus CloudFormation list/describe/create/delete
 permissions. A missing IAM grant fails promotion. For diagnostics without
 running EC2, dispatch `Deploy test` with `lightsail_only` selected.
 
@@ -647,12 +648,14 @@ The GitHub environment listed in `AGENT_BOX_ENVIRONMENT` must exist - create it
 via `gh api --method PUT repos/<owner>/<repo>/environments/<name>` or the
 repo settings UI. No secrets attached; it's just the deployment gate.
 
-Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
+Verify by dispatching `Promote a release candidate` (the publish workflow
+no longer has its own `workflow_dispatch` trigger), then:
 
 ```bash
 curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/lightsail-template.yaml"
 curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
-# what those two currently pin, and what a box can be checked against
+# what the last COMPLETED publication pinned (not necessarily both current
+# templates: a failed upload can leave one template updated before this is written)
 curl -s "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/release-manifest.json"
 ```
 

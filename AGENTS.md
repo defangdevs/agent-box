@@ -338,8 +338,9 @@ avoiding another checkout and driver-preparation runner.
 A test may boot multiple guests. Do not raise that budget without measuring
 memory and CPU pressure. No test assertions are removed to meet timing goals.
 
-The matrix has `fail-fast: false`. The final `Validate module & VM` job runs
-with `always()` and fails unless native checks AND every VM lane succeeded.
+The matrix has `fail-fast: false`. The final `CI gate` job runs
+with `always()` and fails unless native checks AND every VM lane succeeded;
+skipped `native` and `vm` jobs are accepted only when `build` is `false`.
 For #519, measure from the first validation job's start to the final gate's
 completion, not the short final job alone. Report queue time and per-job
 preparation/test times separately, and sum job durations for runner cost.

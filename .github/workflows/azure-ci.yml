@@ -34,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
           # Both ends of the range have to be IN the clone; the default
           # depth-1 checkout has neither a pull request's base nor a
           # push's `before`.
@@ -60,6 +61,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       # Pinned, because the compiled JSON embeds the compiling CLI's version
       # and a version-derived templateHash. check_azure_template.py ignores
