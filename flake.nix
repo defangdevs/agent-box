@@ -451,8 +451,42 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             ];
           };
           services = multiUser.config.systemd.services;
-          tlsCacert = pkgs.cacert.override {
-            blacklist = builtins.fromJSON (builtins.readFile ./modules/src/tls-roots.json);
+          tlsRoots = builtins.fromJSON (builtins.readFile ./modules/src/tls-roots.json);
+          tlsBlacklistFor = version: import ./nix/tls-blacklist.nix {
+            inherit (nixpkgs) lib;
+            inherit version;
+            roots = tlsRoots;
+          };
+          tlsCacert = pkgs.cacert.override { blacklist = tlsBlacklistFor pkgs.cacert.version; };
+          # Exercise the root-store format on the failing 26.05 AMI without
+          # replacing the flake's independent pin or its whole package set.
+          modernCacertBase = pkgs.cacert.overrideAttrs (_: {
+            version = "3.131.1";
+            src = pkgs.fetchurl {
+              name = "certdata.txt";
+              url = "https://raw.githubusercontent.com/nss-dev/nss/refs/tags/NSS_3_131_1_RTM/lib/ckfw/builtins/certdata.txt";
+              hash = "sha256-PsK00kDcEsdH6vRQBh24SvdXxIO72jAvninOtdcL5RA=";
+            };
+          });
+
+          modernPkgs = pkgs // { cacert = modernCacertBase; };
+          modernRuntime = import ./nix/runtime.nix { pkgs = modernPkgs; };
+          modernModule = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.agent-box
+              {
+                nixpkgs.pkgs = modernPkgs;
+                # NixOS appends overlays to an externally supplied set;
+                # preserve the version override through that extension.
+                nixpkgs.overlays = [ (_final: _prev: { cacert = modernCacertBase; }) ];
+                services.agent-box = { enable = true; users.agent = { }; };
+                # The fixture asserts root absence as well as rejection, so
+                # use standard PEM rather than auxiliary distrust records.
+                security.pki.useCompatibleBundle = true;
+                system.stateVersion = "25.05";
+              }
+            ];
           };
 
           # issue #154 Phase 3: "agent-box@" is the systemd %i template unit,
@@ -1894,7 +1928,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
 
           tls-trust =
             assert builtins.all (name: builtins.elem name multiUser.config.security.pki.caCertificateBlacklist)
-              (builtins.fromJSON (builtins.readFile ./modules/src/tls-roots.json));
+              (tlsBlacklistFor pkgs.cacert.version);
             assert multiUser.config.systemd.globalEnvironment.NODE_OPTIONS == "--use-openssl-ca";
             assert multiUser.config.systemd.services.nix-daemon.environment.SSL_CERT_FILE == "/etc/ssl/certs/ca-certificates.crt";
             pkgs.runCommand "agent-box-tls-trust" {
@@ -1907,6 +1941,25 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             python3 ${./tests}/check-tls-trust.py
             touch $out
           '';
+
+          tls-trust-modern =
+            assert tlsBlacklistFor "3.126" == tlsRoots;
+            assert tlsBlacklistFor "3.131.1" == [ "Comodo AAA Services root" ];
+            assert tlsBlacklistFor "3.132" == [ "Comodo AAA Services root" ];
+            assert modernModule.config.security.pki.caCertificateBlacklist == [ "Comodo AAA Services root" ];
+            pkgs.runCommand "agent-box-tls-trust-modern" {
+              nativeBuildInputs = [ pkgs.python3 pkgs.openssl ];
+            } ''
+              mkdir empty-certs
+              export SSL_CERT_DIR="$PWD/empty-certs"
+              for bundle in \
+                "${modernModule.config.environment.etc."ssl/certs/ca-certificates.crt".source}" \
+                "${modernRuntime}/etc/ssl/certs/ca-no-trust-rules-bundle.crt"; do
+                export SSL_CERT_FILE="$bundle" NIX_SSL_CERT_FILE="$bundle"
+                python3 ${./tests}/check-tls-trust.py
+              done
+              touch "$out"
+            '';
 
           module-generated-up-to-date =
             pkgs.runCommand "agent-box-module-generated-up-to-date"
@@ -1925,6 +1978,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 # outside modules/src that the template splices, because both
                 # backends have to read the pin from ONE place (issue #425).
                 pin = ./nix/webhook-pin.nix;
+                tlsPolicy = ./nix/tls-blacklist.nix;
               } ''
               install -d repo/bin repo/modules repo/docs repo/nix
               cp "$assembler" repo/bin/assemble-module.py
@@ -1933,6 +1987,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp -r "$srcDir" repo/modules/src
               cp "$mark" repo/docs/potato.svg
               cp "$pin" repo/nix/webhook-pin.nix
+              cp "$tlsPolicy" repo/nix/tls-blacklist.nix
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';

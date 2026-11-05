@@ -87,6 +87,8 @@ class ReleaseWorkflows(unittest.TestCase):
             self.assertEqual(result.returncode == 0, expected, result.stderr)
 
     def test_both_fresh_boot_results_are_required_for_publication(self):
+        ec2 = workflow("deploy-test.yml")["jobs"]["deploy-test"]
+        self.assertNotIn("continue-on-error", ec2)
         publish = PROMOTE["jobs"]["publish"]
         self.assertEqual(set(publish["needs"]), {"candidate", "deploy-test", "lightsail-test"})
         states = ["success", "failure", "cancelled", "skipped"]

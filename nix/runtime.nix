@@ -52,7 +52,11 @@ let
   # Native hosts do not evaluate NixOS's security.pki module. Ship the same
   # distrust policy in the runtime, independent of the distro CA package.
   tlsCacert = pkgs.cacert.override {
-    blacklist = builtins.fromJSON (builtins.readFile ../modules/src/tls-roots.json);
+    blacklist = import ./tls-blacklist.nix {
+      inherit lib;
+      version = pkgs.cacert.version;
+      roots = builtins.fromJSON (builtins.readFile ../modules/src/tls-roots.json);
+    };
   };
   emptyCaDir = pkgs.runCommand "agent-box-empty-ca-dir" { } "mkdir -p $out/etc/agent-box/empty-ca-dir";
   src = ../modules/src;
