@@ -117,8 +117,8 @@ let
             for u, p in sorted(accounts.items())) + ' }')
         for user in sorted(cfg["users"]):
             # Accept nonempty tags only for an explicitly enabled user/domain.
-            addresses = ', '.join('"^' + user + '([+]' + RECIPIENT_TAG + ')?@'
-                                  + d.lower().replace('.', '[.]') + '$"' for d in cfg["domains"])
+            addresses = ', '.join('"^' + user + '([+]' + RECIPIENT_TAG + ')?@' +
+                                  d.lower().replace('.', '[.]') + '$"' for d in cfg["domains"])
             command = " ".join((COMMAND, "deliver", user))
             lines += [
                 'table rcpt_' + user + ' { ' + addresses + ' }',
@@ -132,8 +132,8 @@ let
     def recipient_parts(address):
         local, separator, domain = address.partition('@')
         user, tagged, tag = local.partition('+')
-        if (not separator or not USER.fullmatch(user.lower()) or not DOMAIN.fullmatch(domain)
-                or (tagged and not re.fullmatch(RECIPIENT_TAG, tag))):
+        if (not separator or not USER.fullmatch(user.lower()) or not DOMAIN.fullmatch(domain) or
+                (tagged and not re.fullmatch(RECIPIENT_TAG, tag))):
             raise PermanentMessageError("invalid email envelope recipient")
         base = user.lower() + '@' + domain.lower()
         recipient = user.lower() + ('+' + tag if tagged else ''') + '@' + domain.lower()
