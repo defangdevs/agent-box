@@ -2189,6 +2189,7 @@ class Renderer:
                "[Journal]\n"
                "SystemMaxUse=200M\n")
         self.nix_conf(t)
+        self.nix_registry(t)
 
     def nixpkgs_cache(self, t):
         """Build the shared nixpkgs cache each user's first install reads.
@@ -2401,6 +2402,67 @@ class Renderer:
         except OSError:
             mode = 0o644
         t.file(target, existing.rstrip("\n") + "\n\n" + want, mode=mode)
+
+    def nix_registry(self, t):
+        """Point `nixpkgs#...` at this box's pinned nixpkgs.
+
+        Without this a bare `nix profile add nixpkgs#foo` resolves through
+        the GLOBAL flake registry, which on a Determinate box maps nixpkgs
+        to FlakeHub's nixpkgs-weekly - a revision agent-box neither chose
+        nor moves. On one aarch64 box that rev had whisper-cpp
+        dependency-failed on Hydra, so the install compiled from source,
+        while the box's own pin had it cached. The system registry
+        (/etc/nix/registry.json) outranks the global one, so naming the
+        jitNixpkgs pin here puts user installs on the revision the harnesses,
+        the nixpkgs cache and every update already agree on.
+
+        It only outranks the GLOBAL registry. A user's own
+        `nix registry add nixpkgs ...` (~/.config/nix/registry.json) still
+        wins, as does `--override-flake nixpkgs ...` or naming any other
+        flake ref outright - the per-case escape hatch for a package the
+        pin carries at an old version.
+
+        JSON has no comment for a generated-file header, so ownership is
+        decided by content: entries other than nixpkgs are always kept, and
+        a nixpkgs entry is replaced only when it is absent or is one this
+        renderer wrote (a nixos.org channel tarball). Anything else is an
+        operator's choice and is left alone with a note.
+        """
+        path = self.p("/etc/nix/registry.json")
+        ours = {"from": {"type": "indirect", "id": "nixpkgs"},
+                "to": {"type": "tarball", "url": self.spec.jit_nixpkgs}}
+        flakes = []
+        try:
+            existing = path.read_text()
+        except OSError:
+            existing = None
+        if existing is not None:
+            try:
+                data = json.loads(existing)
+                flakes = list(data["flakes"])
+                if data.get("version") != 2:
+                    raise ValueError("not a version 2 registry")
+            except (ValueError, KeyError, TypeError) as e:
+                self.notes.append(f"{path}: not a registry agent-box can "
+                                  f"read ({e}) - left alone; nixpkgs# "
+                                  "keeps its global mapping")
+                return
+        kept = []
+        for entry in flakes:
+            frm = entry.get("from", {}) if isinstance(entry, dict) else {}
+            if frm.get("type") != "indirect" or frm.get("id") != "nixpkgs":
+                kept.append(entry)
+                continue
+            to = entry.get("to")
+            url = str(to.get("url", "")) if isinstance(to, dict) else ""
+            if not url.startswith(("https://releases.nixos.org/",
+                                   "https://channels.nixos.org/")):
+                self.notes.append(f"{path}: maps nixpkgs itself - left "
+                                  "alone; agent-box did not pin it")
+                return
+        t.dir(self.p("/etc/nix"), 0o755)
+        t.file(path, json.dumps({"version": 2, "flakes": [ours] + kept},
+                                indent=2) + "\n")
 
     # -- base-OS patching ----------------------------------------------------
 

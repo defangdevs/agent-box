@@ -824,6 +824,60 @@ class RenderTest(unittest.TestCase):
         self.assertIn("min-free = 1073741824", nixconf)
         self.assertIn("max-free = 5368709120", nixconf)
 
+    def test_nixpkgs_registry_follows_the_box_pin(self):
+        """`nixpkgs#` must name the jitNixpkgs pin, not the global
+        registry's moving target, so a user install lands on the revision
+        the harnesses use and that the binary cache has built."""
+        reg = json.loads((FIXTURE / "etc/nix/registry.json").read_text())
+        self.assertEqual(2, reg["version"])
+        entry = reg["flakes"][0]
+        self.assertEqual({"type": "indirect", "id": "nixpkgs"}, entry["from"])
+        self.assertEqual("tarball", entry["to"]["type"])
+        # The fixture renders with no pin file under its root, so the pin
+        # is the channel default - the same URL jitNixpkgs falls back to.
+        self.assertEqual(load_agentbox().CHANNEL_NIXPKGS, entry["to"]["url"])
+
+    def _render_registry(self, existing):
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            (out / "etc/nix/registry.json").write_text(existing)
+            mod = load_agentbox()
+            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
+            rend = mod.Renderer(spec_obj, prof, root=out)
+            tree = rend.render()
+            written = tree.files.get(str(out / "etc/nix/registry.json"))
+            return (json.loads(written[0]) if written else None), rend.notes
+
+    def test_a_foreign_registry_keeps_its_other_entries(self):
+        other = {"from": {"type": "indirect", "id": "mine"},
+                 "to": {"type": "github", "owner": "o", "repo": "r"}}
+        stale = {"from": {"type": "indirect", "id": "nixpkgs"},
+                 "to": {"type": "tarball", "url": "https://releases.nixos.org"
+                        "/nixos/unstable/old/nixexprs.tar.xz"}}
+        reg, _ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [other, stale]}))
+        self.assertIn(other, reg["flakes"], "dropped somebody else's entry")
+        pins = [f for f in reg["flakes"] if f["from"].get("id") == "nixpkgs"]
+        self.assertEqual(1, len(pins), "left the stale pin beside the new one")
+        self.assertNotEqual(stale["to"], pins[0]["to"])
+
+    def test_an_operator_nixpkgs_mapping_is_left_alone(self):
+        theirs = {"version": 2, "flakes": [
+            {"from": {"type": "indirect", "id": "nixpkgs"},
+             "to": {"type": "github", "owner": "NixOS", "repo": "nixpkgs",
+                    "ref": "nixos-25.11"}}]}
+        reg, notes = self._render_registry(json.dumps(theirs))
+        self.assertIsNone(reg, "overruled an operator's own nixpkgs mapping")
+        self.assertTrue(any("registry.json" in n for n in notes),
+                        "skipped the pin without saying so")
+
+    def test_an_unreadable_registry_is_left_alone(self):
+        reg, notes = self._render_registry("not json")
+        self.assertIsNone(reg)
+        self.assertTrue(any("registry.json" in n for n in notes))
+
     def test_a_foreign_nix_custom_conf_keeps_its_scalars(self):
         """/etc/nix/nix.custom.conf is what Determinate tells a HUMAN to
         edit, so a value somebody set there is not ours to overrule.

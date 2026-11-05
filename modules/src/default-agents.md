@@ -94,6 +94,14 @@ plainly rather than handing it back.
 
 - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
   (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
+  `nixpkgs#` is this box's pinned nixpkgs - the same revision the harnesses
+  come from, moved only by a box update - so installs hit the binary cache
+  and every session gets the same versions. When the pin carries a package
+  at an old version, override it for that one install:
+  `nix profile add github:NixOS/nixpkgs/nixpkgs-unstable#pulumi`, or the
+  project's own flake (`nix profile add github:OWNER/REPO`). Run
+  `nix registry add nixpkgs github:NixOS/nixpkgs/nixpkgs-unstable` to change
+  it for your user; `nix registry remove nixpkgs` goes back to the pin.
 - Your config lives in ~/.config/agent-box/. Secrets and environment
   variables go in the file `env` there (KEY=value, one per line; blank lines
   and `#` comment lines are ignored, so annotate freely). Set them with

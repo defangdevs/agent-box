@@ -3153,6 +3153,17 @@ in
     # List settings merge, so hosts can still extend this.
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
+    # ... and `nixpkgs#` resolves to the box's own pin, the one the harnesses
+    # and the nixpkgs cache use, instead of whatever the global registry
+    # follows that week (a rev Hydra may not have built). This is the system
+    # registry, so a user's `nix registry add nixpkgs ...` or a per-command
+    # `--override-flake nixpkgs ...` still wins. Above nixpkgs' own mkDefault
+    # (the system flake) and below a host's plain definition.
+    nix.registry.nixpkgs.to = lib.mkOverride 900 {
+      type = "tarball";
+      url = jitNixpkgsRef;
+    };
+
     # Trust DefangLabs' public Cachix cache, so agent-box-defang-cli.service
     # below substitutes a prebuilt closure instead of compiling Go from
     # source (agent-box#373). This alone would NOT fix first boot if
