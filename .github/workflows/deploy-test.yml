@@ -214,7 +214,10 @@ jobs:
 
           # Pull whatever a FAILED-to-provision instance can still tell us,
           # BEFORE the stack (and the instance) is deleted — this evidence is
-          # otherwise destroyed. get-console-output only ever returns amazon-
+          # otherwise destroyed. SSM inline stdout is capped at 24 KB: keep
+          # the journal tail bounded so the derivation list cannot hide the
+          # actual build error when the response is truncated.
+          # get-console-output only ever returns amazon-
           # init's terminal "Failed to start ..." line (it logs journal-only,
           # deploy/aws/template.yaml:456,601), so the pre-switch journal itself —
           # where an IPv6-only DNS/resolver failure would actually show up —
@@ -237,7 +240,7 @@ jobs:
               --document-name AWS-RunShellScript \
               --parameters 'commands=[
                 "systemctl status amazon-init --no-pager -l 2>&1 || true",
-                "echo ---amazon-init-journal---; journalctl -u amazon-init --no-pager 2>&1 || true",
+                "echo ---amazon-init-journal-tail---; journalctl -u amazon-init -n 80 -o cat --no-pager 2>&1 | tail -c 12000 || true",
                 "echo ---resolvectl---; resolvectl status 2>&1 || true; cat /etc/resolv.conf 2>&1 || true",
                 "echo ---networkd-journal---; journalctl -u systemd-networkd -u systemd-resolved --no-pager 2>&1 | tail -100 || true",
                 "echo ---live-fetch-probe---; curl -6 -sSv --max-time 10 -o /dev/null https://raw.githubusercontent.com/ 2>&1 || true"
