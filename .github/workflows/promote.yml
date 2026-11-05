@@ -77,7 +77,7 @@ jobs:
       agent_nixpkgs_url: ${{ steps.pins.outputs.agent_nixpkgs_url }}
       agent_nixpkgs_sha256: ${{ steps.pins.outputs.agent_nixpkgs_sha256 }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           # All of it: the candidate may be older than the tip, and the
           # record job needs the tags to tell a first promotion from a
@@ -170,7 +170,7 @@ jobs:
           done
           [ "$failed" -eq 0 ]
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
 
       - name: Check out the candidate into its own directory
         # The top-level checkout above is fetch-depth 0 so REV can be
@@ -267,7 +267,7 @@ jobs:
             | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Hand the manifest to the phases that follow
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-manifest
           path: release-manifest.json
@@ -338,12 +338,12 @@ jobs:
       # The tag, the Release, and the `release` branch pointer.
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ needs.candidate.outputs.rev }}
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-manifest
 

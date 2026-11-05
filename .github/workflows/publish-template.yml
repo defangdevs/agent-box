@@ -77,12 +77,12 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ inputs.ref }}
           persist-credentials: false
 
-      - uses: cachix/install-nix-action@v31
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
 
       - name: Resolve the commit being published
         id: rev
@@ -94,7 +94,7 @@ jobs:
       # Publication is callable only from promotion. There is no standalone
       # dispatch that could re-resolve a previously tested dependency set.
       - name: Fetch the candidate's release manifest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: ${{ inputs.manifest_artifact }}
 
@@ -183,7 +183,7 @@ jobs:
           done
 
       - name: Configure AWS credentials via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ env.ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -256,7 +256,7 @@ jobs:
           echo "::notice::Published to https://${BUCKET}.s3.amazonaws.com/${MANIFEST}"
 
       - name: Keep the manifest with the run
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: published-manifest
           path: ${{ env.MANIFEST }}
