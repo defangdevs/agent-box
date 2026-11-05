@@ -1309,14 +1309,16 @@ let
 
     - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
       (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
-      `nixpkgs#` is this box's pinned nixpkgs - the same revision the harnesses
-      come from, moved only by a box update - so installs hit the binary cache
-      and every session gets the same versions. When the pin carries a package
-      at an old version, override it for that one install:
+      `nixpkgs#` is the box's own nixpkgs - the same one the harnesses come
+      from. After the box's first update that is a fixed revision, moved only
+      by the next update; before it, the nixos-unstable channel. Installs hit
+      the binary cache and every session gets the same versions. When it
+      carries a package at an old version, override it for that one install:
       `nix profile add github:NixOS/nixpkgs/nixpkgs-unstable#pulumi`, or the
       project's own flake (`nix profile add github:OWNER/REPO`). Run
       `nix registry add nixpkgs github:NixOS/nixpkgs/nixpkgs-unstable` to change
-      it for your user; `nix registry remove nixpkgs` goes back to the pin.
+      it for your user; `nix registry remove nixpkgs` goes back to the box's
+      mapping (`nix registry list` shows it - an operator may have set their own).
     - Your config lives in ~/.config/agent-box/. Secrets and environment
       variables go in the file `env` there (KEY=value, one per line; blank lines
       and `#` comment lines are ignored, so annotate freely). Set them with
@@ -20445,16 +20447,24 @@ in
     # List settings merge, so hosts can still extend this.
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
-    # ... and `nixpkgs#` resolves to the box's own pin, the one the harnesses
-    # and the nixpkgs cache use, instead of whatever the global registry
-    # follows that week (a rev Hydra may not have built). This is the system
-    # registry, so a user's `nix registry add nixpkgs ...` or a per-command
-    # `--override-flake nixpkgs ...` still wins. Above nixpkgs' own mkDefault
-    # (the system flake) and below a host's plain definition.
-    nix.registry.nixpkgs.to = lib.mkOverride 900 {
-      type = "tarball";
-      url = jitNixpkgsRef;
-    };
+    # ... and `nixpkgs#` resolves to the same nixpkgs the harnesses and the
+    # nixpkgs cache use, instead of whatever the global registry follows
+    # that week (a rev Hydra may not have built). That is a fixed revision
+    # once selfUpdate.agentNixpkgs or jitNixpkgs pins one; with neither it
+    # is the nixos-unstable channel, which moves with the channel. This is
+    # the system registry, so a user's `nix registry add nixpkgs ...` or a
+    # per-command `--override-flake nixpkgs ...` still wins. Above nixpkgs'
+    # own mkDefault (the system flake) and below a host's plain definition.
+    # Only an https archive ref maps to a typed registry entry without
+    # parsing the whole flake-ref grammar; any other jitNixpkgs (github:,
+    # git+, a path) leaves the registry as nixpkgs set it, as on native.
+    nix.registry.nixpkgs.to = lib.mkIf
+      (builtins.match "https://.*[.](tar([.][a-z0-9]+)?|tgz|zip)([?].*)?"
+        jitNixpkgsRef != null)
+      (lib.mkOverride 900 {
+        type = "tarball";
+        url = jitNixpkgsRef;
+      });
 
     # Trust DefangLabs' public Cachix cache, so agent-box-defang-cli.service
     # below substitutes a prebuilt closure instead of compiling Go from

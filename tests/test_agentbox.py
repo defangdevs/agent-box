@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -837,46 +838,181 @@ class RenderTest(unittest.TestCase):
         # is the channel default - the same URL jitNixpkgs falls back to.
         self.assertEqual(load_agentbox().CHANNEL_NIXPKGS, entry["to"]["url"])
 
-    def _render_registry(self, existing):
+    def _render_registry(self, existing=None, stamp=None, config=None,
+                         prepare=None):
+        """Render against a root holding `existing` as the registry and
+        `stamp` as agent-box's record of its last write. Returns the parsed
+        registry it would write (None for none), the notes, the out root
+        and the tree."""
         with tempfile.TemporaryDirectory() as tmp:
             prof = build_fake_profile(tmp)
             out = Path(tmp) / "out"
             (out / "etc/nix").mkdir(parents=True)
-            (out / "etc/nix/registry.json").write_text(existing)
+            (out / "etc/agent-box").mkdir(parents=True)
+            reg = out / "etc/nix/registry.json"
+            if existing is not None:
+                (reg.write_bytes if isinstance(existing, bytes)
+                 else reg.write_text)(existing)
+            if stamp is not None:
+                (out / "etc/agent-box/nix-registry-nixpkgs.json").write_text(
+                    json.dumps(stamp))
+            if prepare:
+                prepare(out)
             mod = load_agentbox()
-            spec_obj = mod.Spec(json.loads(CONFIG_JSON.read_text()), prof)
-            rend = mod.Renderer(spec_obj, prof, root=out)
+            data = json.loads(CONFIG_JSON.read_text())
+            data.update(config or {})
+            rend = mod.Renderer(mod.Spec(data, prof), prof, root=out)
             tree = rend.render()
-            written = tree.files.get(str(out / "etc/nix/registry.json"))
-            return (json.loads(written[0]) if written else None), rend.notes
+            target = reg.resolve() if reg.is_symlink() else reg
+            written = tree.files.get(str(target))
+            return ((json.loads(written[0]) if written else None),
+                    rend.notes, written, tree, out)
 
-    def test_a_foreign_registry_keeps_its_other_entries(self):
+    @staticmethod
+    def _pin(url):
+        return {"from": {"type": "indirect", "id": "nixpkgs"},
+                "to": {"type": "tarball", "url": url}}
+
+    OLD = ("https://releases.nixos.org/nixos/unstable/old/nixexprs.tar.xz")
+
+    def test_a_registry_keeps_other_entries_and_moves_our_pin(self):
         other = {"from": {"type": "indirect", "id": "mine"},
                  "to": {"type": "github", "owner": "o", "repo": "r"}}
-        stale = {"from": {"type": "indirect", "id": "nixpkgs"},
-                 "to": {"type": "tarball", "url": "https://releases.nixos.org"
-                        "/nixos/unstable/old/nixexprs.tar.xz"}}
-        reg, _ = self._render_registry(
-            json.dumps({"version": 2, "flakes": [other, stale]}))
+        stale = self._pin(self.OLD)
+        reg, *_ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [other, stale]}),
+            stamp=stale["to"])
         self.assertIn(other, reg["flakes"], "dropped somebody else's entry")
         pins = [f for f in reg["flakes"] if f["from"].get("id") == "nixpkgs"]
         self.assertEqual(1, len(pins), "left the stale pin beside the new one")
         self.assertNotEqual(stale["to"], pins[0]["to"])
 
-    def test_an_operator_nixpkgs_mapping_is_left_alone(self):
-        theirs = {"version": 2, "flakes": [
-            {"from": {"type": "indirect", "id": "nixpkgs"},
-             "to": {"type": "github", "owner": "NixOS", "repo": "nixpkgs",
-                    "ref": "nixos-25.11"}}]}
-        reg, notes = self._render_registry(json.dumps(theirs))
-        self.assertIsNone(reg, "overruled an operator's own nixpkgs mapping")
-        self.assertTrue(any("registry.json" in n for n in notes),
-                        "skipped the pin without saying so")
+    def test_an_explicit_jit_pin_reaches_the_registry(self):
+        """A renderer that hardcoded the channel URL would pass the fixture
+        test; this one would not."""
+        url = "https://example.org/nixpkgs/pinned.tar.gz"
+        reg, *_ = self._render_registry(config={"jitNixpkgs": url})
+        self.assertEqual({"type": "tarball", "url": url},
+                         reg["flakes"][0]["to"])
 
-    def test_an_unreadable_registry_is_left_alone(self):
-        reg, notes = self._render_registry("not json")
+    def test_a_pin_agent_box_wrote_moves_whatever_its_host(self):
+        """Ownership is the record, not the URL's host: pin A on a host that
+        is not nixos.org is still ours, and moves to pin B."""
+        a = "https://example.org/a.tar.gz"
+        b = "https://example.org/b.tar.gz"
+        reg, *_ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [self._pin(a)]}),
+            stamp={"type": "tarball", "url": a}, config={"jitNixpkgs": b})
+        self.assertEqual(b, reg["flakes"][0]["to"]["url"])
+
+    def test_an_operator_nixpkgs_mapping_is_left_alone(self):
+        """Even one on releases.nixos.org: with no record that agent-box
+        wrote it, it is an operator's choice."""
+        for to in ({"type": "github", "owner": "NixOS", "repo": "nixpkgs",
+                    "ref": "nixos-25.11"},
+                   {"type": "tarball", "url": self.OLD}):
+            with self.subTest(to=to):
+                theirs = {"version": 2, "flakes": [
+                    {"from": {"type": "indirect", "id": "nixpkgs"},
+                     "to": to}]}
+                reg, notes, *_ = self._render_registry(json.dumps(theirs))
+                self.assertIsNone(reg, "overruled an operator's mapping")
+                self.assertTrue(any("registry.json" in n for n in notes),
+                                "skipped the pin without saying so")
+
+    def test_an_operator_edit_after_our_write_is_left_alone(self):
+        mine = {"type": "tarball", "url": self.OLD}
+        theirs = {"type": "github", "owner": "NixOS", "repo": "nixpkgs"}
+        reg, notes, *_ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [
+                {"from": {"type": "indirect", "id": "nixpkgs"},
+                 "to": theirs}]}), stamp=mine)
         self.assertIsNone(reg)
         self.assertTrue(any("registry.json" in n for n in notes))
+
+    def test_an_unreadable_registry_is_left_alone(self):
+        for bad in ("not json", b"\xff\xfe not utf-8",
+                    json.dumps({"version": 1, "flakes": []})):
+            with self.subTest(bad=bad):
+                reg, notes, *_ = self._render_registry(bad)
+                self.assertIsNone(reg)
+                self.assertTrue(any("registry.json" in n for n in notes))
+
+    def test_a_malformed_entry_is_kept_not_fatal(self):
+        odd = {"from": None, "to": None}
+        reg, *_ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [odd, "junk"]}))
+        self.assertIn(odd, reg["flakes"])
+        self.assertIn("junk", reg["flakes"])
+
+    def test_a_non_tarball_jit_ref_leaves_the_registry(self):
+        reg, notes, *_ = self._render_registry(
+            config={"jitNixpkgs": "github:NixOS/nixpkgs/nixos-unstable"})
+        self.assertIsNone(reg, "wrote a github: ref as a tarball URL")
+        self.assertTrue(any("not an https archive" in n for n in notes))
+
+    def test_a_registry_keeps_its_mode_and_symlink(self):
+        def prepare(out):
+            real = out / "elsewhere.json"
+            real.write_text(json.dumps({"version": 2, "flakes": []}))
+            real.chmod(0o600)
+            reg = out / "etc/nix/registry.json"
+            reg.unlink(missing_ok=True)
+            reg.symlink_to(real)
+        reg, _, written, tree, out = self._render_registry(prepare=prepare)
+        self.assertIsNotNone(reg)
+        self.assertEqual(0o600, written[1], "widened a root-only registry")
+        self.assertNotIn(str(out / "etc/nix/registry.json"), tree.files,
+                         "would replace the symlink with a plain file")
+
+    def test_a_settled_registry_is_not_rewritten(self):
+        reg, _, _, tree, out = self._render_registry()
+        stamp = json.loads(tree.files[
+            str(out / "etc/agent-box/nix-registry-nixpkgs.json")][0])
+        again, notes, *_ = self._render_registry(
+            json.dumps(reg, indent=2) + "\n", stamp=stamp)
+        self.assertIsNone(again, "rewrote a settled registry")
+        self.assertFalse([n for n in notes if "registry.json" in n])
+
+    def test_write_if_changed_never_widens_a_temp_file(self):
+        """The temp file is CREATED at the target mode, so a 0600 file is
+        never readable by others, not even between the write and a chmod."""
+        mod = load_agentbox()
+        modes = []
+        real_open = os.open
+
+        def spy(path, flags, mode=0o777, *a, **k):
+            modes.append(mode)
+            return real_open(path, flags, mode, *a, **k)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "secret.json"
+            with mock.patch.object(mod.os, "open", spy):
+                mod.write_if_changed(target, "x\n", 0o600)
+            self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
+        self.assertEqual([0o600], modes)
+
+    def test_rollback_puts_our_registry_pin_back(self):
+        """A rolled-back update restores the pin file and re-applies with
+        the OLD release, which may predate the registry - so the registry
+        is moved back too, but only off the pin the failed run wrote."""
+        mod = load_agentbox()
+        new_pin = "https://releases.nixos.org/nixos/unstable/new/nixexprs.tar.xz"
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = Path(tmp) / "registry.json"
+            stamp = Path(tmp) / "stamp.json"
+            reg.write_text(json.dumps(
+                {"version": 2, "flakes": [self._pin(new_pin)]}))
+            stamp.write_text(json.dumps(self._pin(new_pin)["to"]))
+            with mock.patch.object(mod, "NIX_REGISTRY", str(reg)), \
+                    mock.patch.object(mod, "NIX_REGISTRY_STAMP", str(stamp)):
+                # Not ours to move: the registry names some other ref.
+                mod.retarget_nix_registry("https://x.org/other.tar.gz",
+                                          self.OLD)
+                self.assertIn(new_pin, reg.read_text())
+                mod.retarget_nix_registry(new_pin, self.OLD)
+            back = json.loads(reg.read_text())
+            self.assertEqual(self.OLD, back["flakes"][0]["to"]["url"])
+            self.assertEqual(self.OLD, json.loads(stamp.read_text())["url"])
 
     def test_a_foreign_nix_custom_conf_keeps_its_scalars(self):
         """/etc/nix/nix.custom.conf is what Determinate tells a HUMAN to

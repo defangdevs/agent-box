@@ -3153,16 +3153,24 @@ in
     # List settings merge, so hosts can still extend this.
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
 
-    # ... and `nixpkgs#` resolves to the box's own pin, the one the harnesses
-    # and the nixpkgs cache use, instead of whatever the global registry
-    # follows that week (a rev Hydra may not have built). This is the system
-    # registry, so a user's `nix registry add nixpkgs ...` or a per-command
-    # `--override-flake nixpkgs ...` still wins. Above nixpkgs' own mkDefault
-    # (the system flake) and below a host's plain definition.
-    nix.registry.nixpkgs.to = lib.mkOverride 900 {
-      type = "tarball";
-      url = jitNixpkgsRef;
-    };
+    # ... and `nixpkgs#` resolves to the same nixpkgs the harnesses and the
+    # nixpkgs cache use, instead of whatever the global registry follows
+    # that week (a rev Hydra may not have built). That is a fixed revision
+    # once selfUpdate.agentNixpkgs or jitNixpkgs pins one; with neither it
+    # is the nixos-unstable channel, which moves with the channel. This is
+    # the system registry, so a user's `nix registry add nixpkgs ...` or a
+    # per-command `--override-flake nixpkgs ...` still wins. Above nixpkgs'
+    # own mkDefault (the system flake) and below a host's plain definition.
+    # Only an https archive ref maps to a typed registry entry without
+    # parsing the whole flake-ref grammar; any other jitNixpkgs (github:,
+    # git+, a path) leaves the registry as nixpkgs set it, as on native.
+    nix.registry.nixpkgs.to = lib.mkIf
+      (builtins.match "https://.*[.](tar([.][a-z0-9]+)?|tgz|zip)([?].*)?"
+        jitNixpkgsRef != null)
+      (lib.mkOverride 900 {
+        type = "tarball";
+        url = jitNixpkgsRef;
+      });
 
     # Trust DefangLabs' public Cachix cache, so agent-box-defang-cli.service
     # below substitutes a prebuilt closure instead of compiling Go from
