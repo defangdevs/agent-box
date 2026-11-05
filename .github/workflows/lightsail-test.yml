@@ -76,14 +76,24 @@ jobs:
             --query 'Stacks[0].Outputs[?OutputKey==`WebURL`].OutputValue | [0]' --output text)
           [[ "$url" == https://*/workspace/ ]]
           for i in $(seq 1 30); do
-            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+            code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 10 \
               -u "workspace:$WEB_PASSWORD" "$url" || true)
+            echo "[$i/30] authenticated landing page -> HTTP $code"
             if [ "$code" = 200 ]; then break; fi
             sleep 10
           done
           test "$code" = 200
           code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url")
           test "$code" = 401
+          # Native first boot intentionally has no sessions. Exercise the
+          # same authenticated creation route as the settings page, using a
+          # bare shell so no third-party harness login/download is needed.
+          origin=${url%/workspace/}
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+            -u "workspace:$WEB_PASSWORD" -H "Origin: $origin" \
+            --data-urlencode 'profile=:shell' "$origin/sessions/add")
+          test "$code" = 303
+          url="${url}shell/"
           python3 -m pip install --quiet websocket-client
           for i in $(seq 1 6); do
             if python3 scripts/ws_smoke.py "$url" "$WEB_PASSWORD"; then exit 0; fi

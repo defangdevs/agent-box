@@ -119,6 +119,38 @@ class ReleaseWorkflows(unittest.TestCase):
                                      stubs={"git": f"print({tag!r})\n"})
             self.assertEqual(result.returncode == 0, expected, result.stderr)
 
+    def test_native_smoke_handles_empty_first_boot_and_creates_a_shell(self):
+        script = next(item["run"] for item in workflow("lightsail-test.yml")["jobs"]["lightsail"]["steps"]
+                      if item.get("name") == "Verify HTTPS authentication and a live terminal")
+        curl = '''
+from pathlib import Path
+import sys
+args = sys.argv[1:]
+if '--data-urlencode' in args:
+    assert 'profile=:shell' in args
+    assert args[-1] == 'https://fixture.invalid/sessions/add'
+    assert 'Origin: https://fixture.invalid' in args
+    Path('created').touch()
+    print('303')
+elif '-u' in args:
+    # Without following the first-boot redirect the landing page is 303.
+    print('200' if '-sSL' in args else '303')
+else:
+    print('401')
+'''
+        probe = '''
+from pathlib import Path
+import sys
+if 'scripts/ws_smoke.py' in sys.argv:
+    assert Path('created').exists()
+    assert sys.argv[-2] == 'https://fixture.invalid/workspace/shell/'
+'''
+        result = self.run_script(script, "", extra_env={"WEB_PASSWORD": "dummy"}, stubs={
+            "aws": "print('https://fixture.invalid/workspace/')\n",
+            "curl": curl, "python3": probe,
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_repromotion_preserves_original_release_and_rejects_changed_manifest(self):
         script = step("record", "Publish the Release object carrying the manifest")
         for original, expected in [("original\n", True), ("changed\n", False)]:
