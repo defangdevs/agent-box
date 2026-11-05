@@ -100,7 +100,8 @@ coalescing and session admission apply.
 
 ## Mandatory sender verification
 
-Both SMTP listeners run an OpenSMTPD filter using dkimpy and pyspf. Before
+The IPv4, IPv6 and local control-socket listeners run the same OpenSMTPD
+filter using dkimpy and pyspf. Before
 accepting a message, the filter requires exactly one valid `From` mailbox
 and at least one of:
 
@@ -114,7 +115,8 @@ This rule is unconditional. Unsigned mail without aligned SPF, missing DNS
 records, failed verification, and unrelated signing domains receive SMTP
 `550 5.7.1`. Subdomain alignment is deliberately strict: `mail.example.org`
 does not authenticate `example.org`. A null envelope sender needs aligned
-DKIM. A passing aligned DKIM signature can authenticate forwarded mail when
+DKIM. Local `sendmail` submissions also require aligned DKIM because they
+have no remote IP for SPF. A passing aligned DKIM signature can authenticate forwarded mail when
 SPF fails. Temporary DNS/verifier errors and verifier saturation receive
 `451 4.7.1`, leaving retry responsibility with the sender. Verification uses
 the actual SMTP connection and envelope, never client-supplied transport or
@@ -124,6 +126,9 @@ This is a local authentication acceptance rule, not a full DMARC policy or
 reporting implementation. It does not consult `p=none`/`quarantine`/`reject`
 or relax the rule for domains without DMARC records. DNS work, message size,
 signature count, active connections and concurrent verifications are bounded.
+Headers are limited to 64 KiB before parsing. RSA keys must have a modulus
+between 1024 and 4096 bits and an odd exponent between 3 and 2^32-1;
+these bounds are checked before the RSA operation.
 
 The filter replaces all inbound copies of its verification marker with a
 server-generated value persisted under `/var/lib/agent-box-email`. The value

@@ -32,6 +32,10 @@ WEBHOOK = "/etc/agent-box/email-webhook.py"
 VERIFIED_HEADER = "X-Agent-Box-Email-Verified"
 VERIFIED_POLICY = "exact-domain-v1"
 VERIFIED_TOKEN = "/var/lib/agent-box-email/verification-token"
+MAX_HEADER_BYTES = 65536
+# OpenSMTPD accepts DATA lines up to 65534 bytes; its protocol adds fields
+# before that line. Leave room for the complete frame, including its LF.
+FILTER_FRAME_LIMIT = 131072
 
 
 USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
@@ -68,6 +72,7 @@ def validate_config(cfg):
 
 
 def verification_marker(create=False):
+    """Read root-published transport provenance, creating it on first start."""
     # Persistent across MTA restarts, but unknown to mail queued before the
     # filter was installed. The root-owned directory is created by systemd.
     path = Path(VERIFIED_TOKEN)
@@ -96,6 +101,7 @@ def verification_marker(create=False):
 
 
 def server_config(cfg):
+    """Gate TCP and local control-socket submissions through one filter."""
     # No envelope fields are interpolated into an MDA command. OpenSMTPD sets
     # ORIGINAL_RECIPIENT/SENDER in the child's environment and drops uid first.
     lines = [
@@ -106,6 +112,7 @@ def server_config(cfg):
         'smtp limit max-rcpt 10',
         'queue ttl 1d',
         'filter email_auth proc-exec "' + COMMAND + ' filter" user smtpd group smtpd',
+        'listen on socket filter email_auth',
         'listen on 0.0.0.0 port 25 tls pki mail hostname "' + cfg["domains"][0] + '" filter email_auth',
         'listen on "::" port 25 tls pki mail hostname "' + cfg["domains"][0] + '" filter email_auth',
     ]
@@ -129,9 +136,18 @@ def server_config(cfg):
     return '\n'.join(lines) + '\n'
 
 
-def author_domain(raw):
+def author_domain(raw, header_limit=MAX_HEADER_BYTES):
+    """Extract one author after bounding the header bytes before parsing."""
     # One unambiguous author is required, including when SPF alone passes.
-    msg = BytesParser(policy=email.policy.default).parsebytes(raw, headersonly=True)
+    ends = []
+    for separator in (b'\r\n\r\n', b'\n\n'):
+        boundary = raw.find(separator, 0, header_limit + len(separator))
+        if boundary >= 0:
+            ends.append(boundary + len(separator))
+    end = min(ends, default=len(raw))
+    if end > header_limit:
+        raise PermanentMessageError("email headers exceed the authentication limit")
+    msg = BytesParser(policy=email.policy.default).parsebytes(raw[:end], headersonly=True)
     fields = msg.get_all("From", [])
     if msg.defects or len(fields) != 1 or fields[0].defects:
         raise PermanentMessageError("email requires one valid From mailbox")
@@ -144,6 +160,23 @@ def author_domain(raw):
     return domain
 
 
+def bounded_dkim_key(name, record):
+    """Reject expensive RSA parameters before the library can execute RSA."""
+    try:
+        key, size, algorithm, _ = dkim.evaluate_pk(name, record)
+        if algorithm == b'rsa':
+            if not 1024 <= size <= 4096 or not key['modulus'] & 1:
+                return b''
+            exponent = key['publicExponent']
+            if not 3 <= exponent <= 0xffffffff or not exponent & 1:
+                return b''
+        elif algorithm != b'ed25519':
+            return b''
+    except (dkim.DKIMException, ValueError):
+        return b''
+    return record
+
+
 def authenticate_message(raw, ip, sender, helo):
     """Return a fixed SMTP verdict, never a score for the agent to interpret."""
     try:
@@ -151,8 +184,9 @@ def authenticate_message(raw, ip, sender, helo):
     except (ValueError, IndexError):
         return "reject|550 5.7.1 One valid From mailbox is required"
     temporary = False
-    # Null reverse paths have no MAIL FROM domain to align. They need DKIM.
-    if sender and sender.rpartition('@')[2].lower() == domain:
+    # Local enqueue has no remote peer to check with SPF. Like null reverse
+    # paths, it needs aligned DKIM; the host-wide marker is never sufficient.
+    if ip != "local" and sender and sender.rpartition('@')[2].lower() == domain:
         try:
             result, _ = spf.check2(i=ip, s=sender, h=helo, timeout=2, querytime=10)
             if result == "pass":
@@ -164,6 +198,7 @@ def authenticate_message(raw, ip, sender, helo):
     lookup_failed = False
 
     def lookup(name, timeout=2):
+        """Bound DNS time, TXT size and public-key work for every signature."""
         nonlocal lookup_failed
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -172,7 +207,9 @@ def authenticate_message(raw, ip, sender, helo):
         try:
             answer = dns.resolver.resolve(name.decode("ascii"), "TXT", lifetime=min(2, remaining))
             records = [b''.join(record.strings) for record in answer]
-            return records[0] if len(records) == 1 and len(records[0]) <= 4096 else b''
+            if len(records) != 1 or len(records[0]) > 4096:
+                return b''
+            return bounded_dkim_key(name, records[0])
         except (dns.resolver.NXDOMAIN, dns.resolver.NoAnswer):
             return b''
         except dns.exception.DNSException:
@@ -187,6 +224,8 @@ def authenticate_message(raw, ip, sender, helo):
     # Bound attacker-selected crypto and DNS work. Ignore partial-body and
     # obsolete SHA-1 signatures even if a library would validate them.
     if len(signatures) > 8:
+        if temporary:
+            return "reject|451 4.7.1 Sender verification temporarily unavailable"
         return "reject|550 5.7.1 Too many DKIM signatures"
     for index, signature in enumerate(signatures):
         try:
@@ -220,6 +259,7 @@ class EmailAuthFilter:
         self.output.flush()
 
     async def verdict(self, session, token, state, message):
+        """Publish a verdict only while its original SMTP transaction exists."""
         # Do not build an unbounded queue of messages waiting for DNS.
         if self.workers.locked():
             decision = "reject|451 4.7.1 Sender verifier busy; retry later"
@@ -237,6 +277,7 @@ class EmailAuthFilter:
             message["raw"].clear()
 
     def feed(self, line):
+        """Handle trusted MTA frames while preserving untrusted message bytes."""
         if line == b'config|ready':
             for event in ("link-identify", "tx-begin", "tx-mail", "tx-reset", "tx-rollback", "link-disconnect"):
                 self.emit("register", "report", "smtp-in", event)
@@ -313,7 +354,8 @@ class EmailAuthFilter:
 
 
 async def run_auth_filter(cfg):
-    reader = asyncio.StreamReader(limit=65536)
+    """Consume complete OpenSMTPD frames without blocking on verification."""
+    reader = asyncio.StreamReader(limit=FILTER_FRAME_LIMIT)
     await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
     auth = EmailAuthFilter(cfg, sys.stdout.buffer)
     while line := await reader.readline():
@@ -323,10 +365,13 @@ async def run_auth_filter(cfg):
 
 
 def normalized_message(raw, recipient, sender):
+    """Normalize mail accepted by the filter for the recipient's private bus."""
+    # Delivery includes the MTA's own additional transport headers. Bound
+    # these too, before the MIME parser allocates any header objects.
+    author_domain(raw, header_limit=MAX_HEADER_BYTES + 65536)
     msg = BytesParser(policy=email.policy.default).parsebytes(raw)
     if [str(value) for value in msg.get_all(VERIFIED_HEADER, [])] != [verification_marker()]:
         raise PermanentMessageError("email did not pass the SMTP authentication filter")
-    author_domain(raw)
     parts = list(msg.walk())
     if len(parts) > 100:
         raise PermanentMessageError("email has more than 100 MIME parts")

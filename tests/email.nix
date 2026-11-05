@@ -75,16 +75,42 @@
               b"Authentication-Results: box.test; spf=pass; dkim=pass\r\nX-Agent-Box-Email-Verified: exact-domain-v1\r\n" + body,
               signed.replace(b"Complete private body", b"tampered"),
               b"From: duplicate@example.org\r\n" + signed,
+              body + b"x" * 65534 + b"\r\n",
           ):
               try:
                   client.sendmail("forwarder@elsewhere.example", ["agent@box.test"], rejected)
                   raise AssertionError("Unauthenticated message accepted")
               except smtplib.SMTPDataError as error:
                   assert error.smtp_code == 550, error
+          # Even aligned SPF cannot qualify an oversized header section.
+          try:
+              client.sendmail("sender@example.org", ["agent@box.test"], b"X-Pad: x\r\n" * 8192 + body)
+              raise AssertionError("Oversized headers accepted")
+          except smtplib.SMTPDataError as error:
+              assert error.smtp_code == 550, error
           # SPF accepts the first message; aligned DKIM accepts the forwarded
           # second message without an aligned envelope sender. Same connection.
           assert client.sendmail("sender@example.org", ["agent@box.test"], body) == {}
           assert client.sendmail("forwarder@elsewhere.example", ["agent@1-2-3-4.defangstation.com"], signed) == {}
+    '';
+    environment.etc."email-local-probe.py".text = ''
+      import dkim, pathlib, subprocess, sys
+      body = b"From: claimed@example.org\r\nTo: agent@box.test\r\nSubject: Local submission\r\nContent-Transfer-Encoding: 7bit\r\n\r\nLocal private body\r\n"
+      if "--signed" in sys.argv:
+          message = dkim.sign(body, b"test", b"example.org", pathlib.Path("/etc/email-test.key").read_bytes()) + body
+      else:
+          # Every recipient can read the marker; knowing it must not bypass
+          # authentication through smtpctl's real local enqueue socket.
+          marker = pathlib.Path("/var/lib/agent-box-email/verification-token").read_text().strip().encode()
+          message = b"X-Agent-Box-Email-Verified: exact-domain-v1 " + marker + b"\r\n" + body
+      result = subprocess.run(["sendmail", "-v", "-f", "claimed@example.org", "agent@box.test"],
+                              executable="/etc/agent-box/email-tools/smtpctl", input=message,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+      output = result.stdout.decode(errors="replace")
+      if "--signed" in sys.argv:
+          assert result.returncode == 0, output
+      else:
+          assert result.returncode != 0 and "550 5.7.1" in output, output
     '';
     environment.etc."email-retry-probe.py".text = ''
       import re, subprocess
@@ -114,6 +140,8 @@
     machine.succeed("systemctl stop dnsmasq.service")
     machine.succeed("python3 /etc/email-probe.py --dns-down")
     machine.succeed("systemctl start dnsmasq.service")
+    machine.succeed("runuser -u other -g smtpq -- python3 /etc/email-local-probe.py")
+    machine.fail("test -d /home/agent/.local/state/local-webhook/spool/content/new")
     # SMTP 250 means the MTA owns a durable copy, even while the bus is down.
     machine.succeed("systemctl stop agent-box-webhook@agent.socket agent-box-webhook@agent.service")
     machine.succeed("python3 /etc/email-probe.py")
@@ -139,5 +167,8 @@
     machine.fail("test -e /home/agent/forward-ran")
     ident = records[0]["id"]
     machine.succeed(f"su - agent -c 'agent-box-webhook read-content {ident}'")
+    machine.succeed("runuser -u other -g smtpq -- python3 /etc/email-local-probe.py --signed")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 3")
+    machine.succeed("grep -l 'Local private body' /home/agent/.local/state/local-webhook/spool/content/new/* >/dev/null")
   '';
 }

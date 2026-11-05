@@ -11,6 +11,7 @@ from pathlib import Path
 import pwd
 import subprocess
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -127,11 +128,21 @@ class EmailAdapter(unittest.TestCase):
         self.assertNotIn(' relay', cfg)
         self.assertIn('match from any for any reject', cfg)
         self.assertIn('tls pki mail', cfg)
-        self.assertEqual(cfg.count('filter email_auth'), 3)
+        self.assertIn('listen on socket filter email_auth', cfg)
+        self.assertEqual(cfg.count('filter email_auth'), 4)
         with self.assertRaises(ValueError):
             mail.validate_config(dict(self.cfg, keyFile='/tmp/key"; evil'))
 
 class VerificationMarker(unittest.TestCase):
+    def test_failed_atomic_publication_leaves_no_partial_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'token'
+            with mock.patch.object(mail, 'VERIFIED_TOKEN', str(path)), mock.patch.object(mail.os, 'replace', side_effect=OSError('injected failure')):
+                with self.assertRaises(OSError):
+                    mail.verification_marker(create=True)
+            self.assertFalse(path.exists())
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
     def test_token_is_atomic_persistent_and_rejects_unsafe_files(self):
         fstat = os.fstat
 
@@ -185,6 +196,47 @@ class SenderAuthentication(unittest.TestCase):
         for result in ('fail', 'softfail', 'neutral', 'none', 'permerror'):
             self.assertIn('550', self.verdict(sender='author@example.org', result=result))
         self.assertIn('451', self.verdict(sender='author@example.org', result='temperror'))
+
+    def test_temporary_spf_failure_is_preserved_at_the_signature_cap(self):
+        raw = b'DKIM-Signature: invalid\r\n' * 9 + self.raw
+        self.assertIn('451', self.verdict(raw, sender='author@example.org', result='temperror'))
+        self.assertIn('550', self.verdict(raw, sender='author@example.org', result='fail'))
+
+    def test_local_enqueue_requires_dkim_even_with_an_aligned_envelope(self):
+        forged = b'X-Agent-Box-Email-Verified: exact-domain-v1 public-host-value\r\n' + self.raw
+        self.assertIn('550', self.verdict(forged, sender='author@example.org', result='pass', ip='local'))
+        self.assertEqual(self.verdict(self.signed(), sender='author@example.org', ip='local'), 'proceed')
+
+    def test_headers_are_bounded_before_parsing_but_body_is_independent(self):
+        for separator in (b'\r\n', b'\n'):
+            raw = separator.join([b'From: a@example.org'] + [b'X: x'] * 17000) + separator * 2 + b'body'
+            with mock.patch.object(mail, 'BytesParser') as parser:
+                self.assertIn('550', self.verdict(raw, sender='a@example.org', result='pass'))
+                parser.assert_not_called()
+        prefix = b'From: a@example.org\r\nX-Pad: '
+        headers = prefix + b'x' * (mail.MAX_HEADER_BYTES - len(prefix) - 4) + b'\r\n\r\n'
+        self.assertEqual(mail.author_domain(headers + b'body' * 500000), 'example.org')
+        with self.assertRaises(mail.PermanentMessageError):
+            mail.author_domain(headers.replace(b'X-Pad: ', b'X-Pad: x'))
+
+    def test_hostile_rsa_parameters_never_reach_the_rsa_operation(self):
+        def der(tag, value):
+            length = len(value)
+            size = length.to_bytes((length.bit_length() + 7) // 8, 'big')
+            encoded_size = bytes([length]) if length < 128 else bytes([0x80 | len(size)]) + size
+            return bytes([tag]) + encoded_size + value
+
+        def integer(value):
+            return der(2, b'\0' + value.to_bytes((value.bit_length() + 7) // 8, 'big'))
+
+        for bits, exponent in ((1023, 65537), (4097, 65537), (8192, 65537), (2048, 2**65 + 1), (2048, 2)):
+            modulus = 2**(bits - 1) + 1
+            record = b'v=DKIM1; k=rsa; p=' + base64.b64encode(der(0x30, integer(modulus) + integer(exponent)))
+            answer = [SimpleNamespace(strings=[record])]
+            with mock.patch.object(mail.dns.resolver, 'resolve', return_value=answer):
+                with mock.patch.object(mail.dkim, 'RSASSA_PKCS1_v1_5_verify') as rsa:
+                    self.assertIn('550', mail.authenticate_message(self.signed(), '192.0.2.1', '', 'mx.example.org'))
+                    rsa.assert_not_called()
 
     def test_actual_spf_library_ipv4_and_ipv6(self):
         def lookup(name, qtype, *args):
@@ -315,12 +367,48 @@ class FilterProtocol(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b'451', self.output.getvalue())
         self.auth.workers.release()
         self.auth.workers.release()
-        with mock.patch.object(mail, 'authenticate_message', return_value='proceed'):
-            self.message()
-            self.report(b'link-disconnect')
-            size = len(self.output.getvalue())
-            await self.complete()
+        started, release = threading.Event(), threading.Event()
+
+        def blocked_verify(*args):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError('test verifier was not released')
+            return 'proceed'
+
+        with mock.patch.object(mail, 'authenticate_message', side_effect=blocked_verify):
+            try:
+                self.message()
+                self.assertTrue(await asyncio.to_thread(started.wait, 5))
+                self.report(b'link-disconnect')
+                size = len(self.output.getvalue())
+            finally:
+                release.set()
+                await self.complete()
         self.assertEqual(len(self.output.getvalue()), size)
+
+    async def test_reader_accepts_maximum_smtp_line_plus_protocol_prefix(self):
+        frames = [b'config|ready', b'filter|0.7|0|smtp-in|connect|one|token|rdns|192.0.2.1',
+                  b'report|0.7|0|smtp-in|tx-begin|one|message',
+                  b'report|0.7|0|smtp-in|tx-mail|one|message|ok|a@example.org']
+        for line in (b'From: a@example.org', b'', b'x' * 65534, b'.'):
+            frames.append(b'filter|0.7|0|smtp-in|data-line|one|token|' + line)
+        frames.append(b'filter|0.7|0|smtp-in|commit|one|token')
+        data = b'\n'.join(frames) + b'\n'
+        read_fd, write_fd = os.pipe()
+
+        def produce():
+            with os.fdopen(write_fd, 'wb') as output:
+                output.write(data)
+
+        with os.fdopen(read_fd, 'rb') as source:
+            output = io.BytesIO()
+            producer = asyncio.create_task(asyncio.to_thread(produce))
+            with mock.patch.object(mail.sys, 'stdin', SimpleNamespace(buffer=source)), mock.patch.object(mail.sys, 'stdout', SimpleNamespace(buffer=output)):
+                with mock.patch.object(mail, 'authenticate_message', return_value='proceed') as verify:
+                    await mail.run_auth_filter({'maxMessageBytes': 2097152})
+            await producer
+        self.assertIn(b'filter-result|one|token|proceed\n', output.getvalue())
+        self.assertIn(b'x' * 65534, verify.call_args.args[0])
 
 
 class NativeEmail(unittest.TestCase):
