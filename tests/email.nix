@@ -71,7 +71,8 @@
     assert source["sources"]["email"]["retainPayload"] is True
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@box.test --note mail-test'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@1-2-3-4.defangstation.com --note alias-test'")
-    machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailtags agent-box-webhook subscribe email:agent+* --note tagged-mail-test'")
+    machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailtags agent-box-webhook subscribe email:agent+github@box.test --note tagged-mail-test'")
+    machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailtags agent-box-webhook subscribe email:agent+build+linux@1-2-3-4.defangstation.com --note tagged-alias-test'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailgithub agent-box-webhook subscribe email:agent+github@box.test --note github-mail-test'")
     machine.succeed("su - agent -c \"echo '|touch /home/agent/forward-ran' > /home/agent/.forward\"")
     # SMTP 250 means the MTA owns a durable copy, even while the bus is down.

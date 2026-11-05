@@ -117,8 +117,8 @@ let
             for u, p in sorted(accounts.items())) + ' }')
         for user in sorted(cfg["users"]):
             # Accept nonempty tags only for an explicitly enabled user/domain.
-            addresses = ', '.join('"^' + user + '([+]' + RECIPIENT_TAG + ')?@' +
-                                  d.lower().replace('.', '[.]') + '$"' for d in cfg["domains"])
+            tagged_user = user + '([+]' + RECIPIENT_TAG + ')?'
+            addresses = ', '.join('"^' + tagged_user + '@' + d.lower().replace('.', '[.]') + '$"' for d in cfg["domains"])
             command = " ".join((COMMAND, "deliver", user))
             lines += [
                 'table rcpt_' + user + ' { ' + addresses + ' }',
@@ -132,8 +132,8 @@ let
     def recipient_parts(address):
         local, separator, domain = address.partition('@')
         user, tagged, tag = local.partition('+')
-        if (not separator or not USER.fullmatch(user.lower()) or not DOMAIN.fullmatch(domain) or
-                (tagged and not re.fullmatch(RECIPIENT_TAG, tag))):
+        valid_tag = not tagged or re.fullmatch(RECIPIENT_TAG, tag)
+        if not separator or not USER.fullmatch(user.lower()) or not DOMAIN.fullmatch(domain) or not valid_tag:
             raise PermanentMessageError("invalid email envelope recipient")
         base = user.lower() + '@' + domain.lower()
         recipient = user.lower() + ('+' + tag if tagged else ''') + '@' + domain.lower()
@@ -1094,8 +1094,8 @@ let
     Tagged addresses such as `user+github@hostname` reach the same Linux user's
     bus with their full address as the topic (`email:user+github@hostname`).
     The payload preserves `recipient`, `baseRecipient` and `recipientTag`
-    (`github`, or empty for untagged mail). Subscribe to an exact tagged address
-    or to `email:user+*`, optionally filtered with
+    (`github`, or empty for untagged mail). Subscribe to an exact tagged address,
+    optionally filtered with
     `--when '{"path":"recipientTag","in":["github"]}'`. An exact untagged
     subscription matches only untagged mail. Tags are sender-controlled data.
 

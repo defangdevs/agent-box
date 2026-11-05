@@ -95,13 +95,11 @@ The adapter normalizes the base user and domain to lowercase and keeps the
 tag as supplied by OpenSMTPD. Tags are sender-controlled routing data.
 
 An exact untagged subscription continues to match only untagged mail.
-Subscribe to a full tagged address to route a particular tag, or to the
-prefix `email:agent+*` for all tagged mail to that user. A prefix can cover
-several enabled domains; use a `recipient`, `baseRecipient` or
-`recipientTag` predicate when narrowing it. For example:
+Subscribe to a full tagged address to route a particular tag. Use a
+`recipientTag` predicate when an additional payload check is useful:
 
 ```sh
-agent-box-webhook subscribe email:agent+* --ttl 1 \
+agent-box-webhook subscribe email:agent+github@box.example --ttl 1 \
   --when '{"path":"recipientTag","in":["github"]}' \
   --note 'GitHub-tagged email'
 ```
