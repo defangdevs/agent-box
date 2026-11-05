@@ -191,6 +191,27 @@ class Wiring(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "git is required for the filename fixture")
+    def test_git_quoting_cannot_hide_a_build_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+            subprocess.run(["git", "init", "-q", "--template="], cwd=root, env=env, check=True)
+            name = root / "modules/src/line\nbreak.py"
+            name.parent.mkdir(parents=True)
+            for content in ("old\n", "new\n"):
+                name.write_text(content)
+                subprocess.run(["git", "add", "."], cwd=root, env=env, check=True)
+                subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                                "commit", "-qm", "fixture"], cwd=root, env=env, check=True)
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/changed_paths.py"), str(FILTERS / "ci.paths"),
+                 "--base=HEAD^", "--head=HEAD"],
+                cwd=root, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "true")
+            self.assertIn("line\\nbreak.py", result.stderr)
+
     @unittest.skipUnless(shutil.which("git"), "git is required for the option-injection fixture")
     def test_a_revision_operand_cannot_become_a_file_writing_option(self):
         with tempfile.TemporaryDirectory() as directory:

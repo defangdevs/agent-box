@@ -82,7 +82,7 @@ def to_regex(pattern):
         else:
             out.append(re.escape(char))
         i += 1
-    return re.compile("".join(out) + r"\Z")
+    return re.compile("".join(out) + r"\Z", re.DOTALL)
 
 
 def matches(patterns, files):
@@ -117,14 +117,14 @@ def changed_files(base, head):
             return None
         resolved.append(commit.stdout.strip())
     proc = subprocess.run(
-        ["git", "diff", "--name-only", "--no-renames", f"{resolved[0]}...{resolved[1]}"],
+        ["git", "diff", "--name-only", "-z", "--no-renames", f"{resolved[0]}...{resolved[1]}"],
         capture_output=True, text=True)
     if proc.returncode != 0:
         # A shallow clone, or a base the force-push took away. Either way
         # the range is not answerable here.
         sys.stderr.write(proc.stderr)
         return None
-    return [line for line in proc.stdout.splitlines() if line]
+    return [name for name in proc.stdout.split("\0") if name]
 
 
 def main(argv=None):
@@ -154,7 +154,7 @@ def main(argv=None):
 
     hits = matches(patterns, files)
     for name, pattern in hits[:20]:
-        print(f"{name}  <-  {pattern}", file=sys.stderr)
+        print(f"{name!r}  <-  {pattern}", file=sys.stderr)
     if len(hits) > 20:
         print(f"... and {len(hits) - 20} more", file=sys.stderr)
     print(f"{len(files)} changed path(s), {len(hits)} matched "
