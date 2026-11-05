@@ -1687,7 +1687,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-agentbox-render-ok"
               {
                 nativeBuildInputs = [
-                  (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+                  (pkgs.python3.withPackages (ps: [ ps.pyyaml ps.dkimpy ps.pyspf ]))
                   pkgs.caddy
                   # visudo, for the sudoers half of what `agentbox apply`
                   # now validates before it commits a render (issue #526).

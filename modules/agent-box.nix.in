@@ -31,6 +31,7 @@ let
   };
   emailUsers = lib.filterAttrs (_: u: u.email) cfg.users;
   emailCli = pkgs.writers.writePython3Bin "agent-box-email" {
+    libraries = with pkgs.python3Packages; [ dkimpy pyspf ];
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
     @@include:src/email-cli.py@@
@@ -4925,6 +4926,8 @@ in
         serviceConfig = {
           ExecStart = "${emailCli}/bin/agent-box-email server";
           RuntimeDirectory = "agent-box-email";
+          StateDirectory = "agent-box-email";
+          StateDirectoryMode = "0755";
           Restart = "on-failure";
           RestartSec = 5;
           PrivateTmp = true;

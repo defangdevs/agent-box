@@ -1470,6 +1470,7 @@ class Renderer:
                + "\n\n[Service]\n"
                + f"ExecStart={self.bin}/agent-box-email server\n"
                + "RuntimeDirectory=agent-box-email\nRestart=on-failure\nRestartSec=5\n"
+               + "StateDirectory=agent-box-email\nStateDirectoryMode=0755\n"
                + "PrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/run /var/spool/smtpd "
                + " ".join(u.home for u in users) + "\nNoNewPrivileges=true\n"
                # Linux getifaddrs uses netlink while OpenSMTPD discovers listeners.
