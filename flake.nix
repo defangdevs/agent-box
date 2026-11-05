@@ -502,7 +502,8 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             } ''
               python3 ${./tests/test-ci-scheduling.py} ${./scripts/ci-vm-tests.sh} \
                 ${./.github/workflows/ci.yml} \
-                ${pkgs.writeText "ci-vm-lanes.json" (builtins.toJSON ciVmLanes)}
+                ${pkgs.writeText "ci-vm-lanes.json" (builtins.toJSON ciVmLanes)} \
+                ${./.github/path-filters/ci.paths}
               touch "$out"
             '';
 
