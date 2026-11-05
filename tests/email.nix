@@ -38,12 +38,14 @@
           assert client.has_extn("starttls")
           client.starttls(context=ssl._create_unverified_context())
           client.ehlo()
-          for address in ("other@box.test", "unknown@box.test", "agent@elsewhere.example", "agent+stale@box.test"):
+          for address in ("other@box.test", "unknown@box.test", "agent@elsewhere.example",
+                          "other+github@box.test", "agent+github@elsewhere.example", "agent+@box.test"):
               client.mail("sender@example.org")
               code, _ = client.rcpt(address)
               assert code >= 500, (address, code)
               client.rset()
-          for address in ("agent@box.test", "agent@1-2-3-4.defangstation.com"):
+          for address in ("agent@box.test", "agent@1-2-3-4.defangstation.com",
+                          "agent+github@box.test", "agent+build+linux@1-2-3-4.defangstation.com"):
               assert client.sendmail("sender@example.org", [address], body) == {}
     '';
     environment.etc."email-retry-probe.py".text = ''
@@ -51,7 +53,7 @@
       log = subprocess.check_output(["journalctl", "-u", "agent-box-email.service",
                                      "-o", "cat", "--no-pager"], text=True)
       failed = set(re.findall(r"mda delivery evpid=([0-9a-f]+).*result=TempFail", log))
-      assert len(failed) == 2, log
+      assert len(failed) == 4, log
     '';
     system.stateVersion = "25.05";
   };
@@ -69,6 +71,8 @@
     assert source["sources"]["email"]["retainPayload"] is True
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@box.test --note mail-test'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@1-2-3-4.defangstation.com --note alias-test'")
+    machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailtags agent-box-webhook subscribe email:agent+* --note tagged-mail-test'")
+    machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailgithub agent-box-webhook subscribe email:agent+github@box.test --note github-mail-test'")
     machine.succeed("su - agent -c \"echo '|touch /home/agent/forward-ran' > /home/agent/.forward\"")
     # SMTP 250 means the MTA owns a durable copy, even while the bus is down.
     machine.succeed("systemctl stop agent-box-webhook@agent.socket agent-box-webhook@agent.service")
@@ -78,13 +82,22 @@
     machine.succeed("systemctl start agent-box-webhook@agent.socket")
     # Force the MTA retry now instead of waiting for its normal backoff.
     machine.succeed("runuser -u root -g smtpq -- /etc/agent-box/email-tools/smtpctl schedule all")
-    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 2")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 4")
     machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/peers/emailwait/new -type f | wc -l) -eq 2")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/peers/emailtags/new -type f | wc -l) -eq 2")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/peers/emailgithub/new -type f | wc -l) -eq 1")
     machine.succeed("find /home/agent/.local/state/local-webhook/spool/content/new -type f -exec stat -c '%U %a' {} + | grep 'agent 600' >/dev/null")
     machine.fail("su - other -c 'ls /home/agent/.local/state/local-webhook/spool/content/new'")
     records = json.loads(machine.succeed("python3 -c 'import pathlib,json; print(json.dumps([json.loads(p.read_text()) for p in pathlib.Path(\"/home/agent/.local/state/local-webhook/spool/content/new\").iterdir()]))'"))
-    assert len({r["id"] for r in records}) == 2
+    assert len({r["id"] for r in records}) == 4
+    assert {r["payload"]["recipient"] for r in records} == {
+        "agent@box.test", "agent@1-2-3-4.defangstation.com",
+        "agent+github@box.test", "agent+build+linux@1-2-3-4.defangstation.com"}
     for record in records:
+        payload = record["payload"]
+        local, domain = payload["recipient"].split("@")
+        assert payload["baseRecipient"] == "agent@" + domain
+        assert payload["recipientTag"] == local.partition("+")[2]
         assert "Complete private body" in record["payload"]["text"]
         assert record["payload"]["senderAuthenticated"] is False
         assert record["payload"]["headers"]["to"] == ["other@elsewhere.example"]

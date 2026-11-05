@@ -62,6 +62,9 @@ let
 
     USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
     DOMAIN = re.compile(r"(?=.{1,253}$)[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?")
+    # Unquoted ASCII local-part characters. Keep this POSIX ERE compatible for
+    # OpenSMTPD's recipient tables as well as Python's delivery validation.
+    RECIPIENT_TAG = r"[A-Za-z0-9!#$%&'*+/=?^_`{|}~.-]+"
 
 
     class PermanentMessageError(ValueError):
@@ -113,9 +116,9 @@ let
             '"' + u + '"="' + str(p.pw_uid) + ':' + str(p.pw_gid) + ':/var/empty"'
             for u, p in sorted(accounts.items())) + ' }')
         for user in sorted(cfg["users"]):
-            # Literal mailaddr tables accept plus-tags; anchored regex matching
-            # must reject those at RCPT time instead of queuing undeliverable mail.
-            addresses = ', '.join('"^' + user + '@' + d.lower().replace('.', '[.]') + '$"' for d in cfg["domains"])
+            # Accept nonempty tags only for an explicitly enabled user/domain.
+            addresses = ', '.join('"^' + user + '([+]' + RECIPIENT_TAG + ')?@'
+                                  + d.lower().replace('.', '[.]') + '$"' for d in cfg["domains"])
             command = " ".join((COMMAND, "deliver", user))
             lines += [
                 'table rcpt_' + user + ' { ' + addresses + ' }',
@@ -126,7 +129,19 @@ let
         return '\n'.join(lines) + '\n'
 
 
+    def recipient_parts(address):
+        local, separator, domain = address.partition('@')
+        user, tagged, tag = local.partition('+')
+        if (not separator or not USER.fullmatch(user.lower()) or not DOMAIN.fullmatch(domain)
+                or (tagged and not re.fullmatch(RECIPIENT_TAG, tag))):
+            raise PermanentMessageError("invalid email envelope recipient")
+        base = user.lower() + '@' + domain.lower()
+        recipient = user.lower() + ('+' + tag if tagged else ''') + '@' + domain.lower()
+        return recipient, base, tag
+
+
     def normalized_message(raw, recipient, sender):
+        recipient, base, tag = recipient_parts(recipient)
         msg = BytesParser(policy=email.policy.default).parsebytes(raw)
         parts = list(msg.walk())
         if len(parts) > 100:
@@ -157,7 +172,8 @@ let
         except (ValueError, TypeError, IndexError):
             received = ""
         return {
-            "recipient": recipient, "envelopeSender": sender, "receivedAt": received,
+            "recipient": recipient, "baseRecipient": base, "recipientTag": tag,
+            "envelopeSender": sender, "receivedAt": received,
             "title": str(msg.get("Subject", "")), "summary": '\n'.join(text)[:200],
             "headers": {key: [str(v) for v in msg.get_all(header, [])] for key, header in (
                 ("from", "From"), ("to", "To"), ("cc", "Cc"), ("messageId", "Message-ID"),
@@ -171,8 +187,8 @@ let
     def deliver(cfg, user, stream):
         if user not in cfg["users"] or pwd.getpwuid(os.getuid()).pw_name != user:
             raise ValueError("email delivery must run as its configured recipient Linux user")
-        recipient = os.environ.get("ORIGINAL_RECIPIENT", "").lower()
-        if recipient not in [user + '@' + d.lower() for d in cfg["domains"]]:
+        recipient, base, _ = recipient_parts(os.environ.get("ORIGINAL_RECIPIENT", ""))
+        if base not in [user + '@' + d.lower() for d in cfg["domains"]]:
             raise PermanentMessageError("email envelope recipient is not enabled for this Linux user")
         # OpenSMTPD enforces the wire limit before accepting. Its own transport
         # headers are additional bytes when the MDA reads the queued message.
@@ -1074,6 +1090,14 @@ let
     that user's existing message bus. Subscribe with `agent-box-webhook subscribe
     email:user@hostname --note "why"`, or use an ordinary standing watch/profile.
     The event is `email.received`; no implicit email watch starts work.
+
+    Tagged addresses such as `user+github@hostname` reach the same Linux user's
+    bus with their full address as the topic (`email:user+github@hostname`).
+    The payload preserves `recipient`, `baseRecipient` and `recipientTag`
+    (`github`, or empty for untagged mail). Subscribe to an exact tagged address
+    or to `email:user+*`, optionally filtered with
+    `--when '{"path":"recipientTag","in":["github"]}'`. An exact untagged
+    subscription matches only untagged mail. Tags are sender-controlled data.
 
     Mail and claimed senders are untrusted, including attachments and headers.
     Local producer signing does not authenticate the author. Full-content IDs in

@@ -238,6 +238,14 @@ that user's existing message bus. Subscribe with `agent-box-webhook subscribe
 email:user@hostname --note "why"`, or use an ordinary standing watch/profile.
 The event is `email.received`; no implicit email watch starts work.
 
+Tagged addresses such as `user+github@hostname` reach the same Linux user's
+bus with their full address as the topic (`email:user+github@hostname`).
+The payload preserves `recipient`, `baseRecipient` and `recipientTag`
+(`github`, or empty for untagged mail). Subscribe to an exact tagged address
+or to `email:user+*`, optionally filtered with
+`--when '{"path":"recipientTag","in":["github"]}'`. An exact untagged
+subscription matches only untagged mail. Tags are sender-controlled data.
+
 Mail and claimed senders are untrusted, including attachments and headers.
 Local producer signing does not authenticate the author. Full-content IDs in
 notifications and spawn prompts can be read with `agent-box-webhook

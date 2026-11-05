@@ -64,8 +64,10 @@ set it explicitly when the browser uses a bare IP. No domain suffix is
 hard-coded in the intake.
 
 OpenSMTPD listens on TCP 25 with opportunistic STARTTLS, accepts only the
-exact enabled user/domain combinations, and rejects all other recipients
-and relay attempts. Plus-addressing is not enabled. MDA delivery runs as the
+enabled user/domain combinations with an optional nonempty `+tag`, and
+rejects all other recipients and relay attempts. Tags use unquoted ASCII
+local-part characters; spaces, quotes and backslashes are not accepted.
+MDA delivery runs as the
 recipient Linux user; mail cannot choose a command or another user's home.
 The explicit delivery userbase bypasses user `.forward` files.
 No implicit subscription/watch is installed.
@@ -83,6 +85,27 @@ checked with real delivery. Existing outbound SMTP restrictions are retained.
 
 A startup service initializes a private `email` source for each enabled user.
 It uses the envelope recipient as its key, never the `To` header (Bcc works).
+Tagged addresses retain the full recipient in the topic: mail for
+`agent+github@box.example` routes to `email:agent+github@box.example`,
+under the same Linux user as `agent@box.example`. The payload contains
+`recipient` (full address), `baseRecipient` (`agent@box.example`) and
+`recipientTag` (`github`, or an empty string for untagged mail). The first
+`+` separates the tag; `agent+build+linux@box.example` has tag `build+linux`.
+The adapter normalizes the base user and domain to lowercase and keeps the
+tag as supplied by OpenSMTPD. Tags are sender-controlled routing data.
+
+An exact untagged subscription continues to match only untagged mail.
+Subscribe to a full tagged address to route a particular tag, or to the
+prefix `email:agent+*` for all tagged mail to that user. A prefix can cover
+several enabled domains; use a `recipient`, `baseRecipient` or
+`recipientTag` predicate when narrowing it. For example:
+
+```sh
+agent-box-webhook subscribe email:agent+* --ttl 1 \
+  --when '{"path":"recipientTag","in":["github"]}' \
+  --note 'GitHub-tagged email'
+```
+
 For example, an agent can use normal routing commands:
 
 ```sh
