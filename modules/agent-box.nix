@@ -56,7 +56,7 @@ let
   emailUsers = lib.filterAttrs (_: u: u.email) cfg.users;
   emailCli = pkgs.writers.writePython3Bin "agent-box-email" {
     libraries = with pkgs.python3Packages; [ dkimpy pyspf ];
-    flakeIgnore = [ "E501" "E302" "E305" ];
+    flakeIgnore = [ "E501" "E302" "E305" "W503" ];
   } ''
     """OpenSMTPD configuration and per-user MIME-to-bus delivery (issue #231)."""
 
