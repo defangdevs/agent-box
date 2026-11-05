@@ -105,8 +105,19 @@ def changed_files(base, head):
     # in a push payload (a new branch, or the first push to one).
     if set(base) == {"0"}:
         return None
+    # Resolve operands before diffing. An unresolved argument beginning
+    # with --output= must not become a git-diff option that writes a file.
+    resolved = []
+    for rev in (base, head):
+        commit = subprocess.run(
+            ["git", "rev-parse", "--verify", "--end-of-options", f"{rev}^{{commit}}"],
+            capture_output=True, text=True)
+        if commit.returncode != 0:
+            sys.stderr.write(commit.stderr)
+            return None
+        resolved.append(commit.stdout.strip())
     proc = subprocess.run(
-        ["git", "diff", "--name-only", "--no-renames", f"{base}...{head}"],
+        ["git", "diff", "--name-only", "--no-renames", f"{resolved[0]}...{resolved[1]}"],
         capture_output=True, text=True)
     if proc.returncode != 0:
         # A shallow clone, or a base the force-push took away. Either way

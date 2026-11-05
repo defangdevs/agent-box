@@ -101,7 +101,6 @@ on:
         default: false
 
 permissions:
-  id-token: write
   contents: read
 
 concurrency:
@@ -110,6 +109,9 @@ concurrency:
 
 jobs:
   lightsail-test:
+    permissions:
+      contents: read
+      id-token: write
     if: inputs.lightsail_only == true
     uses: ./.github/workflows/lightsail-test.yml
     secrets: inherit
@@ -117,6 +119,9 @@ jobs:
       ref: ${{ inputs.ref || github.sha }}
 
   deploy-test:
+    permissions:
+      contents: read
+      id-token: write
     if: inputs.lightsail_only != true
     runs-on: ubuntu-latest
     # Two legs run in PARALLEL:
@@ -740,7 +745,7 @@ jobs:
           # whether `tmux attach` found a session. Attach for real and assert the
           # terminal isn't showing tmux's "no sessions". Retries because the
           # agent's claude session can take a moment to come up after boot.
-          python3 -m pip install --quiet websocket-client
+          python3 -m pip install --quiet --only-binary=:all: --require-hashes -r scripts/ws-smoke-requirements.txt
           url='${{ steps.outputs.outputs.web_url }}'
           for i in $(seq 1 12); do
             if python3 scripts/ws_smoke.py "$url" "$WEB_PASSWORD"; then

@@ -15,6 +15,7 @@ list. Runnable directly: `python3 tests/test-changed-paths.py`.
 """
 
 import pathlib
+import os
 import re
 import shutil
 import subprocess
@@ -190,6 +191,25 @@ class Wiring(unittest.TestCase):
 
 
 class Cli(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("git"), "git is required for the option-injection fixture")
+    def test_a_revision_operand_cannot_become_a_file_writing_option(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"}
+            subprocess.run(["git", "init", "-q", "--template="], cwd=root, env=env, check=True)
+            (root / "marker").write_text("fixture\n")
+            subprocess.run(["git", "add", "marker"], cwd=root, env=env, check=True)
+            subprocess.run(["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                            "commit", "-qm", "fixture"], cwd=root, env=env, check=True)
+            target = root / "unexpected"
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "scripts/changed_paths.py"), str(FILTERS / "ci.paths"),
+                 f"--base=--output={target}", "--head=HEAD"],
+                cwd=root, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "true")
+            self.assertFalse(list(root.glob("unexpected*")))
+
     def test_files_from_stdin(self):
         proc = subprocess.run(
             [sys.executable, str(ROOT / "scripts" / "changed_paths.py"),

@@ -48,6 +48,9 @@ permissions:
 
 jobs:
   publish:
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     # Fork this repo? Configure these under Settings > Secrets and variables >
     # Actions > Variables (repo-level, not secrets — none of these are sensitive).

@@ -16,10 +16,12 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   lightsail:
+    permissions:
+      contents: read
+      id-token: write
     runs-on: ubuntu-latest
     environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
     timeout-minutes: 40
@@ -94,7 +96,7 @@ jobs:
             --data-urlencode 'profile=:shell' "$origin/sessions/add")
           test "$code" = 303
           url="${url}shell/"
-          python3 -m pip install --quiet websocket-client
+          python3 -m pip install --quiet --only-binary=:all: --require-hashes -r scripts/ws-smoke-requirements.txt
           for i in $(seq 1 6); do
             if python3 scripts/ws_smoke.py "$url" "$WEB_PASSWORD"; then exit 0; fi
             sleep 10

@@ -2030,7 +2030,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           changed-paths =
             pkgs.runCommand "agent-box-changed-paths"
               {
-                nativeBuildInputs = [ pkgs.python3 ];
+                nativeBuildInputs = [ pkgs.python3 pkgs.git ];
                 matcher = ./scripts/changed_paths.py;
                 tests = ./tests/test-changed-paths.py;
                 filters = ./.github/path-filters;
