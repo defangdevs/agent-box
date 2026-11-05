@@ -3,7 +3,7 @@
 {
   name = "agent-box-email";
   node.pkgsReadOnly = false;
-  nodes.machine = { pkgs, ... }: let
+  nodes.machine = { pkgs, lib, ... }: let
     publicKey = builtins.replaceStrings
       [ "-----BEGIN PUBLIC KEY-----" "-----END PUBLIC KEY-----" "\n" ] [ "" "" "" ]
       (builtins.readFile ./email/dkim-test.pub);
@@ -46,7 +46,7 @@
         ];
       };
     };
-    environment.systemPackages = [ (pkgs.python3.withPackages (ps: [ ps.dkimpy ])) pkgs.util-linux ];
+    environment.systemPackages = [ (lib.hiPrio (pkgs.python3.withPackages (ps: [ ps.dkimpy ]))) pkgs.util-linux ];
     # Public dummy key used only to exercise the real SMTP/DNS/crypto path.
     environment.etc."email-test.key".source = ./email/dkim-test.key;
     environment.etc."email-probe.py".text = ''
