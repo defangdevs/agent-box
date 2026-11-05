@@ -419,16 +419,48 @@ class FilterProtocol(unittest.IsolatedAsyncioTestCase):
             with os.fdopen(write_fd, 'wb') as output:
                 output.write(data)
 
-        with os.fdopen(read_fd, 'rb') as source:
-            output = io.BytesIO()
+        with os.fdopen(read_fd, 'rb') as source, tempfile.TemporaryFile() as output:
             producer = asyncio.create_task(asyncio.to_thread(produce))
             with mock.patch.object(mail.sys, 'stdin', SimpleNamespace(buffer=source)), mock.patch.object(mail.sys, 'stdout', SimpleNamespace(buffer=output)):
                 with mock.patch.object(mail, 'authenticate_message', return_value='proceed') as verify:
                     await mail.run_auth_filter({'maxMessageBytes': 2097152})
             await producer
-        self.assertIn(b'filter-result|one|token|reject|550 5.6.0', output.getvalue())
-        self.assertTrue(all(len(line) < 65536 for line in output.getvalue().splitlines()))
+            output.seek(0)
+            replies = output.read()
+        self.assertIn(b'filter-result|one|token|reject|550 5.6.0', replies)
+        self.assertTrue(all(len(line) < 65536 for line in replies.splitlines()))
         verify.assert_not_called()
+
+    async def test_nonblocking_output_preserves_partial_writes_under_backpressure(self):
+        read_fd, write_fd = os.pipe()
+        output = mail.FilterOutput(write_fd)
+        data = b'filter-dataline|one|token|X-Pad: x\n' * 16000
+        release = threading.Event()
+        write = os.write
+
+        def consume():
+            with os.fdopen(read_fd, 'rb') as source:
+                if not release.wait(10):
+                    raise TimeoutError('writer never encountered backpressure')
+                return source.read()
+
+        def pressured_write(fd, value):
+            try:
+                return write(fd, value)
+            except BlockingIOError:
+                release.set()
+                raise
+
+        consumer = asyncio.create_task(asyncio.to_thread(consume))
+        try:
+            with mock.patch.object(mail.os, 'write', side_effect=pressured_write):
+                output.write(data)
+                await asyncio.wait_for(output.drain(), 10)
+            self.assertTrue(release.is_set())
+        finally:
+            release.set()
+            os.close(write_fd)
+        self.assertEqual(await consumer, data)
 
 
 class NativeEmail(unittest.TestCase):

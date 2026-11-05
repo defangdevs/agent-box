@@ -283,6 +283,46 @@ let
         return "reject|550 5.7.1 Aligned SPF or DKIM authentication is required"
 
 
+    class FilterOutput:
+        """Drain complete responses through the MTA's nonblocking output pipe."""
+
+        def __init__(self, fd):
+            self.fd = fd
+            os.set_blocking(fd, False)
+            self.pending = bytearray()
+            self.lock = asyncio.Lock()
+
+        def write(self, data):
+            self.pending.extend(data)
+
+        def flush(self):
+            # Each input frame and independently completed verdict awaits drain.
+            pass
+
+        async def drain(self):
+            async with self.lock:
+                while self.pending:
+                    try:
+                        written = os.write(self.fd, self.pending)
+                    except BlockingIOError:
+                        loop = asyncio.get_running_loop()
+                        ready = loop.create_future()
+
+                        def writable():
+                            if not ready.done():
+                                ready.set_result(None)
+
+                        loop.add_writer(self.fd, writable)
+                        try:
+                            await ready
+                        finally:
+                            loop.remove_writer(self.fd)
+                    else:
+                        if not written:
+                            raise BrokenPipeError("email filter output closed")
+                        del self.pending[:written]
+
+
     class EmailAuthFilter:
         """OpenSMTPD 0.7 protocol. DNS/crypto run off the protocol reader."""
 
@@ -317,6 +357,8 @@ let
             if self.sessions.get(session) is state and state.get("message") is message:
                 self.emit("filter-result", session, token, decision)
                 message["raw"].clear()
+                if hasattr(self.output, "drain"):
+                    await self.output.drain()
 
         def feed(self, line):
             """Handle trusted MTA frames while preserving untrusted message bytes."""
@@ -405,11 +447,14 @@ let
         """Consume complete OpenSMTPD frames without blocking on verification."""
         reader = asyncio.StreamReader(limit=FILTER_FRAME_LIMIT)
         await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer)
-        auth = EmailAuthFilter(cfg, sys.stdout.buffer)
+        output = FilterOutput(sys.stdout.buffer.fileno())
+        auth = EmailAuthFilter(cfg, output)
         while line := await reader.readline():
             auth.feed(line.rstrip(b'\n'))
+            await output.drain()
         if auth.tasks:
             await asyncio.gather(*auth.tasks)
+        await output.drain()
 
 
     def normalized_message(raw, recipient, sender):
