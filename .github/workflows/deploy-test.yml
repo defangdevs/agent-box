@@ -105,7 +105,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-test-${{ inputs.region || 'us-west-2' }}
+  group: deploy-test-${{ inputs.lightsail_only && 'lightsail' || 'ec2' }}-${{ inputs.region || 'us-west-2' }}
   cancel-in-progress: false
 
 jobs:

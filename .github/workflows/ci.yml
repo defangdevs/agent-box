@@ -138,6 +138,10 @@ jobs:
           BUILD: ${{ needs.changes.outputs.build }}
         run: |
           echo "changes=$CHANGES build=$BUILD native=$NATIVE vm=$VM"
+          case "$BUILD" in
+            true|false) ;;
+            *) echo "::error::Missing or invalid build-path decision: $BUILD"; exit 1 ;;
+          esac
           if [ "$CHANGES" != "success" ]; then
             echo "::error::the changes job did not succeed ($CHANGES), so nothing here knows whether CI was needed."
             exit 1

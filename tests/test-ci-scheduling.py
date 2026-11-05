@@ -108,8 +108,8 @@ sys.exit(int(os.environ["FAILURE"]))
             "VM": "${{ needs.vm.result }}",
             "BUILD": "${{ needs.changes.outputs.build }}",
         })
-        for changes in ["success", "failure"]:
-            for build in ["true", "false"]:
+        for changes in ["success", "failure", "cancelled", "skipped"]:
+            for build in ["true", "false", "", "invalid"]:
                 for native in ["success", "failure", "cancelled", "skipped"]:
                     for vm in ["success", "failure", "cancelled", "skipped"]:
                         with self.subTest(changes=changes, build=build,
@@ -132,6 +132,7 @@ sys.exit(int(os.environ["FAILURE"]))
                                         or (job_result == "skipped"
                                             and build != "true"))
                             expected = (changes == "success"
+                                        and build in ("true", "false")
                                         and ok(native) and ok(vm))
                             self.assertEqual(
                                 result.returncode == 0, expected,
