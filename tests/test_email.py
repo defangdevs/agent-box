@@ -359,6 +359,25 @@ class FilterProtocol(unittest.IsolatedAsyncioTestCase):
         self.request(b'connect', b'rdns|192.0.2.2', session=b'two')
         self.assertIn(b'421', self.output.getvalue())
 
+    async def test_line_limit_boundary_and_next_transaction(self):
+        for size in (mail.MAX_DATA_LINE_BYTES, mail.MAX_DATA_LINE_BYTES + 1):
+            self.output.seek(0)
+            self.output.truncate()
+            self.auth = mail.EmailAuthFilter({'maxMessageBytes': 2097152}, self.output)
+            with mock.patch.object(mail, 'authenticate_message', return_value='proceed') as verify:
+                self.message(SenderAuthentication.raw + b'x' * size + b'\r\n')
+                await self.complete()
+                if size == mail.MAX_DATA_LINE_BYTES:
+                    verify.assert_called_once()
+                    self.assertIn(b'filter-result|one|token|proceed', self.output.getvalue())
+                else:
+                    verify.assert_not_called()
+                    self.assertIn(b'filter-result|one|token|reject|550 5.6.0', self.output.getvalue())
+                self.assertTrue(all(len(line) < 65536 for line in self.output.getvalue().splitlines()))
+                self.message()
+                await self.complete()
+                self.assertTrue(self.output.getvalue().endswith(b'filter-result|one|token|proceed\n'))
+
     async def test_busy_verifier_defers_and_disconnect_discards_late_result(self):
         await self.auth.workers.acquire()
         await self.auth.workers.acquire()
@@ -386,7 +405,7 @@ class FilterProtocol(unittest.IsolatedAsyncioTestCase):
                 await self.complete()
         self.assertEqual(len(self.output.getvalue()), size)
 
-    async def test_reader_accepts_maximum_smtp_line_plus_protocol_prefix(self):
+    async def test_reader_drains_oversized_line_without_echoing_an_oversized_reply(self):
         frames = [b'config|ready', b'filter|0.7|0|smtp-in|connect|one|token|rdns|192.0.2.1',
                   b'report|0.7|0|smtp-in|tx-begin|one|message',
                   b'report|0.7|0|smtp-in|tx-mail|one|message|ok|a@example.org']
@@ -407,8 +426,9 @@ class FilterProtocol(unittest.IsolatedAsyncioTestCase):
                 with mock.patch.object(mail, 'authenticate_message', return_value='proceed') as verify:
                     await mail.run_auth_filter({'maxMessageBytes': 2097152})
             await producer
-        self.assertIn(b'filter-result|one|token|proceed\n', output.getvalue())
-        self.assertIn(b'x' * 65534, verify.call_args.args[0])
+        self.assertIn(b'filter-result|one|token|reject|550 5.6.0', output.getvalue())
+        self.assertTrue(all(len(line) < 65536 for line in output.getvalue().splitlines()))
+        verify.assert_not_called()
 
 
 class NativeEmail(unittest.TestCase):

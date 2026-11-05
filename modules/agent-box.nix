@@ -75,6 +75,9 @@ let
     # OpenSMTPD accepts DATA lines up to 65534 bytes; its protocol adds fields
     # before that line. Leave room for the complete frame, including its LF.
     FILTER_FRAME_LIMIT = 131072
+    # OpenSMTPD's processor-response buffer is 65536 bytes including framing.
+    # Oversized input frames must be drained and rejected, never echoed back.
+    MAX_DATA_LINE_BYTES = 64000
 
 
     USER = re.compile(r"[a-z_][a-z0-9_-]{0,31}")
@@ -369,6 +372,10 @@ let
                     message["complete"] = True
                 else:
                     unstuffed = value[1:] if value.startswith(b'..') else value
+                    if len(value) > MAX_DATA_LINE_BYTES:
+                        message["long_line"] = True
+                    if message.get("long_line"):
+                        return
                     if len(message["raw"]) <= self.limit:
                         message["raw"].extend(unstuffed + b'\r\n')
                     if message["headers"]:
@@ -384,7 +391,9 @@ let
                 if message["pending"] or not message["complete"]:
                     raise ValueError("unexpected email filter commit")
                 message["pending"] = True
-                if len(message["raw"]) > self.limit:
+                if message.get("long_line"):
+                    self.emit("filter-result", session, token, "reject|550 5.6.0 Email line exceeds transport limit")
+                elif len(message["raw"]) > self.limit:
                     self.emit("filter-result", session, token, "reject|552 5.3.4 Message too large")
                 else:
                     task = asyncio.create_task(self.verdict(session, token, state, message))

@@ -75,8 +75,8 @@
               b"Authentication-Results: box.test; spf=pass; dkim=pass\r\nX-Agent-Box-Email-Verified: exact-domain-v1\r\n" + body,
               signed.replace(b"Complete private body", b"tampered"),
               b"From: duplicate@example.org\r\n" + signed,
-              # Leave room for CRLF in OpenSMTPD's 65535-byte input buffer;
-              # the filter prefix still makes this frame exceed 65536 bytes.
+              # Reach the filter without exceeding SMTP's input buffer; its
+              # original filter-response frame would exceed 65536 bytes.
               body + b"x" * 65500 + b"\r\n",
           ):
               try:

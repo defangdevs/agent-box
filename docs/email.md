@@ -129,6 +129,8 @@ signature count, active connections and concurrent verifications are bounded.
 Headers are limited to 64 KiB before parsing. RSA keys must have a modulus
 between 1024 and 4096 bits and an odd exponent between 3 and 2^32-1;
 these bounds are checked before the RSA operation.
+DATA lines above 64,000 bytes are rejected before forwarding them through
+OpenSMTPD's bounded filter-response buffer.
 
 The filter replaces all inbound copies of its verification marker with a
 server-generated value persisted under `/var/lib/agent-box-email`. The value
