@@ -10,6 +10,10 @@ on:
       - '.github/workflows/deploy-test.yml'
   workflow_dispatch:
     inputs:
+      diagnose_run:
+        description: Read the current ipv4 test instance journal for an existing run ID; create no resources
+        type: string
+        default: ''
       region:
         # The test account's SCP only allows us-west-2 — other choices are kept
         # for forks running against their own account.
@@ -50,11 +54,43 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-test-${{ inputs.region || 'us-west-2' }}
+  group: deploy-test-${{ inputs.diagnose_run && 'diagnose' || 'deploy' }}-${{ inputs.region || 'us-west-2' }}
   cancel-in-progress: false
 
 jobs:
+  diagnose:
+    if: inputs.diagnose_run != ''
+    runs-on: ubuntu-latest
+    environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
+    timeout-minutes: 5
+    env:
+      AWS_REGION: ${{ inputs.region || 'us-west-2' }}
+      ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      DIAGNOSE_RUN: ${{ inputs.diagnose_run }}
+    steps:
+      - name: Validate the test run ID
+        run: '[[ "$DIAGNOSE_RUN" =~ ^[0-9]+$ ]]'
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Read the existing test instance journal
+        timeout-minutes: 3
+        run: |
+          iid=$(aws cloudformation describe-stack-resources \
+            --stack-name "agent-box-e2e-ipv4-full-$DIAGNOSE_RUN" \
+            --logical-resource-id Instance \
+            --query 'StackResources[0].PhysicalResourceId' --output text)
+          cid=$(aws ssm send-command --instance-ids "$iid" \
+            --document-name AWS-RunShellScript \
+            --parameters 'commands=["journalctl -u amazon-init -n 100 -o cat --no-pager | tail -c 18000"]' \
+            --query Command.CommandId --output text)
+          aws ssm wait command-executed --command-id "$cid" --instance-id "$iid"
+          aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
+            --query StandardOutputContent --output text
+
   deploy-test:
+    if: inputs.diagnose_run == ''
     runs-on: ubuntu-latest
     # Two legs run in PARALLEL:
     #  - ipv4-full: GH runners are IPv4-only, so this is the only leg that can
