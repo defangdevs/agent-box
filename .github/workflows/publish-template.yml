@@ -43,7 +43,6 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  id-token: write   # for OIDC AssumeRoleWithWebIdentity
   contents: read
 
 jobs:
