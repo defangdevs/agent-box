@@ -225,7 +225,7 @@ jobs:
         run: |
           gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
             --pattern release-manifest.json --clobber
-          python3 scripts/release_manifest.py verify release-manifest.json \
+          python3 scripts/release_manifest.py verify release-manifest.json --repo "$GITHUB_REPOSITORY" \
             --rev "$REV" --source-dir _candidate
 
       - name: Build the candidate's release manifest, once
@@ -361,7 +361,7 @@ jobs:
         env:
           AGENT_BOX_SKIP_PREFETCH: "1"
         run: |
-          python3 scripts/release_manifest.py verify release-manifest.json \
+          python3 scripts/release_manifest.py verify release-manifest.json --repo "$GITHUB_REPOSITORY" \
             --rev "${{ needs.candidate.outputs.rev }}" --source-dir .
 
       - name: Tag the release, or recognise a rollback

@@ -126,6 +126,21 @@ class Build(Rig):
 
 
 class Verify(Rig):
+    def test_manifest_cannot_change_the_expected_repository(self):
+        self.assertTrue(self.verify(self.build(), expect_repo="another/repo"))
+
+    def test_verify_requires_a_full_immutable_revision(self):
+        manifest = self.build()
+        manifest["rev"] = "master"
+        with self.assertRaises(rm.ManifestError):
+            self.verify(manifest)
+
+    def test_schema_and_module_identity_cannot_be_changed(self):
+        for field, value in [("manifest_version", 999), ("module_path", "another.nix")]:
+            manifest = self.build()
+            manifest[field] = value
+            self.assertTrue(self.verify(manifest))
+
     def setUp(self):
         super().setUp()
         self.manifest = self.build()

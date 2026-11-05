@@ -1,4 +1,5 @@
 """Exercise release refusal paths from the actual workflow step scripts."""
+import ast
 import itertools
 import json
 import os
@@ -27,19 +28,44 @@ def step(job, name):
                 if item.get("name") == name)
 
 
+def condition(expression):
+    """Only the booleans and string equality used by the publication guard."""
+    def visit(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.BoolOp):
+            values = [visit(value) for value in node.values]
+            if isinstance(node.op, ast.And):
+                return all(values)
+            if isinstance(node.op, ast.Or):
+                return any(values)
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            if isinstance(node.ops[0], ast.Eq):
+                return visit(node.left) == visit(node.comparators[0])
+        raise AssertionError(f"unsupported workflow condition: {ast.dump(node)}")
+    return visit(ast.parse("(" + expression + ")", mode="eval").body)
+
+
 class ReleaseWorkflows(unittest.TestCase):
-    def run_script(self, script, gh_body, files=None, extra_env=None):
+    def run_script(self, script, gh_body, files=None, extra_env=None, stubs=None, setup=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             stub = root / "gh"
             stub.write_text(f"#!{sys.executable}\n" + gh_body)
             stub.chmod(0o755)
+            for name, body in (stubs or {}).items():
+                tool = root / name
+                tool.write_text(f"#!{sys.executable}\n" + body)
+                tool.chmod(0o755)
             for name, content in (files or {}).items():
                 (root / name).write_text(content)
             env = {**os.environ, "PATH": str(root) + os.pathsep + os.environ["PATH"],
                    "GITHUB_REPOSITORY": "dummy/repo", "REV": "a" * 40,
                    "TAG": "release-fixture", "REASON": "fixture",
+                   "GITHUB_OUTPUT": str(root / "outputs"),
                    **(extra_env or {})}
+            if setup:
+                setup(root, env)
             return subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
                                   cwd=root, env=env, capture_output=True, text=True,
                                   timeout=10)
@@ -73,7 +99,7 @@ class ReleaseWorkflows(unittest.TestCase):
             expression = expression.replace("&&", "and").replace("||", "or")
             expected = candidate == "success" and (
                 ec2 == native == "success" or skip and ec2 == native == "skipped")
-            self.assertEqual(eval(expression, {"__builtins__": {}}), expected)
+            self.assertEqual(condition(expression), expected)
         native = PROMOTE["jobs"]["lightsail-test"]
         self.assertEqual(native["uses"], "./.github/workflows/lightsail-test.yml")
         self.assertEqual(native["with"]["ref"], "${{ needs.candidate.outputs.rev }}")
@@ -84,6 +110,14 @@ class ReleaseWorkflows(unittest.TestCase):
         steps = PUBLISH["jobs"]["publish"]["steps"]
         self.assertFalse(any("release_manifest.py build" in item.get("run", "")
                              for item in steps))
+
+    def test_a_new_candidate_cannot_skip_fresh_boot(self):
+        script = step("candidate", "Decide whether this is a fresh candidate or a re-promotion")
+        for tag, skip, expected in [("", "true", False), ("", "false", True),
+                                    ("release-original", "true", True)]:
+            result = self.run_script(script, "", extra_env={"SKIP_DEPLOY_TEST": skip},
+                                     stubs={"git": f"print({tag!r})\n"})
+            self.assertEqual(result.returncode == 0, expected, result.stderr)
 
     def test_repromotion_preserves_original_release_and_rejects_changed_manifest(self):
         script = step("record", "Publish the Release object carrying the manifest")
@@ -110,6 +144,36 @@ else:
         # printing the first-promotion exception to the ancestry guard.
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("No release branch yet", result.stdout)
+
+    def test_rollback_refusal_and_explicit_pointer_restore_against_local_remote(self):
+        preflight = step("candidate", "Refuse an unauthorized rollback before any public write")
+        move = step("record", "Move the `release` pointer")
+
+        def setup(root, env):
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=root, env=env, text=True).strip()
+            git("init", "--bare", "-q", "remote.git")
+            git("init", "-q")
+            git("config", "user.name", "Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            (root / "marker").write_text("old\n")
+            git("add", "marker")
+            git("commit", "-qm", "old release")
+            env["REV"] = git("rev-parse", "HEAD")
+            (root / "marker").write_text("new\n")
+            git("commit", "-qam", "new release")
+            git("remote", "add", "origin", str(root / "remote.git"))
+            git("push", "-q", "origin", "HEAD:refs/heads/release")
+
+        for allow in ["false", "true"]:
+            script = preflight + "\n" + move + "\n" + '''
+actual=$(git ls-remote --heads origin refs/heads/release | cut -f1)
+test "$actual" = "$REV"
+'''
+            result = self.run_script(script, "", setup=setup,
+                                     extra_env={"ALLOW_ROLLBACK": allow,
+                                                "GIT_CONFIG_GLOBAL": "/dev/null"})
+            self.assertEqual(result.returncode == 0, allow == "true", result.stderr)
 
 
 if __name__ == "__main__":

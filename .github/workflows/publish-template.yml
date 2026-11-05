@@ -104,7 +104,7 @@ jobs:
       # pins into another candidate's templates.
       - name: Verify the manifest describes exactly this commit
         run: |
-          python3 scripts/release_manifest.py verify "$MANIFEST" \
+          python3 scripts/release_manifest.py verify "$MANIFEST" --repo "$GITHUB_REPOSITORY" \
             --rev "${{ steps.rev.outputs.rev }}" --source-dir .
 
       - name: Validate templates locally

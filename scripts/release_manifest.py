@@ -49,6 +49,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -87,7 +88,7 @@ RAW = "https://raw.githubusercontent.com/{repo}/{rev}/{path}"
 
 # Fields that describe when the manifest was made rather than what it
 # describes. `verify` ignores them; everything else must match exactly.
-PROVENANCE = ("created", "created_by", "manifest_version")
+PROVENANCE = ("created", "created_by")
 
 
 class ManifestError(Exception):
@@ -224,7 +225,7 @@ def build(repo, rev, source_dir=None, check_remote=True,
     }
 
 
-def verify(manifest, source_dir=None, check_remote=True, expect_rev=None):
+def verify(manifest, source_dir=None, check_remote=True, expect_rev=None, expect_repo=None):
     """Recompute the manifest from its own rev and report every difference.
 
     The channel entry is re-hashed from the URL the manifest RECORDED, not
@@ -236,6 +237,14 @@ def verify(manifest, source_dir=None, check_remote=True, expect_rev=None):
     repo, rev = manifest.get("repo"), manifest.get("rev")
     if not repo or not rev:
         raise ManifestError("manifest has no repo/rev - nothing to verify")
+    if not isinstance(rev, str) or not re.fullmatch(r"[0-9a-f]{40}", rev):
+        raise ManifestError("manifest rev must be a full 40-character commit sha")
+    if expect_repo and repo != expect_repo:
+        problems.append(f"repo: manifest describes {repo}, expected {expect_repo}")
+    if manifest.get("manifest_version") != MANIFEST_VERSION:
+        problems.append("manifest_version: unsupported release manifest format")
+    if manifest.get("module_path") != MODULE:
+        problems.append(f"module_path: expected {MODULE}")
     if expect_rev and expect_rev != rev:
         problems.append(
             f"rev: manifest describes {rev}, expected {expect_rev}")
@@ -360,6 +369,8 @@ def main(argv=None):
 
     v = shared(sub.add_parser("verify", help="recompute and compare"))
     v.add_argument("manifest")
+    v.add_argument("--repo", default=None, metavar="OWNER/REPO",
+                   help="also require this repository identity")
     v.add_argument("--rev", default=None, metavar="SHA",
                    help="also require the manifest to describe this rev - "
                         "how a box's reported rev is checked against the "
@@ -406,7 +417,7 @@ def main(argv=None):
         problems = verify(load(args.manifest),
                           source_dir=args.source_dir,
                           check_remote=not args.no_remote_check,
-                          expect_rev=args.rev)
+                          expect_rev=args.rev, expect_repo=args.repo)
         if problems:
             for problem in problems:
                 print(f"::error::{problem}", file=sys.stderr)
