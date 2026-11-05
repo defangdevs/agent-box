@@ -61,6 +61,10 @@ on:
         default: ''
   workflow_dispatch:
     inputs:
+      lightsail_only:
+        description: Test the native Lightsail backend instead of the EC2 matrix
+        type: boolean
+        default: false
       region:
         # The test account's SCP only allows us-west-2 — other choices are kept
         # for forks running against their own account.
@@ -105,7 +109,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  lightsail-test:
+    if: inputs.lightsail_only == true
+    uses: ./.github/workflows/lightsail-test.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+
   deploy-test:
+    if: inputs.lightsail_only != true
     runs-on: ubuntu-latest
     # Two legs run in PARALLEL:
     #  - ipv4-full: GH runners are IPv4-only, so this is the only leg that can

@@ -1,0 +1,113 @@
+name: Lightsail fresh-boot test
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Immutable candidate commit
+        type: string
+        required: true
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Immutable candidate commit
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  lightsail:
+    runs-on: ubuntu-latest
+    environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
+    timeout-minutes: 40
+    env:
+      AWS_REGION: us-west-2
+      ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      STACK_NAME: agent-box-native-${{ github.run_id }}-${{ github.run_attempt }}
+      CANDIDATE: ${{ inputs.ref }}
+    steps:
+      - name: Require an immutable candidate and configured role
+        run: |
+          [[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]]
+          test -n "$ROLE_ARN"
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Generate throwaway credentials and pinned stack parameters
+        id: password
+        run: |
+          pw=$(openssl rand -hex 24)
+          echo "::add-mask::$pw"
+          echo "value=$pw" >> "$GITHUB_OUTPUT"
+          hash=$(printf '%s\n' "$pw" | docker run --rm -i caddy:2 caddy hash-password --algorithm argon2id)
+          jq -n --arg hash "$hash" --arg ref "github:${GITHUB_REPOSITORY}/${CANDIDATE}" \
+            '[{ParameterKey:"WebPasswordHash",ParameterValue:$hash},
+              {ParameterKey:"AgentBoxFlakeRef",ParameterValue:$ref}]' > parameters.json
+
+      - name: Create and fresh-boot the Lightsail candidate
+        timeout-minutes: 22
+        run: |
+          aws cloudformation create-stack --stack-name "$STACK_NAME" \
+            --template-body file://deploy/aws/lightsail-template.yaml \
+            --parameters file://parameters.json --on-failure DO_NOTHING \
+            --tags Key=Purpose,Value=agent-box-e2e "Key=RunId,Value=${GITHUB_RUN_ID}"
+          # FirstBootDone is signalled only after the native apply verifies
+          # its required services. Missing Lightsail IAM grants fail this
+          # required job; they must never turn into a skipped release gate.
+          aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+
+      - name: Verify HTTPS authentication and a live terminal
+        timeout-minutes: 10
+        env:
+          WEB_PASSWORD: ${{ steps.password.outputs.value }}
+        run: |
+          url=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[?OutputKey==`WebURL`].OutputValue | [0]' --output text)
+          [[ "$url" == https://*/workspace/ ]]
+          for i in $(seq 1 30); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+              -u "workspace:$WEB_PASSWORD" "$url" || true)
+            if [ "$code" = 200 ]; then break; fi
+            sleep 10
+          done
+          test "$code" = 200
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$url")
+          test "$code" = 401
+          python3 -m pip install --quiet websocket-client
+          for i in $(seq 1 6); do
+            if python3 scripts/ws_smoke.py "$url" "$WEB_PASSWORD"; then exit 0; fi
+            sleep 10
+          done
+          echo '::error::Native candidate has no live browser terminal.'
+          exit 1
+
+      - name: Capture failed stack events
+        if: failure()
+        run: |
+          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+            --query 'StackEvents[?ResourceStatus==`CREATE_FAILED`].[LogicalResourceId,ResourceStatusReason]' \
+            --output table || true
+
+      - name: Destroy the test stack
+        if: always()
+        timeout-minutes: 5
+        run: |
+          # A create call may have failed before the stack was created.
+          stacks=$(aws cloudformation list-stacks \
+            --query "StackSummaries[?StackName=='${STACK_NAME}' && StackStatus!='DELETE_COMPLETE'].StackId" \
+            --output text)
+          if [ -n "$stacks" ]; then
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+          fi

@@ -563,3 +563,26 @@ CodeRabbit reviews every PR in this repo, and pushing the fix does not clear the
          -f event=DISMISS -f message='addressed in <sha>'
 
    `gh pr view NNN --json reviews` has the review ids and their states. A plain `COMMENTED` review carries no merge-blocking verdict, so there is nothing here to clear - asking for a fresh pass with an `@coderabbitai review` comment gets the same result the slow way.
+
+## Releases (#632)
+
+`CI gate`, `AWS template gate` and `Azure template gate` report on every PR
+and push to master. Build path filters live in `.github/path-filters/`;
+keep these terminal job names stable when configuring required checks.
+`scripts/release_manifest.py` records one candidate's source, lockfile,
+module, channel snapshot and templates. `promote.yml` requires green gates
+for that commit and successful EC2 and Lightsail fresh boots before calling
+`publish-template.yml`. Publication has no standalone dispatch.
+
+Re-promoting a previously released commit reuses its original manifest and
+leaves its tag, release notes and manifest asset unchanged. For a public
+install rollback, dispatch promotion with the earlier released commit,
+`allow_rollback` and optionally `skip_deploy_test`. A new commit cannot skip
+fresh boot. This moves public template defaults and the `release` pointer;
+it does not downgrade already-installed boxes past their fast-forward guard.
+The shipped update default remains master until a separate policy change.
+
+`release-workflows` executes the actual workflow refusal scripts against
+fixtures, including missing/failed/foreign-app gates, both fresh-boot
+results, original-manifest immutability and release lookup errors. It is
+automatically included in `ci-native`.

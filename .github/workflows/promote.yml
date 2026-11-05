@@ -22,8 +22,8 @@ name: Promote a release candidate
 #
 # ROLLBACK: dispatch this again with `sha` set to an earlier promoted
 # commit and `allow_rollback` on. That candidate is already tested and
-# already tagged, so nothing new is tagged; its manifest is rebuilt from
-# its own immutable rev, republished, and the `release` pointer is moved
+# already tagged, so nothing new is tagged; its original manifest is
+# downloaded without resolving new dependency pins, republished, and the `release` pointer is moved
 # back. `skip_deploy_test` saves the 40 minutes when the point is to undo a
 # bad release quickly - only ever use it for a commit that was promoted
 # before.
@@ -114,7 +114,11 @@ jobs:
           REV: ${{ steps.rev.outputs.rev }}
           ALLOW_ROLLBACK: ${{ inputs.allow_rollback }}
         run: |
-          git fetch origin release:refs/remotes/origin/release 2>/dev/null || true
+          # A failed fetch is not proof that the release pointer is absent.
+          release_ref=$(git ls-remote --heads origin refs/heads/release)
+          if [ -n "$release_ref" ]; then
+            git fetch origin release:refs/remotes/origin/release
+          fi
           if ! git rev-parse --verify --quiet origin/release >/dev/null; then
             echo "::notice::No release branch yet - nothing to fast-forward from."
             exit 0
@@ -153,7 +157,8 @@ jobs:
           failed=0
           for want in "CI gate" "AWS template gate" "Azure template gate"; do
             verdict=$(jq -r --arg n "$want" '
-              map(select(.name == $n)) | sort_by(.started_at) | last
+              map(select(.name == $n and .app.slug == "github-actions"))
+              | sort_by(.started_at) | last
               | if . == null then "absent"
                 else "\(.status)/\(.conclusion // "none")" end' runs.json)
             if [ "$verdict" = "completed/success" ]; then
@@ -288,10 +293,22 @@ jobs:
       agent_nixpkgs_url: ${{ needs.candidate.outputs.agent_nixpkgs_url }}
       agent_nixpkgs_sha256: ${{ needs.candidate.outputs.agent_nixpkgs_sha256 }}
 
+  lightsail-test:
+    name: Fresh-boot the native candidate
+    needs: candidate
+    if: ${{ !inputs.skip_deploy_test }}
+    uses: ./.github/workflows/lightsail-test.yml
+    secrets: inherit
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      ref: ${{ needs.candidate.outputs.rev }}
+
   # Phase 5: the first step that changes anything the public can see.
   publish:
     name: Publish the promoted templates
-    needs: [ candidate, deploy-test ]
+    needs: [ candidate, deploy-test, lightsail-test ]
     # `always()` is needed to run at all when deploy-test was skipped by
     # input - and then every acceptable state has to be spelled out, or
     # `always()` would also run this after a FAILED deployment test, which
@@ -299,8 +316,9 @@ jobs:
     if: >-
       always()
       && needs.candidate.result == 'success'
-      && (needs.deploy-test.result == 'success'
-          || (needs.deploy-test.result == 'skipped' && inputs.skip_deploy_test))
+      && ((needs.deploy-test.result == 'success' && needs.lightsail-test.result == 'success')
+          || (needs.deploy-test.result == 'skipped' && needs.lightsail-test.result == 'skipped'
+              && inputs.skip_deploy_test))
     uses: ./.github/workflows/publish-template.yml
     secrets: inherit
     permissions:
@@ -313,6 +331,7 @@ jobs:
   record:
     name: Record the promotion
     needs: [ candidate, publish ]
+    if: always() && needs.candidate.result == 'success' && needs.publish.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -399,8 +418,11 @@ jobs:
             echo '```'
           } > notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" --notes-file notes.md
-            gh release upload "$TAG" release-manifest.json --clobber
+            # The original release is the qualification record for rollback.
+            # Never overwrite it, even when this is a re-promotion.
+            mkdir original
+            gh release download "$TAG" --pattern release-manifest.json --dir original
+            cmp release-manifest.json original/release-manifest.json
           else
             gh release create "$TAG" release-manifest.json \
               --title "agent-box $TAG" --notes-file notes.md
@@ -422,7 +444,9 @@ jobs:
         # can lose a commit from the branch.
         run: |
           if [ "$ALLOW_ROLLBACK" = "true" ]; then
-            git push --force origin "$REV:refs/heads/release"
+            release_ref=$(git ls-remote --heads origin refs/heads/release)
+            expected=$(printf '%s' "$release_ref" | cut -f1)
+            git push --force-with-lease="refs/heads/release:$expected" origin "$REV:refs/heads/release"
             echo "::warning::\`release\` was FORCE-moved to $REV (rollback)."
           elif ! git push origin "$REV:refs/heads/release"; then
             echo "::error::$REV is not a fast-forward of \`release\`. If this is a deliberate rollback, dispatch again with allow_rollback."

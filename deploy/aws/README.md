@@ -594,16 +594,25 @@ had never been booted by anything, and its one mutable dependency was
 resolved after the last thing that could have tested it. Publishing is now
 the last phase of `.github/workflows/promote.yml`, which requires the three
 aggregate CI gates green for one exact commit, builds that candidate's
-release manifest ONCE, boots it in `deploy-test` with those pins, and only
-then calls this workflow with the same manifest. So a failed deployment test
+release manifest ONCE, boots EC2 with those pins and Lightsail with the
+recorded flake reference, and only then calls this workflow with the same manifest. So a failed deployment test
 leaves the public defaults unchanged, and the templates always pin what was
 actually tested. See "Releases" in the repo's `AGENTS.md`, including how to
 roll back.
 
-To publish, dispatch `Promote a release candidate`. A `workflow_dispatch` of
-`Publish CFN template to S3` still exists for re-publishing an existing
-release tag; it rebuilds the manifest from that immutable rev and runs no
-tests of its own, so it is not a way to promote something new.
+To publish or roll back, dispatch `Promote a release candidate`. Publication
+has no standalone manual entry point. Re-promoting a release downloads and
+verifies its original manifest; it does not resolve the channel again or
+replace the recorded release asset.
+
+The required Lightsail fresh-boot job creates one temporary Ubuntu instance
+with a static IP, waits for native activation, checks HTTPS authentication
+and the live browser terminal, then deletes the stack even on failure. It
+runs during promotion and on explicit test dispatches, rather than on every
+push. The test role needs the Lightsail create/read/delete permissions for
+the instance and static IP, plus CloudFormation list/describe/create/delete
+permissions. A missing IAM grant fails promotion. For diagnostics without
+running EC2, dispatch `Deploy test` with `lightsail_only` selected.
 
 ### Prerequisites (forking this repo)
 

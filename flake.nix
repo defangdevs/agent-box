@@ -2079,6 +2079,19 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          release-workflows = pkgs.runCommand "agent-box-release-workflows" {
+            nativeBuildInputs = [
+              pkgs.bash pkgs.git pkgs.jq
+              (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+            ];
+          } ''
+            mkdir -p repo/tests repo/.github
+            cp ${./tests/test-release-workflows.py} repo/tests/test-release-workflows.py
+            cp -r ${./.github/workflows} repo/.github/workflows
+            python3 repo/tests/test-release-workflows.py
+            touch "$out"
+          '';
+
           # Unit test for agent-box-upload (issue #368). The three things it
           # gets right were shipped WRONG first, as a curl recipe in the guide
           # (PR #367 review): the token in argv, where every other Linux user
