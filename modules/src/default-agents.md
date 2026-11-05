@@ -233,18 +233,27 @@ Linux user for a separate trust domain.
 
 ## Optional inbound email
 
-When the operator enables email, `<linux-user>@<configured-hostname>` feeds
-that user's existing message bus. Subscribe with `agent-box-webhook subscribe
-email:user@hostname --note "why"`, or use an ordinary standing watch/profile.
-The event is `email.received`; no implicit email watch starts work.
+When the operator enables email, only explicitly registered addresses feed
+that user's existing message bus. Manage them at the settings page under
+Automations -> Email addresses, or use `agent-box-email addresses set
+user+github@hostname --purpose "Triage GitHub notifications" --profile github
+--batch-seconds 120`. Each address requires its own purpose and existing
+worker profile. Changes apply without a rebuild or mail-service restart.
+Unknown and disabled addresses are rejected before accepting a message.
+There is no implicit catch-all or triage address, including the untagged one.
 
-Tagged addresses such as `user+github@hostname` reach the same Linux user's
-bus with their full address as the topic (`email:user+github@hostname`).
-The payload preserves `recipient`, `baseRecipient` and `recipientTag`
-(`github`, or empty for untagged mail). Subscribe to an exact tagged address,
-optionally filtered with
-`--when '{"path":"recipientTag","in":["github"]}'`. An exact untagged
-subscription matches only untagged mail. Tags are sender-controlled data.
+`agent-box-email addresses list` shows the registry. `agent-box-email addresses
+disable user+github@hostname` stops new reception while preserving its
+handler for already accepted mail. Saving an address enables it again.
+A handler is installed before reception is enabled; an unsuccessful handler
+update leaves that address disabled. Remove any older automatic rule for
+the same exact address before registering its replacement.
+
+Addresses such as `user+github@hostname` reach the same Linux user's bus
+with their full address as the topic (`email:user+github@hostname`). The
+payload preserves `recipient`, `baseRecipient` and `recipientTag` (`github`,
+or empty for untagged mail). The event is `email.received`; purpose-specific
+watches batch notifications independently. Tags are sender-controlled data.
 
 SMTP intake requires SPF or DKIM to pass for the exact `From` domain before
 accepting mail; failures are rejected and temporary verification errors are

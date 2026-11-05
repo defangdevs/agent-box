@@ -160,6 +160,128 @@ class EmailAdapter(unittest.TestCase):
         with self.assertRaises(ValueError):
             mail.validate_config(dict(self.cfg, keyFile='/tmp/key"; evil'))
 
+class PurposeAddresses(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.user = pwd.getpwuid(os.getuid()).pw_name
+        self.account = SimpleNamespace(pw_name=self.user, pw_uid=os.getuid(), pw_dir=str(self.root))
+        self.cfg = {'users': [self.user], 'domains': ['box.test'], 'maxMessageBytes': 1024}
+        for patcher in (mock.patch.object(mail, 'ADDRESS_ROOT', self.root / 'addresses'),
+                        mock.patch.object(mail.pwd, 'getpwnam', return_value=self.account),
+                        mock.patch.object(mail.pwd, 'getpwuid', return_value=self.account)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        mail.address_path(self.user).parent.mkdir(parents=True)
+        self.address = self.user + '+github@box.test'
+        self.route = {'purpose': 'Triage GitHub notifications', 'profile': 'github', 'batchSeconds': 120, 'enabled': True}
+        profile = self.root / '.config/agent-box/profiles/github.env'
+        profile.parent.mkdir(parents=True)
+        profile.write_text('HARNESS=claude\n')
+
+    def manage(self, operation='set', **changes):
+        args = dict(operation=operation, address=self.address, purpose=self.route['purpose'],
+                    profile='github', batch_seconds=120)
+        args.update(changes)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            mail.manage_addresses(self.cfg, SimpleNamespace(**args))
+        return json.loads(output.getvalue())
+
+    def test_registry_is_deny_by_default_exact_and_hot_reloaded(self):
+        self.assertIn('550', mail.recipient_decision(self.cfg, self.address.encode()))
+        mail.write_addresses(self.user, {self.address: self.route})
+        self.assertEqual(mail.recipient_decision(self.cfg, self.address.encode()), 'proceed')
+        self.assertEqual(mail.recipient_decision(self.cfg, self.address.upper().encode()), 'proceed')
+        for recipient in (self.user + '@box.test', self.user + '+linear@box.test',
+                          self.user + '+github@other.test', 'other+github@box.test', self.user + '+@box.test'):
+            self.assertIn('550', mail.recipient_decision(self.cfg, recipient.encode()))
+        with mock.patch.object(mail.subprocess, 'run') as run:
+            self.manage('disable')
+            run.assert_not_called()  # Accepted mail can still drain through its handler.
+        self.assertIn('550', mail.recipient_decision(self.cfg, self.address.encode()))
+        self.assertEqual(mail.address_path(self.user).stat().st_mode & 0o777, 0o640)
+
+    def test_handler_is_installed_before_address_becomes_accepted(self):
+        def installed(argv, **kwargs):
+            if argv[-1] == 'ls':
+                return SimpleNamespace(returncode=0, stdout=b'{"dispatch":{"topics":[]}}')
+            self.assertIn('550', mail.recipient_decision(self.cfg, self.address.encode()))
+            self.assertIn('email:' + self.address, argv)
+            self.assertIn('profile=github', argv)
+            self.assertEqual(argv[argv.index('--spawn-window') + 1], '120')
+            self.assertEqual(kwargs['env']['HOME'], str(self.root))
+            return SimpleNamespace(returncode=0)
+
+        with mock.patch.object(mail.subprocess, 'run', side_effect=installed):
+            self.manage()
+        self.assertEqual(mail.recipient_decision(self.cfg, self.address.encode()), 'proceed')
+        self.assertEqual(self.manage('list')['addresses'][self.address], self.route)
+        with mock.patch.object(mail.subprocess, 'run', side_effect=installed):
+            self.manage(address=self.address.upper())
+        self.assertEqual(list(mail.read_addresses(self.cfg, self.user)), [self.address])
+        with mock.patch.object(mail.subprocess, 'run', return_value=SimpleNamespace(returncode=1)):
+            with self.assertRaises(OSError):
+                self.manage(purpose='New handler policy')
+        self.assertIn('550', mail.recipient_decision(self.cfg, self.address.encode()))
+
+    def test_existing_rule_cannot_silently_steal_a_purpose_address(self):
+        result = SimpleNamespace(returncode=0, stdout=json.dumps({'dispatch': {'topics': [
+            {'topic': 'email:' + self.address, 'name': 'old-triage'}]}}).encode())
+        with mock.patch.object(mail.subprocess, 'run', return_value=result) as run:
+            with self.assertRaisesRegex(ValueError, 'another automatic rule'):
+                self.manage()
+            self.assertEqual(run.call_count, 1)
+        self.assertEqual(mail.read_addresses(self.cfg, self.user), {})
+
+    def test_bad_profiles_routes_and_other_users_do_not_register(self):
+        for changes in ({'profile': '../elsewhere'}, {'profile': 'missing'}, {'purpose': ''},
+                        {'purpose': 'a\nb'}, {'batch_seconds': 0}, {'batch_seconds': 3601},
+                        {'address': 'other@box.test'}, {'address': self.user + '@elsewhere.test'}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.manage(**changes)
+        self.assertEqual(mail.read_addresses(self.cfg, self.user), {})
+
+    def test_unreadable_unsafe_and_malformed_registries_temporarily_refuse(self):
+        path = mail.address_path(self.user)
+        for body in ('[]', '{', '{"other@box.test":{}}', 'x' * (mail.MAX_ADDRESS_BYTES + 1)):
+            path.write_text(body)
+            self.assertIn('451', mail.recipient_decision(self.cfg, self.address.encode()))
+        mail.write_addresses(self.user, {self.address: self.route})
+        path.chmod(0o666)
+        self.assertIn('451', mail.recipient_decision(self.cfg, self.address.encode()))
+        path.unlink()
+        path.symlink_to(self.root / 'absent')
+        self.assertIn('451', mail.recipient_decision(self.cfg, self.address.encode()))
+        path.unlink()
+        os.mkfifo(path)
+        self.assertIn('451', mail.recipient_decision(self.cfg, self.address.encode()))
+
+    def test_filter_registers_rcpt_and_keeps_reader_available(self):
+        async def exercise():
+            output = io.BytesIO()
+            with mock.patch.object(mail, 'verification_marker', return_value='marker'):
+                auth = mail.EmailAuthFilter(self.cfg, output)
+            auth.feed(b'config|ready')
+            auth.feed(b'filter|0.7|1|smtp-in|connect|session|connect-token|mx.test|127.0.0.1')
+            auth.feed(b'filter|0.7|1|smtp-in|rcpt-to|session|rcpt-token|' + self.address.encode())
+            await asyncio.gather(*auth.tasks)
+            self.assertIn(b'register|filter|smtp-in|rcpt-to\n', output.getvalue())
+            self.assertIn(b'filter-result|session|rcpt-token|reject|550', output.getvalue())
+            await auth.workers.acquire()
+            await auth.workers.acquire()
+            auth.feed(b'filter|0.7|1|smtp-in|rcpt-to|session|busy-token|' + self.address.encode())
+            await asyncio.gather(*auth.tasks)
+            self.assertIn(b'filter-result|session|busy-token|reject|451', output.getvalue())
+            auth.workers.release()
+            auth.workers.release()
+            auth.feed(b'filter|0.7|1|smtp-in|rcpt-to|session|gone-token|' + self.address.encode())
+            auth.feed(b'report|0.7|1|smtp-in|link-disconnect|session')
+            await asyncio.gather(*auth.tasks)
+            self.assertNotIn(b'filter-result|session|gone-token', output.getvalue())
+        asyncio.run(exercise())
+
+
 class VerificationMarker(unittest.TestCase):
     def test_failed_atomic_publication_leaves_no_partial_token(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,6 +738,13 @@ class NativeEmail(unittest.TestCase):
             self.assertEqual(links['/etc/agent-box/email-tools/smtpctl'], str(profile / 'bin/smtpctl'))
             self.assertIn('agent-box-email.service', tree.units)
             self.assertIn('smtpq', text('/etc/tmpfiles.d/agent-box.conf'))
+            self.assertIn('d /var/lib/agent-box-email/addresses/alice 2750 alice smtpd - -',
+                          text('/etc/tmpfiles.d/agent-box.conf'))
+            for unit in ('agent-box', 'agent-box-settings'):
+                self.assertIn('ReadWritePaths=/var/lib/agent-box-email/addresses/alice',
+                              text('/etc/systemd/system/' + unit + '@alice.service.d/10-host.conf'))
+                self.assertNotIn('/var/lib/agent-box-email/addresses',
+                                 text('/etc/systemd/system/' + unit + '@bob.service.d/10-host.conf'))
             self.assertIn('StateDirectory=agent-box-email', text('/etc/systemd/system/agent-box-email.service'))
             self.assertIn('User=alice', text('/etc/systemd/system/agent-box-email-source@alice.service'))
             self.assertIn('AGENT_BOX_WEBHOOK_URL=https://box.example/alice/webhook',

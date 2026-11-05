@@ -3145,6 +3145,8 @@ class Renderer:
         if agent_box_directive_holds("ReadWritePaths"):
             for template in agent_box_directives["ReadWritePaths"]["templates"]:
                 lines.append(f"ReadWritePaths={template.replace('%i', u.name)}")
+        if self.spec.email_enable and u.email:
+            lines.append(f"ReadWritePaths=/var/lib/agent-box-email/addresses/{u.name}")
         for f in u.environment_files:
             lines.append(f"EnvironmentFile=-{f}")
         t.file(self.p("/etc/systemd/system",
@@ -3284,7 +3286,8 @@ class Renderer:
                        "ExecStart=",
                        f"ExecStart="
                        f"{self.contract_bin(settings_contract['execStart'][0])}",
-                   ]))
+                   ] + ([f"ReadWritePaths=/var/lib/agent-box-email/addresses/{u.name}"]
+                        if self.spec.email_enable and u.email else [])))
         if self.spec.webhook_enable:
             # Env vars and Exec directives come from the shared binding
             # contract (issue #451) instead of being hand-written here —
@@ -3600,7 +3603,9 @@ class Renderer:
         """
         lines = []
         if self.spec.email_enable:
-            lines += ["d /var/empty 0755 root root - -",
+            lines += ["d /var/lib/agent-box-email 0755 root root - -",
+                      "d /var/lib/agent-box-email/addresses 0755 root root - -",
+                      "d /var/empty 0755 root root - -",
                       "d /var/spool/smtpd 0711 root root - -",
                       "d /var/spool/smtpd/offline 0770 root smtpq - -",
                       "d /var/spool/smtpd/purge 0700 smtpq root - -",
@@ -3622,6 +3627,8 @@ class Renderer:
                 f"d {TTYD_SOCKET_DIR} 0755 root root - -",
             ]
         for u in self.spec.users:
+            if self.spec.email_enable and u.email:
+                lines.append(f"d /var/lib/agent-box-email/addresses/{u.name} 2750 {u.name} smtpd - -")
             if self.spec.web_enable:
                 lines += [
                     f"d /var/lib/agent-box-sites/{u.name} 0750 {u.name} caddy - -",
