@@ -65,7 +65,8 @@
               except smtplib.SMTPDataError as error:
                   assert error.smtp_code == 451, error
               sys.exit(0)
-          for address in ("other@box.test", "unknown@box.test", "agent@elsewhere.example", "agent+stale@box.test"):
+          for address in ("other@box.test", "unknown@box.test", "agent@elsewhere.example",
+                          "other+github@box.test", "agent+github@elsewhere.example", "agent+@box.test"):
               client.mail("sender@example.org")
               code, _ = client.rcpt(address)
               assert code >= 500, (address, code)
@@ -94,6 +95,8 @@
           # second message without an aligned envelope sender. Same connection.
           assert client.sendmail("sender@example.org", ["agent@box.test"], body) == {}
           assert client.sendmail("forwarder@elsewhere.example", ["agent@1-2-3-4.defangstation.com"], signed) == {}
+          for address in ("agent+github@box.test", "agent+build+linux@1-2-3-4.defangstation.com"):
+              assert client.sendmail("sender@example.org", [address], body) == {}
     '';
     environment.etc."email-local-probe.py".text = ''
       import dkim, pathlib, subprocess, sys
@@ -119,7 +122,7 @@
       log = subprocess.check_output(["journalctl", "-u", "agent-box-email.service",
                                      "-o", "cat", "--no-pager"], text=True)
       failed = set(re.findall(r"mda delivery evpid=([0-9a-f]+).*result=TempFail", log))
-      assert len(failed) == 2, log
+      assert len(failed) == 4, log
     '';
     system.stateVersion = "25.05";
   };
@@ -138,6 +141,9 @@
     assert source["sources"]["email"]["retainPayload"] is True
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@box.test --note mail-test'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@1-2-3-4.defangstation.com --note alias-test'")
+    machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailtags agent-box-webhook subscribe email:agent+github@box.test --note tagged-mail-test'")
+    machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailtags agent-box-webhook subscribe email:agent+build+linux@1-2-3-4.defangstation.com --note tagged-alias-test'")
+    machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailgithub agent-box-webhook subscribe email:agent+github@box.test --note github-mail-test'")
     machine.succeed("su - agent -c \"echo '|touch /home/agent/forward-ran' > /home/agent/.forward\"")
     machine.succeed("systemctl stop dnsmasq.service")
     machine.succeed("python3 /etc/email-probe.py --dns-down")
@@ -152,13 +158,22 @@
     machine.succeed("systemctl start agent-box-webhook@agent.socket")
     # Force the MTA retry now instead of waiting for its normal backoff.
     machine.succeed("runuser -u root -g smtpq -- /etc/agent-box/email-tools/smtpctl schedule all")
-    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 2")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 4")
     machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/peers/emailwait/new -type f | wc -l) -eq 2")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/peers/emailtags/new -type f | wc -l) -eq 2")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/peers/emailgithub/new -type f | wc -l) -eq 1")
     machine.succeed("find /home/agent/.local/state/local-webhook/spool/content/new -type f -exec stat -c '%U %a' {} + | grep 'agent 600' >/dev/null")
     machine.fail("su - other -c 'ls /home/agent/.local/state/local-webhook/spool/content/new'")
     records = json.loads(machine.succeed("python3 -c 'import pathlib,json; print(json.dumps([json.loads(p.read_text()) for p in pathlib.Path(\"/home/agent/.local/state/local-webhook/spool/content/new\").iterdir()]))'"))
-    assert len({r["id"] for r in records}) == 2
+    assert len({r["id"] for r in records}) == 4
+    assert {r["payload"]["recipient"] for r in records} == {
+        "agent@box.test", "agent@1-2-3-4.defangstation.com",
+        "agent+github@box.test", "agent+build+linux@1-2-3-4.defangstation.com"}
     for record in records:
+        payload = record["payload"]
+        local, domain = payload["recipient"].split("@")
+        assert payload["baseRecipient"] == "agent@" + domain
+        assert payload["recipientTag"] == local.partition("+")[2]
         assert "Complete private body" in record["payload"]["text"]
         assert record["payload"]["senderAuthenticated"] is True
         assert record["payload"]["authenticationPolicy"] == "exact-domain-v1"
@@ -170,7 +185,7 @@
     ident = records[0]["id"]
     machine.succeed(f"su - agent -c 'agent-box-webhook read-content {ident}'")
     machine.succeed("runuser -u other -g smtpq -- python3 /etc/email-local-probe.py --signed")
-    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 3")
+    machine.wait_until_succeeds("test $(find /home/agent/.local/state/local-webhook/spool/content/new -type f | wc -l) -eq 5")
     machine.succeed("grep -l 'Local private body' /home/agent/.local/state/local-webhook/spool/content/new/* >/dev/null")
   '';
 }

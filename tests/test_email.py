@@ -54,6 +54,8 @@ class EmailAdapter(unittest.TestCase):
     def test_mime_and_claimed_identity_are_preserved_as_data(self):
         event = mail.normalized_message(self.raw, self.recipient, 'envelope@example.org')
         self.assertEqual(event['recipient'], self.recipient)
+        self.assertEqual(event['baseRecipient'], self.recipient)
+        self.assertEqual(event['recipientTag'], '')
         self.assertEqual(event['headers']['to'], ['wrong@example.org'])
         self.assertTrue(event['senderAuthenticated'])
         self.assertEqual(event['authenticationPolicy'], 'exact-domain-v1')
@@ -87,9 +89,34 @@ class EmailAdapter(unittest.TestCase):
         self.assertNotEqual(calls[0][0][-1], calls[2][0][-1])
         self.assertEqual(json.loads(calls[0][1])['recipient'], self.recipient)
 
-    def test_other_user_domain_subaddress_and_oversize_are_refused(self):
+    def test_tagged_delivery_preserves_envelope_routing_and_retry_identity(self):
+        calls = []
+        for tag in ('GitHub', 'build+linux', "a!#$%&'*-/=?^_`{|}~.z"):
+            recipient = self.recipient.replace('@', '+' + tag + '@')
+            with mock.patch.dict(os.environ, {'ORIGINAL_RECIPIENT': recipient,
+                                             'EXTENSION': 'forged', 'SENDER': 'sender@example.org'}):
+                with mock.patch.object(mail.subprocess, 'run', return_value=mock.Mock(returncode=0)) as run:
+                    mail.deliver(self.cfg, self.user, io.BytesIO(self.raw))
+                    mail.deliver(self.cfg, self.user, io.BytesIO(self.raw))
+            first, retry = run.call_args_list
+            self.assertEqual(first, retry)
+            event = json.loads(first.kwargs['input'])
+            self.assertEqual(event['recipient'], recipient)
+            self.assertEqual(event['baseRecipient'], self.recipient)
+            self.assertEqual(event['recipientTag'], tag)
+            self.assertEqual(event['headers']['to'], ['wrong@example.org'])
+            self.assertEqual(base64.b64decode(event['rawMimeBase64']), self.raw)
+            calls.append(first.args[0][-1])
+        self.assertEqual(len(set(calls)), 3)
+
+    def test_other_user_domain_invalid_tag_and_oversize_are_refused(self):
         for recipient in ('other@' + self.cfg['domains'][0], self.user + '@elsewhere.example',
-                          self.user + '+session@' + self.cfg['domains'][0], ''):
+                          'other+github@' + self.cfg['domains'][0],
+                          self.user + '+github@elsewhere.example',
+                          self.user + '+@' + self.cfg['domains'][0],
+                          self.user + '+bad tag@' + self.cfg['domains'][0],
+                          self.user + '+bad:tag@' + self.cfg['domains'][0],
+                          self.user + '+tag@evil@' + self.cfg['domains'][0], ''):
             with mock.patch.dict(os.environ, {'ORIGINAL_RECIPIENT': recipient}):
                 with self.assertRaises(mail.PermanentMessageError):
                     mail.deliver(self.cfg, self.user, io.BytesIO(self.raw))
