@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The SMTP adapter must preserve envelope ownership and retry identity."""
 import base64
+import asyncio
 import contextlib
 import importlib.util
 import io
@@ -14,6 +15,11 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+import dkim
+import dns.exception
+import dns.resolver
+import nacl.signing
+
 from test_agentbox import load_agentbox, build_fake_profile
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,6 +30,9 @@ spec.loader.exec_module(mail)
 
 class EmailAdapter(unittest.TestCase):
     def setUp(self):
+        marker = mock.patch.object(mail, 'verification_marker', return_value=mail.VERIFIED_POLICY)
+        marker.start()
+        self.addCleanup(marker.stop)
         self.user = pwd.getpwuid(os.getuid()).pw_name
         self.cfg = {"domains": ["40-70-78-11.defangstation.com"], "users": [self.user],
                     "certificateFile": "/etc/mail/cert.pem", "keyFile": "/etc/mail/key.pem",
@@ -31,6 +40,7 @@ class EmailAdapter(unittest.TestCase):
                     "deliveryCommand": "/store/email", "smtpd": "/store/smtpd"}
         self.recipient = self.user + '@' + self.cfg["domains"][0]
         self.raw = (b'Received: from sender by box id abc123; Mon, 26 Oct 2026 12:00:00 +0000\r\n'
+                    b'X-Agent-Box-Email-Verified: exact-domain-v1\r\n'
                     b'From: Claimed <someone@example.org>\r\nTo: wrong@example.org\r\n'
                     b'Authentication-Results: forged; dkim=pass\r\n'
                     b'Subject: =?utf-8?q?Task?=\r\nMessage-ID: <duplicate@example.org>\r\n'
@@ -44,11 +54,21 @@ class EmailAdapter(unittest.TestCase):
         event = mail.normalized_message(self.raw, self.recipient, 'envelope@example.org')
         self.assertEqual(event['recipient'], self.recipient)
         self.assertEqual(event['headers']['to'], ['wrong@example.org'])
-        self.assertFalse(event['senderAuthenticated'])
+        self.assertTrue(event['senderAuthenticated'])
+        self.assertEqual(event['authenticationPolicy'], 'exact-domain-v1')
         self.assertEqual(event['title'], 'Task')
         self.assertIn('Do the work', event['text'])
         self.assertEqual(event['attachments'][0]['filename'], '../../bad.sh')
         self.assertEqual(base64.b64decode(event['rawMimeBase64']), self.raw)
+
+    def test_unverified_legacy_queue_and_duplicate_markers_never_reach_bus(self):
+        marker = b'X-Agent-Box-Email-Verified: exact-domain-v1\r\n'
+        for raw in (self.raw.replace(marker, b''), self.raw.replace(marker, marker * 2)):
+            with self.assertRaises(mail.PermanentMessageError):
+                mail.normalized_message(raw, self.recipient, 'envelope@example.org')
+        with mock.patch.object(mail, 'verification_marker', return_value=mail.VERIFIED_POLICY + ' server-value'):
+            with self.assertRaises(mail.PermanentMessageError):
+                mail.normalized_message(self.raw, self.recipient, 'envelope@example.org')
 
     def test_retry_is_identical_but_new_smtp_transaction_is_distinct(self):
         calls = []
@@ -80,7 +100,8 @@ class EmailAdapter(unittest.TestCase):
                     mail.deliver(self.cfg, self.user, io.BytesIO(self.raw))
 
     def test_permanent_message_refusal_and_temporary_service_exit_status(self):
-        raw = (b'Content-Type: multipart/mixed; boundary=x\r\n\r\n'
+        raw = (b'X-Agent-Box-Email-Verified: exact-domain-v1\r\nFrom: a@example.org\r\n'
+               b'Content-Type: multipart/mixed; boundary=x\r\n\r\n'
                + b'--x\r\nContent-Type: text/plain\r\n\r\nx\r\n' * 101 + b'--x--\r\n')
         with self.assertRaises(mail.PermanentMessageError):
             mail.normalized_message(raw, self.recipient, '')
@@ -106,8 +127,200 @@ class EmailAdapter(unittest.TestCase):
         self.assertNotIn(' relay', cfg)
         self.assertIn('match from any for any reject', cfg)
         self.assertIn('tls pki mail', cfg)
+        self.assertEqual(cfg.count('filter email_auth'), 3)
         with self.assertRaises(ValueError):
             mail.validate_config(dict(self.cfg, keyFile='/tmp/key"; evil'))
+
+class VerificationMarker(unittest.TestCase):
+    def test_token_is_atomic_persistent_and_rejects_unsafe_files(self):
+        fstat = os.fstat
+
+        def root_stat(fd):
+            return SimpleNamespace(st_uid=0, st_mode=fstat(fd).st_mode)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'token'
+            with mock.patch.object(mail, 'VERIFIED_TOKEN', str(path)), mock.patch.object(mail.os, 'fstat', side_effect=root_stat):
+                first = mail.verification_marker(create=True)
+                self.assertEqual(mail.verification_marker(create=True), first)
+                self.assertEqual(mail.verification_marker(), first)
+                self.assertEqual(len(first.split()[1]), 64)
+                path.chmod(0o666)
+                with self.assertRaises(ValueError):
+                    mail.verification_marker()
+                path.chmod(0o644)
+                path.write_text('invalid\n')
+                with self.assertRaises(ValueError):
+                    mail.verification_marker()
+                path.unlink()
+                path.symlink_to(Path(tmp) / 'missing')
+                with self.assertRaises(OSError):
+                    mail.verification_marker()
+
+
+class SenderAuthentication(unittest.TestCase):
+    raw = b'From: Author <author@example.org>\r\nSubject: Signed task\r\n\r\nPrivate body\r\n.dot line\r\n'
+    private_key = (ROOT / 'tests/email/dkim-test.key').read_bytes()
+    public_key = b''.join((ROOT / 'tests/email/dkim-test.pub').read_bytes().splitlines()[1:-1])
+
+    def signed(self, domain=b'example.org', raw=None, **kw):
+        raw = raw or self.raw
+        return dkim.sign(raw, b'test', domain, self.private_key, **kw) + raw
+
+    def dns_answer(self, name, qtype, **kw):
+        if name.lower() == 'test._domainkey.example.org.':
+            return [SimpleNamespace(strings=[b'v=DKIM1; k=rsa; p=' + self.public_key])]
+        raise dns.resolver.NXDOMAIN()
+
+    def verdict(self, raw=None, sender='forwarder@other.example', result='fail', ip='192.0.2.1'):
+        with mock.patch.object(mail.spf, 'check2', return_value=(result, 'test')):
+            with mock.patch.object(mail.dns.resolver, 'resolve', side_effect=self.dns_answer):
+                return mail.authenticate_message(raw or self.raw, ip, sender, 'mx.example.org')
+
+    def test_spf_pass_requires_exact_from_alignment(self):
+        self.assertEqual(self.verdict(sender='author@example.org', result='pass'), 'proceed')
+        for sender in ('author@evil.example', 'author@sub.example.org', ''):
+            self.assertIn('550', self.verdict(sender=sender, result='pass'))
+        self.assertIn('550', self.verdict())
+        for result in ('fail', 'softfail', 'neutral', 'none', 'permerror'):
+            self.assertIn('550', self.verdict(sender='author@example.org', result=result))
+        self.assertIn('451', self.verdict(sender='author@example.org', result='temperror'))
+
+    def test_actual_spf_library_ipv4_and_ipv6(self):
+        def lookup(name, qtype, *args):
+            return [((name, 'TXT'), [b'v=spf1 ip4:192.0.2.1 ip6:2001:db8::1 -all'])] if qtype == 'TXT' else []
+        with mock.patch.object(mail.spf, 'DNSLookup', side_effect=lookup):
+            for ip in ('192.0.2.1', '2001:db8::1'):
+                self.assertEqual(mail.authenticate_message(self.raw, ip, 'author@example.org', 'mx.example.org'), 'proceed')
+            self.assertIn('550', mail.authenticate_message(self.raw, '192.0.2.2', 'author@example.org', 'mx.example.org'))
+
+    def test_real_dkim_survives_spf_failure_and_null_sender(self):
+        for sender in ('forwarder@other.example', '', 'author@example.org'):
+            self.assertEqual(self.verdict(self.signed(), sender=sender), 'proceed')
+        # A failed first signature must not hide a later valid signature.
+        self.assertEqual(self.verdict(self.signed(b'evil.example', raw=self.signed())), 'proceed')
+
+    def test_tampered_unaligned_partial_and_sha1_signatures_are_rejected(self):
+        signed = self.signed()
+        for raw in (signed.replace(b'Private body', b'Forged task'),
+                    self.signed(b'evil.example'), self.signed(length=True),
+                    self.signed(signature_algorithm=b'rsa-sha1'),
+                    b'DKIM-Signature: invalid\r\n' + self.raw,
+                    b'DKIM-Signature: d=example.org; d=example.org\r\n' + self.raw,
+                    b'DKIM-Signature: invalid\r\n' * 9 + signed):
+            self.assertIn('550', self.verdict(raw))
+
+    def test_ed25519_signature(self):
+        key = nacl.signing.SigningKey(bytes(range(32)))
+        raw = dkim.sign(self.raw, b'test', b'example.org', base64.b64encode(bytes(key)),
+                        signature_algorithm=b'ed25519-sha256') + self.raw
+        answer = [SimpleNamespace(strings=[b'v=DKIM1; k=ed25519; p=' + base64.b64encode(bytes(key.verify_key))])]
+        with mock.patch.object(mail.dns.resolver, 'resolve', return_value=answer):
+            self.assertEqual(mail.authenticate_message(raw, '192.0.2.1', '', 'mx.example.org'), 'proceed')
+
+    def test_missing_ambiguous_malformed_and_group_authors_are_rejected(self):
+        for prefix in (b'', b'From: missing-domain\r\n', b'From: a@example.org, b@example.org\r\n',
+                       b'From: a@example.org\r\nFrom: b@example.org\r\n',
+                       b'From: List: a@example.org;\r\n', b'From: a@bad..example.org\r\n'):
+            self.assertIn('550', self.verdict(prefix + b'\r\nbody', sender='a@example.org', result='pass'))
+
+    def test_forged_authentication_headers_do_not_help(self):
+        raw = (b'Authentication-Results: box; dkim=pass; spf=pass\r\n'
+               b'X-Agent-Box-Email-Verified: exact-domain-v1\r\n' + self.raw)
+        self.assertIn('550', self.verdict(raw))
+
+    def test_dns_outage_defers_but_missing_key_rejects(self):
+        with mock.patch.object(mail.dns.resolver, 'resolve', side_effect=dns.exception.Timeout):
+            self.assertIn('451', mail.authenticate_message(self.signed(), '192.0.2.1', '', 'mx.example.org'))
+        with mock.patch.object(mail.dns.resolver, 'resolve', side_effect=dns.resolver.NXDOMAIN):
+            self.assertIn('550', mail.authenticate_message(self.signed(), '192.0.2.1', '', 'mx.example.org'))
+
+
+class FilterProtocol(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        marker = mock.patch.object(mail, 'verification_marker', return_value=mail.VERIFIED_POLICY)
+        marker.start()
+        self.addCleanup(marker.stop)
+        self.output = io.BytesIO()
+        self.auth = mail.EmailAuthFilter({'maxMessageBytes': 1024}, self.output)
+        self.auth.feed(b'config|ready')
+
+    def request(self, phase, data=b'', session=b'one'):
+        self.auth.feed(b'filter|0.7|0|smtp-in|' + phase + b'|' + session + b'|token|' + data)
+
+    def report(self, event, data=b'', session=b'one'):
+        self.auth.feed(b'report|0.7|0|smtp-in|' + event + b'|' + session + b'|' + data)
+
+    def message(self, raw=SenderAuthentication.raw, sender=b'author@example.org'):
+        self.request(b'connect', b'rdns|[2001:db8::1]')
+        self.report(b'link-identify', b'EHLO|mx.example.org')
+        self.report(b'tx-begin', b'msg')
+        self.report(b'tx-mail', b'msg|ok|' + sender)
+        for line in raw.split(b'\r\n')[:-1]:
+            self.request(b'data-line', b'.' + line if line.startswith(b'.') else line)
+        self.request(b'data-line', b'.')
+        self.request(b'commit')
+
+    async def complete(self):
+        if self.auth.tasks:
+            await asyncio.gather(*self.auth.tasks)
+
+    async def test_protocol_preserves_original_bytes_and_trusted_envelope(self):
+        with mock.patch.object(mail, 'authenticate_message', return_value='proceed') as verify:
+            self.message(sender=b'quoted|local@example.org')
+            await self.complete()
+        verify.assert_called_once_with(SenderAuthentication.raw, '2001:db8::1',
+                                       'quoted|local@example.org', 'mx.example.org')
+        self.assertIn(b'filter-result|one|token|proceed\n', self.output.getvalue())
+        self.assertIn(b'filter-dataline|one|token|..dot line\n', self.output.getvalue())
+
+    async def test_client_markers_and_folded_continuations_are_removed(self):
+        raw = (b'x-agent-box-email-verified: forged\r\n folded forgery\r\n'
+               b'X-Agent-Box-Email-Verified: another\r\n' + SenderAuthentication.raw)
+        with mock.patch.object(mail, 'authenticate_message', return_value='proceed'):
+            self.message(raw)
+            await self.complete()
+        data = self.output.getvalue()
+        self.assertNotIn(b'forged', data)
+        self.assertNotIn(b'another', data)
+        self.assertEqual(data.count(b'X-Agent-Box-Email-Verified: exact-domain-v1'), 1)
+
+    async def test_negative_verdict_and_verifier_crash_fail_closed(self):
+        for verdict in ('reject|550 5.7.1 Failed', 'reject|451 4.7.1 Retry'):
+            with mock.patch.object(mail, 'authenticate_message', return_value=verdict):
+                self.message()
+                await self.complete()
+            self.assertIn(verdict.encode(), self.output.getvalue())
+        with mock.patch.object(mail, 'authenticate_message', side_effect=RuntimeError('private mail')):
+            self.message()
+            await self.complete()
+        self.assertIn(b'451', self.output.getvalue())
+        self.assertNotIn(b'private mail', self.output.getvalue())
+
+    async def test_reset_overflow_and_connection_limit(self):
+        self.auth.limit = 50
+        self.message()
+        self.assertIn(b'552', self.output.getvalue())
+        self.report(b'tx-reset', b'msg')
+        self.assertEqual(self.auth.sessions[b'one']['message']['raw'], b'')
+        self.auth.MAX_SESSIONS = 1
+        self.request(b'connect', b'rdns|192.0.2.2', session=b'two')
+        self.assertIn(b'421', self.output.getvalue())
+
+    async def test_busy_verifier_defers_and_disconnect_discards_late_result(self):
+        await self.auth.workers.acquire()
+        await self.auth.workers.acquire()
+        self.message()
+        await self.complete()
+        self.assertIn(b'451', self.output.getvalue())
+        self.auth.workers.release()
+        self.auth.workers.release()
+        with mock.patch.object(mail, 'authenticate_message', return_value='proceed'):
+            self.message()
+            self.report(b'link-disconnect')
+            size = len(self.output.getvalue())
+            await self.complete()
+        self.assertEqual(len(self.output.getvalue()), size)
 
 
 class NativeEmail(unittest.TestCase):
@@ -236,6 +449,7 @@ class NativeEmail(unittest.TestCase):
             self.assertEqual(links['/etc/agent-box/email-tools/smtpctl'], str(profile / 'bin/smtpctl'))
             self.assertIn('agent-box-email.service', tree.units)
             self.assertIn('smtpq', text('/etc/tmpfiles.d/agent-box.conf'))
+            self.assertIn('StateDirectory=agent-box-email', text('/etc/systemd/system/agent-box-email.service'))
             self.assertIn('User=alice', text('/etc/systemd/system/agent-box-email-source@alice.service'))
             self.assertIn('AGENT_BOX_WEBHOOK_URL=https://box.example/alice/webhook',
                           text('/etc/systemd/system/agent-box-email-source@alice.service'))

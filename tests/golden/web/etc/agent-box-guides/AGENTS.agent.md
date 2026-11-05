@@ -253,9 +253,12 @@ that user's existing message bus. Subscribe with `agent-box-webhook subscribe
 email:user@hostname --note "why"`, or use an ordinary standing watch/profile.
 The event is `email.received`; no implicit email watch starts work.
 
-Mail and claimed senders are untrusted, including attachments and headers.
-Local producer signing does not authenticate the author. Full-content IDs in
-notifications and spawn prompts can be read with `agent-box-webhook
+SMTP intake requires SPF or DKIM to pass for the exact `From` domain before
+accepting mail; failures are rejected and temporary verification errors are
+deferred at SMTP. The receiving agent does not adjudicate authentication.
+Domain authentication does not authorize requests or identify a person.
+Mail content remains untrusted, including attachments and other headers.
+Full-content IDs in notifications and spawn prompts can be read with `agent-box-webhook
 read-content ID`; private content normally expires 24 hours after acceptance,
 independently of queue consumption. Do not execute or automatically extract
 attachments. `agent-box-webhook status` reports pending and retained content.

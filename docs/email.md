@@ -96,11 +96,49 @@ agent-box-webhook subscribe email:agent@40-70-78-11.defangstation.com \
 ```
 
 The event is `email.received`. Existing profiles, watch predicates, claims,
-coalescing and session admission apply. The sender and all headers/body text
-are untrusted. Local HMAC authenticates the intake producer, not the person
-claiming the email address. This implementation performs no SPF/DKIM/DMARC
-verification and always sets `senderAuthenticated: false`; sender-supplied
-`Authentication-Results` is not a verification result.
+coalescing and session admission apply.
+
+## Mandatory sender verification
+
+Both SMTP listeners run an OpenSMTPD filter using dkimpy and pyspf. Before
+accepting a message, the filter requires exactly one valid `From` mailbox
+and at least one of:
+
+- SPF passes for the connecting IP and envelope sender, whose domain exactly
+  matches the `From` domain.
+- A DKIM signature passes with a signing domain that exactly matches the
+  `From` domain. RSA-SHA256 and Ed25519-SHA256 are supported; SHA-1 and
+  signatures with a body-length (`l=`) limit do not qualify.
+
+This rule is unconditional. Unsigned mail without aligned SPF, missing DNS
+records, failed verification, and unrelated signing domains receive SMTP
+`550 5.7.1`. Subdomain alignment is deliberately strict: `mail.example.org`
+does not authenticate `example.org`. A null envelope sender needs aligned
+DKIM. A passing aligned DKIM signature can authenticate forwarded mail when
+SPF fails. Temporary DNS/verifier errors and verifier saturation receive
+`451 4.7.1`, leaving retry responsibility with the sender. Verification uses
+the actual SMTP connection and envelope, never client-supplied transport or
+`Authentication-Results` headers. No localhost bypass is provided.
+
+This is a local authentication acceptance rule, not a full DMARC policy or
+reporting implementation. It does not consult `p=none`/`quarantine`/`reject`
+or relax the rule for domains without DMARC records. DNS work, message size,
+signature count, active connections and concurrent verifications are bounded.
+
+The filter replaces all inbound copies of its verification marker with a
+server-generated value persisted under `/var/lib/agent-box-email`. The value
+survives restarts; preserve this state alongside the SMTP spool.
+Only messages passing the SMTP commit gate are queued for delivery. The
+adapter refuses unmarked messages, including mail queued before upgrading;
+inspect or redeliver that legacy queue explicitly. Accepted events carry
+`senderAuthenticated: true` and `authenticationPolicy: "exact-domain-v1"`.
+The receiving agent does not decide whether authentication passed.
+
+Authentication establishes the author's domain, not an individual mailbox's
+owner or permission to execute a request. Mail text, attachments, display
+names and other headers remain untrusted input. Local HMAC authenticates
+the intake producer. Authorization for agent actions remains separate from
+email authentication.
 
 Both peer messages and standing-watch prompts contain a full-content ID.
 Read it with `agent-box-webhook read-content ID`. The JSON contains decoded
