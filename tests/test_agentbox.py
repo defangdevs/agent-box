@@ -4802,7 +4802,9 @@ class PortalHandoff(unittest.TestCase):
                       files["/etc/agent-box/Caddyfile"])
         env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
         self.assertIn("AGENT_BOX_PORTAL_ISSUER=https://station.example.com\n", env)
-        self.assertNotIn(target, env)
+        # The daemon's own 401 page needs the same destination (CodeRabbit,
+        # PR #1007); trust still comes from the issuer alone.
+        self.assertIn("AGENT_BOX_PORTAL_REDIRECT_URL=" + target + "\n", env)
         # The informational link can also be used without handover configured.
         without_issuer = self._render({"agent": {"root": True}},
                                      {"portalRedirectUrl": target})
@@ -4822,7 +4824,8 @@ class PortalHandoff(unittest.TestCase):
                           files["/etc/agent-box/Caddyfile"])
         for target in ("javascript:alert(1)", "//evil.test/", "https://x.test/'",
                        'https://x.test/"', "https://x.test/\nnext",
-                       "https://x.test/{http.request.host}", "https://x.test/\\path"):
+                       "https://x.test/{http.request.host}", "https://x.test/\\path",
+                       "https://x.test:65536/", "https://x.test:99999/"):
             with self.subTest(target=target):
                 files = self._render({"agent": {"root": True}},
                                      dict(self.PORTAL_WEB, portalRedirectUrl=target))

@@ -3059,6 +3059,8 @@ class Renderer:
                 # off a box nobody wired to a portal.
                 settings += [
                     ("AGENT_BOX_PORTAL_ISSUER", self.spec.portal_issuer),
+                    ("AGENT_BOX_PORTAL_REDIRECT_URL",
+                     self.spec.portal_redirect_url),
                     # env_file drops an empty value, so an unset override
                     # simply is not passed and the daemon derives the
                     # well-known path from the issuer itself.
@@ -3869,7 +3871,8 @@ class Renderer:
         falls back to the issuer's origin. Reject syntax that could escape
         the HTML attribute or Caddy string, including Caddy placeholders.
         """
-        origin = r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?)"
+        origin = (r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])"
+                  r"(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5]?[0-9]{1,4}))?)")
         if self.spec.portal_redirect_url:
             target = self.spec.portal_redirect_url
             if not re.fullmatch(origin + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?", target):
