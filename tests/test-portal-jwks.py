@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DAEMON = (REPO / "tests" / "golden" / "web" / "payloads"
@@ -47,10 +48,16 @@ class Jwks(unittest.TestCase):
         self.d = load(self.work)
         self.calls = 0
         self.result = None
+        self.now = 1_700_000_000
+        self.advance = 0
+        patcher = mock.patch.object(self.d.time, "time", lambda: self.now)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
         def fetch():
             self.calls += 1
             time.sleep(0.05)
+            self.now += self.advance
             return self.result
         self.d.portal_jwks_fetch = fetch
 
@@ -58,7 +65,7 @@ class Jwks(unittest.TestCase):
         shutil.rmtree(self.work, ignore_errors=True)
 
     def seed(self, age, attempted_age):
-        now = int(time.time())
+        now = self.now
         self.d.portal_jwks_write_cache(
             {"fetched": now - age, "attempted": now - attempted_age,
              "keys": KEYS})
@@ -85,6 +92,11 @@ class Jwks(unittest.TestCase):
         self.d.portal_jwks_write_cache(cache)
         self.assertEqual(self.d.portal_jwks_keys("k1"), [])
 
+    def test_expiry_rechecked_after_slow_failed_fetch(self):
+        self.seed(self.d.JWKS_MAX_STALE - 1, 1000)
+        self.advance = 5
+        self.assertEqual(self.d.portal_jwks_keys("k1"), [])
+
     def test_concurrent_requests_fetch_once(self):
         self.seed(self.d.JWKS_TTL + 60, self.d.JWKS_TTL + 60)
         self.result = {"keys": KEYS}
@@ -97,7 +109,8 @@ class Jwks(unittest.TestCase):
         for t in threads:
             t.join()
         self.assertEqual(self.calls, 1)
-        self.assertEqual(len(out), 6)
+        # Followers waited for the refresh and used its keys.
+        self.assertEqual(out, [KEYS] * 6)
 
 
 if __name__ == "__main__":

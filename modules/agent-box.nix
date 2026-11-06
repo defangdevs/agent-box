@@ -31399,8 +31399,13 @@ def portal_jwks_keys(kid, force=False):
     the cache goes stale into a fresh outbound fetch, which is the same
     lever on the portal this floor exists to deny.
     """
-    now = int(time.time())
+    # The lock is held across the fetch: a concurrent request waits for the
+    # refresh in flight, then re-reads the cache and uses what it produced,
+    # instead of answering 401 or starting a second fetch. A failed attempt
+    # moves `attempted`, so a persistent outage costs one bounded wait per
+    # JWKS_REFETCH_FLOOR and every other request returns at once.
     with portal_jwks_lock():
+        now = int(time.time())
         cached = portal_jwks_read_cache() or {}
         fetched, attempted, keys = portal_jwks_unpack(cached)
         # Every return below passes through this bound: a key set older
@@ -31414,20 +31419,17 @@ def portal_jwks_keys(kid, force=False):
             # was the ordinary refresh or a forced retry. Answer from what
             # we have rather than making either path a lever on the portal.
             return usable
-        # Reserve the attempt BEFORE the network call, under the lock, so
-        # concurrent requests see it and do not each start a fetch.
-        portal_jwks_write_cache(
-            {"fetched": fetched, "attempted": now, "keys": keys})
-    document = portal_jwks_fetch()
-    if document is None:
-        # Fetch failed. Stale keys still beat none, but only until
-        # JWKS_MAX_STALE: the portal being briefly unreachable should not
-        # lock out a handover signed by a key we already hold, while a
-        # withdrawn key must not outlive that bound however long the outage.
-        return usable
-    with portal_jwks_lock():
+        document = portal_jwks_fetch()
+        after = int(time.time())
+        if document is None:
+            # Fetch failed. Stale keys still beat none, but only until
+            # JWKS_MAX_STALE, measured again AFTER the fetch: it can take
+            # seconds, and must not carry an expiring set past the bound.
+            portal_jwks_write_cache(
+                {"fetched": fetched, "attempted": after, "keys": keys})
+            return keys if after - fetched < JWKS_MAX_STALE else []
         return portal_jwks_write_cache(
-            {"fetched": now, "attempted": now,
+            {"fetched": after, "attempted": after,
              "keys": document.get("keys", [])})["keys"]
 
 
