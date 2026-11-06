@@ -4027,7 +4027,7 @@ in
           target = if redirect != "" then
             (if redirectMatch == null then "" else redirect)
             else if issuerMatch == null then "" else builtins.head issuerMatch;
-          href = lib.replaceStrings [ "&" ] [ "&amp;" ] target;
+          href = lib.escapeXML target;
         in if target == "" then "" else
           "<p style='margin:12px 0 0;font-size:14px'><a href='${href}' style='color:#58a6ff'>Open this box from your portal page</a></p>";
       webAliases = lib.optional (cfg.web.alias != "") cfg.web.alias ++ cfg.web.aliases;

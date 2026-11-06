@@ -40,6 +40,7 @@ comparison.
 import argparse
 import contextlib
 import hashlib
+import html
 import ipaddress
 import json
 import os
@@ -3884,7 +3885,7 @@ class Renderer:
             target = m.group(1)
         return ("<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
                 "style='color:#58a6ff'>Open this box from your portal "
-                "page</a></p>" % target.replace("&", "&amp;"))
+                "page</a></p>" % html.escape(target, quote=True))
 
     def caddy(self, t):
         """Bind the shared Caddyfile fragments.

@@ -27299,7 +27299,7 @@ if _PORTAL_TARGET:
         "</section>",
         "<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
         "style='color:#58a6ff'>Open this box from your portal page</a></p>"
-        "</section>" % _PORTAL_TARGET.replace("&", "&amp;"))
+        "</section>" % html.escape(_PORTAL_TARGET, quote=True))
 
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
@@ -35281,7 +35281,7 @@ if __name__ == "__main__":
           target = if redirect != "" then
             (if redirectMatch == null then "" else redirect)
             else if issuerMatch == null then "" else builtins.head issuerMatch;
-          href = lib.replaceStrings [ "&" ] [ "&amp;" ] target;
+          href = lib.escapeXML target;
         in if target == "" then "" else
           "<p style='margin:12px 0 0;font-size:14px'><a href='${href}' style='color:#58a6ff'>Open this box from your portal page</a></p>";
       webAliases = lib.optional (cfg.web.alias != "") cfg.web.alias ++ cfg.web.aliases;
