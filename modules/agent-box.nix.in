@@ -662,6 +662,29 @@ let
     else if cfg.selfUpdate.agentNixpkgs != null then cfg.selfUpdate.agentNixpkgs.url
     else "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
 
+  # The registry `to` for jitNixpkgsRef (an https archive; see the registry
+  # block below). narHash and dir are flake attributes, so they leave the
+  # URL; any other query parameter stays on it.
+  jitNixpkgsRegistryTarget =
+    let
+      unescape = builtins.replaceStrings
+        [ "%2B" "%2b" "%2F" "%2f" "%3D" "%3d" ] [ "+" "+" "/" "/" "=" "=" ];
+      parts = lib.splitString "?" jitNixpkgsRef;
+      base = builtins.head parts;
+      params = lib.filter (p: p != "")
+        (lib.splitString "&" (lib.concatStringsSep "?" (builtins.tail parts)));
+      isFlakeParam = p: lib.hasPrefix "narHash=" p || lib.hasPrefix "dir=" p;
+      flakeAttrs = lib.listToAttrs (map
+        (p:
+          let kv = lib.splitString "=" p;
+          in lib.nameValuePair (builtins.head kv)
+            (unescape (lib.concatStringsSep "=" (builtins.tail kv))))
+        (lib.filter isFlakeParam params));
+      rest = lib.filter (p: !(isFlakeParam p)) params;
+    in
+    { type = "tarball"; url = base + lib.optionalString (rest != [ ]) ("?" + lib.concatStringsSep "&" rest); }
+    // flakeAttrs;
+
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
@@ -3152,6 +3175,27 @@ in
     # agent unit's path below) — that flake-ref syntax needs both features.
     # List settings merge, so hosts can still extend this.
     nix.settings.experimental-features = [ "nix-command" "flakes" ];
+
+    # ... and `nixpkgs#` resolves to the same nixpkgs the harnesses and the
+    # nixpkgs cache use, instead of whatever the global registry follows
+    # that week (a rev Hydra may not have built). That is a fixed revision
+    # once selfUpdate.agentNixpkgs or jitNixpkgs pins one; with neither it
+    # is the nixos-unstable channel, which moves with the channel. This is
+    # the system registry, so a user's `nix registry add nixpkgs ...` or a
+    # per-command `--override-flake nixpkgs ...` still wins. Above nixpkgs'
+    # own mkDefault (the system flake) and below a host's plain definition.
+    # Only an https archive ref maps to a typed registry entry without
+    # parsing the whole flake-ref grammar; any other jitNixpkgs (github:,
+    # git+, a path) leaves the registry as nixpkgs set it, as on native.
+    #
+    # An explicit `nix.registry.nixpkgs.flake` is the host's own choice, so
+    # it is left to derive `to`. narHash and dir move from the URL query to
+    # attributes, so nix enforces the hash and keeps the subdirectory.
+    nix.registry.nixpkgs.to = lib.mkIf
+      (builtins.match "https://.*[.](tar([.][a-z0-9]+)?|tgz|zip)([?].*)?"
+        jitNixpkgsRef != null
+        && config.nix.registry.nixpkgs.flake == null)
+      (lib.mkOverride 900 jitNixpkgsRegistryTarget);
 
     # Trust DefangLabs' public Cachix cache, so agent-box-defang-cli.service
     # below substitutes a prebuilt closure instead of compiling Go from
