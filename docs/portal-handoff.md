@@ -286,13 +286,15 @@ parameters, alongside the web password:
 
 | flavor | parameters |
 |---|---|
-| AWS CloudFormation (`deploy/aws/template.yaml`) | `PortalUser`, `PortalIssuer` |
-| AWS Lightsail (`deploy/aws/lightsail-template.yaml`) | `PortalUser`, `PortalIssuer` |
+| AWS CloudFormation (`deploy/aws/template.yaml`) | `PortalUser`, `PortalIssuer`, `PortalRedirectUrl` |
+| AWS Lightsail (`deploy/aws/lightsail-template.yaml`) | `PortalUser`, `PortalIssuer`, `PortalRedirectUrl` |
 | Azure Bicep (`deploy/azure/agent-box.bicep`) | `portalUser`, `portalIssuer`, `portalRedirectUrl` |
 
-Both are optional and both are needed: leave either blank and the box serves
-no handover route at all, which is what a hand-launched box gets. **There is
-no key parameter on any flavor** — that is the point of §2.1.
+`portalRedirectUrl` (AWS: `PortalRedirectUrl`) is optional and only sets the
+public return link. The issuer and user are both needed for handover: leave
+either blank and the box serves no handover route at all, which is what a
+hand-launched box gets. **There is no key parameter on any flavor** - see
+section 2.1.
 
 `portalUser` is the per-box value, and it has to arrive this way rather than
 over the wire: the handover endpoint is unauthenticated by construction, so a
