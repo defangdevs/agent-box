@@ -1,0 +1,63 @@
+name: Update local-webhook pin
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-webhook-pin
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'defangdevs/agent-box' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Prepare a bump from a green upstream release
+        id: bump
+        timeout-minutes: 5
+        run: |
+          python3 scripts/update_webhook_pin.py --write \
+            --body "$RUNNER_TEMP/webhook-pin-body.md" > "$RUNNER_TEMP/webhook-pin-plan.json"
+          cat "$RUNNER_TEMP/webhook-pin-plan.json"
+          jq -r '"changed=\(.changed)"' "$RUNNER_TEMP/webhook-pin-plan.json" >> "$GITHUB_OUTPUT"
+          jq -r '"version=\(.version // "")"' "$RUNNER_TEMP/webhook-pin-plan.json" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble and validate the module
+        if: steps.bump.outputs.changed == 'true'
+        timeout-minutes: 2
+        run: |
+          python3 bin/assemble-module.py
+          python3 bin/assemble-module.py --check
+          python3 tests/test-assemble-module.py
+
+      # One open pin-changing PR at a time, including manual bumps. Never
+      # rewrite an existing PR's branch, where a reviewer may be adding fixes.
+      - name: Open a bump PR for review
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          branch="codex/update-local-webhook-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          title="chore(webhook): bump local-webhook to $VERSION"
+          git switch -c "$branch"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add nix/webhook-pin.nix modules/agent-box.nix
+          git commit -m "$title"
+          gh auth setup-git
+          git push origin "$branch"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" \
+            --title "$title" --body-file "$RUNNER_TEMP/webhook-pin-body.md"
