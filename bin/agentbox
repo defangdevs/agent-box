@@ -52,6 +52,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -152,6 +153,11 @@ HARNESS_UPGRADE_UNIT = "agent-box-harness-upgrade@"
 # did, which is why a native box resolved the channel ONCE, at the first
 # install, and stayed there for ever (issues #559, #590, #614).
 AGENT_PIN_FILE = "/etc/agent-box/agent-nixpkgs-pin"
+# The system flake registry, and agent-box's record of the nixpkgs mapping
+# it last wrote there. JSON has no comment for a generated-file header, so
+# the record is what tells our entry from an operator's (nix_registry).
+NIX_REGISTRY = "/etc/nix/registry.json"
+NIX_REGISTRY_STAMP = "/etc/agent-box/nix-registry-nixpkgs.json"
 # The mutable channel the pin is resolved FROM when nothing overrides it.
 CHANNEL_NIXPKGS = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz"
 # Where the capped newuidmap/newgidmap copies go. This exact path is on
@@ -2189,6 +2195,7 @@ class Renderer:
                "[Journal]\n"
                "SystemMaxUse=200M\n")
         self.nix_conf(t)
+        self.nix_registry(t)
 
     def nixpkgs_cache(self, t):
         """Build the shared nixpkgs cache each user's first install reads.
@@ -2401,6 +2408,40 @@ class Renderer:
         except OSError:
             mode = 0o644
         t.file(target, existing.rstrip("\n") + "\n\n" + want, mode=mode)
+
+    def nix_registry(self, t):
+        """Point `nixpkgs#...` at this box's pinned nixpkgs.
+
+        Without this a bare `nix profile add nixpkgs#foo` resolves through
+        the GLOBAL flake registry, which on a Determinate box maps nixpkgs
+        to FlakeHub's nixpkgs-weekly - a revision agent-box neither chose
+        nor moves. On one aarch64 box that rev had whisper-cpp
+        dependency-failed on Hydra, so the install compiled from source,
+        while the box's own pin had it cached. The system registry
+        (/etc/nix/registry.json) outranks the global one, so naming the
+        jitNixpkgs pin here puts user installs on the revision the harnesses,
+        the nixpkgs cache and every update already agree on.
+
+        It only outranks the GLOBAL registry. A user's own
+        `nix registry add nixpkgs ...` (~/.config/nix/registry.json) still
+        wins, as does `--override-flake nixpkgs ...` or naming any other
+        flake ref outright - the per-case escape hatch for a package the
+        pin carries at an old version.
+
+        The file is shared, so only our own entry is ours: see
+        plan_nix_registry for the ownership rule, and nix_conf for why a
+        foreign file keeps its mode and its symlink.
+        """
+        path = self.p(NIX_REGISTRY)
+        stamp = self.p(NIX_REGISTRY_STAMP)
+        plan = plan_nix_registry(path, stamp, self.spec.jit_nixpkgs)
+        if plan.note:
+            self.notes.append(plan.note)
+        if plan.text is None:
+            return
+        t.dir(self.p("/etc/nix"), 0o755)
+        t.file(plan.target, plan.text, mode=plan.mode)
+        t.file(stamp, plan.stamp)
 
     # -- base-OS patching ----------------------------------------------------
 
@@ -4066,7 +4107,14 @@ def write_if_changed(path, text, mode, dry_run=False):
         return True
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".agentbox-new")
-    tmp.write_text(text)
+    # Created at the TARGET mode, not chmod'ed to it after the write: a
+    # 0600 file (a registry or a nix.custom.conf carrying credentials)
+    # must not exist world-readable even for the moment in between.
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode & 0o777)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
     os.chmod(tmp, mode)
     os.replace(tmp, path)
     print(f"wrote {path}")
@@ -5514,6 +5562,128 @@ def recover_handover(args, profile, generation, target, rc):
     return rc
 
 
+class RegistryPlan:
+    """What nix_registry would write, and where, and why not if it won't."""
+
+    def __init__(self, text=None, target=None, mode=0o644, stamp=None,
+                 note=None):
+        self.text, self.target, self.mode = text, target, mode
+        self.stamp, self.note = stamp, note
+
+
+def registry_target(ref):
+    """The registry `to` for a jitNixpkgs ref, or None.
+
+    Only an https archive URL - which is what the channel default and every
+    pin `agentbox update` writes look like - maps to a registry entry
+    without parsing nix's whole flake-ref grammar here. Anything else
+    (github:, git+, a path) leaves nixpkgs# where it was rather than
+    guessing a type nix would then refuse.
+    """
+    bare, _, query = ref.partition("?")
+    if not (ref.startswith("https://") and re.search(
+            r"\.(tar(\.[a-z0-9]+)?|tgz|zip)$", bare)):
+        return None
+    # narHash and dir are flake attributes, not part of the download URL:
+    # left in `url`, nix would not enforce the hash and would drop the
+    # subdirectory. Every other query parameter stays on the URL.
+    want, rest = {"type": "tarball"}, []
+    for param in query.split("&") if query else []:
+        key, _, value = param.partition("=")
+        if key in ("narHash", "dir"):
+            want[key] = urllib.parse.unquote(value)
+        else:
+            rest.append(param)
+    want["url"] = bare + ("?" + "&".join(rest) if rest else "")
+    return want
+
+
+def plan_nix_registry(path, stamp_path, ref):
+    """Plan /etc/nix/registry.json so nixpkgs maps to `ref`.
+
+    Entries other than nixpkgs are always kept. A nixpkgs entry is replaced
+    only when it is absent, or when it is exactly the mapping agent-box
+    recorded writing last time (NIX_REGISTRY_STAMP) - so an operator's own
+    mapping, whatever host it names, is never overruled, and a pin agent-box
+    wrote is still moved when the pin moves. A file that cannot be read or
+    parsed is left alone. Every skip is a note: a silently skipped setting
+    looks exactly like one never implemented.
+    """
+    path = Path(path)
+    want = registry_target(ref)
+    if want is None:
+        return RegistryPlan(note=f"{path}: jitNixpkgs ({ref}) is not an "
+                                 "https archive URL - nixpkgs# keeps its "
+                                 "existing mapping")
+    ours = {"from": {"type": "indirect", "id": "nixpkgs"}, "to": want}
+    try:
+        recorded = json.loads(Path(stamp_path).read_text())
+    except (OSError, ValueError):
+        recorded = None
+    flakes, mode = [], 0o644
+    target = path.resolve() if path.is_symlink() else path
+    try:
+        existing = path.read_text()
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        existing = None
+    except (OSError, UnicodeDecodeError) as e:
+        return RegistryPlan(note=f"{path}: could not be read ({e}) - left "
+                                 "unchanged")
+    if existing is not None:
+        try:
+            data = json.loads(existing)
+            if not isinstance(data, dict) or data.get("version") != 2:
+                raise ValueError("not a version 2 registry")
+            flakes = list(data["flakes"])
+        except (ValueError, KeyError, TypeError) as e:
+            return RegistryPlan(note=f"{path}: not a registry agent-box can "
+                                     f"read ({e}) - left unchanged")
+    kept = []
+    for entry in flakes:
+        frm = entry.get("from") if isinstance(entry, dict) else None
+        if not (isinstance(frm, dict) and frm.get("type") == "indirect"
+                and frm.get("id") == "nixpkgs"):
+            kept.append(entry)
+            continue
+        # Ours if it is what we recorded writing - or already exactly what
+        # we would write, which needs no record to be safe to restate.
+        if entry.get("to") not in (recorded, want):
+            return RegistryPlan(note=f"{path}: maps nixpkgs itself - left "
+                                     "alone; agent-box did not pin it")
+    text = json.dumps({"version": 2, "flakes": [ours] + kept},
+                      indent=2) + "\n"
+    if existing == text and recorded == want:
+        return RegistryPlan()
+    return RegistryPlan(text=text, target=target, mode=mode,
+                        stamp=json.dumps(want) + "\n")
+
+
+def retarget_nix_registry(from_ref, to_ref):
+    """Move our nixpkgs registry entry from `from_ref` back to `to_ref`.
+
+    For an update that rolled back: the restored release may predate the
+    registry and so never re-render it, which would leave nixpkgs# on the
+    pin the failed release wrote. Only moves an entry that is still ours AND
+    still names `from_ref`; an operator's jitNixpkgs never moved, so its
+    entry is left where it is. Best effort, like the pin restore beside it.
+    """
+    if registry_target(from_ref) is None:
+        return
+    try:
+        recorded = json.loads(Path(NIX_REGISTRY_STAMP).read_text())
+    except (OSError, ValueError):
+        return
+    if recorded != registry_target(from_ref):
+        return
+    plan = plan_nix_registry(NIX_REGISTRY, NIX_REGISTRY_STAMP, to_ref)
+    if plan.text is None:
+        return
+    with contextlib.suppress(OSError):
+        write_if_changed(plan.target, plan.text, plan.mode)
+        write_if_changed(NIX_REGISTRY_STAMP, plan.stamp, 0o644)
+
+
 def read_agent_pin(root="/"):
     """This box's recorded agent-nixpkgs pin, or None before its first update.
 
@@ -5651,6 +5821,8 @@ def post_switch(args, profile):
                     Path(AGENT_PIN_FILE).unlink(missing_ok=True)
                 else:
                     Path(AGENT_PIN_FILE).write_text(previous_pin)
+            retarget_nix_registry(
+                resolved_pin, (previous_pin or "").strip() or CHANNEL_NIXPKGS)
         # Re-apply with the rolled-back code, as a fresh process for the
         # same version-skew reason phase one handed over to us.
         run([str(profile / "bin" / "agentbox"), "apply",

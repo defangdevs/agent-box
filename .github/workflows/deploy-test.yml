@@ -8,12 +8,66 @@ on:
       - 'modules/**'
       - 'scripts/ws_smoke.py'
       - '.github/workflows/deploy-test.yml'
+  # Called by promote.yml, so that promotion tests the EXACT candidate it
+  # is about to publish (issue #632). Everything the manifest pins arrives
+  # here as an input instead of being resolved again: `ref` is the
+  # candidate commit, and the four pin inputs are the identities
+  # release_manifest.py recorded once. A run with them set boots the same
+  # box the 1-click templates will create - which the push-triggered runs
+  # below deliberately do NOT, since a source-template launch is supposed
+  # to track the default branch and the base channel.
+  #
+  # Every matrix leg is required: a failed fresh boot must prevent
+  # publication, including the IPv6 configuration.
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit to test (default: the caller's sha)"
+        type: string
+        default: ''
+      agent_box_rev:
+        description: AgentBoxRev from the candidate's release manifest
+        type: string
+        default: ''
+      agent_box_sha256:
+        description: AgentBoxSha256 from the candidate's release manifest
+        type: string
+        default: ''
+      agent_nixpkgs_url:
+        description: AgentNixpkgsUrl from the candidate's release manifest
+        type: string
+        default: ''
+      agent_nixpkgs_sha256:
+        description: AgentNixpkgsSha256 from the candidate's release manifest
+        type: string
+        default: ''
+      region:
+        type: string
+        default: us-west-2
+      instance_type:
+        type: string
+        default: t4g.small (2 vCPU / 2 GiB)
+      destroy:
+        type: boolean
+        default: true
+      use_spot:
+        type: boolean
+        default: false
+      web_password:
+        # Declared so the shared steps below can read it on either path;
+        # promotion never sets it.
+        type: string
+        default: ''
   workflow_dispatch:
     inputs:
       diagnose_run:
         description: Read the current ipv4 test instance journal for an existing run ID; create no resources
         type: string
         default: ''
+      lightsail_only:
+        description: Test the native Lightsail backend instead of the EC2 matrix
+        type: boolean
+        default: false
       region:
         # The test account's SCP only allows us-west-2 — other choices are kept
         # for forks running against their own account.
@@ -53,7 +107,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: deploy-test-${{ inputs.diagnose_run && 'diagnose' || 'deploy' }}-${{ inputs.region || 'us-west-2' }}
+  group: deploy-test-${{ inputs.diagnose_run && 'diagnose' || (inputs.lightsail_only && 'lightsail' || 'ec2') }}-${{ inputs.region || 'us-west-2' }}
   cancel-in-progress: false
 
 jobs:
@@ -91,11 +145,21 @@ jobs:
           aws ssm get-command-invocation --command-id "$cid" --instance-id "$iid" \
             --query StandardOutputContent --output text
 
+  lightsail-test:
+    permissions:
+      contents: read
+      id-token: write
+    if: inputs.lightsail_only == true && inputs.diagnose_run == ''
+    uses: ./.github/workflows/lightsail-test.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.ref || github.sha }}
+
   deploy-test:
     permissions:
       contents: read
       id-token: write
-    if: inputs.diagnose_run == ''
+    if: inputs.lightsail_only != true && inputs.diagnose_run == ''
     runs-on: ubuntu-latest
     # Two legs run in PARALLEL:
     #  - ipv4-full: GH runners are IPv4-only, so this is the only leg that can
@@ -109,18 +173,8 @@ jobs:
     #    CREATE_COMPLETE and its outputs populate. That still catches template
     #    resolution bugs (e.g. the old EIPAssoc dependency) and empty-GetAtt bugs
     #    (e.g. a blank PrimaryIpv6Address -> "https://.sslip.io/").
-    #    Re-enabled with SSM diagnostics (issue 190): the leg has failed first
-    #    boot on every run since the 26.05 AMI landed (amazon-init dies before
-    #    switch-to-configuration, journal-only, no signal on the console), and
-    #    it was disabled outright rather than kept red at ~39 min a run with
-    #    zero diagnostic value. EnableSsm no longer rides public_ipv4 (below),
-    #    so this leg now gets a root shell path even though amazon-init never
-    #    switches — the stock AMI's amazon-ssm-agent runs unconditionally
-    #    pre-switch, it only needed the instance profile. `continue-on-error`
-    #    keeps this leg's still-expected-until-190-is-diagnosed failure from
-    #    reddening the workflow conclusion (and hiding the next real
-    #    regression on ipv4-full) while it still runs and still captures
-    #    evidence every push. Drop continue-on-error once 190 is fixed.
+    # Both legs passed after #1000 fixed CA-bundle compatibility. Keep
+    # failures visible instead of allowing a promotion with a red leg.
     strategy:
       fail-fast: false
       matrix:
@@ -131,10 +185,6 @@ jobs:
           - leg: ipv6-outputs
             public_ipv4: "false"
             use_spot: "false"
-    # ipv6-outputs is expected to fail until issue 190 is diagnosed and fixed
-    # (see the strategy comment above) — don't let its known-red leg flip the
-    # overall workflow conclusion and mask a real ipv4-full regression.
-    continue-on-error: ${{ matrix.leg == 'ipv6-outputs' }}
     # Fork? Override with a repo-scoped var AGENT_BOX_ENVIRONMENT, or edit the fallback.
     environment: ${{ vars.AGENT_BOX_ENVIRONMENT || 'defang-agent-box' }}
     # Room for one FirstBootDone-timeout retry (issue 112): two create waits
@@ -152,7 +202,12 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # Empty means "whatever triggered this run", which is what the
+          # push and dispatch paths want. promote.yml passes the candidate
+          # commit, so the tree tested is the tree promoted.
+          ref: ${{ inputs.ref }}
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
@@ -177,6 +232,12 @@ jobs:
           # are kept. Caddy's own image computes the hash so this step needs
           # no new toolchain beyond the Docker the runner already has.
           if [ -n "$WEB_PASSWORD_OVERRIDE" ]; then
+            case "$WEB_PASSWORD_OVERRIDE" in
+              *$'\n'*|*$'\r'*)
+                echo "::error::web_password must be a single line."
+                exit 1
+                ;;
+            esac
             pw="$WEB_PASSWORD_OVERRIDE"
             echo "::notice::Using dispatch-provided WebPassword override."
           else
@@ -187,19 +248,58 @@ jobs:
             | docker run --rm -i caddy:2 caddy hash-password --algorithm argon2id)"
           echo "hash=$hash" >> "$GITHUB_OUTPUT"
 
-      - name: Compute module pin (AgentBoxRev + AgentBoxSha256)
+      - name: Resolve the pins this run tests
         id: pin
-        # The source template intentionally has no Default: for these — see
-        # publish-template.yml for the same computation on the S3 path. Here
-        # we pin to the commit that triggered this run so deploy-test always
-        # exercises the module content that just landed.
+        # Two callers, two meanings, and the difference is the point of
+        # issue #632.
+        #
+        # A push or a dispatch has no manifest: pin AgentBoxRev/Sha256 to
+        # the commit that triggered the run and leave the nixpkgs pair
+        # EMPTY, so the box tracks the base channel exactly as a
+        # source-template launch does. That is the early-warning run.
+        #
+        # promote.yml passes the candidate's recorded identities. Then all
+        # four are pinned, and the box this test boots is pinned to the
+        # same source AND the same dependency set the published templates
+        # will carry - which is what "run the deployment tests against
+        # THAT candidate" has to mean. Before this, deploy-test left the
+        # channel unpinned while publish-template re-resolved it, so the
+        # tested box and the 1-click box were never the same artifact.
+        env:
+          IN_REV: ${{ inputs.agent_box_rev }}
+          IN_SHA: ${{ inputs.agent_box_sha256 }}
+          IN_NIXPKGS_URL: ${{ inputs.agent_nixpkgs_url }}
+          IN_NIXPKGS_SHA: ${{ inputs.agent_nixpkgs_sha256 }}
         run: |
-          rev="${{ github.sha }}"
-          sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
-            | openssl dgst -sha256 -binary | base64)"
-          echo "rev=$rev" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "::notice::Pinned AgentBoxRev=$rev AgentBoxSha256=$sha"
+          if [ -n "$IN_REV" ]; then
+            if [ -z "$IN_SHA" ]; then
+              echo "::error::agent_box_rev was given without agent_box_sha256 - an unpinned pair would silently fetch a different module."
+              exit 1
+            fi
+            if { [ -n "$IN_NIXPKGS_URL" ] && [ -z "$IN_NIXPKGS_SHA" ]; } \
+               || { [ -z "$IN_NIXPKGS_URL" ] && [ -n "$IN_NIXPKGS_SHA" ]; }; then
+              echo "::error::agent_nixpkgs_url and agent_nixpkgs_sha256 must be given together - the template requires the pair or neither."
+              exit 1
+            fi
+            rev="$IN_REV"
+            sha="$IN_SHA"
+            nixpkgs_url="$IN_NIXPKGS_URL"
+            nixpkgs_sha="$IN_NIXPKGS_SHA"
+            echo "::notice::Testing the promotion candidate's recorded pins."
+          else
+            rev="${{ github.sha }}"
+            sha="sha256-$(curl -sSfL "https://raw.githubusercontent.com/${{ github.repository }}/${rev}/modules/agent-box.nix" \
+              | openssl dgst -sha256 -binary | base64)"
+            nixpkgs_url=""
+            nixpkgs_sha=""
+          fi
+          {
+            echo "rev=$rev"
+            echo "sha=$sha"
+            echo "nixpkgs_url=$nixpkgs_url"
+            echo "nixpkgs_sha=$nixpkgs_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Pinned AgentBoxRev=$rev AgentBoxSha256=$sha AgentNixpkgsUrl=${nixpkgs_url:-(base channel)}"
 
       - name: Create stack
         id: create
@@ -246,6 +346,8 @@ jobs:
                 "ParameterKey=EnableSsm,ParameterValue=true" \
                 "ParameterKey=AgentBoxRev,ParameterValue=${{ steps.pin.outputs.rev }}" \
                 "ParameterKey=AgentBoxSha256,ParameterValue=${{ steps.pin.outputs.sha }}" \
+                "ParameterKey=AgentNixpkgsUrl,ParameterValue=${{ steps.pin.outputs.nixpkgs_url }}" \
+                "ParameterKey=AgentNixpkgsSha256,ParameterValue=${{ steps.pin.outputs.nixpkgs_sha }}" \
               --on-failure DO_NOTHING \
               --capabilities CAPABILITY_IAM \
               --tags "Key=Purpose,Value=agent-box-e2e" "Key=RunId,Value=${{ github.run_id }}"
