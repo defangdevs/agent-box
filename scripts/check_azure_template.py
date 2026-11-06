@@ -451,7 +451,7 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
 
 
 PORTAL_BLOCK = re.compile(
-    r"(install -d -m 0755 /etc/agent-box\n.*?/etc/agent-box/config\.yaml)"
+    r"(install -d -m 0755 /etc/agent-box\n.*?)"
     r"\n\n# Extra standing instructions", re.S)
 
 

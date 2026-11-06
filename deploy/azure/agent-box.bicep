@@ -535,7 +535,7 @@ sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIASES@|
 # Old prebuilt runtimes do not know this optional field. Keep their issuer
 # fallback usable when no redirect was requested.
 if [ -z "$portal_redirect_url" ]; then
-  sed -i "/^  portalRedirectUrl: ''$/d" /etc/agent-box/config.yaml
+  sed -i "/^  portalRedirectUrl:/d" /etc/agent-box/config.yaml
 else
   # Last, and only in its own scalar: marker-like URL text stays literal.
   sed -i "/^  portalRedirectUrl:/s|@PORTALREDIRECTURL@|$esc_redirect|" /etc/agent-box/config.yaml
