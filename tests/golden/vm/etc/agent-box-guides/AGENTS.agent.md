@@ -515,11 +515,11 @@ the URL 404s until your comment references it.
 Claude cannot take audio, so turn speech into text on the box:
 `agent-box-transcribe FILE` prints the words (`--model small.en` for more
 accuracy, `--model base --lang auto` for other languages). The audio never
-leaves the box and nothing is compiled: the first run fetches ffmpeg and
-whisper.cpp from the box's pinned nixpkgs binary cache (a few hundred MB in
-the nix store) and one model (about 150 MB, in
-`~/.cache/agent-box-transcribe`); later runs only decode, at several times
-real time on 2 vCPUs. It reads at most the first 15 minutes of a clip and
+leaves the box and nothing is compiled: the first run fetches python, pip
+and ffmpeg from the box's pinned nixpkgs binary cache, installs a prebuilt,
+hash-pinned whisper.cpp wheel with pip, and downloads one model (about 200 MB
+in all, in `~/.cache/agent-box-transcribe`); later runs only decode, at several
+times real time on 2 vCPUs. It reads at most the first 15 minutes of a clip and
 warns on stderr when it cuts one; split longer recordings. Do not run
 `nix shell nixpkgs#whisper-cpp` yourself: the unpinned `nixpkgs` registry
 entry can point at a revision the cache lacks, and the build runs a small box

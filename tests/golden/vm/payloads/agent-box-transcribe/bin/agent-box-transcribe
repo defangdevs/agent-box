@@ -2,12 +2,15 @@
 """agent-box-transcribe FILE: speech in an audio file, as text (issue #970).
 
 Claude cannot take audio, so a voice note is turned into text on this box and
-the audio never leaves it. Nothing is compiled here: whisper.cpp and ffmpeg come
+the audio never leaves it. Nothing is compiled here. Python, pip and ffmpeg come
 from the box's pinned nixpkgs (substitute only, so a missing cache entry fails
-fast instead of building), and the ggml model from Hugging Face, pinned by
-sha256. The first run downloads a few hundred MB into the nix store and about
-150 MB of model into ~/.cache/agent-box-transcribe; later runs only decode."""
+fast instead of building). whisper.cpp comes from the prebuilt pywhispercpp
+wheel, installed by pip with --require-hashes from the pins in
+modules/src/transcribe/requirements.txt (Dependabot bumps them). The ggml model
+comes from Hugging Face, pinned by sha256. The first run downloads about 200 MB
+into ~/.cache/agent-box-transcribe; later runs only decode."""
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -27,6 +30,35 @@ MODELS = {
     'small': '1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b',
 }
 MAX_SECONDS = 900
+# Pinned with hashes for pip --require-hashes: pywhispercpp and numpy, for each CPU.
+REQUIREMENTS = '''
+# Hash-pinned for pip --require-hashes (agent-box-transcribe). Dependabot bumps these.
+pywhispercpp==1.5.1 --hash=sha256:39813f1cd3b310c32bc98930f0547c8b2d63d17c8dabd21ec19c4ab23d2c7059 --hash=sha256:fb9d0ba10ddb7414ec0ce6f8c56d8cb3c0b156e6e68e771418a363af6891b321
+numpy==2.5.4 --hash=sha256:4054173604cd8658796053f1f3bc0befb68ec1c0762c57fdad61e199256a8617 --hash=sha256:d549420b8858885cea8838a727842249218b9c1da24dd517e25c9c7a948310a3
+'''
+
+# Runs under the nix python with only the pip --target directory on its path. The
+# C library logs to stderr; the text goes to a file so nothing mixes with it.
+WORKER = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import numpy as np
+import _pywhispercpp as pw
+model, pcm, out, lang, threads = sys.argv[2:7]
+audio = np.frombuffer(open(pcm, 'rb').read(), dtype=np.float32)
+ctx = pw.whisper_init_from_file_with_params(model, pw.whisper_context_default_params())
+p = pw.whisper_full_default_params(pw.whisper_sampling_strategy.WHISPER_SAMPLING_GREEDY)
+p.print_progress = p.print_realtime = p.print_timestamps = p.print_special = False
+p.n_threads = int(threads)
+p.language = lang
+rc = pw.whisper_full(ctx, p, audio, audio.size)
+if rc != 0:
+    sys.exit('whisper_full failed with status %s' % rc)
+segs = [pw.whisper_full_get_segment_text(ctx, i) for i in range(pw.whisper_full_n_segments(ctx))]
+text = ''.join(s.decode('utf-8', 'replace') if isinstance(s, bytes) else s for s in segs)
+json.dump({'text': text.strip()}, open(out, 'w'))
+'''
+
 
 def say(msg):
     print('transcribe: ' + msg, file=sys.stderr)
@@ -85,10 +117,12 @@ def fetch(url, dest, sha256, size_cap):
 NIXPKGS = os.environ.get('AGENT_BOX_NIXPKGS') or 'nixpkgs'
 
 
-def nix_exe(attr, link_name, exe):
-    """Path of exe (relative to the cache) from nixpkgs attr, substituted, never built."""
+def nix_out(attr, link_name, suffix=''):
+    """Store path of nixpkgs attr, substituted from the binary cache, never built.
+
+    nix appends the output name to the link when it is not `out`; suffix says which."""
     link = os.path.join(CACHE, link_name)
-    path = os.path.join(CACHE, exe)
+    path = link + suffix
     if not os.path.exists(path):
         say('fetching %s from the nix binary cache (never built here)' % attr)
         os.makedirs(CACHE, exist_ok=True)
@@ -101,11 +135,45 @@ def nix_exe(attr, link_name, exe):
 
 
 def ensure_ffmpeg():
-    return shutil.which('ffmpeg') or nix_exe('ffmpeg-headless^bin', 'ffmpeg', 'ffmpeg-bin/bin/ffmpeg')  # nix adds -bin for ^bin
+    return shutil.which('ffmpeg') or os.path.join(nix_out('ffmpeg-headless^bin', 'ffmpeg', '-bin'), 'bin', 'ffmpeg')
 
 
-def ensure_whisper():
-    return shutil.which('whisper-cli') or nix_exe('whisper-cpp', 'whisper-cpp', 'whisper-cpp/bin/whisper-cli')
+def ensure_engine():
+    """The nix python, the wheel directory pip made for it, and the libs the wheels need."""
+    python = os.path.join(nix_out('python3', 'python3'), 'bin', 'python3')
+    pip = os.path.join(nix_out('python3Packages.pip', 'pip'), 'bin', 'pip')
+    # The manylinux wheels expect a system libstdc++ and libz; nix has neither on a default path.
+    libs = ':'.join(os.path.join(nix_out(a, n, sfx), 'lib')
+                    for a, n, sfx in (('stdenv.cc.cc.lib', 'gcc', '-lib'), ('zlib', 'zlib', '')))
+    key = hashlib.sha256((REQUIREMENTS + os.path.realpath(python)).encode()).hexdigest()[:12]
+    site = os.path.join(CACHE, 'site-' + key)
+    if os.path.exists(os.path.join(site, '.ok')):
+        return python, site, libs
+    # Install into a private staging directory and publish it with one rename,
+    # so a concurrent run never imports a half-installed tree.
+    os.makedirs(CACHE, exist_ok=True)
+    stage = tempfile.mkdtemp(prefix='stage-', dir=CACHE)
+    try:
+        req = os.path.join(stage, 'requirements.txt')
+        with open(req, 'w') as f:
+            f.write(REQUIREMENTS)
+        # --no-deps: the worker needs only the C extension and numpy. --only-binary:
+        # never build from source. --require-hashes: refuse anything not pinned.
+        r = subprocess.run([pip, 'install', '--disable-pip-version-check', '--no-cache-dir', '--no-deps',
+                            '--only-binary', ':all:', '--require-hashes', '--target', os.path.join(stage, 'site'),
+                            '-r', req], capture_output=True, text=True)
+        if r.returncode != 0:
+            die('pip could not install the pinned wheels: ' + r.stderr.strip()[-400:])
+        open(os.path.join(stage, 'site', '.ok'), 'w').close()
+        try:
+            os.rename(os.path.join(stage, 'site'), site)
+        except OSError:
+            # Another run published first: keep a good one.
+            if not os.path.exists(os.path.join(site, '.ok')):
+                die('could not publish the installed wheels at %s' % site)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    return python, site, libs
 
 
 def to_pcm(ffmpeg, src, out):
@@ -122,19 +190,16 @@ def to_pcm(ffmpeg, src, out):
             'Split the recording to get the rest.' % (MAX_SECONDS // 60, MAX_SECONDS // 60))
 
 
-def run_cli(binary, ff, model, pcm, lang):
-    """whisper-cli on 16 kHz mono audio; prints the text."""
+def run_engine(python, site, libs, model, pcm, lang):
     with tempfile.TemporaryDirectory() as d:
-        wav = os.path.join(d, 'a.wav')
-        c = subprocess.run([ff, '-nostdin', '-loglevel', 'error', '-f', 'f32le', '-ar', '16000', '-ac', '1',
-                            '-i', pcm, wav], capture_output=True, text=True)
-        if c.returncode != 0:
-            die('could not convert the audio: ' + c.stderr.strip()[-300:])
-        r = subprocess.run([binary, '-m', model, '-f', wav, '-nt', '-np', '-l', lang],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            die('whisper-cli failed: ' + r.stderr.strip()[-400:])
-        return r.stdout.strip()
+        out = os.path.join(d, 'out.json')
+        env = dict(os.environ, LD_LIBRARY_PATH=libs)
+        r = subprocess.run([python, '-I', '-c', WORKER, site, model, pcm, out, lang,
+                            str(max(1, min(os.cpu_count() or 1, 8)))], capture_output=True, text=True, env=env)
+        if r.returncode != 0 or not os.path.exists(out):
+            die('whisper failed: ' + r.stderr.strip()[-400:])
+        with open(out) as f:
+            return json.load(f)['text']
 
 
 def main(argv):
@@ -165,11 +230,11 @@ def main(argv):
     ffmpeg = ensure_ffmpeg()
     model = fetch(MODEL_URL % model_name, os.path.join(CACHE, 'ggml-%s.bin' % model_name),
                   MODELS[model_name], 600 << 20)
-    cli = ensure_whisper()
+    python, site, libs = ensure_engine()
     with tempfile.TemporaryDirectory() as d:
         pcm = os.path.join(d, 'a.f32')
         to_pcm(ffmpeg, src, pcm)
-        text = run_cli(cli, ffmpeg, model, pcm, lang)
+        text = run_engine(python, site, libs, model, pcm, lang)
     # Words from a stranger's voice note: data, not instructions.
     if not text:
         die('no speech was recognized in %s' % src)
