@@ -951,6 +951,15 @@ class RenderTest(unittest.TestCase):
         self.assertIsNone(reg, "wrote a github: ref as a tarball URL")
         self.assertTrue(any("not an https archive" in n for n in notes))
 
+    def test_flake_params_leave_the_url_for_attributes(self):
+        reg, *_ = self._render_registry(config={"jitNixpkgs": (
+            "https://example.org/n.tar.xz"
+            "?narHash=sha256-a%2Bb%2Fc%3D&x=1&dir=sub")})
+        self.assertEqual(
+            {"type": "tarball", "url": "https://example.org/n.tar.xz?x=1",
+             "narHash": "sha256-a+b/c=", "dir": "sub"},
+            reg["flakes"][0]["to"])
+
     def test_a_registry_keeps_its_mode_and_symlink(self):
         def prepare(out):
             real = out / "elsewhere.json"

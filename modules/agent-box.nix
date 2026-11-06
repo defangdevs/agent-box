@@ -1309,9 +1309,12 @@ let
 
     - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
       (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
-      `nixpkgs#` is the box's own nixpkgs - the same one the harnesses come
-      from. After the box's first update that is a fixed revision, moved only
-      by the next update; before it, the nixos-unstable channel. Installs hit
+      When the registry maps `nixpkgs` to the box's nixpkgs, `nixpkgs#` is the
+      same one the harnesses come from. After the box's first update that is a
+      fixed revision, moved only by the next update; before it, the
+      nixos-unstable channel. If `jitNixpkgs` is not an https archive, or an
+      operator mapped `nixpkgs` themselves, agent-box leaves the mapping alone:
+      run `nix registry list` to see what `nixpkgs#` resolves to. Installs hit
       the binary cache and every session gets the same versions. When it
       carries a package at an old version, override it for that one install:
       `nix profile add github:NixOS/nixpkgs/nixpkgs-unstable#pulumi`, or the
@@ -5738,6 +5741,29 @@ done
     if cfg.jitNixpkgs != null then cfg.jitNixpkgs
     else if cfg.selfUpdate.agentNixpkgs != null then cfg.selfUpdate.agentNixpkgs.url
     else "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz";
+
+  # The registry `to` for jitNixpkgsRef (an https archive; see the registry
+  # block below). narHash and dir are flake attributes, so they leave the
+  # URL; any other query parameter stays on it.
+  jitNixpkgsRegistryTarget =
+    let
+      unescape = builtins.replaceStrings
+        [ "%2B" "%2b" "%2F" "%2f" "%3D" "%3d" ] [ "+" "+" "/" "/" "=" "=" ];
+      parts = lib.splitString "?" jitNixpkgsRef;
+      base = builtins.head parts;
+      params = lib.filter (p: p != "")
+        (lib.splitString "&" (lib.concatStringsSep "?" (builtins.tail parts)));
+      isFlakeParam = p: lib.hasPrefix "narHash=" p || lib.hasPrefix "dir=" p;
+      flakeAttrs = lib.listToAttrs (map
+        (p:
+          let kv = lib.splitString "=" p;
+          in lib.nameValuePair (builtins.head kv)
+            (unescape (lib.concatStringsSep "=" (builtins.tail kv))))
+        (lib.filter isFlakeParam params));
+      rest = lib.filter (p: !(isFlakeParam p)) params;
+    in
+    { type = "tarball"; url = base + lib.optionalString (rest != [ ]) ("?" + lib.concatStringsSep "&" rest); }
+    // flakeAttrs;
 
   agentPackage = agent:
     if cfg.package != null then cfg.package
@@ -20458,13 +20484,15 @@ in
     # Only an https archive ref maps to a typed registry entry without
     # parsing the whole flake-ref grammar; any other jitNixpkgs (github:,
     # git+, a path) leaves the registry as nixpkgs set it, as on native.
+    #
+    # An explicit `nix.registry.nixpkgs.flake` is the host's own choice, so
+    # it is left to derive `to`. narHash and dir move from the URL query to
+    # attributes, so nix enforces the hash and keeps the subdirectory.
     nix.registry.nixpkgs.to = lib.mkIf
       (builtins.match "https://.*[.](tar([.][a-z0-9]+)?|tgz|zip)([?].*)?"
-        jitNixpkgsRef != null)
-      (lib.mkOverride 900 {
-        type = "tarball";
-        url = jitNixpkgsRef;
-      });
+        jitNixpkgsRef != null
+        && config.nix.registry.nixpkgs.flake == null)
+      (lib.mkOverride 900 jitNixpkgsRegistryTarget);
 
     # Trust DefangLabs' public Cachix cache, so agent-box-defang-cli.service
     # below substitutes a prebuilt closure instead of compiling Go from

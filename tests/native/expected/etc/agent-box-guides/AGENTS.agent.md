@@ -146,9 +146,12 @@ plainly rather than handing it back.
 
 - Install extra tools with nix, e.g. `nix profile add nixpkgs#awscli2`
   (no sudo needed; tools land in ~/.nix-profile/bin, already on PATH).
-  `nixpkgs#` is the box's own nixpkgs - the same one the harnesses come
-  from. After the box's first update that is a fixed revision, moved only
-  by the next update; before it, the nixos-unstable channel. Installs hit
+  When the registry maps `nixpkgs` to the box's nixpkgs, `nixpkgs#` is the
+  same one the harnesses come from. After the box's first update that is a
+  fixed revision, moved only by the next update; before it, the
+  nixos-unstable channel. If `jitNixpkgs` is not an https archive, or an
+  operator mapped `nixpkgs` themselves, agent-box leaves the mapping alone:
+  run `nix registry list` to see what `nixpkgs#` resolves to. Installs hit
   the binary cache and every session gets the same versions. When it
   carries a package at an old version, override it for that one install:
   `nix profile add github:NixOS/nixpkgs/nixpkgs-unstable#pulumi`, or the

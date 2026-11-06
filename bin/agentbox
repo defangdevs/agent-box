@@ -52,6 +52,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -5572,11 +5573,22 @@ def registry_target(ref):
     (github:, git+, a path) leaves nixpkgs# where it was rather than
     guessing a type nix would then refuse.
     """
-    bare = ref.split("?", 1)[0]
-    if ref.startswith("https://") and re.search(
-            r"\.(tar(\.[a-z0-9]+)?|tgz|zip)$", bare):
-        return {"type": "tarball", "url": ref}
-    return None
+    bare, _, query = ref.partition("?")
+    if not (ref.startswith("https://") and re.search(
+            r"\.(tar(\.[a-z0-9]+)?|tgz|zip)$", bare)):
+        return None
+    # narHash and dir are flake attributes, not part of the download URL:
+    # left in `url`, nix would not enforce the hash and would drop the
+    # subdirectory. Every other query parameter stays on the URL.
+    want, rest = {"type": "tarball"}, []
+    for param in query.split("&") if query else []:
+        key, _, value = param.partition("=")
+        if key in ("narHash", "dir"):
+            want[key] = urllib.parse.unquote(value)
+        else:
+            rest.append(param)
+    want["url"] = bare + ("?" + "&".join(rest) if rest else "")
+    return want
 
 
 def plan_nix_registry(path, stamp_path, ref):
