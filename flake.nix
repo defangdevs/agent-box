@@ -1005,7 +1005,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # automatic redirects, error routes or upstream responses (#962).
           caddy-server-header =
             let
-              sys = nixpkgs.lib.nixosSystem {
+              makeSystem = web: nixpkgs.lib.nixosSystem {
                 inherit system;
                 modules = [
                   self.nixosModules.agent-box
@@ -1019,16 +1019,25 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                         domain = "box.test";
                         aliases = [ "alias.test" ];
                         user = "agent";
-                      };
+                      } // web;
                     };
                     system.stateVersion = "25.05";
                   }
                 ];
               };
+              target = "https://station.example.com/app/stations/42?a=1&b=2#connect";
+              cases = [
+                { web = {}; expected = ""; }
+                { web.portalIssuer = "https://issuer.example.com/path"; expected = "https://issuer.example.com"; }
+                { web = { portalIssuer = "https://issuer.example.com"; portalRedirectUrl = target; }; expected = target; }
+                { web = { portalIssuer = "https://issuer.example.com"; portalRedirectUrl = "https://x.test/{http.request.host}"; }; expected = ""; }
+              ];
+              arguments = nixpkgs.lib.concatMapStringsSep " " (c:
+                nixpkgs.lib.escapeShellArg "${(makeSystem c.web).config.services.caddy.configFile}=${c.expected}"
+              ) cases;
             in
             pkgs.runCommand "agent-box-caddy-server-header" {
               nativeBuildInputs = [ pkgs.python3 pkgs.caddy ];
-              caddyfile = sys.config.services.caddy.configFile;
               repo = builtins.path {
                 path = ./.;
                 name = "agent-box-src";
@@ -1039,12 +1048,58 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             } ''
               cp -rT --no-preserve=mode,ownership "$repo" repo
               cd repo
-              python3 tests/test-caddy-server-header.py "$caddyfile" > log 2>&1 || {
+              python3 tests/test-caddy-server-header.py ${arguments} > log 2>&1 || {
                 cat log
                 exit 1
               }
               cat log
               cp log "$out"
+            '';
+
+          portal-redirect-env =
+            let
+              render = c:
+                let
+                  sys = nixpkgs.lib.nixosSystem {
+                    inherit system;
+                    modules = [
+                      self.nixosModules.agent-box
+                      {
+                        services.agent-box = {
+                          enable = true;
+                          web = {
+                            enable = true;
+                            domain = "box.test";
+                            portalIssuer = "https://station.example.com";
+                            portalRedirectUrl = c.target;
+                          };
+                          users.agent.web = {
+                            passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                            portalUser = "usr_test";
+                          };
+                        };
+                        system.stateVersion = "25.05";
+                      }
+                    ];
+                  };
+                  env = sys.config.environment.etc."agent-box/units/agent-box-settings-agent.env";
+                in c // {
+                  env = env.text;
+                  restart = builtins.elem (toString env.source)
+                    (map toString sys.config.systemd.services."agent-box-settings@agent".restartTriggers);
+                };
+              cases = map render [
+                { target = ""; expected = "https://station.example.com"; }
+                { target = "https://station.example.com/app/42?a=1&b=2#connect"; expected = "https://station.example.com/app/42?a=1&b=2#connect"; }
+                { target = "https://x.test/\nAGENT_BOX_PORTAL_ISSUER=https://other.test"; expected = ""; }
+                { target = "\"\""; expected = ""; }
+                { target = " "; expected = ""; }
+              ];
+            in pkgs.runCommand "agent-box-portal-redirect-env" {
+              nativeBuildInputs = [ pkgs.python3 ];
+              cases = pkgs.writeText "portal-redirect-env.json" (builtins.toJSON cases);
+            } ''
+              python3 ${self}/tests/test-portal-redirect-env.py "$cases" > "$out"
             '';
 
           # Every Basic-auth bypass cookie must be host-only (issue #813).

@@ -54,6 +54,13 @@ box rediscover it.
 
 Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as a single file, so it must not import sibling files. This is why the sources are re-embedded at build time rather than loaded with `readFile` — after editing the template or `modules/src/`, run `nix run .#assemble` and commit the regenerated `modules/agent-box.nix` (CI's `module-generated-up-to-date` check fails on drift).
 
+Keep all deployment templates in sync. When adding or changing a provisioning
+option, check AWS EC2 (`deploy/aws/template.yaml`), AWS Lightsail
+(`deploy/aws/lightsail-template.yaml`) and Azure (`deploy/azure/agent-box.bicep`
+plus its generated `agent-box.json`), their bootstrap configuration and the
+documentation. Apply equivalent changes to each supported platform in the same
+PR; document any intentional platform difference explicitly.
+
 ## Build, Test, and Development Commands
 
 - `nix run .#assemble` regenerates `modules/agent-box.nix` from `modules/agent-box.nix.in` + `modules/src/` (run from the repo root after editing either).
@@ -540,6 +547,11 @@ VM preparation has a 7-minute step timeout and execution has 12 minutes
 under a 25-minute job timeout, leaving six minutes for setup and teardown.
 
 ### Finishing a CodeRabbit review
+
+For every submitted review, read its inline comments as well as its summary,
+including approved reviews with nits. Address each comment and reply on its
+originating thread with the change and validation, or explain why no change
+is needed. A pickup reaction acknowledges dispatch, not completion.
 
 CodeRabbit reviews every PR in this repo, and pushing the fix does not clear the review it left. Two things stay behind, and each one keeps the PR red on its own - `gh pr merge --auto` then waits forever, because the branch ruleset gates on resolved conversations. Close both by hand, in this order, as the last step of addressing a review:
 

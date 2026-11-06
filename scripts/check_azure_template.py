@@ -87,6 +87,7 @@ HOSTILE_AGENTSMD = "x\nAGENTBOX_AGENTSMD\ntouch /tmp/pwned\n@@WEBPASSWORD@@\n"
 # has no character constraint for a string parameter, and these two are
 # validated and decoded by the bootstrap itself rather than the template).
 PORTAL_ISSUER_SAMPLE = "https://station.example.com"
+PORTAL_REDIRECT_SAMPLE = "https://station.example.com/app/stations/42?a=1&b=2#connect"
 PORTAL_USER_SAMPLE = "usr_2Nk9x"
 PUBLIC_IP_SAMPLE = "203.0.113.7"
 DOMAIN_SAMPLE = PUBLIC_IP_SAMPLE
@@ -105,6 +106,7 @@ SAMPLE = {
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
     "@@PORTALISSUERB64@@": base64.b64encode(
         PORTAL_ISSUER_SAMPLE.encode()).decode(),
+    "@@PORTALREDIRECTURLB64@@": base64.b64encode(PORTAL_REDIRECT_SAMPLE.encode()).decode(),
     "@@PORTALUSERIDB64@@": base64.b64encode(
         PORTAL_USER_SAMPLE.encode()).decode(),
     "@@PUBLICIPB64@@": base64.b64encode(PUBLIC_IP_SAMPLE.encode()).decode(),
@@ -128,6 +130,7 @@ DEFAULT_OF = {
     # Both default to '' -- handover off, which is the default box.
     "@@PORTALISSUERB64@@": "portalIssuer",
     "@@PORTALUSERIDB64@@": "portalUser",
+    "@@PORTALREDIRECTURLB64@@": "portalRedirectUrl",
 }
 
 
@@ -448,7 +451,7 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
 
 
 PORTAL_BLOCK = re.compile(
-    r"(install -d -m 0755 /etc/agent-box\n.*?/etc/agent-box/config\.yaml)"
+    r"(install -d -m 0755 /etc/agent-box\n.*?)"
     r"\n\n# Extra standing instructions", re.S)
 
 
@@ -471,9 +474,11 @@ def extract_portal_block(script: str) -> str:
 def run_portal_block(
     block: str, workdir: Path, issuer_b64: str, user_b64: str,
     sslip_b64: str, public_ip: str = PUBLIC_IP_SAMPLE,
+    redirect_url: str = PORTAL_REDIRECT_SAMPLE,
 ) -> subprocess.CompletedProcess:
     text = block.replace("@@PORTALISSUERB64@@", issuer_b64)
     text = text.replace("@@PORTALUSERIDB64@@", user_b64)
+    text = text.replace("@@PORTALREDIRECTURLB64@@", b64(redirect_url))
     text = text.replace("@@SSLIPDOMAINSB64@@", sslip_b64)
     text = text.replace("@@PUBLICIPB64@@", b64(public_ip))
     text = text.replace("/etc/agent-box", str(workdir))
@@ -601,6 +606,12 @@ def check_written_config(template: dict) -> int:
                       file=sys.stderr)
                 rc = 1
                 continue
+            if web.get("portalRedirectUrl") != PORTAL_REDIRECT_SAMPLE:
+                print("FAIL: %s: portalRedirectUrl landed as %r, wanted %r"
+                      % (label, web.get("portalRedirectUrl"),
+                         PORTAL_REDIRECT_SAMPLE), file=sys.stderr)
+                rc = 1
+                continue
             got = (web.get("portalIssuer"), u.get("portalUser"))
             # Off is empty VALUES, not absent keys, which is what the module
             # already reads as off.
@@ -612,6 +623,29 @@ def check_written_config(template: dict) -> int:
                 continue
             print("OK: config.yaml (%s) parses and declares what it should"
                   % label)
+    for target in ("", PORTAL_REDIRECT_SAMPLE,
+                   "https://station.example.com/@DOMAIN@/@MANAGED_BY@?x=@PORTALUSERID@",
+                   "http://localhost:3000/app/stations/42", "https://[::1]:8443/app/42",
+                   "javascript:alert(1)", "https://x.test/'bad",
+                   "https://x.test/\nAGENTBOX_CONFIG\ntouch /tmp/pwned"):
+        valid = target == "" or (target.startswith(("https://", "http://"))
+                                  and "'" not in target and "\n" not in target)
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            done = run_portal_block(block, workdir, b64(PORTAL_ISSUER_SAMPLE),
+                                    b64(PORTAL_USER_SAMPLE), b64("[]"),
+                                    redirect_url=target)
+            data = parsed_config(workdir)
+            if valid:
+                if (done.returncode or data["web"].get("portalRedirectUrl", "") != target
+                        or (not target and "portalRedirectUrl" in data["web"])):
+                    print("FAIL: redirect URL did not survive bootstrap:", repr(target),
+                          done.stderr, file=sys.stderr)
+                    rc = 1
+            elif done.returncode == 0 or data is not None:
+                print("FAIL: unsafe redirect URL reached config.yaml:", repr(target),
+                      file=sys.stderr)
+                rc = 1
     return rc
 
 

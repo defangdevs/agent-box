@@ -14,6 +14,7 @@ Metadata:
         Parameters:
           - PortalUser
           - PortalIssuer
+          - PortalRedirectUrl
       - Label:
           default: Compute and cost
         Parameters:
@@ -45,6 +46,8 @@ Metadata:
         default: Portal account id this box belongs to (issue #593)
       PortalIssuer:
         default: Portal issuer URL that signs handover tokens
+      PortalRedirectUrl:
+        default: Portal page for this box (optional)
       Agent:
         default: Agent CLI
       UserName:
@@ -249,6 +252,18 @@ Parameters:
       (<issuer>/.well-known/jwks.json). This is whatever the portal uses - it
       is NOT a Defang hostname. Blank (the default) disables portal handover
       entirely.
+  PortalRedirectUrl:
+    Type: String
+    Default: ""
+    MaxLength: 2048
+    # No quotes, backslashes or braces: safe in Nix and YAML literals.
+    AllowedPattern: '^$|^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?([/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?$'
+    Description: >-
+      Public destination of the 401 page's portal link, including a per-box
+      path, query and fragment. Blank uses the portal issuer origin.
+      Percent-encode spaces and quotes; do not include credentials or
+      private account identifiers. Requires a module or runtime supporting
+      web.portalRedirectUrl when set.
   WebPasswordHash:
     Type: String
     NoEcho: true
@@ -886,6 +901,9 @@ Resources:
                     # fetches the portal's published key set from this
                     # issuer's well-known path.
                     portalIssuer = "${PortalIssuer}";
+                  } // lib.optionalAttrs ("${PortalRedirectUrl}" != "") {
+                    # Omit when unset so older pinned modules still work.
+                    portalRedirectUrl = "${PortalRedirectUrl}";
                   };
                   # Lets the agent update the box on request:
                   #   sudo /run/current-system/sw/bin/systemctl \

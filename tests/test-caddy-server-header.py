@@ -3,6 +3,7 @@
 import base64
 import http.client
 import http.server
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path
@@ -43,7 +44,17 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def exercise(source, directory):
+class Links(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.targets = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.targets.append(dict(attrs).get("href"))
+
+
+def exercise(source, directory, portal_url=None):
     directory.mkdir()
     http_port, https_port = free_port(), free_port()
     upstream = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
@@ -121,6 +132,10 @@ def exercise(source, directory):
             assert "www-authenticate" in fields
             assert fields["content-type"].startswith("text/html")
             assert b"Sign in required" in body
+            links = Links()
+            links.feed(body.decode())
+            assert links.targets == ([portal_url] if portal_url else []), links.targets
+            print(f"PASS: {directory.name} 401 portal link = {portal_url!r}")
             request("box.test", "/agent", 302)
             request("box.test", "/agent/receive/invalid", 404)
             for target in ("/", "/agent/", "/agent/main/", "/agent/settings/",
@@ -152,12 +167,24 @@ def exercise(source, directory):
 
 with tempfile.TemporaryDirectory() as tmp:
     root = Path(tmp)
-    cfg = root / "config.json"
-    cfg.write_text(json.dumps({
-        "domain": "box.test", "web": {"enable": True, "aliases": ["alias.test"]},
-        "users": {"agent": {"root": True}},
-    }))
-    native = (render(root, cfg) / "etc/agent-box/Caddyfile").read_text()
-    exercise(native, root / "native")
+    target = "https://station.example.com/app/stations/42?a=1&b=2#connect"
+    cases = [
+        ({}, None),
+        ({"portalIssuer": "https://issuer.example.com/path"}, "https://issuer.example.com"),
+        ({"portalIssuer": "https://issuer.example.com", "portalRedirectUrl": target}, target),
+        ({"portalIssuer": "https://issuer.example.com", "portalRedirectUrl": "https://x.test/{http.request.host}"}, None),
+    ]
+    for index, (web, expected) in enumerate(cases):
+        cfg = root / "config.json"
+        cfg.write_text(json.dumps({
+            "domain": "box.test",
+            "web": dict(web, enable=True, aliases=["alias.test"]),
+            "users": {"agent": {"root": True}},
+        }))
+        case_root = root / f"render-{index}"
+        case_root.mkdir()
+        native = (render(case_root, cfg) / "etc/agent-box/Caddyfile").read_text()
+        exercise(native, root / f"native-{index}", expected)
     for index, argument in enumerate(sys.argv[1:]):
-        exercise(Path(argument).read_text(), root / f"nixos-{index}")
+        path, _, expected = argument.partition("=")
+        exercise(Path(path).read_text(), root / f"nixos-{index}", expected or None)

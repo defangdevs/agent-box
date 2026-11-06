@@ -261,6 +261,14 @@ web:
   a box and no public key is committed to a template.
   `web.portalJwksUrl` overrides that path for a portal that publishes
   somewhere else.
+- `web.portalRedirectUrl` sets the link shown on the unauthenticated 401
+  page, for example `https://station.example.com/app/stations/42`. The full
+  path, query and fragment are kept. When unset or empty, the link uses the
+  origin of `portalIssuer`. Invalid explicit URLs omit the link without
+  falling back. Use an absolute HTTP(S) URL and percent-encode spaces,
+  quotes and brackets in its path or query. The link is public; keep
+  credentials and private account identifiers out of it. It does not
+  change token verification, key discovery or ownership checks.
 - **`portalProject` is optional**, and narrows `portalUser` to one project
   within that account:
 
@@ -278,13 +286,15 @@ parameters, alongside the web password:
 
 | flavor | parameters |
 |---|---|
-| AWS CloudFormation (`deploy/aws/template.yaml`) | `PortalUser`, `PortalIssuer` |
-| AWS Lightsail (`deploy/aws/lightsail-template.yaml`) | `PortalUser`, `PortalIssuer` |
-| Azure Bicep (`deploy/azure/agent-box.bicep`) | `portalUser`, `portalIssuer` |
+| AWS CloudFormation (`deploy/aws/template.yaml`) | `PortalUser`, `PortalIssuer`, `PortalRedirectUrl` |
+| AWS Lightsail (`deploy/aws/lightsail-template.yaml`) | `PortalUser`, `PortalIssuer`, `PortalRedirectUrl` |
+| Azure Bicep (`deploy/azure/agent-box.bicep`) | `portalUser`, `portalIssuer`, `portalRedirectUrl` |
 
-Both are optional and both are needed: leave either blank and the box serves
-no handover route at all, which is what a hand-launched box gets. **There is
-no key parameter on any flavor** — that is the point of §2.1.
+`portalRedirectUrl` (AWS: `PortalRedirectUrl`) is optional and only sets the
+public return link. The issuer and user are both needed for handover: leave
+either blank and the box serves no handover route at all, which is what a
+hand-launched box gets. **There is no key parameter on any flavor** - see
+section 2.1.
 
 `portalUser` is the per-box value, and it has to arrive this way rather than
 over the wire: the handover endpoint is unauthenticated by construction, so a

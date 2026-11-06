@@ -21,6 +21,7 @@ to every render test, because it is a property of the environment
 cloud-init provides. So the script must export HOME before it sources
 anything from the Nix profile.
 """
+import base64
 import re
 import subprocess
 import sys
@@ -154,7 +155,8 @@ def check(template: Path) -> int:
 
 
 PORTAL_BLOCK = re.compile(
-    r"(install -d -m 0755 /etc/agent-box\n.*/etc/agent-box/config\.yaml)",
+    r"(install -d -m 0755 /etc/agent-box\n.*?)"
+    r"(?=\n# Extra standing instructions)",
     re.S)
 
 
@@ -181,18 +183,28 @@ def check_written_config(template) -> int:
     block = block.replace("${Agent}", "claude").replace("${UserName}", "agent")
 
     rc = 0
-    for label, (issuer, account) in {
-        "handover on": ("https://station.example.com", "usr_2Nk9x"),
-        "handover off": ("", ""),
+    for label, (issuer, account, redirect) in {
+        "handover on": ("https://station.example.com", "usr_2Nk9x", ""),
+        "handover off": ("", "", ""),
         # '&' is IN PortalIssuer's AllowedPattern (a query string may have
         # one) but is sed replacement-text magic -- unescaped, this is
         # exactly the input that used to splice the placeholder into
         # config.yaml instead of the URL.
         "handover on, ampersand": (
-            "https://station.example.com/cb?a=1&b=2", "usr_2Nk9x"),
+            "https://station.example.com/cb?a=1&b=2", "usr_2Nk9x", ""),
+        "redirect destination": (
+            "https://station.example.com", "usr_2Nk9x",
+            "https://station.example.com/app/42?a=1&b=2#connect"),
+        "redirect without handover": ("", "", "http://localhost:3000/app/42"),
+        "redirect markers": ("", "",
+                             "https://x.test/@USER@/@PORTALISSUER@?x=@PORTALREDIRECTURL@"),
+        "redirect shell syntax stays literal": ("", "", "https://x.test/$(id)?x=$USER"),
+        "redirect IPv6": ("", "", "https://[::1]:8443/app/42"),
     }.items():
         text = (block.replace("${PortalIssuerPlain}", issuer)
-                     .replace("${PortalUserPlain}", account))
+                     .replace("${PortalUserPlain}", account)
+                     .replace("${PortalRedirectUrlBase64}",
+                              base64.b64encode(redirect.encode()).decode()))
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
             text = text.replace("/etc/agent-box", str(workdir))
@@ -218,6 +230,12 @@ def check_written_config(template) -> int:
         got = (web.get("enable"), user.get("root"),
                web.get("portalIssuer"), user.get("portalUser"))
         want = (True, True, issuer, account)
+        if (web.get("portalRedirectUrl", "") != redirect
+                or (not redirect and "portalRedirectUrl" in web)):
+            print(f"FAIL: {template.name}: config.yaml ({label}) did not "
+                  "preserve the redirect or omit its unset key.", file=sys.stderr)
+            rc = 1
+            continue
         if got != want:
             print(f"FAIL: {template.name}: config.yaml ({label}) landed as "
                   f"{got!r}, wanted {want!r}", file=sys.stderr)
@@ -228,6 +246,55 @@ def check_written_config(template) -> int:
     return rc
 
 
+def check_redirect_parameters() -> int:
+    """Both AWS launch forms must accept the same safe redirect values."""
+    class CfnLoader(yaml.SafeLoader):
+        pass
+
+    def cfn_value(loader, tag, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node)
+        return loader.construct_mapping(node)
+
+    CfnLoader.add_multi_constructor("!", cfn_value)
+    previous = None
+    for name in ("template.yaml", "lightsail-template.yaml"):
+        data = yaml.load((REPO / "deploy/aws" / name).read_text(), Loader=CfnLoader)
+        parameter = data["Parameters"].get("PortalRedirectUrl")
+        if not parameter or (previous is not None and parameter != previous):
+            print(f"FAIL: {name}: redirect parameter is missing or differs "
+                  "between AWS templates.", file=sys.stderr)
+            return 1
+        previous = parameter
+        for target, valid in (
+            ("", True),
+            ("https://station.example.com/app/42?a=1&b=2#connect", True),
+            ("http://localhost:3000/app/42", True),
+            ("https://[::1]:8443/app/42", True),
+            ("https://x.test/$(id)?x=$USER", True),
+            ("javascript:alert(1)", False),
+            ("https://user:pass@x.test/", False),
+            ("https://x.test/'bad", False),
+            ('https://x.test/"bad', False),
+            ("https://x.test/{bad}", False),
+            ("https://x.test/\\bad", False),
+            ("https://x.test/a b", False),
+            ("https://x.test/\nnext", False),
+        ):
+            if bool(re.fullmatch(parameter["AllowedPattern"], target)) != valid:
+                print(f"FAIL: {name}: unexpected redirect validation for "
+                      f"{target!r}", file=sys.stderr)
+                return 1
+        if parameter["Default"] != "":
+            print(f"FAIL: {name}: redirect must be opt-in.", file=sys.stderr)
+            return 1
+        print(f"OK: {name}: redirect parameter accepts safe URLs and "
+              "refuses unsafe values.")
+    return 0
+
+
 def main() -> int:
     if not TEMPLATES:
         print(
@@ -236,8 +303,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    return max(max(check(t), check_written_config(t))
-               for t in TEMPLATES)
+    return max(check_redirect_parameters(),
+               max(max(check(t), check_written_config(t)) for t in TEMPLATES))
 
 
 if __name__ == "__main__":

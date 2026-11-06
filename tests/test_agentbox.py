@@ -4183,6 +4183,39 @@ class ApplyActivationTest(unittest.TestCase):
         self.assertIn(["systemctl", "show", unit],
                       [call[:3] for call in self.calls])
 
+    def test_changed_settings_environment_refreshes_only_active_daemons(self):
+        path = "/etc/agent-box/units/agent-box-settings-agent.env"
+        self.extra_files[path] = "AGENT_BOX_PORTAL_REDIRECT_URL=https://x.test/new\n"
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: (
+            ["agent-box-settings@agent.service"]
+            if pattern == "agent-box-settings@agent.service" else [])
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
+        self.calls.clear()
+        self.mod.write_if_changed = lambda *args: False
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
+        self.calls.clear()
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: []
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
+
+    def test_a_failed_settings_environment_refresh_fails_apply(self):
+        path = "/etc/agent-box/units/agent-box-settings-agent.env"
+        self.extra_files[path] = "AGENT_BOX_PORTAL_REDIRECT_URL=https://x.test/new\n"
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: (
+            ["agent-box-settings@agent.service"]
+            if pattern == "agent-box-settings@agent.service" else [])
+        self.fail_when = ["restart agent-box-settings@agent.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "refresh agent-box-settings@agent.service")
+
     def test_invalid_tcp_mitigation_fails_before_activation(self):
         self.extra_files[self.mod.CVE_2026_98432_RULES] = (
             SRC / "cve-2026-98432.nft").read_text()
@@ -4818,6 +4851,62 @@ class PortalHandoff(unittest.TestCase):
                            {"portalIssuer": "https://x.test'\"{"})[
             "/etc/agent-box/Caddyfile"]
         self.assertNotIn(hint, bad)
+
+    def test_401_redirect_preserves_the_destination_without_changing_trust(self):
+        target = "https://station.example.com/app/stations/42?a=1&b=2#connect"
+        web = dict(self.PORTAL_WEB, portalRedirectUrl=target)
+        files = self._render({"agent": dict(self.MAPPED)}, web)
+        self.assertIn("href='" + target.replace("&", "&amp;") + "'",
+                      files["/etc/agent-box/Caddyfile"])
+        env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+        self.assertIn("AGENT_BOX_PORTAL_ISSUER=https://station.example.com\n", env)
+        # The daemon's own 401 page needs the same destination (CodeRabbit,
+        # PR #1007); trust still comes from the issuer alone.
+        self.assertIn("AGENT_BOX_PORTAL_REDIRECT_URL=" + json.dumps(target) + "\n", env)
+        # The informational link can also be used without handover configured.
+        without_issuer = self._render({"agent": {"root": True}},
+                                     {"portalRedirectUrl": target})
+        self.assertIn("/app/stations/42", without_issuer["/etc/agent-box/Caddyfile"])
+
+    def test_401_redirect_keeps_template_marker_text_literal(self):
+        target = "https://station.example.com/@DOMAIN@/@MANAGED_BY@?x=@PORTALUSERID@"
+        files = self._render({"agent": {"root": True}},
+                             dict(self.PORTAL_WEB, portalRedirectUrl=target))
+        self.assertIn("href='" + target + "'", files["/etc/agent-box/Caddyfile"])
+
+    def test_invalid_redirect_cannot_add_environment_assignments(self):
+        for target in ('""', " ", "\n", "\r", "\t", "\\\n",
+                       "https://x.test/\nAGENT_BOX_PORTAL_ISSUER=https://other.test"):
+            with self.subTest(target=target):
+                files = self._render({"agent": dict(self.MAPPED)},
+                                     dict(self.PORTAL_WEB, portalRedirectUrl=target))
+                env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+                lines = env.splitlines()
+                redirects = [line for line in lines
+                             if line.startswith("AGENT_BOX_PORTAL_REDIRECT_URL=")]
+                self.assertEqual(len(redirects), 1)
+                self.assertEqual(json.loads(redirects[0].split("=", 1)[1]), target)
+                self.assertEqual([line for line in lines
+                                  if line.startswith("AGENT_BOX_PORTAL_ISSUER=")],
+                                 ["AGENT_BOX_PORTAL_ISSUER=https://station.example.com"])
+                self.assertNotIn("Open this box from your portal page",
+                                 files["/etc/agent-box/Caddyfile"])
+
+    def test_401_redirect_falls_back_only_when_unset(self):
+        for target in (None, ""):
+            web = dict(self.PORTAL_WEB, portalRedirectUrl=target)
+            files = self._render({"agent": {"root": True}}, web)
+            self.assertIn("href='https://station.example.com'",
+                          files["/etc/agent-box/Caddyfile"])
+        for target in ("javascript:alert(1)", "//evil.test/", "https://x.test/'",
+                       'https://x.test/"', "https://x.test/\nnext",
+                       "https://x.test/{http.request.host}", "https://x.test/\\path",
+                       "https://x.test:65536/", "https://x.test:99999/"):
+            with self.subTest(target=target):
+                files = self._render({"agent": {"root": True}},
+                                     dict(self.PORTAL_WEB, portalRedirectUrl=target))
+                self.assertNotIn("Open this box from your portal page",
+                                 files["/etc/agent-box/Caddyfile"])
 
     def test_the_jwks_url_is_passed_only_when_overridden(self):
         """Keys are FETCHED, so there is nothing to configure per rotation.

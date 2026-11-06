@@ -19794,6 +19794,23 @@ in
         '';
       };
 
+      portalRedirectUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "https://station.example.com/app/stations/42";
+        description = ''
+          Destination of the portal link on the unauthenticated 401 page.
+          Set this to the specific box's page in a managed portal. Empty
+          (the default) links to portalIssuer's origin instead.
+
+          Accepts an absolute HTTP(S) URL, including a path, query and
+          fragment. Percent-encode spaces, quotes and brackets in the path
+          or query. Invalid values omit the link. This is a public link:
+          do not include credentials or private account identifiers.
+          Token verification and signing-key discovery still use portalIssuer.
+        '';
+      };
+
       portalJwksUrl = lib.mkOption {
         type = lib.types.str;
         default = "";
@@ -21875,6 +21892,8 @@ in
 #                                 sign-in cards (claude, codex, github)
 #   AGENT_BOX_PORTAL_ISSUER      portal handover (issue #541): the `iss`
 #                                 a handover token must carry
+#   AGENT_BOX_PORTAL_REDIRECT_URL  optional return link for the 401 page
+#                                 (defaults to the issuer's origin)
 #   AGENT_BOX_PORTAL_JWKS_URL    where the portal publishes its signing
 #                                 keys; defaults to the issuer's
 #                                 /.well-known/jwks.json
@@ -22076,6 +22095,7 @@ HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 # whether THIS user declares exactly that (sub, project) pair below. The
 # signature only proves the portal said it.
 PORTAL_ISSUER = os.environ.get("AGENT_BOX_PORTAL_ISSUER", "")
+PORTAL_REDIRECT_URL = os.environ.get("AGENT_BOX_PORTAL_REDIRECT_URL", "")
 # Where the portal publishes its signing keys. Derived from the ISSUER, not
 # from anything in the token: a `jku`/`kid` that could point the box at a
 # key server of the caller's choosing would make the signature check
@@ -27484,15 +27504,27 @@ AUTH_REQUIRED_BODY = """<!doctype html><html lang='en'><meta charset='utf-8'><me
 # or expired portal session: forward_auth passes this daemon's refusal
 # through without Caddy's own error handler. Only the issuer's origin is
 # linked, and only when it is a plain http(s) origin.
-_PORTAL_ORIGIN = re.fullmatch(
-    r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?)"
-    r"(?:[/?#].*)?", PORTAL_ISSUER)
-if _PORTAL_ORIGIN:
+_PORTAL_ORIGIN_RE = (
+    r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])"
+    r"(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|"
+    r"[1-5]?[0-9]{1,4}))?)")
+# Same rules as the Caddy page (portal_hint / portalHint): a configured
+# return URL keeps its path, query and fragment; unset falls back to the
+# issuer's origin. Anything that could escape the attribute is refused.
+if PORTAL_REDIRECT_URL:
+    _PORTAL_TARGET = (PORTAL_REDIRECT_URL if re.fullmatch(
+        _PORTAL_ORIGIN_RE
+        + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?",
+        PORTAL_REDIRECT_URL) else "")
+else:
+    _m = re.fullmatch(_PORTAL_ORIGIN_RE + r"(?:[/?#].*)?", PORTAL_ISSUER)
+    _PORTAL_TARGET = _m.group(1) if _m else ""
+if _PORTAL_TARGET:
     AUTH_REQUIRED_BODY = AUTH_REQUIRED_BODY.replace(
         "</section>",
         "<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
         "style='color:#58a6ff'>Open this box from your portal page</a></p>"
-        "</section>" % _PORTAL_ORIGIN.group(1))
+        "</section>" % html.escape(_PORTAL_TARGET, quote=True))
 
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
@@ -35556,13 +35588,20 @@ if __name__ == "__main__":
       ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
       isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
       webDomainIsIpv4 = isIpv4 cfg.web.domain;
-      # The 401 page's portal link (issue #937): the issuer's origin only,
-      # and nothing at all for a value that is not a plain http(s) origin.
+      # Preserve a configured destination; only an unset one uses the
+      # issuer's origin. Neither HTML nor Caddy may interpret URL syntax.
       portalHint =
-        let m = builtins.match "(https?://([A-Za-z0-9.-]+|[[][0-9A-Fa-f:.]+[]])(:[0-9]+)?)([/?#].*)?"
-                  cfg.web.portalIssuer;
-        in if m == null then "" else
-          "<p style='margin:12px 0 0;font-size:14px'><a href='${builtins.head m}' style='color:#58a6ff'>Open this box from your portal page</a></p>";
+        let
+          origin = "(https?://([A-Za-z0-9.-]+|[[][0-9A-Fa-f:.]+[]])(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5]?[0-9]{1,4}))?)";
+          redirect = cfg.web.portalRedirectUrl;
+          redirectMatch = builtins.match "${origin}([/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?" redirect;
+          issuerMatch = builtins.match "${origin}([/?#].*)?" cfg.web.portalIssuer;
+          target = if redirect != "" then
+            (if redirectMatch == null then "" else redirect)
+            else if issuerMatch == null then "" else builtins.head issuerMatch;
+          href = lib.escapeXML target;
+        in if target == "" then "" else
+          "<p style='margin:12px 0 0;font-size:14px'><a href='${href}' style='color:#58a6ff'>Open this box from your portal page</a></p>";
       webAliases = lib.optional (cfg.web.alias != "") cfg.web.alias ++ cfg.web.aliases;
 
       # Prefix every non-blank line — Nix indented strings strip the common
@@ -36534,6 +36573,11 @@ if __name__ == "__main__":
             # than passed empty.
             + lib.optionalString (portalHandoffFor name) (
                 "AGENT_BOX_PORTAL_ISSUER=${cfg.web.portalIssuer}\n"
+                + lib.optionalString (cfg.web.portalRedirectUrl != "")
+                    # JSON quotes keep this one environment assignment.
+                    # Invalid explicit values stay nonempty and are refused
+                    # by the daemon instead of selecting issuer fallback.
+                    "AGENT_BOX_PORTAL_REDIRECT_URL=${builtins.toJSON cfg.web.portalRedirectUrl}\n"
                 # Only when overridden: the daemon derives the well-known
                 # path from the issuer, so passing it unconditionally would
                 # be one more place the default could drift.
@@ -36628,6 +36672,7 @@ if __name__ == "__main__":
       }) terminalUsers))
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {
         overrideStrategy = "asDropin";
+        restartTriggers = [ config.environment.etc."agent-box/units/agent-box-settings-${name}.env".source ];
         # Restart in ONE step, not stop-in-old-config then start-in-new.
         # This unit is socket-activated, so the default two-step restart
         # leaves a window: the stop runs before the new configuration's

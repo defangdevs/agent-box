@@ -40,6 +40,7 @@ comparison.
 import argparse
 import contextlib
 import hashlib
+import html
 import ipaddress
 import json
 import os
@@ -702,7 +703,8 @@ BOX_SCHEMA = _Obj({
     # only overrides that path.
     "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
                  "alias": DOMAIN_SUFFIX, "aliases": STR_LIST,
-                 "portalIssuer": STR, "portalJwksUrl": STR}),
+                 "portalIssuer": STR, "portalJwksUrl": STR,
+                 "portalRedirectUrl": STR}),
     "email": _Obj({
         "enable": BOOL, "domains": STR_LIST,
         "certificateFile": STR, "keyFile": STR,
@@ -872,6 +874,7 @@ class Spec:
         # means no handover route is served at all, so a box nobody wired to
         # a portal exposes no unauthenticated endpoint.
         self.portal_issuer = web.get("portalIssuer") or ""
+        self.portal_redirect_url = web.get("portalRedirectUrl") or ""
         self.portal_jwks_url = web.get("portalJwksUrl") or ""
         self.protect_memory = bool(data.get("protectMemory", True))
         # Rootless containers for the agent users (issue #600).
@@ -1157,6 +1160,7 @@ class Tree:
         self.remove = []
         self.units = []      # unit names to enable
         self.disable = []    # unit names to disable
+        self.settings_restart = set()
 
     def file(self, path, text, mode=0o644):
         self.files[str(path)] = (text, mode)
@@ -3057,6 +3061,9 @@ class Renderer:
                 # off a box nobody wired to a portal.
                 settings += [
                     ("AGENT_BOX_PORTAL_ISSUER", self.spec.portal_issuer),
+                    ("AGENT_BOX_PORTAL_REDIRECT_URL",
+                     json.dumps(self.spec.portal_redirect_url)
+                     if self.spec.portal_redirect_url else ""),
                     # env_file drops an empty value, so an unset override
                     # simply is not passed and the daemon derives the
                     # well-known path from the issuer itself.
@@ -3870,18 +3877,24 @@ class Renderer:
     def portal_hint(self):
         """HTML for the 401 page's portal link, or "" (issue #937).
 
-        Only the issuer's scheme+host[:port] is linked, and only when it
-        has no character that could break out of the Caddy string or the
-        attribute; anything else renders no hint rather than a broken page.
+        A configured return URL keeps its path, query and fragment. Unset
+        falls back to the issuer's origin. Reject syntax that could escape
+        the HTML attribute or Caddy string, including Caddy placeholders.
         """
-        m = re.fullmatch(r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?)"
-                         r"(?:[/?#].*)?",
-                         self.spec.portal_issuer)
-        if not m:
-            return ""
+        origin = (r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])"
+                  r"(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5]?[0-9]{1,4}))?)")
+        if self.spec.portal_redirect_url:
+            target = self.spec.portal_redirect_url
+            if not re.fullmatch(origin + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?", target):
+                return ""
+        else:
+            m = re.fullmatch(origin + r"(?:[/?#].*)?", self.spec.portal_issuer)
+            if not m:
+                return ""
+            target = m.group(1)
         return ("<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
                 "style='color:#58a6ff'>Open this box from your portal "
-                "page</a></p>" % m.group(1))
+                "page</a></p>" % html.escape(target, quote=True))
 
     def caddy(self, t):
         """Bind the shared Caddyfile fragments.
@@ -3911,7 +3924,6 @@ class Renderer:
                     "@DEFAULT_SNI@",
                     f"  default_sni {self.spec.domain}"
                     if isinstance(ip, ipaddress.IPv4Address) else "")
-            text = text.replace("@PORTAL_HINT@", self.portal_hint())
             text = text.replace("@MANAGED_BY@", "agentbox apply")
             text = text.replace("@APPLY_CMD@", "agentbox apply")
             text = text.replace("@RELOAD_CMD@", CADDY_RELOAD_CMD)
@@ -3940,13 +3952,15 @@ class Renderer:
                 ]:
                     text = text.replace(token, value)
             left = re.findall(r"@[A-Z_]+@", text.replace(
-                "@WEBHOOK_ROUTES@", ""))
+                "@WEBHOOK_ROUTES@", "").replace("@PORTAL_HINT@", ""))
             if left:
                 raise ConfigError(
                     f"caddyfile-{name}.caddy has unbound token(s) "
                     f"{sorted(set(left))} — the fragment gained a token the "
                     "native renderer does not know about")
-            return text
+            # Insert URL data after binding tokens so marker-like path text
+            # remains literal, matching Nix's non-recursive replaceStrings.
+            return text.replace("@PORTAL_HINT@", self.portal_hint())
 
         parts = [bind("header")]
         for u in self.spec.users:
@@ -4665,6 +4679,13 @@ def commit(tree, args):
     for path, (text, mode) in sorted(tree.files.items()):
         if write_if_changed(path, text, mode, args.dry_run):
             changed += 1
+            # EnvironmentFile paths stay stable across apply. An active
+            # daemon must reread changed contents even if its unit did not.
+            match = re.fullmatch(r"agent-box-settings-([a-z_][a-z0-9_-]*)\.env",
+                                 Path(path).name)
+            if match:
+                tree.settings_restart.add(
+                    f"agent-box-settings@{match.group(1)}.service")
     for link, target in sorted(tree.links):
         if link_if_changed(link, target, args.dry_run):
             changed += 1
@@ -4875,6 +4896,10 @@ def activate(spec, tree, removed, advisory, act):
     if "nix-daemon.service" in active_units("nix-daemon.service"):
         act.require("refresh Nix daemon TLS trust",
                     ["systemctl", "restart", "nix-daemon.service"])
+    for unit in sorted(tree.settings_restart):
+        if unit in active_units(unit):
+            if not act.require(f"refresh {unit}", ["systemctl", "restart", unit]):
+                failed_starts.add(unit)
     # Enable what the config declares; stop instances for users that
     # were removed from it, so a shrinking config is honored too.
     for unit in tree.units:

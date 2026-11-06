@@ -63,6 +63,10 @@ param portalUser string = ''
 @maxLength(512)
 param portalIssuer string = ''
 
+@description('Destination of the portal link on the unauthenticated 401 page, including a per-box path if needed. Empty uses the portal issuer origin. Public HTTP(S) URL only; no credentials or private account identifiers. Requires a runtime supporting web.portalRedirectUrl when using a prebuilt image.')
+@maxLength(2048)
+param portalRedirectUrl string = ''
+
 // The picker annotates each value with vCPU/RAM/price because the portal's
 // generated form renders allowed values verbatim - there is no separate label
 // field, exactly as with the Lightsail template's BundleId. Only the first
@@ -439,6 +443,7 @@ install -d -m 0755 /etc/agent-box
 # decorator, so the check has to happen at runtime instead. A bad value fails
 # the boot rather than landing in config.yaml unvetted.
 portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
+portal_redirect_url="$(printf %s '@@PORTALREDIRECTURLB64@@' | base64 -d)"
 portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
 if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
   if ! [[ "$portal_issuer" =~ ^https://[A-Za-z0-9._~:/?#@\!\&\(\)*+,\;=%-]+$ ]]; then
@@ -449,6 +454,19 @@ if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
     echo "portalUser is not a plain account id" >&2
     exit 1
   fi
+fi
+if ! PORTAL_REDIRECT_URL="$portal_redirect_url" python3 - <<'PYURL'
+import os
+import re
+import sys
+
+value = os.environ["PORTAL_REDIRECT_URL"]
+origin = r"https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?"
+if value and not re.fullmatch(origin + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?", value):
+    sys.exit("portalRedirectUrl is not a plain HTTP(S) URL")
+PYURL
+then
+  exit 1
 fi
 public_ip="$(printf %s '@@PUBLICIPB64@@' | base64 -d)"
 if ! [[ "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
@@ -493,6 +511,7 @@ web:
   # handover route and no unauthenticated endpoint. No key is configured --
   # the box fetches the portal's published key set from this issuer.
   portalIssuer: '@PORTALISSUER@'
+  portalRedirectUrl: '@PORTALREDIRECTURL@'
 users:
   @@USER@@:
     root: true
@@ -508,10 +527,19 @@ AGENTBOX_CONFIG
 # them too costs nothing and keeps all substitutions uniform. box_aliases is
 # already JSON made from validated DNS suffixes and the validated public IP.
 esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
+esc_redirect=$(printf '%s' "$portal_redirect_url" | sed -e 's/[&\]/\\&/g')
 esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
 esc_domain=$(printf '%s' "$public_ip" | sed -e 's/[&\]/\\&/g')
 sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIASES@|$box_aliases|; s|@DOMAIN@|$esc_domain|" \
   /etc/agent-box/config.yaml
+# Old prebuilt runtimes do not know this optional field. Keep their issuer
+# fallback usable when no redirect was requested.
+if [ -z "$portal_redirect_url" ]; then
+  sed -i "/^  portalRedirectUrl:/d" /etc/agent-box/config.yaml
+else
+  # Last, and only in its own scalar: marker-like URL text stays literal.
+  sed -i "/^  portalRedirectUrl:/s|@PORTALREDIRECTURL@|$esc_redirect|" /etc/agent-box/config.yaml
+fi
 
 # Extra standing instructions for the agent, if the deployment gave any.
 install -d -m 0755 /etc/agent-box-guides
@@ -557,7 +585,7 @@ var portalOn = !empty(portalUser) && !empty(portalIssuer)
 var portalUserYaml = portalOn ? portalUser : ''
 var portalIssuerYaml = portalOn ? portalIssuer : ''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
@@ -569,6 +597,7 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   '@@SSLIPDOMAINSB64@@', base64(string(effectiveSslipDomains))),
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
+  '@@PORTALREDIRECTURLB64@@', base64(portalRedirectUrl)),
   '@@PORTALUSERIDB64@@', base64(portalUserYaml)),
   // ARM string(true) renders `True`, while the shell branch deliberately
   // compares its marker to lowercase `true`.
