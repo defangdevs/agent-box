@@ -21669,6 +21669,8 @@ in
 #                                 sign-in cards (claude, codex, github)
 #   AGENT_BOX_PORTAL_ISSUER      portal handover (issue #541): the `iss`
 #                                 a handover token must carry
+#   AGENT_BOX_PORTAL_REDIRECT_URL  optional return link for the 401 page
+#                                 (defaults to the issuer's origin)
 #   AGENT_BOX_PORTAL_JWKS_URL    where the portal publishes its signing
 #                                 keys; defaults to the issuer's
 #                                 /.well-known/jwks.json
@@ -21870,6 +21872,7 @@ HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 # whether THIS user declares exactly that (sub, project) pair below. The
 # signature only proves the portal said it.
 PORTAL_ISSUER = os.environ.get("AGENT_BOX_PORTAL_ISSUER", "")
+PORTAL_REDIRECT_URL = os.environ.get("AGENT_BOX_PORTAL_REDIRECT_URL", "")
 # Where the portal publishes its signing keys. Derived from the ISSUER, not
 # from anything in the token: a `jku`/`kid` that could point the box at a
 # key server of the caller's choosing would make the signature check
@@ -27276,15 +27279,27 @@ AUTH_REQUIRED_BODY = """<!doctype html><html lang='en'><meta charset='utf-8'><me
 # or expired portal session: forward_auth passes this daemon's refusal
 # through without Caddy's own error handler. Only the issuer's origin is
 # linked, and only when it is a plain http(s) origin.
-_PORTAL_ORIGIN = re.fullmatch(
-    r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?)"
-    r"(?:[/?#].*)?", PORTAL_ISSUER)
-if _PORTAL_ORIGIN:
+_PORTAL_ORIGIN_RE = (
+    r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])"
+    r"(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|"
+    r"[1-5]?[0-9]{1,4}))?)")
+# Same rules as the Caddy page (portal_hint / portalHint): a configured
+# return URL keeps its path, query and fragment; unset falls back to the
+# issuer's origin. Anything that could escape the attribute is refused.
+if PORTAL_REDIRECT_URL:
+    _PORTAL_TARGET = (PORTAL_REDIRECT_URL if re.fullmatch(
+        _PORTAL_ORIGIN_RE
+        + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?",
+        PORTAL_REDIRECT_URL) else "")
+else:
+    _m = re.fullmatch(_PORTAL_ORIGIN_RE + r"(?:[/?#].*)?", PORTAL_ISSUER)
+    _PORTAL_TARGET = _m.group(1) if _m else ""
+if _PORTAL_TARGET:
     AUTH_REQUIRED_BODY = AUTH_REQUIRED_BODY.replace(
         "</section>",
         "<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
         "style='color:#58a6ff'>Open this box from your portal page</a></p>"
-        "</section>" % _PORTAL_ORIGIN.group(1))
+        "</section>" % _PORTAL_TARGET.replace("&", "&amp;"))
 
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
@@ -35259,7 +35274,7 @@ if __name__ == "__main__":
       # issuer's origin. Neither HTML nor Caddy may interpret URL syntax.
       portalHint =
         let
-          origin = "(https?://([A-Za-z0-9.-]+|[[][0-9A-Fa-f:.]+[]])(:[0-9]+)?)";
+          origin = "(https?://([A-Za-z0-9.-]+|[[][0-9A-Fa-f:.]+[]])(:(6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5]?[0-9]{1,4}))?)";
           redirect = cfg.web.portalRedirectUrl;
           redirectMatch = builtins.match "${origin}([/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?" redirect;
           issuerMatch = builtins.match "${origin}([/?#].*)?" cfg.web.portalIssuer;
@@ -36240,6 +36255,8 @@ if __name__ == "__main__":
             # than passed empty.
             + lib.optionalString (portalHandoffFor name) (
                 "AGENT_BOX_PORTAL_ISSUER=${cfg.web.portalIssuer}\n"
+                + lib.optionalString (cfg.web.portalRedirectUrl != "")
+                    "AGENT_BOX_PORTAL_REDIRECT_URL=${cfg.web.portalRedirectUrl}\n"
                 # Only when overridden: the daemon derives the well-known
                 # path from the issuer, so passing it unconditionally would
                 # be one more place the default could drift.

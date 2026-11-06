@@ -606,7 +606,12 @@ def check_written_config(template: dict) -> int:
                       file=sys.stderr)
                 rc = 1
                 continue
-            assert web.get("portalRedirectUrl") == PORTAL_REDIRECT_SAMPLE, web
+            if web.get("portalRedirectUrl") != PORTAL_REDIRECT_SAMPLE:
+                print("FAIL: %s: portalRedirectUrl landed as %r, wanted %r"
+                      % (label, web.get("portalRedirectUrl"),
+                         PORTAL_REDIRECT_SAMPLE), file=sys.stderr)
+                rc = 1
+                continue
             got = (web.get("portalIssuer"), u.get("portalUser"))
             # Off is empty VALUES, not absent keys, which is what the module
             # already reads as off.
