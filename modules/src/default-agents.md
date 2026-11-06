@@ -462,7 +462,8 @@ accuracy, `--model base --lang auto` for other languages). The audio never
 leaves the box and nothing is compiled: the first run fetches python, pip
 and ffmpeg from the box's pinned nixpkgs binary cache, installs a prebuilt,
 hash-pinned whisper.cpp wheel with pip, and downloads one model (about 200 MB
-in all, in `~/.cache/agent-box-transcribe`); later runs only decode, at several
+in all with the default `base.en`; `--model small.en` alone is 488 MB; all in
+`~/.cache/agent-box-transcribe`); later runs only decode, at several
 times real time on 2 vCPUs. It reads at most the first 15 minutes of a clip and
 warns on stderr when it cuts one; split longer recordings. Do not run
 `nix shell nixpkgs#whisper-cpp` yourself: the unpinned `nixpkgs` registry

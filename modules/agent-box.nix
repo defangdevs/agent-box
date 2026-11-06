@@ -1677,7 +1677,8 @@ let
     leaves the box and nothing is compiled: the first run fetches python, pip
     and ffmpeg from the box's pinned nixpkgs binary cache, installs a prebuilt,
     hash-pinned whisper.cpp wheel with pip, and downloads one model (about 200 MB
-    in all, in `~/.cache/agent-box-transcribe`); later runs only decode, at several
+    in all with the default `base.en`; `--model small.en` alone is 488 MB; all in
+    `~/.cache/agent-box-transcribe`); later runs only decode, at several
     times real time on 2 vCPUs. It reads at most the first 15 minutes of a clip and
     warns on stderr when it cuts one; split longer recordings. Do not run
     `nix shell nixpkgs#whisper-cpp` yourself: the unpinned `nixpkgs` registry
@@ -13082,7 +13083,8 @@ fast instead of building). whisper.cpp comes from the prebuilt pywhispercpp
 wheel, installed by pip with --require-hashes from the pins in
 modules/src/transcribe/requirements.txt (Dependabot bumps them). The ggml model
 comes from Hugging Face, pinned by sha256. The first run downloads about 200 MB
-into ~/.cache/agent-box-transcribe; later runs only decode."""
+(with the default base.en model, 148 MB; small.en alone is 488 MB) into
+~/.cache/agent-box-transcribe; later runs only decode."""
 import hashlib
 import json
 import os
@@ -13191,18 +13193,32 @@ def fetch(url, dest, sha256, size_cap):
 NIXPKGS = os.environ.get('AGENT_BOX_NIXPKGS') or 'nixpkgs'
 
 
+def nix_bin():
+    """The nix this box uses: AGENT_BOX_NIX_BIN, then PATH, then the standard profiles."""
+    for c in (os.environ.get('AGENT_BOX_NIX_BIN'), shutil.which('nix'),
+              '/nix/var/nix/profiles/default/bin/nix', os.path.expanduser('~/.nix-profile/bin/nix')):
+        if c and os.path.exists(c):
+            return c
+    die('nix was not found: set AGENT_BOX_NIX_BIN or put nix on PATH')
+
+
 def nix_out(attr, link_name, suffix='''):
     """Store path of nixpkgs attr, substituted from the binary cache, never built.
 
     nix appends the output name to the link when it is not `out`; suffix says which."""
-    link = os.path.join(CACHE, link_name)
+    # Keyed by the ref, so a changed AGENT_BOX_NIXPKGS never reuses an old pin's link.
+    link = os.path.join(CACHE, '%s-%s' % (link_name, hashlib.sha256(NIXPKGS.encode()).hexdigest()[:8]))
     path = link + suffix
     if not os.path.exists(path):
         say('fetching %s from the nix binary cache (never built here)' % attr)
         os.makedirs(CACHE, exist_ok=True)
         # --max-jobs 0: substitute or fail. Compiling on a small box runs it out of memory.
-        r = subprocess.run(['nix', 'build', '--max-jobs', '0', '--out-link', link,
-                            '%s#%s' % (NIXPKGS, attr)], capture_output=True, text=True)
+        try:
+            r = subprocess.run([nix_bin(), '--extra-experimental-features', 'nix-command flakes',
+                                'build', '--max-jobs', '0', '--out-link', link, '%s#%s' % (NIXPKGS, attr)],
+                               capture_output=True, text=True)
+        except OSError as e:
+            die('could not run nix: %s' % e)
         if r.returncode != 0:
             die('%s is not in the binary cache and was not built: %s' % (attr, r.stderr.strip()[-400:]))
     return path
