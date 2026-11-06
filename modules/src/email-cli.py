@@ -225,8 +225,13 @@ def address_watch(cfg, user, address, route):
     profile = Path(account.pw_dir) / ".config/agent-box/profiles" / (route["profile"] + ".env")
     if not profile.is_file():
         raise ValueError("email worker profile does not exist")
-    harness = re.search(r'^HARNESS=["\']?([A-Za-z0-9_-]+)["\']?[ \t]*$', profile.read_text(errors="replace"), re.M)
-    if not harness or harness.group(1) == "shell":
+    with profile.open(encoding="utf-8", errors="replace") as source:
+        text = source.read(65537)
+    if len(text) > 65536:
+        raise ValueError("email worker profile is too large")
+    # The env store is last-value-wins, so the last HARNESS decides the launch.
+    harness = re.findall(r'^HARNESS=["\']?([A-Za-z0-9_-]+)["\']?[ \t]*$', text, re.M)
+    if not harness or harness[-1] == "shell":
         raise ValueError("email worker profile needs a HARNESS (claude or codex)")
     env = dict(os.environ, HOME=account.pw_dir,
                LOCAL_WEBHOOK_STATE_DIR=str(Path(account.pw_dir) / ".local/state/local-webhook"),
@@ -240,7 +245,9 @@ def address_watch(cfg, user, address, route):
     def covers(topic):
         topic, wanted = topic.lower(), "email:" + address.lower()
         return topic == wanted or (topic.endswith("/*") and wanted.startswith(topic[:-1]))
-    if any(covers(w.get("topic", "")) and w.get("name") != "email-address" for w in watches):
+    if any(covers(w.get("topic", "")) and not (w.get("name") == "email-address"
+                                               and w.get("topic", "").lower() == "email:" + address.lower())
+           for w in watches):
         raise ValueError("another automatic rule handles this address; remove that rule before registering it")
     command = [sys.executable, WEBHOOK, "subscribe", "email:" + address,
                "--deliver-to", "subagent", "--name", "email-address", "--ttl", "0",
