@@ -702,7 +702,8 @@ BOX_SCHEMA = _Obj({
     # only overrides that path.
     "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
                  "alias": DOMAIN_SUFFIX, "aliases": STR_LIST,
-                 "portalIssuer": STR, "portalJwksUrl": STR}),
+                 "portalIssuer": STR, "portalJwksUrl": STR,
+                 "portalRedirectUrl": STR}),
     "email": _Obj({
         "enable": BOOL, "domains": STR_LIST,
         "certificateFile": STR, "keyFile": STR,
@@ -872,6 +873,7 @@ class Spec:
         # means no handover route is served at all, so a box nobody wired to
         # a portal exposes no unauthenticated endpoint.
         self.portal_issuer = web.get("portalIssuer") or ""
+        self.portal_redirect_url = web.get("portalRedirectUrl") or ""
         self.portal_jwks_url = web.get("portalJwksUrl") or ""
         self.protect_memory = bool(data.get("protectMemory", True))
         # Rootless containers for the agent users (issue #600).
@@ -3863,18 +3865,23 @@ class Renderer:
     def portal_hint(self):
         """HTML for the 401 page's portal link, or "" (issue #937).
 
-        Only the issuer's scheme+host[:port] is linked, and only when it
-        has no character that could break out of the Caddy string or the
-        attribute; anything else renders no hint rather than a broken page.
+        A configured return URL keeps its path, query and fragment. Unset
+        falls back to the issuer's origin. Reject syntax that could escape
+        the HTML attribute or Caddy string, including Caddy placeholders.
         """
-        m = re.fullmatch(r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?)"
-                         r"(?:[/?#].*)?",
-                         self.spec.portal_issuer)
-        if not m:
-            return ""
+        origin = r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?)"
+        if self.spec.portal_redirect_url:
+            target = self.spec.portal_redirect_url
+            if not re.fullmatch(origin + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?", target):
+                return ""
+        else:
+            m = re.fullmatch(origin + r"(?:[/?#].*)?", self.spec.portal_issuer)
+            if not m:
+                return ""
+            target = m.group(1)
         return ("<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
                 "style='color:#58a6ff'>Open this box from your portal "
-                "page</a></p>" % m.group(1))
+                "page</a></p>" % target.replace("&", "&amp;"))
 
     def caddy(self, t):
         """Bind the shared Caddyfile fragments.
@@ -3904,7 +3911,6 @@ class Renderer:
                     "@DEFAULT_SNI@",
                     f"  default_sni {self.spec.domain}"
                     if isinstance(ip, ipaddress.IPv4Address) else "")
-            text = text.replace("@PORTAL_HINT@", self.portal_hint())
             text = text.replace("@MANAGED_BY@", "agentbox apply")
             text = text.replace("@APPLY_CMD@", "agentbox apply")
             text = text.replace("@RELOAD_CMD@", CADDY_RELOAD_CMD)
@@ -3933,13 +3939,15 @@ class Renderer:
                 ]:
                     text = text.replace(token, value)
             left = re.findall(r"@[A-Z_]+@", text.replace(
-                "@WEBHOOK_ROUTES@", ""))
+                "@WEBHOOK_ROUTES@", "").replace("@PORTAL_HINT@", ""))
             if left:
                 raise ConfigError(
                     f"caddyfile-{name}.caddy has unbound token(s) "
                     f"{sorted(set(left))} — the fragment gained a token the "
                     "native renderer does not know about")
-            return text
+            # Insert URL data after binding tokens so marker-like path text
+            # remains literal, matching Nix's non-recursive replaceStrings.
+            return text.replace("@PORTAL_HINT@", self.portal_hint())
 
         parts = [bind("header")]
         for u in self.spec.users:

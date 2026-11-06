@@ -4794,6 +4794,41 @@ class PortalHandoff(unittest.TestCase):
             "/etc/agent-box/Caddyfile"]
         self.assertNotIn(hint, bad)
 
+    def test_401_redirect_preserves_the_destination_without_changing_trust(self):
+        target = "https://station.example.com/app/stations/42?a=1&b=2#connect"
+        web = dict(self.PORTAL_WEB, portalRedirectUrl=target)
+        files = self._render({"agent": dict(self.MAPPED)}, web)
+        self.assertIn("href='" + target.replace("&", "&amp;") + "'",
+                      files["/etc/agent-box/Caddyfile"])
+        env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+        self.assertIn("AGENT_BOX_PORTAL_ISSUER=https://station.example.com\n", env)
+        self.assertNotIn(target, env)
+        # The informational link can also be used without handover configured.
+        without_issuer = self._render({"agent": {"root": True}},
+                                     {"portalRedirectUrl": target})
+        self.assertIn("/app/stations/42", without_issuer["/etc/agent-box/Caddyfile"])
+
+    def test_401_redirect_keeps_template_marker_text_literal(self):
+        target = "https://station.example.com/@DOMAIN@/@MANAGED_BY@?x=@PORTALUSERID@"
+        files = self._render({"agent": {"root": True}},
+                             dict(self.PORTAL_WEB, portalRedirectUrl=target))
+        self.assertIn("href='" + target + "'", files["/etc/agent-box/Caddyfile"])
+
+    def test_401_redirect_falls_back_only_when_unset(self):
+        for target in (None, ""):
+            web = dict(self.PORTAL_WEB, portalRedirectUrl=target)
+            files = self._render({"agent": {"root": True}}, web)
+            self.assertIn("href='https://station.example.com'",
+                          files["/etc/agent-box/Caddyfile"])
+        for target in ("javascript:alert(1)", "//evil.test/", "https://x.test/'",
+                       'https://x.test/"', "https://x.test/\nnext",
+                       "https://x.test/{http.request.host}", "https://x.test/\\path"):
+            with self.subTest(target=target):
+                files = self._render({"agent": {"root": True}},
+                                     dict(self.PORTAL_WEB, portalRedirectUrl=target))
+                self.assertNotIn("Open this box from your portal page",
+                                 files["/etc/agent-box/Caddyfile"])
+
     def test_the_jwks_url_is_passed_only_when_overridden(self):
         """Keys are FETCHED, so there is nothing to configure per rotation.
 

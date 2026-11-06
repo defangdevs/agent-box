@@ -2275,6 +2275,23 @@ in
         '';
       };
 
+      portalRedirectUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "";
+        example = "https://station.example.com/app/stations/42";
+        description = ''
+          Destination of the portal link on the unauthenticated 401 page.
+          Set this to the specific box's page in a managed portal. Empty
+          (the default) links to portalIssuer's origin instead.
+
+          Accepts an absolute HTTP(S) URL, including a path, query and
+          fragment. Percent-encode spaces, quotes and brackets in the path
+          or query. Invalid values omit the link. This is a public link:
+          do not include credentials or private account identifiers.
+          Token verification and signing-key discovery still use portalIssuer.
+        '';
+      };
+
       portalJwksUrl = lib.mkOption {
         type = lib.types.str;
         default = "";
@@ -3999,13 +4016,20 @@ in
       ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
       isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
       webDomainIsIpv4 = isIpv4 cfg.web.domain;
-      # The 401 page's portal link (issue #937): the issuer's origin only,
-      # and nothing at all for a value that is not a plain http(s) origin.
+      # Preserve a configured destination; only an unset one uses the
+      # issuer's origin. Neither HTML nor Caddy may interpret URL syntax.
       portalHint =
-        let m = builtins.match "(https?://([A-Za-z0-9.-]+|[[][0-9A-Fa-f:.]+[]])(:[0-9]+)?)([/?#].*)?"
-                  cfg.web.portalIssuer;
-        in if m == null then "" else
-          "<p style='margin:12px 0 0;font-size:14px'><a href='${builtins.head m}' style='color:#58a6ff'>Open this box from your portal page</a></p>";
+        let
+          origin = "(https?://([A-Za-z0-9.-]+|[[][0-9A-Fa-f:.]+[]])(:[0-9]+)?)";
+          redirect = cfg.web.portalRedirectUrl;
+          redirectMatch = builtins.match "${origin}([/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?" redirect;
+          issuerMatch = builtins.match "${origin}([/?#].*)?" cfg.web.portalIssuer;
+          target = if redirect != "" then
+            (if redirectMatch == null then "" else redirect)
+            else if issuerMatch == null then "" else builtins.head issuerMatch;
+          href = lib.replaceStrings [ "&" ] [ "&amp;" ] target;
+        in if target == "" then "" else
+          "<p style='margin:12px 0 0;font-size:14px'><a href='${href}' style='color:#58a6ff'>Open this box from your portal page</a></p>";
       webAliases = lib.optional (cfg.web.alias != "") cfg.web.alias ++ cfg.web.aliases;
 
       # Prefix every non-blank line — Nix indented strings strip the common
