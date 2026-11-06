@@ -1683,6 +1683,31 @@ class RenderTest(unittest.TestCase):
                             f"the guide promises `{cmd}`, which this box "
                             f"does not have")
 
+    def test_every_cli_a_payload_looks_up_on_path_is_installed(self):
+        """A shared payload that resolves an agent-box CLI from PATH
+        (`shutil.which(...)` or `command -v ...`) degrades silently when
+        the profile does not ship it: env-exec found no
+        agent-box-webhook-self on native boxes, so no session got
+        LOCAL_WEBHOOK_SELF, "@self" muted nobody, and a hook session
+        received and eyes-reacted to its own PR comment. Every name a
+        payload probes for must be a wrapper or a profile payload."""
+        probed = set()
+        for path in SRC.iterdir():
+            if path.suffix not in (".py", ".sh"):
+                continue
+            text = path.read_text()
+            probed |= set(re.findall(
+                r'shutil\.which\("(agent-box-[a-z0-9-]+)"\)', text))
+            probed |= set(re.findall(
+                r'command -v (agent-box-[a-z0-9-]+)', text))
+        self.assertIn("agent-box-webhook-self", probed)
+        wrappers = {p.name for p in (FIXTURE / "usr/local/bin").iterdir()}
+        payloads = profile_payload_names()
+        for cmd in sorted(probed):
+            self.assertTrue(cmd in wrappers or cmd in payloads,
+                            f"a payload looks up `{cmd}` on PATH, which "
+                            f"the native profile does not install")
+
     def test_the_session_cli_can_reach_the_env_store(self):
         """session-cli.sh reads AGENT_BOX_ENVSTORE_BIN with ${VAR:?}, so an
         unset value is not a degraded `env` verb — it is an error message

@@ -355,6 +355,13 @@ let
     receiveCli
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-bare" "webhook-cli.sh")
+    # The GitHub login this box acts as. env-exec runs it at every session
+    # start and exports LOCAL_WEBHOOK_SELF; without it on PATH, a session's
+    # webhook peer resolves "@self" to nobody, so the spawn-seeded mute and
+    # the default self-echo exclude are inert and the session receives (and
+    # the ack adapter reacts to) its own comments. Needs no env wrapper: it
+    # reads the token from the environment env-exec has already loaded.
+    (payload "agent-box-webhook-self" "webhook-self.sh")
     (pkgs.writers.writePython3Bin "agent-box-webhook-ack" {
       flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
     } (envStoreLib + "\n\n" + ''
