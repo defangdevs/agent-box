@@ -2757,6 +2757,8 @@ def webhook_save(form):
         return False
     if name and not WATCH_NAME_RE.fullmatch(name):
         return False
+    if topic.lower().startswith("email:") and name == "email-address":
+        return False
     if profile and (not PROFILE_NAME_RE.fullmatch(profile)
                     or profile not in read_profiles()):
         return False
@@ -9371,6 +9373,8 @@ def render_webhooks(watches):
     stamp = hook_args_stamp()
     for entry in watches:
         topic = str(entry.get("topic") or "")
+        if topic.startswith("email:") and entry.get("name") == "email-address":
+            continue  # Managed together with SMTP acceptance in the address editor.
         if not topic:
             continue
         note = str(entry.get("note") or "")
@@ -9393,7 +9397,75 @@ def render_webhooks(watches):
     if not rows:
         rows.append('<li class="empty">No automatic session rules.</li>')
     return ('<ul class="tbl"><li class="tbl-head">Automatic session rule</li>'
-            + "".join(rows) + "</ul>" + render_watch_editor())
+            + "".join(rows) + "</ul>" + render_watch_editor() + render_email_addresses())
+
+
+EMAIL_COMMAND = "/etc/agent-box/bin/agent-box-email"
+
+
+def email_cli(args):
+    """All Settings address changes use the same validated CLI as a session."""
+    return subprocess.run([EMAIL_COMMAND, "addresses", *args],
+                          capture_output=True, text=True, timeout=40)
+
+
+def render_email_addresses():
+    if not os.path.isfile("/etc/agent-box/email.json"):
+        return ""
+    try:
+        result = email_cli(["list"])
+        if result.returncode:
+            raise ValueError("email registry unavailable")
+        data = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return '<h3 id="email">Email addresses</h3><p class="note">Email addresses are unavailable.</p>'
+    esc = html.escape
+    profiles = read_profiles()
+
+    def editor(address="", route=None):
+        route = route or {}
+        selected = route.get("profile", "")
+        choices = sorted(set(profiles) | ({selected} if selected else set()))
+        options = '<option value="">Choose a profile</option>' + "".join(
+            '<option value="%s"%s>%s</option>' % (
+                esc(p), " selected" if p == selected else "",
+                esc(p + (" (missing)" if p not in profiles else ""))) for p in choices)
+        return (
+            '<form method="post" action="%s/email/set">' % esc(BASE)
+            + '<label>Email address<input name="address" type="email" required maxlength="320" value="%s" '
+              'placeholder="%s+github@%s"%s></label>' % (
+                  esc(address), esc(data["user"]), esc(data["domains"][0]), " readonly" if address else "")
+            + '<label>Purpose<input name="purpose" required maxlength="500" value="%s" '
+              'placeholder="Triage GitHub notifications"></label>' % esc(route.get("purpose", ""))
+            + '<label>Worker profile<select name="profile" required>%s</select></label>' % options
+            + '<label>Batching window (seconds)<input name="batch_seconds" type="number" required '
+              'min="1" max="3600" value="%s"></label>' % route.get("batchSeconds", 60)
+            + '<button class="btn small" type="submit">%s</button></form>' % (
+                "Save and enable" if address else "Add address"))
+
+    rows = []
+    for address, route in sorted(data["addresses"].items()):
+        safe = esc(address)
+        heading = (
+            '<li class="foldrow prof-row"><details class="watch-editor" data-fold="email-%s">'
+            '<summary><span class="nm"><code>%s</code></span><span class="meta">%s</span></summary>'
+        ) % (safe, safe, "Deferred" if route.get("pending") else "Receiving" if route["enabled"] else "Disabled")
+        disable = ""
+        if route["enabled"] or route.get("pending"):
+            disable = (
+                '<form method="post" action="%s/email/disable">' % esc(BASE)
+                + '<input type="hidden" name="address" value="%s">' % safe
+                + '<button class="btn small" type="submit">Disable reception</button></form>')
+        rows.append(heading + '<div class="fold"><p>%s</p>' % esc(route["purpose"])
+                    + editor(address, route) + disable + '</div></details></li>')
+    return ('<h3 id="email">Email addresses</h3>'
+            '<p class="note">Only registered, enabled addresses receive mail. Each address has its own purpose '
+            'and worker profile. The batching window groups notifications before starting a session. '
+            'Disabling reception keeps the handler for mail already accepted. '
+            'An incomplete handler update defers new mail until it is saved successfully.</p>'
+            + '<ul class="tbl">' + ("".join(rows) or '<li class="empty">No email addresses registered.</li>')
+            + '</ul><details class="watch-editor" data-fold="email-add"><summary>Add email address</summary>'
+            + editor() + '</details>')
 
 
 def render_reboot_line():
@@ -12319,6 +12391,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "page. Open a session and run "
                                  "`agent-box-webhook rotate SOURCE`."), "error"),
         "webhook_saved": ("Automatic session rule saved. Changes apply to the next event.", "ok"),
+        "email_saved": ("Email address saved and reception enabled.", "ok"),
+        "email_disabled": ("Email reception disabled. The handler remains for already accepted mail.", "ok"),
         "webhook_invalid": (("Could not save the rule. Check its topic, name, profile and event predicate. "
                              "Rule names must be unique within a topic."), "error"),
         "webhook_deleted": ("Event rule deleted. The change applies to the next event.", "ok"),
@@ -13762,6 +13836,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if back_page == TERM_HOME and SESSION_RE.match(name):
                 ok += "&tab=" + name
             self._redirect(ok, back_page)
+        elif path in (BASE + "/email/set", BASE + "/email/disable") and WEBHOOKS:
+            operation = path.rsplit("/", 1)[1]
+            args = [operation, form.get("address", [""])[0]]
+            if operation == "set":
+                args += ["--purpose", form.get("purpose", [""])[0],
+                         "--profile", form.get("profile", [""])[0],
+                         "--batch-seconds", form.get("batch_seconds", ["60"])[0]]
+            try:
+                result = email_cli(args)
+                if result.returncode:
+                    raise ValueError("Check the address, purpose, worker profile and batching window. "
+                                     "Remove any older automatic rule for the same address first. "
+                                     "If its handler could not be installed, reception has not been enabled.")
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                self._send_html(render_page("Could not update email address. " + str(error),
+                                            kind="error"), status=400)
+                return
+            self._redirect("ok=email_saved" if operation == "set" else "ok=email_disabled")
         elif path == BASE + "/webhooks/save" and WEBHOOKS:
             ok = webhook_save(form)
             self._redirect("ok=webhook_saved" if ok else "ok=webhook_invalid")
@@ -13770,6 +13862,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             key = (form.get("key", [""])[0]).strip()
             dispatch = bool(form.get("dispatch", [""])[0])
             watch_name = form.get("watch_name", [""])[0]
+            if dispatch and topic.lower().startswith("email:") and watch_name == "email-address":
+                self._redirect("ok=webhook_kept")
+                return
             # The key names a filter file, so hold it to the shape the
             # supervisor mints: this user, and one of this user's own
             # sessions (or the bare user key, which only reads the shared

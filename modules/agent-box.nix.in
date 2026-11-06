@@ -32,7 +32,7 @@ let
   emailUsers = lib.filterAttrs (_: u: u.email) cfg.users;
   emailCli = pkgs.writers.writePython3Bin "agent-box-email" {
     libraries = with pkgs.python3Packages; [ dkimpy pyspf ];
-    flakeIgnore = [ "E501" "E302" "E305" ];
+    flakeIgnore = [ "E501" "E302" "E305" "W503" ];
   } ''
     @@include:src/email-cli.py@@
   '';
@@ -823,6 +823,7 @@ let
     # Same "presence tells an agent the feature is live" reasoning as the
     # two above: a box with no shipped checkout has no agent-box-checkout.
     ++ lib.optional checkoutEnabled checkoutCli
+    ++ lib.optional cfg.email.enable emailCli
     ++ agentBaseTools
     ++ cfg.extraPackages
   );
@@ -3578,7 +3579,8 @@ in
           ReadWritePaths =
             let readWritePaths = agentBoxDirective "ReadWritePaths"; in
             lib.optionals (contractConditionHolds readWritePaths.condition)
-              readWritePaths.templates;
+              readWritePaths.templates
+            ++ lib.optional (cfg.email.enable && u.email) "/var/lib/agent-box-email/addresses/${name}";
           # NoNewPrivileges would break the sudoAllowlist escape hatch (sudo
           # is setuid root; NNP blocks the euid transition). Enable it only
           # when the effective allowlist is empty — with a non-empty
@@ -4651,7 +4653,11 @@ in
               pkgs.jq
             ]);
           };
-        serviceConfig.ExecStart = [ "" (settingsContractBin (lib.elemAt settingsContract.execStart 0)) ];
+        serviceConfig = {
+          ExecStart = [ "" (settingsContractBin (lib.elemAt settingsContract.execStart 0)) ];
+          ReadWritePaths = lib.optional (cfg.email.enable && cfg.users.${name}.email)
+            "/var/lib/agent-box-email/addresses/${name}";
+        };
       }) terminalUsers))
       # Webhook receiver daemon (issue #101), one per terminal user, gated on
       # webhook.enable. Runs webhook.py (via the agent-box-webhook-receiver
@@ -4916,6 +4922,7 @@ in
     };
   }
   (lib.mkIf cfg.email.enable {
+    environment.systemPackages = [ emailCli ];
     assertions = [
       { assertion = webhookEnabled; message = "agent-box email requires web.enable and webhook.enable."; }
       { assertion = emailUsers != { }; message = "agent-box email requires at least one users.<name>.email = true."; }
@@ -4938,12 +4945,14 @@ in
     users.users.smtpd = { isSystemUser = true; group = "smtpd"; };
     users.users.smtpq = { isSystemUser = true; group = "smtpq"; };
     systemd.tmpfiles.rules = [
+      "d /var/lib/agent-box-email 0755 root root - -"
+      "d /var/lib/agent-box-email/addresses 0755 root root - -"
       "d /var/empty 0755 root root - -"
       "d /var/spool/smtpd 0711 root root - -"
       "d /var/spool/smtpd/offline 0770 root smtpq - -"
       "d /var/spool/smtpd/purge 0700 smtpq root - -"
       "d /var/spool/smtpd/queue 0700 smtpq root - -"
-    ];
+    ] ++ lib.mapAttrsToList (name: _: "d /var/lib/agent-box-email/addresses/${name} 2750 ${name} smtpd - -") emailUsers;
     systemd.services = (lib.mapAttrs' (name: _: lib.nameValuePair "agent-box-email-source@${name}" {
       description = "Configure the private email bus source for ${name}";
       before = [ "agent-box-email.service" ];

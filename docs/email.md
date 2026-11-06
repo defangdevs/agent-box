@@ -1,7 +1,7 @@
 # Optional inbound email
 
-Email is disabled by default. When enabled, `<linux-user>@<configured-hostname>`
-feeds that user's existing local-webhook bus. The hostnames can be IP-based
+Email is disabled by default. When enabled, explicitly registered purpose
+addresses feed the owning Linux user's existing local-webhook bus. The hostnames can be IP-based
 names under defangstation.com, sslip.io or nip.io, or domains you manage. They
 must resolve to the receiving box and have an appropriate MX record (these
 three services currently return an MX pointing back to the IP-based hostname).
@@ -64,13 +64,14 @@ set it explicitly when the browser uses a bare IP. No domain suffix is
 hard-coded in the intake.
 
 OpenSMTPD listens on TCP 25 with opportunistic STARTTLS, accepts only the
-enabled user/domain combinations with an optional nonempty `+tag`, and
-rejects all other recipients and relay attempts. Tags use unquoted ASCII
+registered, enabled addresses for configured Linux users and domains.
+Unregistered addresses, including arbitrary `+tags`, and relay attempts are
+rejected at RCPT before any message is queued. Tags use unquoted ASCII
 local-part characters; spaces, quotes and backslashes are not accepted.
 MDA delivery runs as the
 recipient Linux user; mail cannot choose a command or another user's home.
 The explicit delivery userbase bypasses user `.forward` files.
-No implicit subscription/watch is installed.
+No catch-all address or implicit triage watch is installed.
 
 NixOS opens host TCP 25 only when enabled. Native hosts with an independently
 managed firewall also need to allow inbound TCP 25. The EC2/Lightsail
@@ -94,30 +95,75 @@ under the same Linux user as `agent@box.example`. The payload contains
 The adapter normalizes the base user and domain to lowercase and keeps the
 tag as supplied by OpenSMTPD. Tags are sender-controlled routing data.
 
-An exact untagged subscription continues to match only untagged mail.
-Subscribe to a full tagged address to route a particular tag. Use a
-`recipientTag` predicate when an additional payload check is useful:
+## Runtime purpose addresses
+
+In Settings, open **Automations -> Email addresses**. Add a complete address,
+a short purpose, an existing worker profile and a batching window. Each
+address has its own exact-topic standing watch. For example, triage, GitHub
+notifications and Linear notifications can use different profiles and batch
+sizes. Creating and changing addresses needs no rebuild or MTA restart.
+
+The CLI provides the same operations:
+
+```sh
+agent-box-email addresses set agent+triage@box.example \
+  --purpose 'Triage incoming correspondence' --profile triage --batch-seconds 30
+agent-box-email addresses set agent+github@box.example \
+  --purpose 'Triage GitHub notifications' --profile github --batch-seconds 120
+agent-box-email addresses set agent+linear@box.example \
+  --purpose 'Triage Linear notifications' --profile linear --batch-seconds 120
+agent-box-email addresses list
+agent-box-email addresses disable agent+github@box.example
+```
+
+Create purpose-specific worker profiles first. The purpose is included in
+that address's watch briefing; the profile supplies the worker configuration
+and instructions. Register an untagged address explicitly if desired. An
+address must belong to the calling Linux user and a host-configured domain.
+Domain aliases are separate addresses and must each be registered.
+Registry addresses are lowercase, matching the bus's case-insensitive topic
+identity; differently cased spellings cannot acquire separate handlers.
+
+A handler is installed before reception is enabled. Updating an existing
+address first defers new reception with SMTP 451; if saving its handler
+fails, it keeps deferring until a successful save. This prevents a brief
+configuration change from permanently bouncing mail. Disable stops new SMTP
+recipients while preserving the watch for previously accepted mail. Saving
+again enables it.
+Another automatic rule for the same address must be removed first, preventing
+an earlier rule from silently taking its notifications. Managed address
+watches are edited through Email addresses, not the generic rule editor.
+
+The event is `email.received`. Existing durable dispatch, coalescing, claims
+and hook-session admission apply. Batching groups a burst into a session;
+there is no separate agent or dispatcher per idle address. Existing-session
+subscriptions can still observe an explicitly registered address, for example:
 
 ```sh
 agent-box-webhook subscribe email:agent+github@box.example --ttl 1 \
-  --when '{"path":"recipientTag","in":["github"]}' \
-  --note 'GitHub-tagged email'
+  --note 'Observe GitHub mail for this task'
 ```
 
-For example, an agent can use normal routing commands:
+Registries are stored under `/var/lib/agent-box-email/addresses/<user>/`.
+The root-owned parent separates users. Each per-user directory is setgid
+`<user>:smtpd` with mode `2750`; atomically published registry files are
+`0640`. The filter reads bounded, validated metadata without access to the
+user's private webhook state or credentials. Missing or disabled addresses
+receive `550 5.1.1`; an unreadable or corrupt registry receives `451 4.3.0`
+so senders can retry. There are at most 128 entries and 128 KiB per registry.
+Keep these registries with the host's persistent email state.
 
-```sh
-agent-box-webhook subscribe email:agent@40-70-78-11.defangstation.com \
-  --ttl 1 --note 'Email for the work I am handling'
+### Upgrade from unrestricted tags
 
-agent-box-webhook subscribe email:agent@40-70-78-11.defangstation.com \
-  --deliver-to subagent --name email-intake --profile triage \
-  --when '{"path":"event","in":["email.received"]}' \
-  --note 'Triage incoming email as untrusted input'
-```
-
-The event is `email.received`. Existing profiles, watch predicates, claims,
-coalescing and session admission apply.
+This changes reception to deny by default. Existing email watches do not
+implicitly authorize addresses. After deploying this release, register every
+intended address in Settings or with the CLI, including any untagged triage
+address. Remove a prior automatic rule for the same exact address before
+registering its replacement. Until registered, the address is rejected at
+SMTP; senders receiving a permanent refusal may need to resend after setup.
+Already queued mail keeps its transport responsibility and can drain through
+its previous bus handler. No previously accepted email is replayed by adding
+an address.
 
 ## Mandatory sender verification
 

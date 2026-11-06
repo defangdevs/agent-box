@@ -98,6 +98,14 @@
           for address in ("agent+github@box.test", "agent+build+linux@1-2-3-4.defangstation.com"):
               assert client.sendmail("sender@example.org", [address], body) == {}
     '';
+    environment.etc."email-address-probe.py".text = ''
+      import smtplib, sys
+      with smtplib.SMTP("localhost", 25, timeout=20) as client:
+          client.ehlo()
+          client.mail("sender@example.org")
+          code, _ = client.rcpt(sys.argv[1])
+          assert code == int(sys.argv[2]), code
+    '';
     environment.etc."email-local-probe.py".text = ''
       import dkim, pathlib, subprocess, sys
       body = b"From: claimed@example.org\r\nTo: agent@box.test\r\nSubject: Local submission\r\nContent-Transfer-Encoding: 7bit\r\n\r\nLocal private body\r\n"
@@ -139,6 +147,33 @@
     source = json.loads(machine.succeed("cat /home/agent/.local/state/local-webhook/sources.json"))
     assert source["defaultSource"] == "github"
     assert source["sources"]["email"]["retainPayload"] is True
+    # Enabling a Linux user does not implicitly accept its base address or
+    # arbitrary tags. Settings and the CLI publish the same runtime registry.
+    machine.succeed("python3 /etc/email-address-probe.py agent@box.test 550")
+    machine.succeed("su - agent -c 'agent-box-profile set mail-test HARNESS=claude'")
+    smtp_pid = machine.succeed("systemctl show -p MainPID --value agent-box-email.service").strip()
+    result = machine.succeed("su - agent -c 'curl -s --unix-socket /run/agent-box-settings/agent.sock -o /tmp/email-response -w %{http_code} --data address=agent%40box.test --data purpose=triage --data profile=mail-test --data batch_seconds=30 http://localhost/agent/settings/email/set'")
+    assert result == "303", result
+    machine.succeed("python3 /etc/email-address-probe.py agent@box.test 250")
+    for address in ("agent@1-2-3-4.defangstation.com", "agent+github@box.test", "agent+build+linux@1-2-3-4.defangstation.com"):
+        machine.succeed(f"su - agent -c 'agent-box-email addresses set {address} --purpose notifications --profile mail-test --batch-seconds 120'")
+    entries = json.loads(machine.succeed("su - agent -c 'agent-box-webhook ls'"))["dispatch"]["topics"]
+    managed = [e for e in entries if e.get("name") == "email-address"]
+    assert len(managed) == 4
+    assert all(e["spawnConfig"]["profile"] == "mail-test" for e in managed)
+    machine.succeed("python3 /etc/email-address-probe.py agent+linear@box.test 550")
+    machine.succeed("su - agent -c 'agent-box-email addresses disable agent+github@box.test'")
+    machine.succeed("python3 /etc/email-address-probe.py agent+github@box.test 550")
+    machine.succeed("su - agent -c 'agent-box-email addresses set agent+github@box.test --purpose github --profile mail-test --batch-seconds 120'")
+    machine.succeed("python3 /etc/email-address-probe.py agent+github@box.test 250")
+    assert machine.succeed("systemctl show -p MainPID --value agent-box-email.service").strip() == smtp_pid
+    machine.fail("su - other -c 'cat /var/lib/agent-box-email/addresses/agent/addresses.json'")
+    machine.succeed("su - agent -c 'curl -fsS --unix-socket /run/agent-box-settings/agent.sock http://localhost/agent/settings/' | grep 'Email addresses' >/dev/null")
+    # The remainder exercises MTA retry and observer inboxes without starting
+    # actual AI workers. Verify managed watches above, then remove only these
+    # fixture handlers while retaining the exact-address admission registry.
+    for entry in managed:
+        machine.succeed(f"su - agent -c 'agent-box-webhook unsubscribe {entry['topic']} --name email-address --deliver-to subagent'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@box.test --note mail-test'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailwait agent-box-webhook subscribe email:agent@1-2-3-4.defangstation.com --note alias-test'")
     machine.succeed("su - agent -c 'LOCAL_WEBHOOK_SESSION=emailtags agent-box-webhook subscribe email:agent+github@box.test --note tagged-mail-test'")

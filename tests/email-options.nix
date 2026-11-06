@@ -1,8 +1,7 @@
 # Reject invalid recipient configuration before the SMTP service can restart-loop.
 { nixpkgs, system, agent-box, pkgs }:
 let
-  failed = extra:
-    builtins.filter (a: !a.assertion && nixpkgs.lib.hasInfix "agent-box email" a.message)
+  evaluated = extra:
       (nixpkgs.lib.nixosSystem {
         inherit system;
         modules = [
@@ -22,10 +21,17 @@ let
             system.stateVersion = "25.05";
           }
         ];
-      }).config.assertions;
+      }).config;
+  failed = extra:
+    builtins.filter (a: !a.assertion && nixpkgs.lib.hasInfix "agent-box email" a.message)
+      (evaluated extra).assertions;
+  enabled = evaluated { };
   rejects = label: extra: builtins.any (a: nixpkgs.lib.hasInfix label a.message) (failed extra);
 in
 assert failed { } == [ ];
+assert builtins.elem "/var/lib/agent-box-email/addresses/agent" enabled.systemd.services."agent-box@agent".serviceConfig.ReadWritePaths;
+assert builtins.elem "/var/lib/agent-box-email/addresses/agent" enabled.systemd.services."agent-box-settings@agent".serviceConfig.ReadWritePaths;
+assert builtins.elem "d /var/lib/agent-box-email/addresses/agent 2750 agent smtpd - -" enabled.systemd.tmpfiles.rules;
 assert failed { email.domains = [ "a" "1-2-3-4.defangstation.com" ]; } == [ ];
 assert failed { users._worker = { email = true; web.passwordHashFile = "/etc/worker.hash"; }; } == [ ];
 assert rejects "email.domains" { email.domains = [ "box.test." ]; };

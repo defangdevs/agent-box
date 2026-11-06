@@ -331,7 +331,7 @@ let
   cliPayloads = [
     (pkgs.writers.writePython3Bin "agent-box-email" {
       libraries = with pkgs.python3Packages; [ dkimpy pyspf ];
-      flakeIgnore = [ "E501" "E302" "E305" ];
+      flakeIgnore = [ "E501" "E302" "E305" "W503" ];
     } (readSrc "email-cli.py"))
     (pkgs.writers.writePython3Bin "agent-box-whatsapp" {
       flakeIgnore = [ "E501" "E302" "E305" ];
