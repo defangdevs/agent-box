@@ -823,6 +823,7 @@ let
     # Same "presence tells an agent the feature is live" reasoning as the
     # two above: a box with no shipped checkout has no agent-box-checkout.
     ++ lib.optional checkoutEnabled checkoutCli
+    ++ lib.optional cfg.email.enable emailCli
     ++ agentBaseTools
     ++ cfg.extraPackages
   );

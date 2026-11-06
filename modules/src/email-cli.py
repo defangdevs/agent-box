@@ -179,9 +179,12 @@ def read_addresses(cfg, user):
         raise ValueError("invalid email address registry")
     for address, route in data.items():
         normalized, base, _ = recipient_parts(address)
+        # An entry for a domain that was removed from the configuration is
+        # inert (recipient_decision refuses it) but must not make the whole
+        # registry unreadable; it stays listable and can be disabled.
         if (normalized.lower() != address or len(address) > 254 or len(address.split('@', 1)[0]) > 64
-                or base not in [user + '@' + d.lower() for d in cfg["domains"]]):
-            raise ValueError("email address must belong to its configured Linux user and domain")
+                or base.split('@', 1)[0] != user):
+            raise ValueError("email address must belong to its Linux user")
         if (not isinstance(route, dict) or type(route.get("enabled")) is not bool
                 or type(route.get("pending", False)) is not bool
                 or not isinstance(route.get("purpose"), str) or not route["purpose"].strip()
@@ -222,6 +225,9 @@ def address_watch(cfg, user, address, route):
     profile = Path(account.pw_dir) / ".config/agent-box/profiles" / (route["profile"] + ".env")
     if not profile.is_file():
         raise ValueError("email worker profile does not exist")
+    harness = re.search(r'^HARNESS=["\']?([A-Za-z0-9_-]+)["\']?[ \t]*$', profile.read_text(errors="replace"), re.M)
+    if not harness or harness.group(1) == "shell":
+        raise ValueError("email worker profile needs a HARNESS (claude or codex)")
     env = dict(os.environ, HOME=account.pw_dir,
                LOCAL_WEBHOOK_STATE_DIR=str(Path(account.pw_dir) / ".local/state/local-webhook"),
                LOCAL_WEBHOOK_HTTP_SOCK="/run/agent-box-webhook/" + user + ".sock")
@@ -230,8 +236,10 @@ def address_watch(cfg, user, address, route):
     if listing.returncode:
         raise OSError("could not inspect existing email address handlers")
     watches = json.loads(listing.stdout).get("dispatch", {}).get("topics", [])
-    if any(w.get("topic", "").lower() == ("email:" + address).lower()
-           and w.get("name") != "email-address" for w in watches):
+    def covers(topic):
+        topic, wanted = topic.lower(), "email:" + address.lower()
+        return topic == wanted or (topic.endswith("/*") and wanted.startswith(topic[:-1]))
+    if any(covers(w.get("topic", "")) and w.get("name") != "email-address" for w in watches):
         raise ValueError("another automatic rule handles this address; remove that rule before registering it")
     command = [sys.executable, WEBHOOK, "subscribe", "email:" + address,
                "--deliver-to", "subagent", "--name", "email-address", "--ttl", "0",
@@ -255,8 +263,9 @@ def manage_addresses(cfg, args):
     # The bus matches email topics case-insensitively. Use that same identity
     # so differently cased tags cannot configure two handlers for one topic.
     address = address.lower()
-    if (len(address) > 254 or len(address.split('@', 1)[0]) > 64
-            or base not in [user + '@' + d.lower() for d in cfg["domains"]]):
+    in_domain = base in [user + '@' + d.lower() for d in cfg["domains"]]
+    if (len(address) > 254 or len(address.split('@', 1)[0]) > 64 or base.split('@', 1)[0] != user
+            or not (in_domain or args.operation == "disable")):
         raise ValueError("email address must belong to your Linux user and a configured domain")
     # The root-owned parent fixes the directory identity. Never follow a
     # caller-supplied lock symlink or block indefinitely behind a stuck CLI.
@@ -282,6 +291,9 @@ def manage_addresses(cfg, args):
             if address not in data and len(data) >= MAX_ADDRESSES:
                 raise ValueError("email address limit reached")
             route = {"purpose": purpose, "profile": args.profile, "batchSeconds": args.batch_seconds, "enabled": True}
+            final = dict(data, **{address: route})
+            if len(json.dumps(final, sort_keys=True, ensure_ascii=True, indent=2)) + 1 > MAX_ADDRESS_BYTES:
+                raise ValueError("email address registry is full")
             # Defer new mail while replacing its handler. A failed update
             # stays closed without permanently bouncing a sender's retry.
             if address in data:
