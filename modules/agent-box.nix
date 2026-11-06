@@ -2610,6 +2610,15 @@ def main(argv):
     home = os.path.expanduser("~")
     config = os.path.join(home, ".config", "agent-box")
 
+    # Find the two session-start helpers BEFORE the env store and the profile
+    # load: either may set PATH, and a PATH without the runtime bin would
+    # hide them. A missing resolver fails silently - "@self" then mutes
+    # nobody, and a session receives (and the box eyes-reacts to) its own
+    # comments - so look them up with the PATH the unit gave us. The
+    # helpers still RUN below, after the load, because they need the token.
+    resolver = shutil.which("agent-box-webhook-self")
+    sweeper = shutil.which("agent-box-webhook-backfill")
+
     # The per-user secrets file the settings page and `agent-box-session env`
     # manage.
     load_into(os.environ, os.path.join(config, "env"))
@@ -2656,7 +2665,6 @@ def main(argv):
     # DNS or egress is broken must still start its sessions. Best effort — no
     # token, no network, no resolver or a slow one leaves the key unset, which
     # is what a box that writes nothing to GitHub wants anyway.
-    resolver = shutil.which("agent-box-webhook-self")
     if resolver:
         try:
             result = subprocess.run(
@@ -2694,7 +2702,6 @@ def main(argv):
     # module option. (Spelled that way round on purpose: `<NAME>=` in any
     # rendered payload, comment included, is what backend-parity reads as a
     # backend SUPPLYING the name, and neither backend supplies this one.)
-    sweeper = shutil.which("agent-box-webhook-backfill")
     if sweeper and os.environ.get("AGENT_BOX_WEBHOOK_BACKFILL", "1") != "0":
         try:
             subprocess.run(
@@ -10807,6 +10814,58 @@ _hc_main "$@"
       esac
     }
 
+    # A caller's own --ignore-sender or --exclude REPLACES the rule that drops
+    # this box's own echoes: the spawn-seeded ["@self"] mute, or the default
+    # self-echo exclude of a new GitHub session subscription. That is often what
+    # the caller wants, so this is a hint, not a refusal: it says whether "@self"
+    # is still muted, and the caller re-runs or keeps it. Shared GitHub accounts
+    # are why the ack adapter cannot decide this by itself: another box's comment
+    # under the same login can be real work.
+    self_echo_hint() {
+      [ "''${ignore_given:-0}" = 1 ] || [ "''${exclude_given:-0}" = 1 ] || return 0
+      self="''${LOCAL_WEBHOOK_SELF:-}"
+      if [ -z "$self" ]; then
+        echo "agent-box-webhook: this box's GitHub login is unknown" \
+             "(LOCAL_WEBHOOK_SELF is unset), so \"@self\" mutes nobody and" \
+             "this box's own comments and pushes arrive as events" >&2
+        return 0
+      fi
+      self_lc="$(printf '%s' "$self" | tr '[:upper:]' '[:lower:]')"
+      muted=0
+      if [ "$ignore_given" = 1 ]; then
+        old_ifs=$IFS; IFS=,
+        for ign in $ignore_list; do
+          ign="$(printf '%s' "$ign" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          case "$ign" in ("@self"|"$self_lc") muted=1 ;; esac
+        done
+        IFS=$old_ifs
+        if [ "$muted" = 1 ]; then
+          echo "agent-box-webhook: --ignore-sender includes @self ($self): this" \
+               "box's own events on $topic are muted, its CI results too" >&2
+        else
+          echo "agent-box-webhook: --ignore-sender replaces the sender mute, and" \
+               "@self ($self) is not in it. Add --ignore-sender @self to mute" \
+               "this box's own events, or keep it as-is to receive them" >&2
+        fi
+      fi
+      # Only a session subscription gets the default self-echo exclude; a
+      # standing watch has none to replace.
+      if [ "$exclude_given" = 1 ] && [ "$muted" = 0 ] && [ "$deliver_to" = session ]; then
+        case "$(printf '%s' "$exclude_value" | tr '[:upper:]' '[:lower:]')" in
+          (*"$self_lc"*)
+            echo "agent-box-webhook: --exclude replaces the default exclude; yours" \
+                 "names $self, so check that it still drops this box's own" \
+                 "comments and pushes" >&2 ;;
+          (*)
+            echo "agent-box-webhook: --exclude replaces the default exclude, which" \
+                 "dropped this box's own comments, pushes and reviews ($self)." \
+                 "Yours does not name $self, so they now arrive. Add" \
+                 "--ignore-sender @self (it mutes this box's CI results too) or a" \
+                 "sender clause in --exclude, or keep it as-is" >&2 ;;
+        esac
+      fi
+    }
+
     claim_coverage_hints() {
       # Inspect the generated scope, so paired narrow claims count just like a
       # bare number. Hints neither resolve associations nor change ownership.
@@ -10861,6 +10920,9 @@ _hc_main "$@"
           emitted_include=0
           user_include=""; user_include_flag=""
           note=""; have_note=0
+          # Captured AND forwarded, so the end of this command can say whether the
+          # caller's own mute or exclude still drops this box's echoes ("@self").
+          ignore_given=0; ignore_list=""; exclude_given=0; exclude_value=""
           # Filter --claim out of the argument list as we scan it: webhook.py has
           # never heard of that flag, so it is translated to --include below and
           # must not survive into the exec. Rotate idiom — take from the front,
@@ -10889,6 +10951,8 @@ _hc_main "$@"
                 (events) events_policy="$a"; have_events=1; want=""; continue ;;
                 (uinclude) user_include="$a"; want=""; continue ;;
                 (note) note="$a"; have_note=1; want=""; continue ;;
+                (ignore) ignore_list="$ignore_list,$a" ;;
+                (exclude) exclude_value="$a" ;;
               esac
               want=""
               set -- "$@" "$a"; continue
@@ -10897,8 +10961,18 @@ _hc_main "$@"
               --deliver-to) want=deliver-to ;;
               --name) want=name ;;
               --deliver-to=*) deliver_to="''${a#--deliver-to=}" ;;
-              --drop|--drop=*) have_drop=1 ;;
-              --exclude|--exclude=*) have_exclude=1 ;;
+              # --drop is the old name of --exclude. The value is captured for
+              # the self-echo hint and still forwarded unchanged.
+              --drop|--exclude)
+                case "$a" in (--drop) have_drop=1 ;; (*) have_exclude=1 ;; esac
+                exclude_given=1; want=exclude ;;
+              --drop=*|--exclude=*)
+                case "$a" in (--drop=*) have_drop=1 ;; (*) have_exclude=1 ;; esac
+                exclude_given=1; exclude_value="''${a#*=}" ;;
+              --ignore-sender|--ignore-senders)
+                ignore_given=1; want=ignore ;;
+              --ignore-sender=*|--ignore-senders=*)
+                ignore_given=1; ignore_list="$ignore_list,''${a#*=}" ;;
               # --include and its old name --when are captured, not forwarded:
               # with a claim they are ANDed into one rule below, and without one
               # they are re-emitted unchanged under the spelling the caller used.
@@ -11210,6 +11284,7 @@ _hc_main "$@"
                "--claim sha:<merge commit> (gh pr view N --json mergeCommit --jq" \
                ".mergeCommit.oid), never --claim branch:<default>." >&2
         fi
+        self_echo_hint
         if [ "$deliver_to" = session ] && [ -n "''${topic:-}" ]; then
           remember_codex_wake
         fi

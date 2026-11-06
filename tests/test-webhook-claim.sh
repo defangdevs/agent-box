@@ -848,6 +848,46 @@ if [ -n "$WEBHOOK_PY" ]; then
   done
 fi
 
+# --- a caller's own mute or exclude says whether "@self" is still muted ---
+# The user chose a hint over a refusal (PR #1006 follow-up): the box's login
+# is shared by several boxes, so receiving its "own" comments can be right.
+hint_case() {  # NAME PATTERN(grep -E, or !PATTERN for absent) ARGS...
+  name=$1; pat=$2; shift 2
+  run "$@" >/dev/null
+  case "$pat" in
+    (!*) if grep -Eq "${pat#!}" "$work/err"; then no "$name" "$(cat "$work/err")"
+         else ok "$name"; fi ;;
+    (*)  if grep -Eq "$pat" "$work/err"; then ok "$name"
+         else no "$name" "$(cat "$work/err")"; fi ;;
+  esac
+}
+export LOCAL_WEBHOOK_SELF=DefangDevs
+hint_case "--ignore-sender @self says this box is muted" \
+  'includes @self \(DefangDevs\)' defangdevs/agent-box --ignore-sender @self
+hint_case "--ignore-sender with the login itself, any case, counts as @self" \
+  'includes @self' defangdevs/agent-box --ignore-sender 'bot, defangdevs'
+hint_case "--ignore-sender without @self says it is not muted" \
+  '@self \(DefangDevs\) is not in it' defangdevs/agent-box --ignore-sender=dependabot
+hint_case "--exclude without the login says own echoes now arrive" \
+  'Yours does not name DefangDevs, so they now arrive' \
+  defangdevs/agent-box --exclude '{"path":"event","in":["star"]}'
+hint_case "--exclude naming the login is acknowledged" \
+  'yours names DefangDevs' defangdevs/agent-box \
+  --exclude '{"path":"_senderLower","in":["defangdevs"]}'
+hint_case "--exclude plus --ignore-sender @self gives no exclude warning" \
+  '!now arrive' defangdevs/agent-box --exclude '{}' --ignore-sender @self
+hint_case "a standing watch's --exclude replaces no self-echo default" \
+  '!now arrive' defangdevs/agent-box --deliver-to subagent \
+  --when '{"path":"action","in":["opened"]}' --exclude '{}'
+hint_case "no mute or exclude flag, no hint" \
+  '!@self|now arrive' defangdevs/agent-box
+# Before the capture, a flag's value ahead of the topic became the topic.
+hint_case "--ignore-sender's value before the topic is not read as the topic" \
+  'events on defangdevs/agent-box are muted' --ignore-sender @self defangdevs/agent-box
+unset LOCAL_WEBHOOK_SELF
+hint_case "an unknown login says @self mutes nobody" \
+  '"@self" mutes nobody' defangdevs/agent-box --ignore-sender @self
+
 # The wrapper's own help must say where the instructions belong.
 if bash "$SCRIPT" --help 2>&1 | grep -q "put the worker's instructions"; then
   ok "subscribe --help points worker instructions at a profile"

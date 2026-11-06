@@ -371,6 +371,15 @@ def main(argv):
     home = os.path.expanduser("~")
     config = os.path.join(home, ".config", "agent-box")
 
+    # Find the two session-start helpers BEFORE the env store and the profile
+    # load: either may set PATH, and a PATH without the runtime bin would
+    # hide them. A missing resolver fails silently - "@self" then mutes
+    # nobody, and a session receives (and the box eyes-reacts to) its own
+    # comments - so look them up with the PATH the unit gave us. The
+    # helpers still RUN below, after the load, because they need the token.
+    resolver = shutil.which("agent-box-webhook-self")
+    sweeper = shutil.which("agent-box-webhook-backfill")
+
     # The per-user secrets file the settings page and `agent-box-session env`
     # manage.
     load_into(os.environ, os.path.join(config, "env"))
@@ -417,7 +426,6 @@ def main(argv):
     # DNS or egress is broken must still start its sessions. Best effort — no
     # token, no network, no resolver or a slow one leaves the key unset, which
     # is what a box that writes nothing to GitHub wants anyway.
-    resolver = shutil.which("agent-box-webhook-self")
     if resolver:
         try:
             result = subprocess.run(
@@ -455,7 +463,6 @@ def main(argv):
     # module option. (Spelled that way round on purpose: `<NAME>=` in any
     # rendered payload, comment included, is what backend-parity reads as a
     # backend SUPPLYING the name, and neither backend supplies this one.)
-    sweeper = shutil.which("agent-box-webhook-backfill")
     if sweeper and os.environ.get("AGENT_BOX_WEBHOOK_BACKFILL", "1") != "0":
         try:
             subprocess.run(
