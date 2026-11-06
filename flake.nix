@@ -2949,6 +2949,27 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # Stale-key bound and refresh serialization for the portal JWKS
+          # cache (issue #634), against the assembled daemon.
+          portal-jwks =
+            pkgs.runCommand "agent-box-portal-jwks"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-portal-jwks.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-portal-jwks.py
+              python3 repo/tests/test-portal-jwks.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # Browser-independent protocol coverage for the resumable receiver
           # (issue #898), against the same assembled daemon that ships. This
           # includes a deliberately severed PATCH request and continuation

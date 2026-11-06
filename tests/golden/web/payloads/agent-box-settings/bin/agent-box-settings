@@ -782,6 +782,9 @@ PORTAL_JWKS_URL = os.environ.get("AGENT_BOX_PORTAL_JWKS_URL", "") or (
 # expires anyway, so this is the ceiling on how long a WITHDRAWN key stays
 # usable rather than how quickly a new one is picked up.
 JWKS_TTL = 3600
+# Hard ceiling on trusting a cached key set, outage or not (issue #634):
+# the TTL plus one hour of grace for a portal that is briefly unreachable.
+JWKS_MAX_STALE = 2 * JWKS_TTL
 # Floor between refetches triggered by an unknown `kid`. Without it the
 # unauthenticated handover route is an outbound-request amplifier: a caller
 # minting tokens with random `kid`s would have the box hammer the portal.
@@ -10312,40 +10315,66 @@ def portal_jwks_keys(kid, force=False):
     the cache goes stale into a fresh outbound fetch, which is the same
     lever on the portal this floor exists to deny.
     """
-    now = int(time.time())
-    cached = portal_jwks_read_cache() or {}
-    try:
-        fetched = int(cached.get("fetched", 0))
-    except (TypeError, ValueError):
-        fetched = 0
-    try:
-        attempted = int(cached.get("attempted", 0))
-    except (TypeError, ValueError):
-        attempted = 0
-    keys = cached.get("keys") or []
-    if not isinstance(keys, list):
-        keys = []
-    fresh = keys and now - fetched < JWKS_TTL
-    if fresh and not force:
-        return keys
-    if now - attempted < JWKS_REFETCH_FLOOR:
-        # An attempt happened too recently to try again, whether that was
-        # the ordinary refresh or a forced retry. Answer from what we have
-        # rather than making either path a lever on the portal.
-        return keys
-    document = portal_jwks_fetch()
-    if document is None:
-        # Fetch failed. Stale keys still beat none: the portal being briefly
-        # unreachable should not lock out a handover signed by a key we
-        # already hold. A withdrawn key outliving its withdrawal by up to
-        # JWKS_TTL is the cost, and it is why that value is not days.
-        # `attempted` still moves, so a persistent outage stays capped at
-        # one fetch per JWKS_REFETCH_FLOOR rather than one per request.
+    # The lock is held across the fetch: a concurrent request waits for the
+    # refresh in flight, then re-reads the cache and uses what it produced,
+    # instead of answering 401 or starting a second fetch. A failed attempt
+    # moves `attempted`, so a persistent outage costs one bounded wait per
+    # JWKS_REFETCH_FLOOR and every other request returns at once.
+    with portal_jwks_lock():
+        now = int(time.time())
+        cached = portal_jwks_read_cache() or {}
+        fetched, attempted, keys = portal_jwks_unpack(cached)
+        # Every return below passes through this bound: a key set older
+        # than JWKS_MAX_STALE is no key set, however the refresh went.
+        usable = keys if now - fetched < JWKS_MAX_STALE else []
+        fresh = usable and now - fetched < JWKS_TTL
+        if fresh and not force:
+            return usable
+        if now - attempted < JWKS_REFETCH_FLOOR:
+            # An attempt happened too recently to try again, whether that
+            # was the ordinary refresh or a forced retry. Answer from what
+            # we have rather than making either path a lever on the portal.
+            return usable
+        document = portal_jwks_fetch()
+        after = int(time.time())
+        if document is None:
+            # Fetch failed. Stale keys still beat none, but only until
+            # JWKS_MAX_STALE, measured again AFTER the fetch: it can take
+            # seconds, and must not carry an expiring set past the bound.
+            portal_jwks_write_cache(
+                {"fetched": fetched, "attempted": after, "keys": keys})
+            return keys if after - fetched < JWKS_MAX_STALE else []
         return portal_jwks_write_cache(
-            {"fetched": fetched, "attempted": now, "keys": keys})["keys"]
-    return portal_jwks_write_cache(
-        {"fetched": now, "attempted": now,
-         "keys": document.get("keys", [])})["keys"]
+            {"fetched": after, "attempted": after,
+             "keys": document.get("keys", [])})["keys"]
+
+
+def portal_jwks_unpack(cached):
+    """(fetched, attempted, keys) from a cache record, tolerating junk."""
+    def seconds(name):
+        try:
+            return int(cached.get(name, 0))
+        except (TypeError, ValueError):
+            return 0
+    keys = cached.get("keys") or []
+    return seconds("fetched"), seconds("attempted"), (
+        keys if isinstance(keys, list) else [])
+
+
+@contextlib.contextmanager
+def portal_jwks_lock():
+    """Serialize cache read-decide-reserve across threads and processes."""
+    with _PORTAL_JWKS_THREAD_LOCK:
+        fd = os.open(portal_jwks_cache_path() + ".lock",
+                     os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+
+_PORTAL_JWKS_THREAD_LOCK = threading.Lock()
 
 
 # SubjectPublicKeyInfo prefix for an Ed25519 key: SEQUENCE { SEQUENCE {

@@ -156,8 +156,10 @@ skew allowance — so a minute after you stop using it).
 
 **An outage is survivable, but not indefinitely.** If the endpoint is
 unreachable the box keeps using the keys it already cached, so a brief blip
-does not lock anyone out. The cost is that a **withdrawn** key stays usable
-for up to the cache hour. If you need a key dead sooner than that, the
+does not lock anyone out, but never for more than two hours after the last
+successful fetch: past that the box rejects handovers until the endpoint
+answers (Basic authentication still works). The cost is that a **withdrawn**
+key stays usable for up to those two hours. If you need a key dead sooner than that, the
 revocation to reach for is per-account (§6), not the key set.
 
 ## 3. Delivery: POST, never a URL
