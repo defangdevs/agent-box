@@ -536,7 +536,8 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             } ''
               python3 ${./tests/test-ci-scheduling.py} ${./scripts/ci-vm-tests.sh} \
                 ${./.github/workflows/ci.yml} \
-                ${pkgs.writeText "ci-vm-lanes.json" (builtins.toJSON ciVmLanes)}
+                ${pkgs.writeText "ci-vm-lanes.json" (builtins.toJSON ciVmLanes)} \
+                ${./.github/path-filters/ci.paths}
               touch "$out"
             '';
 
@@ -2071,6 +2072,80 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cat log
               cp log "$out"
             '';
+
+          # The path filters and the always-reporting CI gate (issue #632).
+          # The gate is a REQUIRED status check, so both of its failure
+          # directions are silent: a filter that matches too little skips
+          # the checks and reports green over the change that needed them,
+          # and one that matches too much runs the whole VM suite on a
+          # docs commit. The `Wiring` cases are the ones no other check
+          # can see - that a gated workflow has not grown a trigger-level
+          # `paths:` again, which is exactly what made green CI
+          # unrequireable before.
+          changed-paths =
+            pkgs.runCommand "agent-box-changed-paths"
+              {
+                nativeBuildInputs = [ pkgs.python3 pkgs.git ];
+                matcher = ./scripts/changed_paths.py;
+                tests = ./tests/test-changed-paths.py;
+                filters = ./.github/path-filters;
+                workflows = ./.github/workflows;
+              } ''
+              install -d repo/scripts repo/tests repo/.github
+              cp "$matcher" repo/scripts/changed_paths.py
+              cp "$tests" repo/tests/test-changed-paths.py
+              cp -r "$filters" repo/.github/path-filters
+              cp -r "$workflows" repo/.github/workflows
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to
+              # be python's own.
+              python3 repo/tests/test-changed-paths.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # The release manifest promotion records (issue #632): the
+          # identities the deployment test ran against and the identities
+          # the published templates carry. Weighted at the refusals, since
+          # a manifest that verifies when it should not is how an untested
+          # artifact becomes the public install default - and it looks
+          # exactly like a pass. Hermetic: no network, and
+          # `nix-prefetch-url` is a stub the test writes itself.
+          release-manifest =
+            pkgs.runCommand "agent-box-release-manifest"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                # Not `builder`, which is a derivation's own
+                # reserved attribute.
+                manifester = ./scripts/release_manifest.py;
+                tests = ./tests/test-release-manifest.py;
+              } ''
+              install -d repo/scripts repo/tests
+              cp "$manifester" repo/scripts/release_manifest.py
+              cp "$tests" repo/tests/test-release-manifest.py
+              python3 repo/tests/test-release-manifest.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          release-workflows = pkgs.runCommand "agent-box-release-workflows" {
+            nativeBuildInputs = [
+              pkgs.bash pkgs.git pkgs.jq
+              (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+            ];
+          } ''
+            mkdir -p repo/tests repo/.github
+            cp ${./tests/test-release-workflows.py} repo/tests/test-release-workflows.py
+            cp -r ${./.github/workflows} repo/.github/workflows
+            python3 repo/tests/test-release-workflows.py
+            touch "$out"
+          '';
 
           # Unit test for agent-box-upload (issue #368). The three things it
           # gets right were shipped WRONG first, as a curl recipe in the guide
