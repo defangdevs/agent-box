@@ -236,6 +236,7 @@ def address_watch(cfg, user, address, route):
     if listing.returncode:
         raise OSError("could not inspect existing email address handlers")
     watches = json.loads(listing.stdout).get("dispatch", {}).get("topics", [])
+
     def covers(topic):
         topic, wanted = topic.lower(), "email:" + address.lower()
         return topic == wanted or (topic.endswith("/*") and wanted.startswith(topic[:-1]))
