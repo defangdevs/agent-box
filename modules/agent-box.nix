@@ -36256,7 +36256,10 @@ if __name__ == "__main__":
             + lib.optionalString (portalHandoffFor name) (
                 "AGENT_BOX_PORTAL_ISSUER=${cfg.web.portalIssuer}\n"
                 + lib.optionalString (cfg.web.portalRedirectUrl != "")
-                    "AGENT_BOX_PORTAL_REDIRECT_URL=${cfg.web.portalRedirectUrl}\n"
+                    # JSON quotes keep this one environment assignment.
+                    # Invalid explicit values stay nonempty and are refused
+                    # by the daemon instead of selecting issuer fallback.
+                    "AGENT_BOX_PORTAL_REDIRECT_URL=${builtins.toJSON cfg.web.portalRedirectUrl}\n"
                 # Only when overridden: the daemon derives the well-known
                 # path from the issuer, so passing it unconditionally would
                 # be one more place the default could drift.
@@ -36351,6 +36354,7 @@ if __name__ == "__main__":
       }) terminalUsers))
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-box-settings@${name}" {
         overrideStrategy = "asDropin";
+        restartTriggers = [ config.environment.etc."agent-box/units/agent-box-settings-${name}.env".source ];
         # Restart in ONE step, not stop-in-old-config then start-in-new.
         # This unit is socket-activated, so the default two-step restart
         # leaves a window: the stop runs before the new configuration's

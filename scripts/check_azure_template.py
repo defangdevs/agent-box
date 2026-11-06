@@ -637,7 +637,8 @@ def check_written_config(template: dict) -> int:
                                     redirect_url=target)
             data = parsed_config(workdir)
             if valid:
-                if done.returncode or data["web"].get("portalRedirectUrl", "") != target:
+                if (done.returncode or data["web"].get("portalRedirectUrl", "") != target
+                        or (not target and "portalRedirectUrl" in data["web"])):
                     print("FAIL: redirect URL did not survive bootstrap:", repr(target),
                           done.stderr, file=sys.stderr)
                     rc = 1

@@ -1056,6 +1056,52 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          portal-redirect-env =
+            let
+              render = c:
+                let
+                  sys = nixpkgs.lib.nixosSystem {
+                    inherit system;
+                    modules = [
+                      self.nixosModules.agent-box
+                      {
+                        services.agent-box = {
+                          enable = true;
+                          web = {
+                            enable = true;
+                            domain = "box.test";
+                            portalIssuer = "https://station.example.com";
+                            portalRedirectUrl = c.target;
+                          };
+                          users.agent.web = {
+                            passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                            portalUser = "usr_test";
+                          };
+                        };
+                        system.stateVersion = "25.05";
+                      }
+                    ];
+                  };
+                  env = sys.config.environment.etc."agent-box/units/agent-box-settings-agent.env";
+                in c // {
+                  env = env.text;
+                  restart = builtins.elem (toString env.source)
+                    (map toString sys.config.systemd.services."agent-box-settings@agent".restartTriggers);
+                };
+              cases = map render [
+                { target = ""; expected = "https://station.example.com"; }
+                { target = "https://station.example.com/app/42?a=1&b=2#connect"; expected = "https://station.example.com/app/42?a=1&b=2#connect"; }
+                { target = "https://x.test/\nAGENT_BOX_PORTAL_ISSUER=https://other.test"; expected = ""; }
+                { target = "\"\""; expected = ""; }
+                { target = " "; expected = ""; }
+              ];
+            in pkgs.runCommand "agent-box-portal-redirect-env" {
+              nativeBuildInputs = [ pkgs.python3 ];
+              cases = pkgs.writeText "portal-redirect-env.json" (builtins.toJSON cases);
+            } ''
+              python3 ${self}/tests/test-portal-redirect-env.py "$cases" > "$out"
+            '';
+
           # Every Basic-auth bypass cookie must be host-only (issue #813).
           # Boxes commonly sit below shared sslip.io or domainstation.com
           # suffixes, so a Domain attribute would send one box's credential

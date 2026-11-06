@@ -1160,6 +1160,7 @@ class Tree:
         self.remove = []
         self.units = []      # unit names to enable
         self.disable = []    # unit names to disable
+        self.settings_restart = set()
 
     def file(self, path, text, mode=0o644):
         self.files[str(path)] = (text, mode)
@@ -3061,7 +3062,8 @@ class Renderer:
                 settings += [
                     ("AGENT_BOX_PORTAL_ISSUER", self.spec.portal_issuer),
                     ("AGENT_BOX_PORTAL_REDIRECT_URL",
-                     self.spec.portal_redirect_url),
+                     json.dumps(self.spec.portal_redirect_url)
+                     if self.spec.portal_redirect_url else ""),
                     # env_file drops an empty value, so an unset override
                     # simply is not passed and the daemon derives the
                     # well-known path from the issuer itself.
@@ -4670,6 +4672,13 @@ def commit(tree, args):
     for path, (text, mode) in sorted(tree.files.items()):
         if write_if_changed(path, text, mode, args.dry_run):
             changed += 1
+            # EnvironmentFile paths stay stable across apply. An active
+            # daemon must reread changed contents even if its unit did not.
+            match = re.fullmatch(r"agent-box-settings-([a-z_][a-z0-9_-]*)\.env",
+                                 Path(path).name)
+            if match:
+                tree.settings_restart.add(
+                    f"agent-box-settings@{match.group(1)}.service")
     for link, target in sorted(tree.links):
         if link_if_changed(link, target, args.dry_run):
             changed += 1
@@ -4880,6 +4889,10 @@ def activate(spec, tree, removed, advisory, act):
     if "nix-daemon.service" in active_units("nix-daemon.service"):
         act.require("refresh Nix daemon TLS trust",
                     ["systemctl", "restart", "nix-daemon.service"])
+    for unit in sorted(tree.settings_restart):
+        if unit in active_units(unit):
+            if not act.require(f"refresh {unit}", ["systemctl", "restart", unit]):
+                failed_starts.add(unit)
     # Enable what the config declares; stop instances for users that
     # were removed from it, so a shrinking config is honored too.
     for unit in tree.units:

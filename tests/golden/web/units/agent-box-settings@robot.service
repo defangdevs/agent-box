@@ -1,4 +1,5 @@
 [Unit]
+X-Restart-Triggers=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-X-Restart-Triggers-agent-box-settings-robot
 
 [Service]
 Environment="AGENT_BOX_AGENTS=claude,codex,shell"
