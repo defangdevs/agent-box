@@ -38,6 +38,11 @@
         // the top level — the fold below then closes under the operator with
         // nothing to show for it.
         callbacks: {
+          // Creation forms hold local drafts and visibility. Their lists
+          // refresh independently, so keep these editors intact on a swap.
+          beforeNodeMorphed: function (from) {
+            if (from.nodeType === 1 && from.matches("#watch-editor, #email-editor")) { return false; }
+          },
           // Which rows the operator folded open is state this HTML does not
           // carry: <details open> is reflected to the attribute when they
           // click it, and the server re-renders a row it is not driving as
@@ -1242,7 +1247,8 @@
 
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
-  ["secret-editor", "session-editor", "password-editor", "profile-editor"].forEach(function (id) {
+  ["secret-editor", "session-editor", "password-editor", "profile-editor",
+   "watch-editor", "email-editor"].forEach(function (id) {
     var el = document.getElementById(id);
     if (el) { el.hidden = true; }
   });
