@@ -7639,7 +7639,7 @@ case "$cmd" in
             pane=""
             while IFS= read -r -d ''' ev; do
               case "$ev" in (TMUX_PANE=*) pane="''${ev#TMUX_PANE=}"; break ;; esac
-            done < "/proc/$pp/environ" 2>/dev/null
+            done < "/proc/$pp/environ" 2>/dev/null || true
             [ -n "$pane" ] || continue
             [ "$(t display-message -p -t "$pane" '#S' 2>/dev/null)" = "$n" ] || continue
             th="''${th:+$th, }$t1"
