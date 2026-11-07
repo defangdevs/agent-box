@@ -2487,11 +2487,16 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           webhook-self =
             pkgs.runCommand "agent-box-webhook-self-test"
               {
-                nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.python3 ];
                 script = ./modules/src/webhook-self.sh;
                 tests = ./tests/test-webhook-self.sh;
+                # env-exec is what RUNS the resolver at session start; the
+                # installed form is envstore.py followed by env-exec.py.
+                envstore = ./modules/src/lib/envstore.py;
+                envExec = ./modules/src/env-exec.py;
               } ''
-              bash "$tests" "$script" > log 2>&1 || {
+              { cat "$envstore"; printf '\n\n'; cat "$envExec"; } > env-exec.py
+              bash "$tests" "$script" "$PWD/env-exec.py" > log 2>&1 || {
                 cat log
                 exit 1
               }

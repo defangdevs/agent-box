@@ -848,6 +848,70 @@ if [ -n "$WEBHOOK_PY" ]; then
   done
 fi
 
+# --- a caller's own mute or exclude says whether "@self" is still muted ---
+# The user chose a hint over a refusal (PR #1006 follow-up): the box's login
+# is shared by several boxes, so receiving its "own" comments can be right.
+hint_case() {  # NAME PATTERN(grep -E, or !PATTERN for absent) ARGS...
+  name=$1; pat=$2; shift 2
+  run "$@" >/dev/null
+  case "$pat" in
+    (!*) if grep -Eq "${pat#!}" "$work/err"; then no "$name" "$(cat "$work/err")"
+         else ok "$name"; fi ;;
+    (*)  if grep -Eq "$pat" "$work/err"; then ok "$name"
+         else no "$name" "$(cat "$work/err")"; fi ;;
+  esac
+}
+export LOCAL_WEBHOOK_SELF=DefangDevs
+hint_case "--ignore-sender @self says this box is muted" \
+  'includes @self \(DefangDevs\)' defangdevs/agent-box --ignore-sender @self
+hint_case "--ignore-sender with the login itself, any case, counts as @self" \
+  'includes @self' defangdevs/agent-box --ignore-sender 'bot, defangdevs'
+hint_case "--ignore-sender without @self says it is not muted" \
+  '@self \(DefangDevs\) is not in it' defangdevs/agent-box --ignore-sender=dependabot
+hint_case "--exclude says the default self-echo rule is gone, without promising delivery" \
+  'That default no longer drops them' \
+  defangdevs/agent-box --exclude '{"path":"event","in":["star"]}'
+hint_case "--exclude naming the login is not taken as a sender mute" \
+  'That default no longer drops them' defangdevs/agent-box \
+  --exclude '{"path":"title","in":["defangdevs-bottle"]}'
+hint_case "--drop, the old name of --exclude, gets the same hint" \
+  'That default no longer drops them' defangdevs/agent-box --drop '{}'
+hint_case "--exclude= form gets the same hint" \
+  'That default no longer drops them' defangdevs/agent-box --exclude='{}'
+hint_case "--drop= form gets the same hint" \
+  'That default no longer drops them' defangdevs/agent-box --drop='{}'
+hint_case "--exclude before the topic does not swallow the topic" \
+  'That default no longer drops them' --exclude '{}' defangdevs/agent-box
+hint_case "--ignore-senders (plural) with @self counts as muted" \
+  'includes @self' defangdevs/agent-box --ignore-senders @self
+hint_case "a separated --exclude value before the topic is not taken as the topic" \
+  'own events on defangdevs/agent-box are muted' \
+  --exclude '{}' --ignore-sender @self defangdevs/agent-box
+# webhook.py stores `bot*` literally, so a file named like the login must not
+# turn the glob into a match (no pathname expansion while splitting).
+( cd "$work" && : > defangdevs && LOCAL_WEBHOOK_SELF=defangdevs \
+    bash "$SCRIPT" subscribe defangdevs/agent-box --ignore-sender 'defang*' \
+    >/dev/null 2>"$work/err" )
+if grep -q 'is not in it' "$work/err"; then
+  ok "--ignore-sender 'defang*' is not expanded against file names"
+else
+  no "--ignore-sender 'defang*' is not expanded against file names" "$(cat "$work/err")"
+fi
+rm -f "$work/defangdevs"
+hint_case "--exclude plus --ignore-sender @self gives no exclude warning" \
+  '!default no longer drops' defangdevs/agent-box --exclude '{}' --ignore-sender @self
+hint_case "a standing watch's --exclude replaces no self-echo default" \
+  '!default no longer drops' defangdevs/agent-box --deliver-to subagent \
+  --when '{"path":"action","in":["opened"]}' --exclude '{}'
+hint_case "no mute or exclude flag, no hint" \
+  '!@self|no longer drops' defangdevs/agent-box
+# Before the capture, a flag's value ahead of the topic became the topic.
+hint_case "--ignore-sender's value before the topic is not read as the topic" \
+  'events on defangdevs/agent-box are muted' --ignore-sender @self defangdevs/agent-box
+unset LOCAL_WEBHOOK_SELF
+hint_case "an unknown login says @self mutes nobody" \
+  '"@self" mutes nobody' defangdevs/agent-box --ignore-sender @self
+
 # The wrapper's own help must say where the instructions belong.
 if bash "$SCRIPT" --help 2>&1 | grep -q "put the worker's instructions"; then
   ok "subscribe --help points worker instructions at a profile"
