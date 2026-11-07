@@ -24539,15 +24539,16 @@ def render_watch_editor(entry=None):
     else:
         fields += ('<p class="note">This unnamed rule keeps its existing event policy. '
                    'Add a named rule to choose different events.</p>')
+    wrapper = ('<div id="watch-editor" class="editor watch-editor">' if creating else
+               '<details class="watch-editor" data-fold="watch-editor-%s-%s">'
+               '<summary>Edit rule</summary>' % (esc(topic), esc(name)))
     return (
-        '<details class="watch-editor" data-fold="watch-editor-%s-%s">'
-        '<summary>%s</summary><form method="post" action="%s/webhooks/save">'
+        wrapper + '<form method="post" action="%s/webhooks/save">'
         '%s<p class="note">The first matching rule in the list wins. '
         'Choose events that do not overlap with earlier rules, including wildcard rules. '
         'Existing sessions that claimed the work still receive it.</p>'
-        '<button class="btn" type="submit">Save rule</button></form></details>'
-        % (esc(topic), esc(name), "Add automatic session rule" if creating else "Edit rule",
-           esc(BASE), fields))
+        '<button class="btn" type="submit">Save rule</button></form>%s'
+        % (esc(BASE), fields, "</div>" if creating else "</details>"))
 
 
 def hook_args_stamp():
@@ -28465,6 +28466,31 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   // settles. Only folds the operator opened themselves survive a morph whose
   // incoming HTML renders them closed.
   var manuallyOpenFolds = new WeakSet();
+  var initializedEditors = new WeakSet();
+  function syncEditors() {
+    document.querySelectorAll("[data-toggle]").forEach(function (button) {
+      var id = button.getAttribute("data-toggle");
+      var editor = document.getElementById(id);
+      if (!editor) { return; }
+      // The server leaves forms visible without JS. Initialize each new
+      // editor once, including one inserted when an unavailable list recovers.
+      if (!initializedEditors.has(editor)) {
+        editor.hidden = true;
+        initializedEditors.add(editor);
+      }
+      button.setAttribute("aria-controls", id);
+      button.setAttribute("aria-expanded", String(!editor.hidden));
+    });
+  }
+  function refreshEditorProfiles(editor, incoming) {
+    var current = editor.querySelector("select[name=profile]");
+    var choices = incoming.querySelector("select[name=profile]");
+    if (!current || !choices || current.innerHTML === choices.innerHTML) { return; }
+    var selected = current.value;
+    current.innerHTML = choices.innerHTML;
+    current.value = selected;
+    if (current.selectedIndex < 0) { current.value = ""; }
+  }
   // Patch the live DOM toward a freshly-rendered document, one region at a
   // time. Rendering stays entirely server-side; this only decides how the
   // new HTML replaces the old.
@@ -28499,6 +28525,14 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
         // the top level — the fold below then closes under the operator with
         // nothing to show for it.
         callbacks: {
+          // Keep creation drafts and visibility, while updating the profile
+          // choices that another settings action may have added or removed.
+          beforeNodeMorphed: function (from, to) {
+            if (from.nodeType === 1 && from.matches("#watch-editor, #email-editor")) {
+              refreshEditorProfiles(from, to);
+              return false;
+            }
+          },
           // Which rows the operator folded open is state this HTML does not
           // carry: <details open> is reflected to the attribute when they
           // click it, and the server re-renders a row it is not driving as
@@ -28520,6 +28554,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
         }
       });
     });
+    syncEditors();
   }
   function parseHTML(text) {
     return new DOMParser().parseFromString(text, "text/html");
@@ -29703,10 +29738,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
 
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
-  ["secret-editor", "session-editor", "password-editor", "profile-editor"].forEach(function (id) {
-    var el = document.getElementById(id);
-    if (el) { el.hidden = true; }
-  });
+  syncEditors();
 
   document.addEventListener("click", function (e) {
     var t = e.target && e.target.closest ? e.target.closest("[data-toggle],[data-edit]") : null;
@@ -29719,11 +29751,13 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       key.value = t.getAttribute("data-edit");
       key.readOnly = true;
       form.querySelector("[name=value]").focus();
+      syncEditors();
       return;
     }
     var el = document.getElementById(t.getAttribute("data-toggle"));
     if (!el) { return; }
     el.hidden = !el.hidden;
+    syncEditors();
     if (!el.hidden && el.id === "secret-editor") {
       form.reset();
       var ki = form.querySelector("input[name=key]");
@@ -29764,12 +29798,22 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       // it has an id of its own to be swapped by. Without them a profile
       // created here stayed invisible until a full reload — and the picker
       // could not offer the profile the operator had just made.
-      applyDoc(parseHTML(t),
+      var doc = parseHTML(t);
+      applyDoc(doc,
         ["msg-slot", "secrets-list", "sessions-list", "profiles-list",
          "profile-picker", "webhook-endpoint", "webhooks-list",
          "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
-      if (ed) { f.reset(); ed.hidden = true; }
+      if (ed) {
+        var creatingAutomation = ed.matches("#watch-editor, #email-editor");
+        // Rejections include webhook_invalid redirects and email HTTP 400s.
+        // A positive save banner is required before discarding either draft.
+        if (!creatingAutomation || doc.querySelector('#msg-slot .msg[data-kind="ok"]')) {
+          f.reset();
+          ed.hidden = true;
+        }
+      }
+      syncEditors();
       var added = wsActive();   // the tab the fetched page marks current
       connectPoll();
       if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
@@ -31097,8 +31141,10 @@ def render_webhooks(watches):
         ))
     if not rows:
         rows.append('<li class="empty">No automatic session rules.</li>')
-    return ('<ul class="tbl"><li class="tbl-head">Automatic session rule</li>'
-            + "".join(rows) + "</ul>" + render_watch_editor() + render_email_addresses())
+    return ('<div class="sec-head"><h3>Automatic session rules</h3>'
+            '<button type="button" class="btn" data-toggle="watch-editor" aria-controls="watch-editor" aria-expanded="true">Add rule</button></div>'
+            + render_watch_editor() + '<ul class="tbl">'
+            + "".join(rows) + "</ul>" + render_email_addresses())
 
 
 EMAIL_COMMAND = "/etc/agent-box/bin/agent-box-email"
@@ -31159,14 +31205,15 @@ def render_email_addresses():
                 + '<button class="btn small" type="submit">Disable reception</button></form>')
         rows.append(heading + '<div class="fold"><p>%s</p>' % esc(route["purpose"])
                     + editor(address, route) + disable + '</div></details></li>')
-    return ('<h3 id="email">Email addresses</h3>'
+    return ('<div class="sec-head"><h3 id="email">Email addresses</h3>'
+            '<button type="button" class="btn" data-toggle="email-editor" aria-controls="email-editor" aria-expanded="true">Add email address</button></div>'
             '<p class="note">Only registered, enabled addresses receive mail. Each address has its own purpose '
             'and worker profile. The batching window groups notifications before starting a session. '
             'Disabling reception keeps the handler for mail already accepted. '
             'An incomplete handler update defers new mail until it is saved successfully.</p>'
+            + '<div id="email-editor" class="editor watch-editor">' + editor() + '</div>'
             + '<ul class="tbl">' + ("".join(rows) or '<li class="empty">No email addresses registered.</li>')
-            + '</ul><details class="watch-editor" data-fold="email-add"><summary>Add email address</summary>'
-            + editor() + '</details>')
+            + '</ul>')
 
 
 def render_reboot_line():

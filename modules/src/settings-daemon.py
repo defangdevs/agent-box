@@ -1968,15 +1968,16 @@ def render_watch_editor(entry=None):
     else:
         fields += ('<p class="note">This unnamed rule keeps its existing event policy. '
                    'Add a named rule to choose different events.</p>')
+    wrapper = ('<div id="watch-editor" class="editor watch-editor">' if creating else
+               '<details class="watch-editor" data-fold="watch-editor-%s-%s">'
+               '<summary>Edit rule</summary>' % (esc(topic), esc(name)))
     return (
-        '<details class="watch-editor" data-fold="watch-editor-%s-%s">'
-        '<summary>%s</summary><form method="post" action="%s/webhooks/save">'
+        wrapper + '<form method="post" action="%s/webhooks/save">'
         '%s<p class="note">The first matching rule in the list wins. '
         'Choose events that do not overlap with earlier rules, including wildcard rules. '
         'Existing sessions that claimed the work still receive it.</p>'
-        '<button class="btn" type="submit">Save rule</button></form></details>'
-        % (esc(topic), esc(name), "Add automatic session rule" if creating else "Edit rule",
-           esc(BASE), fields))
+        '<button class="btn" type="submit">Save rule</button></form>%s'
+        % (esc(BASE), fields, "</div>" if creating else "</details>"))
 
 
 def hook_args_stamp():
@@ -6316,8 +6317,10 @@ def render_webhooks(watches):
         ))
     if not rows:
         rows.append('<li class="empty">No automatic session rules.</li>')
-    return ('<ul class="tbl"><li class="tbl-head">Automatic session rule</li>'
-            + "".join(rows) + "</ul>" + render_watch_editor() + render_email_addresses())
+    return ('<div class="sec-head"><h3>Automatic session rules</h3>'
+            '<button type="button" class="btn" data-toggle="watch-editor" aria-controls="watch-editor" aria-expanded="true">Add rule</button></div>'
+            + render_watch_editor() + '<ul class="tbl">'
+            + "".join(rows) + "</ul>" + render_email_addresses())
 
 
 EMAIL_COMMAND = "/etc/agent-box/bin/agent-box-email"
@@ -6378,14 +6381,15 @@ def render_email_addresses():
                 + '<button class="btn small" type="submit">Disable reception</button></form>')
         rows.append(heading + '<div class="fold"><p>%s</p>' % esc(route["purpose"])
                     + editor(address, route) + disable + '</div></details></li>')
-    return ('<h3 id="email">Email addresses</h3>'
+    return ('<div class="sec-head"><h3 id="email">Email addresses</h3>'
+            '<button type="button" class="btn" data-toggle="email-editor" aria-controls="email-editor" aria-expanded="true">Add email address</button></div>'
             '<p class="note">Only registered, enabled addresses receive mail. Each address has its own purpose '
             'and worker profile. The batching window groups notifications before starting a session. '
             'Disabling reception keeps the handler for mail already accepted. '
             'An incomplete handler update defers new mail until it is saved successfully.</p>'
+            + '<div id="email-editor" class="editor watch-editor">' + editor() + '</div>'
             + '<ul class="tbl">' + ("".join(rows) or '<li class="empty">No email addresses registered.</li>')
-            + '</ul><details class="watch-editor" data-fold="email-add"><summary>Add email address</summary>'
-            + editor() + '</details>')
+            + '</ul>')
 
 
 def render_reboot_line():
