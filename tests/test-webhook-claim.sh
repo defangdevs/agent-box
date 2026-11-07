@@ -471,6 +471,25 @@ if include_of defangdevs/agent-box --events terminal-ci \
    | jq -e 'has("any")' >/dev/null 2>&1
 then ok "--events alone is a filtered observation subscription"
 else no "--events alone is a filtered observation subscription"; fi
+# ci-summary: green is delivered once per WORKFLOW, never once per job. A
+# workflow_run success is in; a job-level success is out; a failing job is in.
+cs=$(include_of defangdevs/agent-box --events ci-summary)
+cs_has() { # cs_has PATH VALUE — does the policy match PATH == VALUE?
+  printf '%s' "$cs" | jq -e --arg p "$1" --arg v "$2" \
+    'any(.any[]; .path == $p and (.in | index($v)))' >/dev/null 2>&1
+}
+if cs_has workflow_run.conclusion success \
+   && cs_has workflow_run.conclusion failure \
+   && cs_has workflow_run.conclusion cancelled; then
+  ok "ci-summary delivers every finished workflow, green included"
+else no "ci-summary delivers every finished workflow, green included" "$cs"; fi
+if cs_has check_run.conclusion success || cs_has workflow_job.conclusion success \
+   || cs_has check_suite.conclusion success; then
+  no "ci-summary drops per-job success" "$cs"
+else ok "ci-summary drops per-job success"; fi
+if cs_has check_run.conclusion failure && cs_has workflow_job.conclusion failure; then
+  ok "ci-summary still delivers a failing job"
+else no "ci-summary still delivers a failing job" "$cs"; fi
 run defangdevs/agent-box --all-events >/dev/null
 [ $? -ne 0 ] \
   && ok "--all-events without a claim is refused rather than ignored" \
@@ -543,7 +562,7 @@ run defangdevs/agent-box --all-events --claim branch:main >/dev/null
 # The guidance has to be actionable, or an agent just picks another wrong
 # claim: name the three shapes that ARE bounded, and the no-claim way to
 # watch the branch it was told it cannot own.
-for want in "--claim sha:" "--events terminal-ci" "branch:<topic branch>"; do
+for want in "--claim sha:" "--events ci-summary" "branch:<topic branch>"; do
   grep -qF -- "$want" "$work/err" \
     || no "the refusal offers [$want]" "$(cat "$work/err")"
 done

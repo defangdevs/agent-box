@@ -31,8 +31,10 @@ together.
 A session claim REQUIRES a policy. `--events actionable` is terminal CI
 failure, a review verdict, a comment, an assignment, the object closing, or
 a pull request entering merge conflict state;
-`--events terminal-ci` is runs that have FINISHED, whatever the outcome, and
-nothing queued, in progress or merely created. Write `--include` yourself for
+`--events ci-summary` is one event per FINISHED workflow, green included, plus
+any failing job - the right policy for "did my merge pass?";
+`--events terminal-ci` is every job, run and check that has FINISHED, whatever
+the outcome, so a repo with twenty jobs sends twenty events per commit. Write `--include` yourself for
 anything else - it is ANDed with the claim, not refused alongside it - or say
 `--all-events` if you really do want the whole lifecycle. Scope-only claims
 are refused because they are how one `--claim branch:master` queued 37
@@ -49,7 +51,7 @@ put a second agent on your own PR.
 it moves, everybody merges onto it, and the claim would match every later
 commit and every workflow/check lifecycle event on them for the whole TTL. A
 claim is a bounded unit of work. To WATCH the default branch, subscribe with
-`--events terminal-ci` and no claim - an observation subscription, not
+`--events ci-summary` and no claim - an observation subscription, not
 ownership.
 
 **A numbered claim stops at the merge.** It covers the PR, its comments and
@@ -60,7 +62,7 @@ across with the commit instead:
     agent-box-webhook subscribe OWNER/REPO \
       --note "PR 42 merged: watching post-merge CI" \
       --claim "sha:$(gh pr view 42 --json mergeCommit --jq .mergeCommit.oid)" \
-      --events terminal-ci
+      --events ci-summary
 
 Use the BARE number for a PR, as above. GitHub reports a PR comment as an
 `issue_comment` carrying `issue.number`, not `pull_request.number` - so
