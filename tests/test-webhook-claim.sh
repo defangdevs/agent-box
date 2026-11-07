@@ -869,19 +869,19 @@ hint_case "--ignore-sender with the login itself, any case, counts as @self" \
 hint_case "--ignore-sender without @self says it is not muted" \
   '@self \(DefangDevs\) is not in it' defangdevs/agent-box --ignore-sender=dependabot
 hint_case "--exclude says the default self-echo rule is gone, without promising delivery" \
-  'Unless your exclude drops them too, they now arrive' \
+  'That default no longer drops them' \
   defangdevs/agent-box --exclude '{"path":"event","in":["star"]}'
 hint_case "--exclude naming the login is not taken as a sender mute" \
-  'Unless your exclude drops them too' defangdevs/agent-box \
+  'That default no longer drops them' defangdevs/agent-box \
   --exclude '{"path":"title","in":["defangdevs-bottle"]}'
 hint_case "--drop, the old name of --exclude, gets the same hint" \
-  'Unless your exclude drops them too' defangdevs/agent-box --drop '{}'
+  'That default no longer drops them' defangdevs/agent-box --drop '{}'
 hint_case "--exclude= form gets the same hint" \
-  'Unless your exclude drops them too' defangdevs/agent-box --exclude='{}'
+  'That default no longer drops them' defangdevs/agent-box --exclude='{}'
 hint_case "--drop= form gets the same hint" \
-  'Unless your exclude drops them too' defangdevs/agent-box --drop='{}'
+  'That default no longer drops them' defangdevs/agent-box --drop='{}'
 hint_case "--exclude before the topic does not swallow the topic" \
-  'Unless your exclude drops them too' --exclude '{}' defangdevs/agent-box
+  'That default no longer drops them' --exclude '{}' defangdevs/agent-box
 hint_case "--ignore-senders (plural) with @self counts as muted" \
   'includes @self' defangdevs/agent-box --ignore-senders @self
 hint_case "a separated --exclude value before the topic is not taken as the topic" \
@@ -899,12 +899,12 @@ else
 fi
 rm -f "$work/defangdevs"
 hint_case "--exclude plus --ignore-sender @self gives no exclude warning" \
-  '!now arrive' defangdevs/agent-box --exclude '{}' --ignore-sender @self
+  '!default no longer drops' defangdevs/agent-box --exclude '{}' --ignore-sender @self
 hint_case "a standing watch's --exclude replaces no self-echo default" \
-  '!now arrive' defangdevs/agent-box --deliver-to subagent \
+  '!default no longer drops' defangdevs/agent-box --deliver-to subagent \
   --when '{"path":"action","in":["opened"]}' --exclude '{}'
 hint_case "no mute or exclude flag, no hint" \
-  '!@self|now arrive' defangdevs/agent-box
+  '!@self|no longer drops' defangdevs/agent-box
 # Before the capture, a flag's value ahead of the topic became the topic.
 hint_case "--ignore-sender's value before the topic is not read as the topic" \
   'events on defangdevs/agent-box are muted' --ignore-sender @self defangdevs/agent-box

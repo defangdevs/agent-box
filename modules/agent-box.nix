@@ -10863,9 +10863,9 @@ _hc_main "$@"
       if [ "$exclude_given" = 1 ] && [ "$muted" = 0 ] && [ "$deliver_to" = session ]; then
         echo "agent-box-webhook: --exclude replaces the default exclude, which" \
              "dropped this box's own comments, pushes and reviews ($self)." \
-             "Unless your exclude drops them too, they now arrive. Add" \
-             "--ignore-sender @self (it mutes this box's CI results too) or a" \
-             "sender clause in --exclude, or keep it as-is" >&2
+             "That default no longer drops them; your own rules decide. To keep" \
+             "them out, add --ignore-sender @self (it mutes this box's CI results" \
+             "too) or a sender clause in --exclude" >&2
       fi
     }
 
