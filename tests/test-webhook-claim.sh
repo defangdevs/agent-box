@@ -478,9 +478,11 @@ cs_has() { # cs_has PATH VALUE — does the policy match PATH == VALUE?
   printf '%s' "$cs" | jq -e --arg p "$1" --arg v "$2" \
     'any(.any[]; .path == $p and (.in | index($v)))' >/dev/null 2>&1
 }
-if cs_has workflow_run.conclusion success \
-   && cs_has workflow_run.conclusion failure \
-   && cs_has workflow_run.conclusion cancelled; then
+all_conclusions=1
+for c in success failure cancelled timed_out action_required neutral skipped stale startup_failure; do
+  cs_has workflow_run.conclusion "$c" || all_conclusions=0
+done
+if [ "$all_conclusions" = 1 ]; then
   ok "ci-summary delivers every finished workflow, green included"
 else no "ci-summary delivers every finished workflow, green included" "$cs"; fi
 if cs_has check_run.conclusion success || cs_has workflow_job.conclusion success \

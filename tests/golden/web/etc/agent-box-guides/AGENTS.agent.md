@@ -505,7 +505,8 @@ a pull request entering merge conflict state;
 `--events ci-summary` is one event per FINISHED workflow, green included, plus
 any failing job - the right policy for "did my merge pass?";
 `--events terminal-ci` is every job, run and check that has FINISHED, whatever
-the outcome, so a repo with twenty jobs sends twenty events per commit. Write `--include` yourself for
+the outcome, so each job adds a delivery per subscribed event shape (twenty jobs send
+twenty `workflow_job` events, and check and workflow events add more). Write `--include` yourself for
 anything else - it is ANDed with the claim, not refused alongside it - or say
 `--all-events` if you really do want the whole lifecycle. Scope-only claims
 are refused because they are how one `--claim branch:master` queued 37
