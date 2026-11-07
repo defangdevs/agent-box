@@ -20,6 +20,7 @@ SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def api(endpoint, paginate=False):
+    """Read GitHub JSON, optionally retaining each paginated response."""
     command = ["gh", "api"]
     if paginate:
         command += ["--paginate", "--slurp"]
@@ -27,10 +28,12 @@ def api(endpoint, paginate=False):
 
 
 def items(endpoint):
+    """Flatten an API list endpoint across every page."""
     return [item for page in api(endpoint, paginate=True) for item in page]
 
 
 def download(rev):
+    """Read the webhook source at an immutable SHA without executing it."""
     if not SHA.fullmatch(rev):
         raise ValueError("Expected a full commit SHA")
     url = f"https://raw.githubusercontent.com/{UPSTREAM}/{rev}/local-webhook/webhook.py"
@@ -39,10 +42,12 @@ def download(rev):
 
 
 def digest(payload):
+    """Return the flat file hash in Nix SRI format."""
     return "sha256-" + base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
 
 
 def version(payload):
+    """Read a literal stable VERSION assignment as a sortable tuple."""
     match = VERSION.search(payload.decode("utf-8"))
     if not match:
         raise ValueError("Cannot read local-webhook VERSION")
@@ -50,6 +55,7 @@ def version(payload):
 
 
 def pin_fields(text):
+    """Validate the pin format before any network access or replacement."""
     fields = {}
     for name in ("repo", "rev", "sha256"):
         matches = re.findall(rf'^  {name} = "([^"]+)";$', text, re.MULTILINE)
@@ -62,12 +68,13 @@ def pin_fields(text):
 
 
 def prepare(root, repository):
+    """Return the update plan, proposed pin and PR body without writing files."""
     text = (root / PIN).read_text(encoding="utf-8")
     pin = pin_fields(text)
     # Include manually authored bumps, not just this workflow's branch names.
     for pull in items(f"repos/{repository}/pulls?state=open&per_page=100"):
         files = items(f"repos/{repository}/pulls/{pull['number']}/files?per_page=100")
-        if any(file["filename"] == PIN for file in files):
+        if any(file["filename"] == PIN or file.get("previous_filename") == PIN for file in files):
             return {"changed": False, "reason": f"PR #{pull['number']} already changes {PIN}"}, text, ""
 
     releases = []
@@ -142,6 +149,7 @@ def prepare(root, repository):
 
 
 def main():
+    """Apply an explicitly requested write only after all release checks pass."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--write", action="store_true", help="Write the pin after all checks pass")
     parser.add_argument("--body", type=Path, help="Write the proposed PR description here")

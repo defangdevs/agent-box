@@ -52,6 +52,15 @@ jobs:
         run: |
           branch="codex/update-local-webhook-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           title="chore(webhook): bump local-webhook to $VERSION"
+          find_pr() {
+            gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --base master \
+              --state all --json url --jq '.[0].url // empty'
+          }
+          existing=$(find_pr)
+          if [ -n "$existing" ]; then
+            echo "$existing"
+            exit 0
+          fi
           git switch -c "$branch"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
@@ -59,5 +68,16 @@ jobs:
           git commit -m "$title"
           gh auth setup-git
           git push origin "$branch"
-          gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" \
-            --title "$title" --body-file "$RUNNER_TEMP/webhook-pin-body.md"
+          if gh pr create --repo "$GITHUB_REPOSITORY" --base master --head "$branch" \
+            --title "$title" --body-file "$RUNNER_TEMP/webhook-pin-body.md"; then
+            exit 0
+          fi
+          # A failed response can still have created the PR. Preserve any
+          # referenced branch; a failed lookup also exits before deletion.
+          existing=$(find_pr)
+          if [ -n "$existing" ]; then
+            echo "$existing"
+            exit 0
+          fi
+          git push origin --delete "$branch"
+          exit 1

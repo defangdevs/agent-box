@@ -238,6 +238,11 @@ deployment assumptions before merging; the workflow never merges. It uses
 `GITHUB_TOKEN`, so PR CI may require "Approve workflows to run". Manual
 bumps still follow the commands in `nix/webhook-pin.nix`'s header.
 
+Before cutover, verify Settings -> Actions -> General allows GitHub Actions
+to create and approve pull requests; workflow permissions alone do not enable
+PR creation. The repository API reports this as
+`can_approve_pull_request_reviews` under `actions/permissions/workflow`.
+
 When migrating an existing box, remove only the old named dispatch watch
 with `agent-box-webhook unsubscribe defangdevs/local-channels --deliver-to
 subagent --name webhook-pin-bump` after verifying the Actions workflow.

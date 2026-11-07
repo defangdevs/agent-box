@@ -2135,7 +2135,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             '';
 
           webhook-pin-update = pkgs.runCommand "agent-box-webhook-pin-update" {
-            nativeBuildInputs = [ (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+            nativeBuildInputs = [ pkgs.bash (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
           } ''
             mkdir -p repo/scripts repo/tests repo/.github/workflows
             cp ${./scripts/update_webhook_pin.py} repo/scripts/update_webhook_pin.py
