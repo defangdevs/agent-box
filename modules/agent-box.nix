@@ -7620,6 +7620,21 @@ case "$cmd" in
         if [ -s "$tf" ]; then
           th="$("$JQ" -r '.thread // empty' "$tf" 2>/dev/null)" || th=""
           [ -z "$th" ] || kind="$kind (thread $th)"
+        else
+          # local-webhook keys its peer record by thread (codex/pin-*.json),
+          # not by tmux name, so the file above is usually absent (#1015).
+          # Name every thread whose delivery peer is alive: exact when the
+          # daemon hosts one, a short candidate list when it hosts several.
+          th=""
+          for pf in "$sd"/codex/*.json; do
+            [ -s "$pf" ] || continue
+            pp="$("$JQ" -r '.pid // empty' "$pf" 2>/dev/null)" || pp=""
+            case "$pp" in (""|*[!0-9]*) continue ;; esac
+            kill -0 "$pp" 2>/dev/null || continue
+            t1="$("$JQ" -r '.thread // empty' "$pf" 2>/dev/null)" || t1=""
+            [ -z "$t1" ] || th="''${th:+$th, }$t1"
+          done
+          [ -z "$th" ] || kind="$kind (live thread(s) with a delivery peer: $th; hand over with codex queue --thread ID --message TEXT)"
         fi
       fi
       # A session whose agent CRASHED is still a live tmux session, because
@@ -14145,14 +14160,17 @@ whether one of them already has this object: its claim, its note, its working \
 directory and its pane (tmux -L agent-box capture-pane -pt NAME | tail -40) \
 are the evidence, and a claude session can also be asked directly (ListAgents, \
 then SendMessage to the name ListAgents PRINTS - a Remote Control name such \
-as agent-claude@host, never the tmux name in the list below). If one of them \
+as agent-claude@host, never the tmux name in the list below; a Codex Remote \
+Control daemon is not in ListAgents - hand over to its thread with codex queue \
+--thread THREAD_ID --message TEXT, where THREAD_ID is the thread agent-box-session \
+peers prints, and a non-zero exit means nobody was told). If one of them \
 has it — or is working on the branch or in the git worktree you would use — \
 YIELD: tell that session what the event said, say plainly what you did NOT \
 do, and only then remove yourself with agent-box-session rm $1. That is a \
 complete and correct outcome, not a failure: the event has reached a session \
 that already holds the context, which is the whole point of a watch that \
 brakes. But a yield exists only if the hand-over SUCCEEDED. Read the \
-SendMessage result: any failure - \"No agent named ... is reachable\", \"session \
+SendMessage or codex queue result: any failure - \"No agent named ... is reachable\", \"session \
 list was too long to check\", or anything else - means nobody was told, and \
 you must NOT remove yourself. Say so in your final message, leave the session \
 running for a person to read, and do not retry the same name. If nobody has \

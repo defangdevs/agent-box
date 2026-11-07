@@ -641,6 +641,21 @@ case "$cmd" in
         if [ -s "$tf" ]; then
           th="$("$JQ" -r '.thread // empty' "$tf" 2>/dev/null)" || th=""
           [ -z "$th" ] || kind="$kind (thread $th)"
+        else
+          # local-webhook keys its peer record by thread (codex/pin-*.json),
+          # not by tmux name, so the file above is usually absent (#1015).
+          # Name every thread whose delivery peer is alive: exact when the
+          # daemon hosts one, a short candidate list when it hosts several.
+          th=""
+          for pf in "$sd"/codex/*.json; do
+            [ -s "$pf" ] || continue
+            pp="$("$JQ" -r '.pid // empty' "$pf" 2>/dev/null)" || pp=""
+            case "$pp" in (""|*[!0-9]*) continue ;; esac
+            kill -0 "$pp" 2>/dev/null || continue
+            t1="$("$JQ" -r '.thread // empty' "$pf" 2>/dev/null)" || t1=""
+            [ -z "$t1" ] || th="${th:+$th, }$t1"
+          done
+          [ -z "$th" ] || kind="$kind (live thread(s) with a delivery peer: $th; hand over with codex queue --thread ID --message TEXT)"
         fi
       fi
       # A session whose agent CRASHED is still a live tmux session, because
