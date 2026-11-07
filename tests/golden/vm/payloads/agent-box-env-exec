@@ -377,6 +377,8 @@ def main(argv):
     # nobody, and a session receives (and the box eyes-reacts to) its own
     # comments - so look them up with the PATH the unit gave us. The
     # helpers still RUN below, after the load, because they need the token.
+    # The load can also ADD them (a launcher that inherited a narrow PATH),
+    # so a helper missing now is looked up again after the load.
     resolver = shutil.which("agent-box-webhook-self")
     sweeper = shutil.which("agent-box-webhook-backfill")
 
@@ -412,6 +414,9 @@ def main(argv):
     # box-wide setting and a profile overlay leave the two keys present.
     if os.environ.get("DEFANG_ACCESS_TOKEN"):
         os.environ.pop("DEFANG_WORKSPACE", None)
+
+    resolver = resolver or shutil.which("agent-box-webhook-self")
+    sweeper = sweeper or shutil.which("agent-box-webhook-backfill")
 
     # The GitHub login this box acts as, for local-webhook's "@self" sender
     # mute (issue #261). Resolved HERE because this is the one process that

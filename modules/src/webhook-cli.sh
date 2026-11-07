@@ -909,12 +909,14 @@ self_echo_hint() {
   self_lc="$(printf '%s' "$self" | tr '[:upper:]' '[:lower:]')"
   muted=0
   if [ "$ignore_given" = 1 ]; then
-    old_ifs=$IFS; IFS=,
+    # No pathname expansion: `bot*` is a literal sender to webhook.py, and
+    # must not turn into a matching file name here.
+    old_ifs=$IFS; IFS=,; case $- in (*f*) old_f=1 ;; (*) old_f=0; set -f ;; esac
     for ign in $ignore_list; do
       ign="$(printf '%s' "$ign" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
       case "$ign" in ("@self"|"$self_lc") muted=1 ;; esac
     done
-    IFS=$old_ifs
+    IFS=$old_ifs; [ "$old_f" = 1 ] || set +f
     if [ "$muted" = 1 ]; then
       echo "agent-box-webhook: --ignore-sender includes @self ($self): this" \
            "box's own events on $topic are muted, its CI results too" >&2
@@ -925,20 +927,16 @@ self_echo_hint() {
     fi
   fi
   # Only a session subscription gets the default self-echo exclude; a
-  # standing watch has none to replace.
+  # standing watch has none to replace. The predicate is not judged here: an
+  # exclude can drop self-sent events without naming the login (for example
+  # every "created" action), and naming the login does not make a sender
+  # clause. So say what was removed, and promise nothing about delivery.
   if [ "$exclude_given" = 1 ] && [ "$muted" = 0 ] && [ "$deliver_to" = session ]; then
-    case "$(printf '%s' "$exclude_value" | tr '[:upper:]' '[:lower:]')" in
-      (*"$self_lc"*)
-        echo "agent-box-webhook: --exclude replaces the default exclude; yours" \
-             "names $self, so check that it still drops this box's own" \
-             "comments and pushes" >&2 ;;
-      (*)
-        echo "agent-box-webhook: --exclude replaces the default exclude, which" \
-             "dropped this box's own comments, pushes and reviews ($self)." \
-             "Yours does not name $self, so they now arrive. Add" \
-             "--ignore-sender @self (it mutes this box's CI results too) or a" \
-             "sender clause in --exclude, or keep it as-is" >&2 ;;
-    esac
+    echo "agent-box-webhook: --exclude replaces the default exclude, which" \
+         "dropped this box's own comments, pushes and reviews ($self)." \
+         "Unless your exclude drops them too, they now arrive. Add" \
+         "--ignore-sender @self (it mutes this box's CI results too) or a" \
+         "sender clause in --exclude, or keep it as-is" >&2
   fi
 }
 
@@ -998,7 +996,7 @@ case "$cmd" in
       note=""; have_note=0
       # Captured AND forwarded, so the end of this command can say whether the
       # caller's own mute or exclude still drops this box's echoes ("@self").
-      ignore_given=0; ignore_list=""; exclude_given=0; exclude_value=""
+      ignore_given=0; ignore_list=""; exclude_given=0
       # Filter --claim out of the argument list as we scan it: webhook.py has
       # never heard of that flag, so it is translated to --include below and
       # must not survive into the exec. Rotate idiom — take from the front,
@@ -1028,7 +1026,6 @@ case "$cmd" in
             (uinclude) user_include="$a"; want=""; continue ;;
             (note) note="$a"; have_note=1; want=""; continue ;;
             (ignore) ignore_list="$ignore_list,$a" ;;
-            (exclude) exclude_value="$a" ;;
           esac
           want=""
           set -- "$@" "$a"; continue
@@ -1037,14 +1034,14 @@ case "$cmd" in
           --deliver-to) want=deliver-to ;;
           --name) want=name ;;
           --deliver-to=*) deliver_to="${a#--deliver-to=}" ;;
-          # --drop is the old name of --exclude. The value is captured for
-          # the self-echo hint and still forwarded unchanged.
+          # --drop is the old name of --exclude. Its value is consumed here
+          # (so it is never read as the topic) and forwarded unchanged.
           --drop|--exclude)
             case "$a" in (--drop) have_drop=1 ;; (*) have_exclude=1 ;; esac
             exclude_given=1; want=exclude ;;
           --drop=*|--exclude=*)
             case "$a" in (--drop=*) have_drop=1 ;; (*) have_exclude=1 ;; esac
-            exclude_given=1; exclude_value="${a#*=}" ;;
+            exclude_given=1 ;;
           --ignore-sender|--ignore-senders)
             ignore_given=1; want=ignore ;;
           --ignore-sender=*|--ignore-senders=*)
