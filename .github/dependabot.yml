@@ -1,0 +1,10 @@
+# Bumps the hash-pinned wheels agent-box-transcribe installs with pip
+# --require-hashes (modules/src/transcribe/requirements.txt, issue #970). After a
+# bump run `nix run .#assemble`, `nix run .#update-golden` and
+# `python3 tests/test_agentbox.py --update`: the module embeds the file.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /modules/src/transcribe
+    schedule:
+      interval: weekly
