@@ -6318,7 +6318,7 @@ def render_webhooks(watches):
     if not rows:
         rows.append('<li class="empty">No automatic session rules.</li>')
     return ('<div class="sec-head"><h3>Automatic session rules</h3>'
-            '<button type="button" class="btn" data-toggle="watch-editor">Add rule</button></div>'
+            '<button type="button" class="btn" data-toggle="watch-editor" aria-controls="watch-editor" aria-expanded="true">Add rule</button></div>'
             + render_watch_editor() + '<ul class="tbl">'
             + "".join(rows) + "</ul>" + render_email_addresses())
 
@@ -6382,7 +6382,7 @@ def render_email_addresses():
         rows.append(heading + '<div class="fold"><p>%s</p>' % esc(route["purpose"])
                     + editor(address, route) + disable + '</div></details></li>')
     return ('<div class="sec-head"><h3 id="email">Email addresses</h3>'
-            '<button type="button" class="btn" data-toggle="email-editor">Add email address</button></div>'
+            '<button type="button" class="btn" data-toggle="email-editor" aria-controls="email-editor" aria-expanded="true">Add email address</button></div>'
             '<p class="note">Only registered, enabled addresses receive mail. Each address has its own purpose '
             'and worker profile. The batching window groups notifications before starting a session. '
             'Disabling reception keeps the handler for mail already accepted. '

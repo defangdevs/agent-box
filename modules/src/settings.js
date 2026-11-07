@@ -4,6 +4,31 @@
   // settles. Only folds the operator opened themselves survive a morph whose
   // incoming HTML renders them closed.
   var manuallyOpenFolds = new WeakSet();
+  var initializedEditors = new WeakSet();
+  function syncEditors() {
+    document.querySelectorAll("[data-toggle]").forEach(function (button) {
+      var id = button.getAttribute("data-toggle");
+      var editor = document.getElementById(id);
+      if (!editor) { return; }
+      // The server leaves forms visible without JS. Initialize each new
+      // editor once, including one inserted when an unavailable list recovers.
+      if (!initializedEditors.has(editor)) {
+        editor.hidden = true;
+        initializedEditors.add(editor);
+      }
+      button.setAttribute("aria-controls", id);
+      button.setAttribute("aria-expanded", String(!editor.hidden));
+    });
+  }
+  function refreshEditorProfiles(editor, incoming) {
+    var current = editor.querySelector("select[name=profile]");
+    var choices = incoming.querySelector("select[name=profile]");
+    if (!current || !choices || current.innerHTML === choices.innerHTML) { return; }
+    var selected = current.value;
+    current.innerHTML = choices.innerHTML;
+    current.value = selected;
+    if (current.selectedIndex < 0) { current.value = ""; }
+  }
   // Patch the live DOM toward a freshly-rendered document, one region at a
   // time. Rendering stays entirely server-side; this only decides how the
   // new HTML replaces the old.
@@ -38,10 +63,13 @@
         // the top level — the fold below then closes under the operator with
         // nothing to show for it.
         callbacks: {
-          // Creation forms hold local drafts and visibility. Their lists
-          // refresh independently, so keep these editors intact on a swap.
-          beforeNodeMorphed: function (from) {
-            if (from.nodeType === 1 && from.matches("#watch-editor, #email-editor")) { return false; }
+          // Keep creation drafts and visibility, while updating the profile
+          // choices that another settings action may have added or removed.
+          beforeNodeMorphed: function (from, to) {
+            if (from.nodeType === 1 && from.matches("#watch-editor, #email-editor")) {
+              refreshEditorProfiles(from, to);
+              return false;
+            }
           },
           // Which rows the operator folded open is state this HTML does not
           // carry: <details open> is reflected to the attribute when they
@@ -64,6 +92,7 @@
         }
       });
     });
+    syncEditors();
   }
   function parseHTML(text) {
     return new DOMParser().parseFromString(text, "text/html");
@@ -1247,11 +1276,7 @@
 
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
-  ["secret-editor", "session-editor", "password-editor", "profile-editor",
-   "watch-editor", "email-editor"].forEach(function (id) {
-    var el = document.getElementById(id);
-    if (el) { el.hidden = true; }
-  });
+  syncEditors();
 
   document.addEventListener("click", function (e) {
     var t = e.target && e.target.closest ? e.target.closest("[data-toggle],[data-edit]") : null;
@@ -1264,11 +1289,13 @@
       key.value = t.getAttribute("data-edit");
       key.readOnly = true;
       form.querySelector("[name=value]").focus();
+      syncEditors();
       return;
     }
     var el = document.getElementById(t.getAttribute("data-toggle"));
     if (!el) { return; }
     el.hidden = !el.hidden;
+    syncEditors();
     if (!el.hidden && el.id === "secret-editor") {
       form.reset();
       var ki = form.querySelector("input[name=key]");
@@ -1309,12 +1336,22 @@
       // it has an id of its own to be swapped by. Without them a profile
       // created here stayed invisible until a full reload — and the picker
       // could not offer the profile the operator had just made.
-      applyDoc(parseHTML(t),
+      var doc = parseHTML(t);
+      applyDoc(doc,
         ["msg-slot", "secrets-list", "sessions-list", "profiles-list",
          "profile-picker", "webhook-endpoint", "webhooks-list",
          "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
-      if (ed) { f.reset(); ed.hidden = true; }
+      if (ed) {
+        var creatingAutomation = ed.matches("#watch-editor, #email-editor");
+        // Rejections include webhook_invalid redirects and email HTTP 400s.
+        // A positive save banner is required before discarding either draft.
+        if (!creatingAutomation || doc.querySelector('#msg-slot .msg[data-kind="ok"]')) {
+          f.reset();
+          ed.hidden = true;
+        }
+      }
+      syncEditors();
       var added = wsActive();   // the tab the fetched page marks current
       connectPoll();
       if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
