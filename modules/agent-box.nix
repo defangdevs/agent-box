@@ -890,8 +890,11 @@ let
       A session claim REQUIRES a policy. `--events actionable` is terminal CI
       failure, a review verdict, a comment, an assignment, the object closing, or
       a pull request entering merge conflict state;
-      `--events terminal-ci` is runs that have FINISHED, whatever the outcome, and
-      nothing queued, in progress or merely created. Write `--include` yourself for
+      `--events ci-summary` is one event per FINISHED workflow, green included, plus
+      any failing job - the right policy for "did my merge pass?";
+      `--events terminal-ci` is every job, run and check that has FINISHED, whatever
+      the outcome, so each job adds a delivery per subscribed event shape (twenty jobs send
+      twenty `workflow_job` events, and check and workflow events add more). Write `--include` yourself for
       anything else - it is ANDed with the claim, not refused alongside it - or say
       `--all-events` if you really do want the whole lifecycle. Scope-only claims
       are refused because they are how one `--claim branch:master` queued 37
@@ -908,7 +911,7 @@ let
       it moves, everybody merges onto it, and the claim would match every later
       commit and every workflow/check lifecycle event on them for the whole TTL. A
       claim is a bounded unit of work. To WATCH the default branch, subscribe with
-      `--events terminal-ci` and no claim - an observation subscription, not
+      `--events ci-summary` and no claim - an observation subscription, not
       ownership.
 
       **A numbered claim stops at the merge.** It covers the PR, its comments and
@@ -919,7 +922,7 @@ let
           agent-box-webhook subscribe OWNER/REPO \
             --note "PR 42 merged: watching post-merge CI" \
             --claim "sha:$(gh pr view 42 --json mergeCommit --jq .mergeCommit.oid)" \
-            --events terminal-ci
+            --events ci-summary
 
       Use the BARE number for a PR, as above. GitHub reports a PR comment as an
       `issue_comment` carrying `issue.number`, not `pull_request.number` - so
@@ -10167,8 +10170,11 @@ _hc_main "$@"
       actionable      something is asking you to do something — terminal CI
                       FAILURE, a review verdict, a comment, an assignment, the
                       object closing or reopening, or a PR entering conflict
-      terminal-ci     runs that have FINISHED, whatever the outcome; excludes
-                      queued, in_progress and check-created
+      ci-summary      one event per FINISHED workflow, whatever the outcome
+                      (green too), plus any failing job; no per-job success
+                      events. The one for "did my merge pass?"
+      terminal-ci     every job, run and check that has FINISHED, whatever the
+                      outcome; excludes queued, in_progress and check-created
 
     --include JSON does the same job with your own predicate, and is ANDed with
     the claim rather than refused alongside it. --all-events is the explicit
@@ -10527,9 +10533,16 @@ _hc_main "$@"
     # are deliberately few: a policy nobody can predict the meaning of is worse
     # than writing the predicate out.
     #
-    #   terminal-ci   a run that has FINISHED, whatever the outcome — the six
-    #                 shapes CI reports through. Excludes queued, in_progress and
-    #                 check-created, which is the bulk of the noise.
+    #   ci-summary    one event per workflow that has FINISHED, whatever the
+    #                 outcome, so green is NOT silent — plus every failing job,
+    #                 so a red job does not wait for its workflow. Per-job and
+    #                 per-check SUCCESS is left out: a repo with twenty jobs sends
+    #                 twenty "passed" events per commit, none of which asks for
+    #                 anything (53 of 98 events in one session's transcript).
+    #   terminal-ci   every run, job and check that has FINISHED, whatever the
+    #                 outcome — the six shapes CI reports through. Excludes
+    #                 queued, in_progress and check-created. Use it only when the
+    #                 per-job outcome is itself the point.
     #   actionable    something is asking you to do something: terminal CI
     #                 FAILURE (a green run asks for nothing), a review verdict, a
     #                 comment, an assignment, the object closing or reopening,
@@ -10543,6 +10556,19 @@ _hc_main "$@"
     events_predicate() {
       # events_predicate POLICY — the event-relevance predicate, as JSON.
       case "$1" in
+        (ci-summary)
+          # A workflow_run is the one shape that means "everything in this
+          # workflow is done", so it carries the green result. Job-level shapes
+          # contribute failures only. Commit statuses and deployments have no
+          # workflow to summarise them, so their finished states stay as they are.
+          "$JQ" -nc --argjson t "$ci_terminal_json" --argjson ci "$ci_failure_json" '
+            {any: [
+              {path:"workflow_run.conclusion", "in":$t},
+              {path:"workflow_job.conclusion", "in":$ci},
+              {path:"check_run.conclusion", "in":$ci}, {path:"check_suite.conclusion", "in":$ci},
+              {path:"deployment_status.state", "in":["success","error","failure","inactive"]},
+              {path:"state", "in":["success","error","failure"]}
+            ]}' ;;
         (terminal-ci)
           "$JQ" -nc --argjson t "$ci_terminal_json" '
             {any: [
@@ -10573,7 +10599,7 @@ _hc_main "$@"
             ]}' ;;
         (*)
           echo "agent-box-webhook: --events '$1' is not a policy — use" \
-               "terminal-ci or actionable, write --include yourself, or say" \
+               "ci-summary, terminal-ci or actionable, write --include yourself, or say" \
                "--all-events to keep the whole lifecycle" >&2
           return 1 ;;
       esac
@@ -10713,8 +10739,8 @@ _hc_main "$@"
            "lifecycle event on it for the whole TTL (issue #706). Claim what is" \
            "actually yours: --claim <PR number>, --claim branch:<topic branch>," \
            "or --claim sha:<40-character commit> for one run's CI. To WATCH the" \
-           "default branch without owning it, subscribe with --events terminal-ci" \
-           "and no claim." >&2
+           "default branch without owning it, subscribe with --events ci-summary" \
+           "(or terminal-ci) and no claim." >&2
       return 1
     }
 
@@ -11195,7 +11221,9 @@ _hc_main "$@"
                    "opened issue #706. Add one of:" \
                    "--events actionable (comments, reviews, assignments," \
                    "closes, terminal CI failure);" \
-                   "--events terminal-ci (finished runs only, whatever the" \
+                   "--events ci-summary (one event per finished workflow, green" \
+                   "included, plus failing jobs);" \
+                   "--events terminal-ci (every finished job, whatever the" \
                    "outcome);" \
                    "--include JSON (your own predicate, ANDed with the claim);" \
                    "--all-events (say you really do want every lifecycle" \
