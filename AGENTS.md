@@ -226,41 +226,34 @@ The rules, all enforced by `scripts/check_vendor.py`:
 
 ## Keeping the local-webhook pin from going stale
 
-`nix/webhook-pin.nix` vendors one file (`local-webhook/webhook.py`) from
-`defangdevs/local-channels`, but not through `scripts/check_vendor.py` - it
-has no `vendor.json` entry and no weekly `--upstream` check, so nothing here
-notices when local-channels tags a release. The pin drifts until whoever
-remembers to look bumps it by hand, following the steps in that file's own
-header comment (`nix-prefetch-url` + `nix hash convert` + `nix run
-.#assemble`).
+`.github/workflows/update-webhook-pin.yml` checks stable `vX.Y.Z` tags in
+`defangdevs/local-channels` daily and supports manual dispatch. It replaces
+the box-local `webhook-pin-bump` standing watch; deployments need no watch
+or agent profile for this repository maintenance.
 
-A running box can close that gap itself with a standing webhook watch
-instead of a person remembering: subscribe `defangdevs/local-channels` for a
-version-tag push, deliver to a subagent, and give that watch its own profile
-whose system prompt requires sanity checks before it touches anything - the
-new tag's commit is on green CI, no live session or open PR is already
-bumping it, and the commits since the current pin are read for any
-default-behavior change agent-box depends on - and only then runs the
-mechanical bump and opens a PR, never a merge:
+`scripts/update_webhook_pin.py` selects the newest stable release, verifies
+its exact commit passed upstream's default-branch CI, and calculates the
+SRI hash of `local-webhook/webhook.py` without executing upstream code. It
+refuses downgrades and tag/file version mismatches, checks the old pin's
+hash, and leaves any existing pin-changing PR alone. A newer release may
+have diverged from an old pre-squash pin; the PR explicitly flags that case
+for review and includes the comparison and upstream commit subjects.
 
-    agent-box-profile set webhook-pin-bumper HARNESS=claude \
-      SYSTEM_PROMPT="<sanity checks first, then the bump, then a PR - never a merge>"
-    agent-box-webhook subscribe defangdevs/local-channels \
-      --deliver-to subagent --name webhook-pin-bump \
-      --profile webhook-pin-bumper \
-      --when '{"all":[{"path":"event","in":["push"]},
-                       {"path":"ref","contains":["refs/tags/v"]},
-                       {"path":"deleted","notIn":[true]}]}' \
-      --note "..."
+The workflow updates `nix/webhook-pin.nix`, assembles the module, runs the
+assembler tests, and opens a PR. Review default watch/dispatch behavior and
+deployment assumptions before merging; the workflow never merges. It uses
+`GITHUB_TOKEN`, so PR CI may require "Approve workflows to run". Manual
+bumps still follow the commands in `nix/webhook-pin.nix`'s header.
 
-This is box-local state (`~/.local/state/local-webhook`,
-`~/.config/agent-box/profiles/`), set up per deployment rather than shipped
-in the module, so a fresh box - or one nobody has run this command on - gets
-no automation and the pin still has to be noticed by hand. Whether every
-deployment should get this by default, in
-`services.agent-box.webhook.watchPolicy`, is a real design question - it
-means every box opens PRs against a repo it may not have push access to -
-and is left open rather than decided here.
+Before cutover, verify Settings -> Actions -> General allows GitHub Actions
+to create and approve pull requests; workflow permissions alone do not enable
+PR creation. The repository API reports this as
+`can_approve_pull_request_reviews` under `actions/permissions/workflow`.
+
+When migrating an existing box, remove only the old named dispatch watch
+with `agent-box-webhook unsubscribe defangdevs/local-channels --deliver-to
+subagent --name webhook-pin-bump` after verifying the Actions workflow.
+Keep shared repository webhooks and unrelated subscriptions.
 
 ## Coding Style & Naming Conventions
 

@@ -2189,6 +2189,17 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          webhook-pin-update = pkgs.runCommand "agent-box-webhook-pin-update" {
+            nativeBuildInputs = [ pkgs.bash (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+          } ''
+            mkdir -p repo/scripts repo/tests repo/.github/workflows
+            cp ${./scripts/update_webhook_pin.py} repo/scripts/update_webhook_pin.py
+            cp ${./tests/test-update-webhook-pin.py} repo/tests/test-update-webhook-pin.py
+            cp ${./.github/workflows/update-webhook-pin.yml} repo/.github/workflows/update-webhook-pin.yml
+            python3 repo/tests/test-update-webhook-pin.py
+            touch "$out"
+          '';
+
           release-workflows = pkgs.runCommand "agent-box-release-workflows" {
             nativeBuildInputs = [
               pkgs.bash pkgs.git pkgs.jq
