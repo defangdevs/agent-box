@@ -1304,6 +1304,30 @@
     }
   });
 
+  // New profiles collect all settings in one save. Keep row indices unique
+  // after removals so the server can pair blank values with the right keys.
+  var profileEnvIndex = 0;
+  document.addEventListener("click", function (e) {
+    var add = e.target.closest("[data-add-profile-env]");
+    if (add) {
+      var rows = add.parentElement.querySelector("[data-profile-env-rows]");
+      var row = rows.querySelector("[data-profile-env-row]").cloneNode(true);
+      profileEnvIndex += 1;
+      row.querySelectorAll("input").forEach(function (input) {
+        input.name = input.name.replace(/_[0-9]+$/, "_" + profileEnvIndex);
+        input.value = "";
+      });
+      rows.appendChild(row);
+      row.querySelector("input").focus();
+      return;
+    }
+    var remove = e.target.closest("[data-remove-profile-env]");
+    if (!remove) { return; }
+    var row = remove.closest("[data-profile-env-row]");
+    if (row.parentElement.children.length > 1) { row.remove(); }
+    else { row.querySelectorAll("input").forEach(function (input) { input.value = ""; }); }
+  });
+
   document.addEventListener("submit", function (e) {
     var f = e.target;
     if (e.defaultPrevented || !f || (f.method || "").toLowerCase() !== "post") { return; }
@@ -1348,6 +1372,8 @@
         // A positive save banner is required before discarding either draft.
         if (!creatingAutomation || doc.querySelector('#msg-slot .msg[data-kind="ok"]')) {
           f.reset();
+          var rows = f.querySelectorAll("[data-profile-env-row]");
+          for (var i = 1; i < rows.length; i++) { rows[i].remove(); }
           ed.hidden = true;
         }
       }

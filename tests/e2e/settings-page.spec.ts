@@ -455,3 +455,35 @@ test('restart is confirm-guarded and kills the agent tmux session', async ({ bro
     await expect.poll(tmuxSessionAlive, { timeout: 10_000 }).toBe(false);
   }
 });
+
+// Creation keeps several unsaved settings together until the profile is saved.
+test('create a profile with multiple environment settings', async ({ browser }) => {
+  const page = await authedPage(browser);
+  const name = `e2e_${Date.now().toString(36)}`;
+  const first = uniqueKey();
+  const second = uniqueKey();
+  await page.goto(SETTINGS_PATH);
+  await page.getByRole('button', { name: 'Add profile' }).click();
+  const editor = page.locator('#profile-editor');
+  await editor.getByLabel('Profile name').fill(name);
+  await editor.getByLabel('Assistant', { exact: true }).selectOption('claude');
+  await editor.getByLabel('Environment setting name').first().fill(first);
+  await editor.getByLabel('Value for that setting').first().fill('first-secret');
+  await editor.getByRole('button', { name: 'Add setting' }).click();
+  await editor.getByLabel('Environment setting name').last().fill('DISCARD_ME');
+  await editor.getByRole('button', { name: 'Remove' }).last().click();
+  await editor.getByRole('button', { name: 'Add setting' }).click();
+  await editor.getByLabel('Environment setting name').last().fill(second);
+  await editor.getByLabel('Value for that setting').last().fill('second-secret');
+  await editor.getByRole('button', { name: 'Save' }).click();
+  const profile = page.locator('.prof-row', { hasText: name });
+  await expect(profile).toContainText('2 custom settings');
+  await profile.locator('summary').click();
+  await expect(profile).toContainText(first);
+  await expect(profile).toContainText(second);
+  await expect(page.locator('body')).not.toContainText('second-secret');
+  page.once('dialog', d => d.accept());
+  await profile.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(profile).toHaveCount(0);
+  await page.close();
+});

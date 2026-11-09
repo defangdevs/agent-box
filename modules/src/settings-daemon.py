@@ -580,6 +580,17 @@ def read_profiles():
     return out
 
 
+def profile_env_key_error(key):
+    """Validate custom environment names consistently for both profile forms."""
+    if key in PROFILE_RESERVED:
+        return "%s is already a profile option. Set it in the form above." % (
+            PROFILE_RESERVED_LABELS.get(key, "That name"))
+    if not KEY_RE.match(key):
+        return ("Invalid setting name. Use letters, digits and underscores; "
+                "do not start with a digit.")
+    return None
+
+
 def profile_write(name, assignments, drop=(), must_exist=False):
     """One read-modify-write on a profile, under the store's own lock.
 
@@ -4780,17 +4791,21 @@ PROFILES_SECTION_TPL = """<section>
           <textarea name="SYSTEM_PROMPT" rows="2" spellcheck="false"
                     placeholder="instructions (optional) &mdash; used for every session with this profile"></textarea>
         </div>
-        <div class="row env-row">
-          <input type="text" name="key" placeholder="KEY_NAME (optional)"
-                 pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off"
-                 aria-label="Environment setting name">
-          <input type="password" name="value" placeholder="value"
-                 autocomplete="off" aria-label="Value for that setting">
+        <div data-profile-env-rows>
+          <div class="row env-row" data-profile-env-row>
+            <input type="text" name="env_key_0" placeholder="KEY_NAME (optional)"
+                   pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off"
+                   aria-label="Environment setting name">
+            <input type="password" name="env_value_0" placeholder="value"
+                   autocomplete="off" aria-label="Value for that setting">
+            <button type="button" class="btn" data-remove-profile-env>Remove</button>
+          </div>
         </div>
-        <p class="note">Saving a profile with the same name replaces it.
-        Leave an optional field blank to remove its current value. Add a
-        starting environment setting above, or more from the profile&rsquo;s
-        own row below once it is saved.</p>
+        <button type="button" class="btn" data-add-profile-env>Add setting</button>
+        <p class="note">Saving a profile with the same name updates it.
+        Leave an optional launch field blank to remove its current value.
+        Sessions under the same account can access one another&rsquo;s values;
+        profiles do not separate trusted and untrusted work.</p>
         <div class="row profile-actions">
           <button type="submit" class="btn">Save</button>
         </div>
@@ -10208,22 +10223,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 key = (form.get("key", [""])[0]).strip()
                 value = form.get("value", [""])[0]
                 value = value.replace("\r\n", "\n").replace("\r", "\n")
-                if not KEY_RE.match(key) or key in PROFILE_RESERVED:
-                    if key in PROFILE_RESERVED:
-                        message = (
-                            "%s is already a profile option. Set it in the "
-                            "form above."
-                            % PROFILE_RESERVED_LABELS.get(key, "That name")
-                        )
-                    else:
-                        message = (
-                            "Invalid setting name. Use letters, digits and "
-                            "underscores; do not start with a digit."
-                        )
-                    self._send_html(
-                        render_page(message, kind="error"),
-                        status=400,
-                    )
+                message = profile_env_key_error(key)
+                if message:
+                    self._send_html(render_page(message, kind="error"), status=400)
                     return
                 # Same must_exist guard as delkey, for the same stale-tab
                 # reason: this form only ever appears inside an existing
@@ -10295,36 +10297,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 + ", ".join(PROFILE_AGENTS), kind="error"),
                     status=400)
                 return
-            # An optional starting environment setting (issue #493): the "New
-            # profile" pane has no fold to add one to until the profile
-            # exists, so this one pair rides in on the same request and the
-            # same write as the launch config, rather than needing a second
-            # round trip through /profiles/setkey's must_exist gate. Blank
-            # key is the ordinary case (most profiles start with none) and is
-            # silently skipped; a stray value with no key name is meaningless
-            # and dropped with it.
-            env_key = (form.get("key", [""])[0]).strip()
-            if env_key:
-                env_value = form.get("value", [""])[0]
-                env_value = env_value.replace("\r\n", "\n").replace("\r", "\n")
-                if not KEY_RE.match(env_key) or env_key in PROFILE_RESERVED:
-                    if env_key in PROFILE_RESERVED:
-                        message = (
-                            "%s is already a profile option. Set it in the "
-                            "form above."
-                            % PROFILE_RESERVED_LABELS.get(env_key, "That name")
-                        )
-                    else:
-                        message = (
-                            "Invalid setting name. Use letters, digits and "
-                            "underscores; do not start with a digit."
-                        )
-                    self._send_html(
-                        render_page(message, kind="error"),
-                        status=400,
-                    )
+            # Indexed names keep each key paired with its value even when a
+            # blank form field is omitted by parse_qs. Validate every row
+            # before writing anything, so a bad later row cannot partly save.
+            pairs = [(form.get("key", [""])[0], form.get("value", [""])[0])]
+            for field in form:
+                match = re.fullmatch(r"env_key_([0-9]+)", field)
+                if match:
+                    pairs.append((form[field][0], form.get(
+                        "env_value_" + match.group(1), [""])[0]))
+            seen = set()
+            for raw_key, env_value in pairs:
+                env_key = raw_key.strip()
+                if not env_key:
+                    continue
+                message = profile_env_key_error(env_key)
+                if not message and env_key in seen:
+                    message = "Each environment setting must have a different name."
+                if message:
+                    self._send_html(render_page(message, kind="error"), status=400)
                     return
-                assignments.append((env_key, env_value))
+                seen.add(env_key)
+                assignments.append((env_key, env_value.replace("\r\n", "\n").replace("\r", "\n")))
             try:
                 profile_write(name, assignments, drop=drop)
             except EnvStoreError as exc:
