@@ -2028,6 +2028,17 @@ reap_ephemeral() {
   fi
 }
 
+# Park Claude sessions whose Remote Control conversation was archived in the
+# app (#940): the TUI keeps running after the server closes the bridge, so
+# nothing else ever frees the pane. Parked, not removed: `restart` resumes it.
+park_archived_rc() {
+  _arch="$("${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" archived "$REGISTRY_FILE" 2>/dev/null)" || return 0
+  while IFS= read -r _n; do
+    case "$_n" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
+    agent-box-session stop "$_n" >/dev/null 2>&1 || true
+  done < <(printf '%s\n' "$_arch")
+}
+
 # Reconcile forever; systemd stop tears the whole tree down (ExecStop
 # kill-server + cgroup kill), Restart=always revives a crashed loop.
 # Sessions flagged stopped (a clean agent exit, or agent-box-session
@@ -2053,6 +2064,10 @@ while true; do
     esac
     $TMUX has-session -t "=$sname" 2>/dev/null || start_session "$sname"
   done < <($JQ -r '.sessions | to_entries[] | select(.value.stopped != true) | .key' "$REGISTRY_FILE" 2>/dev/null)
+  _arch_tick=$(( ${_arch_tick:-0} + 1 ))
+  if [ $(( _arch_tick % 15 )) -eq 0 ]; then
+    park_archived_rc
+  fi
   sync_codex_threads
   supervise_whatsapp
   supervise_slack

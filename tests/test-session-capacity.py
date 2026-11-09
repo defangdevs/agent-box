@@ -224,6 +224,49 @@ class Hibernation(unittest.TestCase):
         self.assertIsNone(capacity.hibernation_candidate(
             sessions, name="idle", token=selected["token"]))
 
+    WARNING = {"type": "system", "subtype": "informational", "level": "warning",
+               "content": "Remote Control disconnected - this session was ended "
+                          "or archived from another device or app (code 4090)",
+               "timestamp": "2026-11-09T12:00:10Z"}
+
+    def append(self, transcript, *records):
+        with transcript.open("a") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def archived(self, sessions, created=1_000_000_000):
+        return capacity.archived_probe(
+            "idle", sessions["idle"], {"idle"}, created=lambda _n: created)
+
+    def test_archived_rc_session_is_detected_and_user_sessions_count(self):
+        sessions, transcript = self.claude()
+        sessions["idle"].pop("origin")
+        self.assertFalse(self.archived(sessions))
+        self.append(transcript, self.WARNING)
+        self.assertTrue(self.archived(sessions))
+
+    def test_archived_rc_refuses_unproven_states(self):
+        sessions, transcript = self.claude()
+        self.append(transcript, self.WARNING)
+        # Warning predates this tmux session: a resumed copy must not re-park.
+        self.assertFalse(self.archived(sessions, created=2_000_000_000))
+        # Input after the warning means somebody uses the session.
+        self.append(transcript, {"type": "user", "message": {"content": "hi"}})
+        self.assertFalse(self.archived(sessions))
+        # Reworded warning fails safe.
+        sessions, transcript = self.claude()
+        self.append(transcript, dict(self.WARNING, content="Remote Control ended"))
+        self.assertFalse(self.archived(sessions))
+        # An open turn is never parked.
+        sessions, transcript = self.claude(closed=False)
+        self.append(transcript, self.WARNING)
+        self.assertFalse(self.archived(sessions))
+        # Daemons own several conversations.
+        sessions, transcript = self.claude()
+        self.append(transcript, self.WARNING)
+        sessions["idle"]["remoteControlDaemon"] = True
+        self.assertFalse(self.archived(sessions))
+
     def test_open_truncated_and_recent_claude_turns_stay_resident(self):
         sessions, transcript = self.claude(closed=False)
         self.assertIsNone(capacity.hibernation_candidate(sessions))

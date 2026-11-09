@@ -21,6 +21,10 @@ def capacity_main():
         sessions = {}
     command = sys.argv[1]
     try:
+        if command == "archived":
+            for archived_name in archived_sessions(sessions):
+                print(archived_name)
+            return 0
         if command == "hibernate-candidate":
             result = hibernation_candidate(sessions, excludes=sys.argv[3:])
             if result is None:

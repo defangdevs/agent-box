@@ -648,6 +648,101 @@ def hibernation_candidate(sessions, excludes=(), name=None, token=None,
         return None
     return min(candidates, key=lambda result: (result["idleSince"], result["name"]))
 
+
+# Archived Remote Control sessions (#940). When the Claude app archives an
+# /rc conversation the server closes the bridge socket with code 4090 and the
+# TUI writes one informational warning to its transcript, then keeps running.
+# Nothing else records it, so the supervisor parks such a session the way a
+# clean /exit would. Unknown or reworded evidence leaves the session up.
+ARCHIVED_RC_SIGNS = ("(code 4090)", "archived")
+
+
+def _archived_rc_warning(record):
+    if (record.get("type") != "system"
+            or record.get("subtype") != "informational"):
+        return False
+    content = record.get("content")
+    return (isinstance(content, str)
+            and all(sign in content for sign in ARCHIVED_RC_SIGNS))
+
+
+def _archived_parse_time(value):
+    if not isinstance(value, str):
+        return None
+    import datetime as archived_datetime
+    try:
+        stamp = archived_datetime.datetime.fromisoformat(
+            value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        return None
+    return stamp.timestamp()
+
+
+def _archived_session_created(name):
+    command = [hibernate_os.environ.get("AGENT_BOX_TMUX_BIN", "tmux"),
+               "-L", hibernate_os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box"),
+               "display-message", "-p", "-t", "=" + name, "#{session_created}"]
+    env = dict(hibernate_os.environ)
+    if env.get("AGENT_BOX_TMUX_TMPDIR"):
+        env["TMUX_TMPDIR"] = env["AGENT_BOX_TMUX_TMPDIR"]
+    import subprocess as archived_subprocess
+    try:
+        proc = archived_subprocess.run(command, capture_output=True, text=True,
+                                       timeout=5, check=False, env=env)
+    except (OSError, archived_subprocess.TimeoutExpired):
+        return None
+    raw = proc.stdout.strip()
+    return int(raw) if proc.returncode == 0 and raw.isdecimal() else None
+
+
+def archived_probe(name, entry, live, created=_archived_session_created):
+    if not isinstance(entry, dict) or name not in live:
+        return False
+    if (entry.get("agent") != "claude" or entry.get("stopped") is True
+            or _hibernate_crashed(entry)
+            or entry.get("remoteControlDaemon") is True
+            or entry.get("remoteControlServer") is True):
+        return False
+    target = _hibernate_claude_transcript(name, entry)
+    if target is None:
+        return False
+    records = _hibernate_records(target[1])
+    if not records:
+        return False
+    turns = [(i, r) for i, r in enumerate(records)
+             if r.get("type") in ("assistant", "user")
+             and isinstance(r.get("message"), dict)]
+    warned = [i for i, r in enumerate(records) if _archived_rc_warning(r)]
+    if not warned:
+        return False
+    at = warned[-1]
+    # No user or assistant record may follow the warning: later input means
+    # somebody is using the session, and an open turn is never parked.
+    if any(i > at for i, _ in turns):
+        return False
+    before = [r for i, r in turns if i < at]
+    if before:
+        last = before[-1]
+        if not (last.get("type") == "assistant"
+                and last["message"].get("stop_reason") == "end_turn"):
+            return False
+    # A resumed session replays the old transcript tail. Only a warning
+    # written by THIS tmux session counts, or restart would re-park at once.
+    stamp = _archived_parse_time(records[at].get("timestamp"))
+    started = created(name)
+    return stamp is not None and started is not None and stamp > started
+
+
+def archived_sessions(sessions):
+    try:
+        live = capacity_live_checked()
+    except SessionCapacityError as exc:
+        raise SessionHibernationError(str(exc)) from exc
+    return sorted(name for name, entry in sessions.items()
+                  if archived_probe(name, entry, live))
+
 import json as capacity_json
 import sys
 
@@ -671,6 +766,10 @@ def capacity_main():
         sessions = {}
     command = sys.argv[1]
     try:
+        if command == "archived":
+            for archived_name in archived_sessions(sessions):
+                print(archived_name)
+            return 0
         if command == "hibernate-candidate":
             result = hibernation_candidate(sessions, excludes=sys.argv[3:])
             if result is None:
