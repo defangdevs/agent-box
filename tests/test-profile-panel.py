@@ -879,6 +879,44 @@ class ProfileRoutes(ProfileFixture):
         self.assertIn("HARNESS=claude", text)
         self.assertIn("API_TOKEN=hunter2", text)
 
+    def test_multiple_starting_settings_are_paired_and_saved_atomically(self):
+        _, base = self.serve()
+        status, _ = self.post(base, "/profiles/set", name="multiple",
+                              HARNESS="claude", env_key_0="FIRST",
+                              env_value_0="", env_key_2="SECOND",
+                              env_value_2="second-value")
+        self.assertEqual(status, 303)
+        text = self.profile_text("multiple")
+        self.assertIn("FIRST=", text)
+        self.assertIn("SECOND=second-value", text)
+        page = urllib.request.urlopen(base + "/").read().decode()
+        self.assertNotIn("second-value", page)
+        status, _ = self.post(base, "/profiles/set", name="invalid",
+                              HARNESS="claude", env_key_0="GOOD",
+                              env_value_0="value", env_key_1="MODEL",
+                              env_value_1="bad")
+        self.assertEqual(status, 400)
+        self.assertIsNone(self.profile_text("invalid"))
+
+    def test_starting_value_without_name_is_refused(self):
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="missing",
+                                 HARNESS="claude", env_key_0="GOOD",
+                                 env_value_0="one", env_value_1="orphan")
+        self.assertEqual(status, 400)
+        self.assertIn("Enter a name", body)
+        self.assertIsNone(self.profile_text("missing"))
+
+    def test_duplicate_starting_settings_are_refused(self):
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="duplicate",
+                                 HARNESS="claude", env_key_0="TOKEN",
+                                 env_value_0="one", env_key_1="TOKEN",
+                                 env_value_1="two")
+        self.assertEqual(status, 400)
+        self.assertIn("different name", body)
+        self.assertIsNone(self.profile_text("duplicate"))
+
     def test_a_blank_starting_setting_is_simply_skipped(self):
         """The ordinary case: most profiles start with no environment
         setting of their own, and a bare Save with the field left empty
