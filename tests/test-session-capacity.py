@@ -169,6 +169,8 @@ class Hibernation(unittest.TestCase):
             "#!" + shutil.which("bash") + "\n"
             "if [ \"$1 $2 $3\" = '-L agent-box list-sessions' ]; then "
             "cat \"$TEST_LIVE_FILE\"; exit 0; fi\n"
+            "if [ \"$1 $2 $3\" = '-L agent-box display-message' ]; then "
+            "[ \"$6\" = '=idle:' ] && echo 1000000000; exit 0; fi\n"
             "echo unexpected tmux call >&2; exit 1\n")
         self.tmux.chmod(0o755)
         self.env = mock.patch.dict(os.environ, {
@@ -261,11 +263,24 @@ class Hibernation(unittest.TestCase):
         sessions, transcript = self.claude(closed=False)
         self.append(transcript, self.WARNING)
         self.assertFalse(self.archived(sessions))
+        # A warning with no earlier turn proves nothing about a closed turn.
+        sessions, transcript = self.claude()
+        transcript.write_text(json.dumps(self.WARNING) + "\n")
+        self.assertFalse(self.archived(sessions))
         # Daemons own several conversations.
         sessions, transcript = self.claude()
         self.append(transcript, self.WARNING)
         sessions["idle"]["remoteControlDaemon"] = True
         self.assertFalse(self.archived(sessions))
+
+    def test_archived_scan_isolates_a_session_with_bad_state(self):
+        sessions, transcript = self.claude()
+        self.append(transcript, self.WARNING)
+        self.write_json(".local/state/agent-box/session/broken.json", [])
+        sessions["broken"] = {"agent": "claude"}
+        self.live.write_text("idle\nbroken\n")
+        # The fake tmux only answers for the exact target "=idle:".
+        self.assertEqual(capacity.archived_sessions(sessions), ["idle"])
 
     def test_open_truncated_and_recent_claude_turns_stay_resident(self):
         sessions, transcript = self.claude(closed=False)

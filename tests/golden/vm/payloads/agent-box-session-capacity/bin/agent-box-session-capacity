@@ -683,7 +683,7 @@ def _archived_parse_time(value):
 def _archived_session_created(name):
     command = [hibernate_os.environ.get("AGENT_BOX_TMUX_BIN", "tmux"),
                "-L", hibernate_os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box"),
-               "display-message", "-p", "-t", "=" + name, "#{session_created}"]
+               "display-message", "-p", "-t", "=" + name + ":", "#{session_created}"]
     env = dict(hibernate_os.environ)
     if env.get("AGENT_BOX_TMUX_TMPDIR"):
         env["TMUX_TMPDIR"] = env["AGENT_BOX_TMUX_TMPDIR"]
@@ -723,11 +723,13 @@ def archived_probe(name, entry, live, created=_archived_session_created):
     if any(i > at for i, _ in turns):
         return False
     before = [r for i, r in turns if i < at]
-    if before:
-        last = before[-1]
-        if not (last.get("type") == "assistant"
-                and last["message"].get("stop_reason") == "end_turn"):
-            return False
+    # No proof of a closed turn (none seen, or the last is open) means no park.
+    if not before:
+        return False
+    last = before[-1]
+    if not (last.get("type") == "assistant"
+            and last["message"].get("stop_reason") == "end_turn"):
+        return False
     # A resumed session replays the old transcript tail. Only a warning
     # written by THIS tmux session counts, or restart would re-park at once.
     stamp = _archived_parse_time(records[at].get("timestamp"))
@@ -740,8 +742,15 @@ def archived_sessions(sessions):
         live = capacity_live_checked()
     except SessionCapacityError as exc:
         raise SessionHibernationError(str(exc)) from exc
-    return sorted(name for name, entry in sessions.items()
-                  if archived_probe(name, entry, live))
+    archived = []
+    for name, entry in sessions.items():
+        try:
+            if archived_probe(name, entry, live):
+                archived.append(name)
+        except (SessionHibernationError, OSError):
+            # Unreadable evidence for one session must not block the others.
+            continue
+    return sorted(archived)
 
 import json as capacity_json
 import sys
