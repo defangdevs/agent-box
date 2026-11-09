@@ -1370,7 +1370,12 @@
         var creatingAutomation = ed.matches("#watch-editor, #email-editor");
         // Rejections include webhook_invalid redirects and email HTTP 400s.
         // A positive save banner is required before discarding either draft.
-        if (!creatingAutomation || doc.querySelector('#msg-slot .msg[data-kind="ok"]')) {
+        var creatingProfile = ed.id === "profile-editor";
+        var msg = doc.querySelector("#msg-slot .msg");
+        var saved = msg && (msg.dataset.kind === "ok" ||
+          (creatingProfile && msg.dataset.kind === "warn" &&
+           msg.textContent.indexOf("Profile saved, with a warning:") !== -1));
+        if ((!creatingAutomation && !creatingProfile) || saved) {
           f.reset();
           var rows = f.querySelectorAll("[data-profile-env-row]");
           for (var i = 1; i < rows.length; i++) { rows[i].remove(); }

@@ -10301,15 +10301,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # blank form field is omitted by parse_qs. Validate every row
             # before writing anything, so a bad later row cannot partly save.
             pairs = [(form.get("key", [""])[0], form.get("value", [""])[0])]
+            indices = set()
             for field in form:
-                match = re.fullmatch(r"env_key_([0-9]+)", field)
+                match = re.fullmatch(r"env_(?:key|value)_([0-9]+)", field)
                 if match:
-                    pairs.append((form[field][0], form.get(
-                        "env_value_" + match.group(1), [""])[0]))
+                    indices.add(match.group(1))
+            for index in sorted(indices, key=int):
+                pairs.append((form.get("env_key_" + index, [""])[0],
+                              form.get("env_value_" + index, [""])[0]))
             seen = set()
             for raw_key, env_value in pairs:
                 env_key = raw_key.strip()
                 if not env_key:
+                    if env_value:
+                        self._send_html(render_page(
+                            "Enter a name for each environment setting value.",
+                            kind="error"), status=400)
+                        return
                     continue
                 message = profile_env_key_error(env_key)
                 if not message and env_key in seen:

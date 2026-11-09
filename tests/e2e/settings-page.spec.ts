@@ -473,8 +473,17 @@ test('create a profile with multiple environment settings', async ({ browser }) 
   await editor.getByLabel('Environment setting name').last().fill('DISCARD_ME');
   await editor.getByRole('button', { name: 'Remove' }).last().click();
   await editor.getByRole('button', { name: 'Add setting' }).click();
-  await editor.getByLabel('Environment setting name').last().fill(second);
+  await editor.getByLabel('Environment setting name').last().fill(first);
   await editor.getByLabel('Value for that setting').last().fill('second-secret');
+  await editor.getByRole('button', { name: 'Save' }).click();
+  await expect(page.locator('.msg')).toContainText('different name');
+  await expect(editor).toBeVisible();
+  await expect(editor.getByLabel('Value for that setting').last()).toHaveValue('second-secret');
+  await editor.getByLabel('Environment setting name').last().fill('');
+  await editor.getByRole('button', { name: 'Save' }).click();
+  await expect(page.locator('.msg')).toContainText('Enter a name');
+  await expect(editor.getByLabel('Value for that setting').last()).toHaveValue('second-secret');
+  await editor.getByLabel('Environment setting name').last().fill(second);
   await editor.getByRole('button', { name: 'Save' }).click();
   const profile = page.locator('.prof-row', { hasText: name });
   await expect(profile).toContainText('2 custom settings');

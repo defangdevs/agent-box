@@ -898,6 +898,15 @@ class ProfileRoutes(ProfileFixture):
         self.assertEqual(status, 400)
         self.assertIsNone(self.profile_text("invalid"))
 
+    def test_starting_value_without_name_is_refused(self):
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="missing",
+                                 HARNESS="claude", env_key_0="GOOD",
+                                 env_value_0="one", env_value_1="orphan")
+        self.assertEqual(status, 400)
+        self.assertIn("Enter a name", body)
+        self.assertIsNone(self.profile_text("missing"))
+
     def test_duplicate_starting_settings_are_refused(self):
         _, base = self.serve()
         status, body = self.post(base, "/profiles/set", name="duplicate",
