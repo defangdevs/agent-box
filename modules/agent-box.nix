@@ -1493,10 +1493,13 @@ let
     Media must either be captioned that way or sent during an explicitly opened
     ten-minute upload window. The bridge accepts them only from that
     account's Message Yourself chat. The device link belongs to the Linux user and
-    survives agent session restarts. Automatic message receipts are off by default;
-    set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
-    diagnostic receipts. Agent replies and explicit command responses stay enabled.
-    Node and the bridge are installed only when
+    survives agent session restarts. When you begin work on a WhatsApp message,
+    acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
+    (or Claude's `whatsapp_ack` tool). This sends an eyes reaction; a queued message
+    receives none. Optional text receipts are off by default; set
+    `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable them.
+    Agent replies and explicit command responses remain enabled. Node and the bridge
+    are installed only when
     pairing is requested; they are not part of the base image. The supervisor
     runs the bridge without spending a session slot. Message text and linked-device
     keys are stored in private files under `~/.local/state/local-whatsapp` on this
@@ -8165,12 +8168,12 @@ import time
 from urllib.request import urlopen
 
 
-REV = "79d4af3148eb074debe33c9823849fcbafe3c766"
+REV = "3ff8d6d8b37ff32b605293bab98d89bdae9e8aa6"
 FILES = {
-    "bridge.mjs": "2709fc674687f9c10b65d8fcff011f93780de3ac589a11896cba3279e153e27a",
-    "state.mjs": "a8d8173dbc149f18ff8a258d59ffb1f77923307533d05cfe736ecd58242f016c",
-    "package.json": "949405236ff6608624f604bc9429f4b89889748e85cb097aca19e0b3e6d6db36",
-    "package-lock.json": "b6271066fbfcae42f9d175fad87e8f943d4e7a8fa3664fbc1e3a4e5df5eba4e2",
+    "bridge.mjs": "84fc06a65ed31b512c58084c5d67f446ead518de9b1263104721e7649f4abe33",
+    "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
+    "package.json": "89561631f88c915a2b721b4e864d65de1e639fee0f9952fd9180a36b8b2b3a26",
+    "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
