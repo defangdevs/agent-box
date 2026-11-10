@@ -305,10 +305,13 @@ primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
 Media must either be captioned that way or sent during an explicitly opened
 ten-minute upload window. The bridge accepts them only from that
 account's Message Yourself chat. The device link belongs to the Linux user and
-survives agent session restarts. Automatic message receipts are off by default;
-set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
-diagnostic receipts. Agent replies and explicit command responses stay enabled.
-Node and the bridge are installed only when
+survives agent session restarts. When you begin work on a WhatsApp message,
+acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
+(or Claude's `whatsapp_ack` tool). This sends an eyes reaction; a queued message
+receives none. Optional text receipts are off by default; set
+`LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable them.
+Agent replies and explicit command responses remain enabled. Node and the bridge
+are installed only when
 pairing is requested; they are not part of the base image. The supervisor
 runs the bridge without spending a session slot. Message text and linked-device
 keys are stored in private files under `~/.local/state/local-whatsapp` on this

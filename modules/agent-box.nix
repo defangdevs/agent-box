@@ -1717,10 +1717,13 @@ let
     Media must either be captioned that way or sent during an explicitly opened
     ten-minute upload window. The bridge accepts them only from that
     account's Message Yourself chat. The device link belongs to the Linux user and
-    survives agent session restarts. Automatic message receipts are off by default;
-    set `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable
-    diagnostic receipts. Agent replies and explicit command responses stay enabled.
-    Node and the bridge are installed only when
+    survives agent session restarts. When you begin work on a WhatsApp message,
+    acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
+    (or Claude's `whatsapp_ack` tool). This sends an eyes reaction; a queued message
+    receives none. Optional text receipts are off by default; set
+    `LOCAL_WHATSAPP_DEBUG=1` in the env store and restart the bridge to enable them.
+    Agent replies and explicit command responses remain enabled. Node and the bridge
+    are installed only when
     pairing is requested; they are not part of the base image. The supervisor
     runs the bridge without spending a session slot. Message text and linked-device
     keys are stored in private files under `~/.local/state/local-whatsapp` on this
@@ -8554,12 +8557,12 @@ import time
 from urllib.request import urlopen
 
 
-REV = "79d4af3148eb074debe33c9823849fcbafe3c766"
+REV = "cd70050eaca87cd45bf936cd87b0dbd18ab41fd2"
 FILES = {
-    "bridge.mjs": "2709fc674687f9c10b65d8fcff011f93780de3ac589a11896cba3279e153e27a",
-    "state.mjs": "a8d8173dbc149f18ff8a258d59ffb1f77923307533d05cfe736ecd58242f016c",
-    "package.json": "949405236ff6608624f604bc9429f4b89889748e85cb097aca19e0b3e6d6db36",
-    "package-lock.json": "b6271066fbfcae42f9d175fad87e8f943d4e7a8fa3664fbc1e3a4e5df5eba4e2",
+    "bridge.mjs": "c76883483a33b5b1e6cf31b8fbb2dede119cd22888b0d239f74f4c39a097d302",
+    "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
+    "package.json": "8dda2da5443512104027d3905e14cf24def81ab240a12d6aea6799fb15dea200",
+    "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
@@ -17131,6 +17134,9 @@ esac
     WEBHOOK_MARKETPLACE=local-channels
     WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
     WHATSAPP_PLUGIN_REF="local-whatsapp@$WEBHOOK_MARKETPLACE"
+    # Oldest plugin that has whatsapp_ack (pickup reactions); an older install is
+    # refreshed, since a session restart never updates a plugin by itself.
+    WHATSAPP_PLUGIN_MIN_VERSION=0.6.0
     WHATSAPP_PLUGIN_REPO="''${AGENT_BOX_WEBHOOK_REPO:-defangdevs/local-channels}"
     # Where local-webhook keeps its per-session subscription filters. Spelled once
     # because two callers need to agree on it: the spawn below exports it as
@@ -17538,8 +17544,25 @@ esac
              + {($mkt): {source: {source: "github", repo: $repo}}})
            | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
         installed="$HOME/.claude/plugins/installed_plugins.json"
-        if ! [ -s "$installed" ] || ! "$JQ" -e --arg ref "$WHATSAPP_PLUGIN_REF" \
-             '.plugins[$ref] // [] | length > 0' "$installed" >/dev/null 2>&1; then
+        # Every scope that holds the plugin is checked: a current user entry must
+        # not hide an older project or local one that is the copy a session loads.
+        wa_have=""
+        wa_stale_scopes=""
+        if [ -s "$installed" ]; then
+          wa_have="$("$JQ" -r --arg ref "$WHATSAPP_PLUGIN_REF" \
+            '.plugins[$ref][]? | "\(.scope // "user") \(.version // "0")"' \
+            "$installed" 2>/dev/null)" || wa_have=""
+        fi
+        while read -r wa_scope wa_ver; do
+          [ -n "$wa_scope" ] || continue
+          if [ "$(printf '%s\n%s\n' "$WHATSAPP_PLUGIN_MIN_VERSION" "$wa_ver" \
+               | sort -V | head -n 1)" != "$WHATSAPP_PLUGIN_MIN_VERSION" ]; then
+            wa_stale_scopes="$wa_stale_scopes $wa_scope"
+          fi
+        done <<<"$wa_have"
+        wa_stale=false
+        [ -z "$wa_stale_scopes" ] || wa_stale=true
+        if [ -z "$wa_have" ] || [ "$wa_stale" = true ]; then
           wa_marker="$HOME/.claude/plugins/.agent-box-whatsapp-install"
           wa_now="$(date +%s)"
           wa_last=0
@@ -17551,8 +17574,19 @@ esac
               mkdir -p "$HOME/.claude/plugins"
               printf '%s\n' "$wa_now" > "$wa_marker"
               timeout 90 "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
-              if ! timeout 90 "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1; then
-                echo "local-whatsapp plugin: install failed; will retry after the cooldown" >&2
+              wa_ok=true
+              if [ "$wa_stale" = true ]; then
+                wa_verb=update
+                for wa_scope in $wa_stale_scopes; do
+                  timeout 90 "$cbin" plugin update "$WHATSAPP_PLUGIN_REF" --scope "$wa_scope" \
+                    >/dev/null 2>&1 || wa_ok=false
+                done
+              else
+                wa_verb=install
+                timeout 90 "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1 || wa_ok=false
+              fi
+              if [ "$wa_ok" != true ]; then
+                echo "local-whatsapp plugin: $wa_verb failed; will retry after the cooldown" >&2
               fi
             fi
           fi
@@ -19540,11 +19574,20 @@ esac
       whatsapp_last_start="$now"
       session_cli="$(command -v agent-box-session)" || return
       codex_cli="$(agent_bin codex stable 2>/dev/null)" || codex_cli=""
+      # Diagnostic receipts are opt-in from the env store; this unit does not load
+      # the store itself, so read the one setting the bridge honours.
+      wa_debug=""
+      envstore="''${AGENT_BOX_ENVSTORE_BIN:-}"
+      if [ -x "$envstore" ]; then
+        wa_debug="$("$envstore" json 2>/dev/null \
+          | "$JQ" -r '.LOCAL_WHATSAPP_DEBUG // empty' 2>/dev/null)" || wa_debug=""
+      fi
       if [ -n "$codex_cli" ]; then
-        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" \
+        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
           LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$whatsapp" serve &
       else
-        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" "$whatsapp" serve &
+        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
+          "$whatsapp" serve &
       fi
       whatsapp_pid=$!
     }
