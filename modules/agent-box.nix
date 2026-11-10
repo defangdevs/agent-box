@@ -8168,11 +8168,11 @@ import time
 from urllib.request import urlopen
 
 
-REV = "db54008c792a2028b2d094ab6876bb57ed7483ef"
+REV = "cd70050eaca87cd45bf936cd87b0dbd18ab41fd2"
 FILES = {
-    "bridge.mjs": "84fc06a65ed31b512c58084c5d67f446ead518de9b1263104721e7649f4abe33",
+    "bridge.mjs": "c76883483a33b5b1e6cf31b8fbb2dede119cd22888b0d239f74f4c39a097d302",
     "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
-    "package.json": "89561631f88c915a2b721b4e864d65de1e639fee0f9952fd9180a36b8b2b3a26",
+    "package.json": "8dda2da5443512104027d3905e14cf24def81ab240a12d6aea6799fb15dea200",
     "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
 HOME = Path.home()
