@@ -169,6 +169,8 @@ class Hibernation(unittest.TestCase):
             "#!" + shutil.which("bash") + "\n"
             "if [ \"$1 $2 $3\" = '-L agent-box list-sessions' ]; then "
             "cat \"$TEST_LIVE_FILE\"; exit 0; fi\n"
+            "if [ \"$1 $2 $3\" = '-L agent-box display-message' ]; then "
+            "[ \"$6\" = '=idle:' ] && echo 1000000000; exit 0; fi\n"
             "echo unexpected tmux call >&2; exit 1\n")
         self.tmux.chmod(0o755)
         self.env = mock.patch.dict(os.environ, {
@@ -223,6 +225,62 @@ class Hibernation(unittest.TestCase):
                          + "\n")
         self.assertIsNone(capacity.hibernation_candidate(
             sessions, name="idle", token=selected["token"]))
+
+    WARNING = {"type": "system", "subtype": "informational", "level": "warning",
+               "content": "Remote Control disconnected - this session was ended "
+                          "or archived from another device or app (code 4090)",
+               "timestamp": "2026-11-09T12:00:10Z"}
+
+    def append(self, transcript, *records):
+        with transcript.open("a") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def archived(self, sessions, created=1_000_000_000):
+        return capacity.archived_probe(
+            "idle", sessions["idle"], {"idle"}, created=lambda _n: created)
+
+    def test_archived_rc_session_is_detected_and_user_sessions_count(self):
+        sessions, transcript = self.claude()
+        sessions["idle"].pop("origin")
+        self.assertFalse(self.archived(sessions))
+        self.append(transcript, self.WARNING)
+        self.assertTrue(self.archived(sessions))
+
+    def test_archived_rc_refuses_unproven_states(self):
+        sessions, transcript = self.claude()
+        self.append(transcript, self.WARNING)
+        # Warning predates this tmux session: a resumed copy must not re-park.
+        self.assertFalse(self.archived(sessions, created=2_000_000_000))
+        # Input after the warning means somebody uses the session.
+        self.append(transcript, {"type": "user", "message": {"content": "hi"}})
+        self.assertFalse(self.archived(sessions))
+        # Reworded warning fails safe.
+        sessions, transcript = self.claude()
+        self.append(transcript, dict(self.WARNING, content="Remote Control ended"))
+        self.assertFalse(self.archived(sessions))
+        # An open turn is never parked.
+        sessions, transcript = self.claude(closed=False)
+        self.append(transcript, self.WARNING)
+        self.assertFalse(self.archived(sessions))
+        # A warning with no earlier turn proves nothing about a closed turn.
+        sessions, transcript = self.claude()
+        transcript.write_text(json.dumps(self.WARNING) + "\n")
+        self.assertFalse(self.archived(sessions))
+        # Daemons own several conversations.
+        sessions, transcript = self.claude()
+        self.append(transcript, self.WARNING)
+        sessions["idle"]["remoteControlDaemon"] = True
+        self.assertFalse(self.archived(sessions))
+
+    def test_archived_scan_isolates_a_session_with_bad_state(self):
+        sessions, transcript = self.claude()
+        self.append(transcript, self.WARNING)
+        self.write_json(".local/state/agent-box/session/broken.json", [])
+        sessions["broken"] = {"agent": "claude"}
+        self.live.write_text("idle\nbroken\n")
+        # The fake tmux only answers for the exact target "=idle:".
+        self.assertEqual(capacity.archived_sessions(sessions), ["idle"])
 
     def test_open_truncated_and_recent_claude_turns_stay_resident(self):
         sessions, transcript = self.claude(closed=False)
