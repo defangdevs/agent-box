@@ -16796,14 +16796,24 @@ esac
              + {($mkt): {source: {source: "github", repo: $repo}}})
            | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
         installed="$HOME/.claude/plugins/installed_plugins.json"
+        # Every scope that holds the plugin is checked: a current user entry must
+        # not hide an older project or local one that is the copy a session loads.
         wa_have=""
-        [ -s "$installed" ] && wa_have="$("$JQ" -r --arg ref "$WHATSAPP_PLUGIN_REF" \
-          '.plugins[$ref][0].version // empty' "$installed" 2>/dev/null)" || true
-        wa_stale=false
-        if [ -n "$wa_have" ] && [ "$(printf '%s\n%s\n' "$WHATSAPP_PLUGIN_MIN_VERSION" "$wa_have" \
-             | sort -V | head -n 1)" != "$WHATSAPP_PLUGIN_MIN_VERSION" ]; then
-          wa_stale=true
+        wa_stale_scopes=""
+        if [ -s "$installed" ]; then
+          wa_have="$("$JQ" -r --arg ref "$WHATSAPP_PLUGIN_REF" \
+            '.plugins[$ref][]? | "\(.scope // "user") \(.version // "0")"' \
+            "$installed" 2>/dev/null)" || wa_have=""
         fi
+        while read -r wa_scope wa_ver; do
+          [ -n "$wa_scope" ] || continue
+          if [ "$(printf '%s\n%s\n' "$WHATSAPP_PLUGIN_MIN_VERSION" "$wa_ver" \
+               | sort -V | head -n 1)" != "$WHATSAPP_PLUGIN_MIN_VERSION" ]; then
+            wa_stale_scopes="$wa_stale_scopes $wa_scope"
+          fi
+        done <<<"$wa_have"
+        wa_stale=false
+        [ -z "$wa_stale_scopes" ] || wa_stale=true
         if [ -z "$wa_have" ] || [ "$wa_stale" = true ]; then
           wa_marker="$HOME/.claude/plugins/.agent-box-whatsapp-install"
           wa_now="$(date +%s)"
@@ -16816,12 +16826,18 @@ esac
               mkdir -p "$HOME/.claude/plugins"
               printf '%s\n' "$wa_now" > "$wa_marker"
               timeout 90 "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
+              wa_ok=true
               if [ "$wa_stale" = true ]; then
                 wa_verb=update
+                for wa_scope in $wa_stale_scopes; do
+                  timeout 90 "$cbin" plugin update "$WHATSAPP_PLUGIN_REF" --scope "$wa_scope" \
+                    >/dev/null 2>&1 || wa_ok=false
+                done
               else
                 wa_verb=install
+                timeout 90 "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1 || wa_ok=false
               fi
-              if ! timeout 90 "$cbin" plugin "$wa_verb" "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1; then
+              if [ "$wa_ok" != true ]; then
                 echo "local-whatsapp plugin: $wa_verb failed; will retry after the cooldown" >&2
               fi
             fi
@@ -18810,11 +18826,20 @@ esac
       whatsapp_last_start="$now"
       session_cli="$(command -v agent-box-session)" || return
       codex_cli="$(agent_bin codex stable 2>/dev/null)" || codex_cli=""
+      # Diagnostic receipts are opt-in from the env store; this unit does not load
+      # the store itself, so read the one setting the bridge honours.
+      wa_debug=""
+      envstore="''${AGENT_BOX_ENVSTORE_BIN:-}"
+      if [ -x "$envstore" ]; then
+        wa_debug="$("$envstore" json 2>/dev/null \
+          | "$JQ" -r '.LOCAL_WHATSAPP_DEBUG // empty' 2>/dev/null)" || wa_debug=""
+      fi
       if [ -n "$codex_cli" ]; then
-        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" \
+        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
           LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$whatsapp" serve &
       else
-        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" "$whatsapp" serve &
+        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
+          "$whatsapp" serve &
       fi
       whatsapp_pid=$!
     }
