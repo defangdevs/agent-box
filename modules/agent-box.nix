@@ -16386,6 +16386,9 @@ esac
     WEBHOOK_MARKETPLACE=local-channels
     WEBHOOK_PLUGIN_REF="local-webhook@$WEBHOOK_MARKETPLACE"
     WHATSAPP_PLUGIN_REF="local-whatsapp@$WEBHOOK_MARKETPLACE"
+    # Oldest plugin that has whatsapp_ack (pickup reactions); an older install is
+    # refreshed, since a session restart never updates a plugin by itself.
+    WHATSAPP_PLUGIN_MIN_VERSION=0.6.0
     WHATSAPP_PLUGIN_REPO="''${AGENT_BOX_WEBHOOK_REPO:-defangdevs/local-channels}"
     # Where local-webhook keeps its per-session subscription filters. Spelled once
     # because two callers need to agree on it: the spawn below exports it as
@@ -16793,8 +16796,15 @@ esac
              + {($mkt): {source: {source: "github", repo: $repo}}})
            | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
         installed="$HOME/.claude/plugins/installed_plugins.json"
-        if ! [ -s "$installed" ] || ! "$JQ" -e --arg ref "$WHATSAPP_PLUGIN_REF" \
-             '.plugins[$ref] // [] | length > 0' "$installed" >/dev/null 2>&1; then
+        wa_have=""
+        [ -s "$installed" ] && wa_have="$("$JQ" -r --arg ref "$WHATSAPP_PLUGIN_REF" \
+          '.plugins[$ref][0].version // empty' "$installed" 2>/dev/null)" || true
+        wa_stale=false
+        if [ -n "$wa_have" ] && [ "$(printf '%s\n%s\n' "$WHATSAPP_PLUGIN_MIN_VERSION" "$wa_have" \
+             | sort -V | head -n 1)" != "$WHATSAPP_PLUGIN_MIN_VERSION" ]; then
+          wa_stale=true
+        fi
+        if [ -z "$wa_have" ] || [ "$wa_stale" = true ]; then
           wa_marker="$HOME/.claude/plugins/.agent-box-whatsapp-install"
           wa_now="$(date +%s)"
           wa_last=0
@@ -16806,8 +16816,13 @@ esac
               mkdir -p "$HOME/.claude/plugins"
               printf '%s\n' "$wa_now" > "$wa_marker"
               timeout 90 "$cbin" plugin marketplace update "$WEBHOOK_MARKETPLACE" >/dev/null 2>&1 || true
-              if ! timeout 90 "$cbin" plugin install "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1; then
-                echo "local-whatsapp plugin: install failed; will retry after the cooldown" >&2
+              if [ "$wa_stale" = true ]; then
+                wa_verb=update
+              else
+                wa_verb=install
+              fi
+              if ! timeout 90 "$cbin" plugin "$wa_verb" "$WHATSAPP_PLUGIN_REF" >/dev/null 2>&1; then
+                echo "local-whatsapp plugin: $wa_verb failed; will retry after the cooldown" >&2
               fi
             fi
           fi
