@@ -151,6 +151,7 @@
       .then(function (r) { if (!r.ok) { throw new Error(); } return r.json(); })
       .catch(function () { return null; });
   }
+  var resourceShow = null;
   function resourceUsage() {
     var section = document.querySelector("[data-resources-url]");
     if (!section) { return; }
@@ -181,8 +182,11 @@
         section.querySelector('[data-resource="' + name + '"]').textContent = values[name];
       });
     }
+    // The live feed pushes the same reading every few seconds; the poll
+    // below is its fallback and stands down while the feed carries it.
+    resourceShow = show;
     function refresh() {
-      if (document.hidden || pending) { return; }
+      if (document.hidden || pending || feedCarries("resources")) { return; }
       pending = true;
       var controller = new AbortController();
       var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
@@ -222,16 +226,30 @@
       return r.text();
     });
   }
-  // Re-fetch the page this script is running on.
-  function fetchPage() {
-    var here = window.location.pathname;
-    return settleRedirect(fetch(here + window.location.search), here);
+  // Re-fetch the page this script is running on. `sections` names the
+  // regions the caller will keep: the daemon then renders only those
+  // (X-Agent-Box-Sections), which skips the webhook, email and sign-in
+  // probes that a region nobody keeps would cost. A page that does not know
+  // the header (the workspace) answers in full, which is still correct.
+  var SECTIONS_HEADER = "X-Agent-Box-Sections";
+  function sectionHeaders(sections) {
+    var headers = {};
+    if (sections) { headers[SECTIONS_HEADER] = sections.join(" "); }
+    return headers;
   }
+  function fetchPage(sections) {
+    var here = window.location.pathname;
+    return settleRedirect(
+      fetch(here + window.location.search, { headers: sectionHeaders(sections) }),
+      here);
+  }
+  var SESSION_REGIONS = ["msg-slot", "sessions-list", "tab-bar"];
+  var CONNECT_REGIONS = ["msg-slot", "connect-list"];
   // Re-fetch the current page and patch the live session list/tabs, so
   // the visible list tracks a restart even when nothing was "starting"
   // at submit time (which is what otherwise gates schedulePoll).
   function pollPageOnce() {
-    return fetchPage()
+    return fetchPage(SESSION_REGIONS)
       .then(function (t) {
         if (t === null) { return; }
         applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
@@ -431,7 +449,7 @@
       pollTimer = null;
       // Keep the query string: on the workspace it carries ?tab=, so
       // the fetched tab bar marks the same tab current.
-      fetchPage()
+      fetchPage(SESSION_REGIONS)
         .then(function (t) {
           if (t === null) { return; }
           applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
@@ -461,27 +479,36 @@
     var el = document.getElementById("connect-list");
     return !!el && el.getAttribute("data-busy") === "1";
   }
+  // Fetch only the cards (and the banner a settled sign-in can raise) when
+  // the cards' fingerprint moved. Shared by the poll below and the feed.
+  function connectSaw(fp) {
+    var el = document.getElementById("connect-list");
+    if (!el || !fp || fp === el.getAttribute("data-fp")) {
+      return Promise.resolve();
+    }
+    return fetchPage(CONNECT_REGIONS)
+      // A settled connection can produce page-level feedback (for
+      // example, which sessions a fresh sign-in restarted). Morph the
+      // banner slot with the card state so that result appears where every
+      // other transient action message lives (issue #835).
+      .then(function (t) {
+        if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
+      })
+      .catch(function () {});
+  }
+  // The fallback for a page with no live feed: with the feed carrying the
+  // "connect" topic, the daemon watches a busy card itself and this stops.
   function connectPoll() {
-    if (connectTimer || !connectBusy()) { return; }
+    if (connectTimer || !connectBusy() || feedCarries("connect")) { return; }
     connectTimer = window.setTimeout(function () {
       connectTimer = null;
+      if (feedCarries("connect")) { return; }
       if (document.hidden) { connectPoll(); return; }
       var el = document.getElementById("connect-list");
       var url = el && el.getAttribute("data-status");
       if (!url) { connectPoll(); return; }
       fetchStatus(url)
-        .then(function (s) {
-          var fp = s && s.connect_fp;
-          if (!fp || fp === el.getAttribute("data-fp")) { return null; }
-          return fetchPage();
-        })
-        // A settled connection can produce page-level feedback (for
-        // example, which sessions a fresh sign-in restarted). Morph the
-        // banner slot with the card state so that result appears where every
-        // other transient action message lives (issue #835).
-        .then(function (t) {
-          if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
-        })
+        .then(function (s) { return connectSaw(s && s.connect_fp); })
         .catch(function () {})
         .then(function () { connectPoll(); });
     }, 2500);
@@ -502,6 +529,19 @@
   // posts do). The fingerprint, not the state itself, is what travels:
   // rendering stays server-side and nothing sensitive crosses the feed.
   var liveFeed = false;
+  // Which topics the open stream carries. The settings page also asks for
+  // "resources" (the usage panel's numbers) and "connect" (the sign-in
+  // cards' fingerprint), each of which replaces a poll. Resources frames
+  // arrive every few seconds, so they double as a heartbeat: a stream that
+  // went quiet for FEED_STALE_MS died without an error event, and the polls
+  // come back until it reconnects.
+  var feedTopics = {};
+  var lastFrame = 0;
+  var FEED_STALE_MS = 15000;
+  function feedCarries(topic) {
+    if (!feedTopics[topic]) { return false; }
+    return !feedTopics.resources || Date.now() - lastFrame < FEED_STALE_MS;
+  }
   var probeTimer = null, probeEvery = 0;
   var NO_FEED_MS = 5000;    // no stream: the fingerprint poll IS the feed
   var BACKSTOP_MS = 30000;  // stream up: slow re-check, so nothing can stick
@@ -535,6 +575,8 @@
       if (probeTimer) { window.clearInterval(probeTimer); }
       probeTimer = window.setInterval(function () {
         if (!document.hidden) { probe(); }
+        // A stream that went stale hands a busy card back to its poll.
+        connectPoll();
       }, ms);
     }
     document.addEventListener("visibilitychange", function () {
@@ -546,15 +588,31 @@
     // real box (Caddy always serves TLS); only a plain-HTTP dev rig
     // spends a whole connection out of the browser's per-origin six on
     // it, alongside each pane's terminal WebSocket.
-    var es = new EventSource(url);
+    var topics = ["sessions"];
+    if (document.querySelector("[data-resources-url]")) { topics.push("resources"); }
+    if (document.getElementById("connect-list")) { topics.push("connect"); }
+    var es = new EventSource(url + "?topics=" + topics.join(","));
     es.onopen = function () {
       liveFeed = true;
+      lastFrame = Date.now();
+      topics.forEach(function (t) { feedTopics[t] = true; });
       setProbe(BACKSTOP_MS);
     };
+    function frame(e) {
+      lastFrame = Date.now();
+      try { return JSON.parse(e.data); } catch (err) { return null; }
+    }
     es.addEventListener("sessions", function (e) {
-      var s = null;
-      try { s = JSON.parse(e.data); } catch (err) { return; }
+      var s = frame(e);
       saw(s && s.fp);
+    });
+    es.addEventListener("resources", function (e) {
+      var s = frame(e);
+      if (s && resourceShow) { resourceShow(s); }
+    });
+    es.addEventListener("connect", function (e) {
+      var s = frame(e);
+      connectSaw(s && s.fp);
     });
     es.onerror = function () {
       // A dropped stream reconnects on its own (a box update restarts
@@ -564,7 +622,9 @@
       // will not stream — and per spec it never retries, so the poll
       // goes back to being the feed.
       liveFeed = false;
+      feedTopics = {};
       if (es.readyState === EventSource.CLOSED) { setProbe(NO_FEED_MS); }
+      connectPoll();
     };
   }
 
@@ -1328,6 +1388,36 @@
     else { row.querySelectorAll("input").forEach(function (input) { input.value = ""; }); }
   });
 
+  // Which page regions a form's answer can change, when that is known to be
+  // fewer than all of them: the daemon then renders only those. A secret
+  // changes its own list and the sign-in cards (a stored key can shadow a
+  // sign-in); a sign-in action changes its card and the banner. Every other
+  // form still gets, and applies, the whole page.
+  function formSections(f) {
+    if (f.closest("#connect-list")) { return CONNECT_REGIONS; }
+    if (f.closest("#secret-editor, #secrets-list")) {
+      return ["msg-slot", "secrets-list", "connect-list"];
+    }
+    return null;
+  }
+  // Disable the form's submit buttons until its answer is in, and show a
+  // button's data-busy-label meanwhile. Returns the function that undoes
+  // it. The form is often replaced by the answer; undoing a detached form
+  // is harmless.
+  function markBusy(f, submitter) {
+    var buttons = Array.prototype.slice.call(f.querySelectorAll('[type="submit"]'));
+    var label = submitter && submitter.getAttribute("data-busy-label");
+    var text = submitter ? submitter.textContent : "";
+    f.setAttribute("aria-busy", "true");
+    buttons.forEach(function (b) { b.disabled = true; });
+    if (label) { submitter.textContent = label; }
+    return function () {
+      f.removeAttribute("aria-busy");
+      buttons.forEach(function (b) { b.disabled = false; });
+      if (label) { submitter.textContent = text; }
+    };
+  }
+
   document.addEventListener("submit", function (e) {
     var f = e.target;
     if (e.defaultPrevented || !f || (f.method || "").toLowerCase() !== "post") { return; }
@@ -1336,8 +1426,14 @@
     // can prompt for the new password; fetch() suppresses that UX.
     if (f.hasAttribute("data-native")) { return; }
     e.preventDefault();
+    // One submission at a time per form. The answer can take a moment, and
+    // a second press used to send the same POST again with nothing on
+    // screen to say the first one was still going.
+    if (f.getAttribute("aria-busy") === "true") { return; }
+    var submitter = e.submitter || f.querySelector('[type="submit"]');
     var body = new URLSearchParams();
     new FormData(f).forEach(function (v, k) { body.append(k, v); });
+    var sections = formSections(f);
     // On the workspace, adding a session should focus its new tab. The
     // name is auto-derived by the daemon, so the page only learns it
     // from the answer: a successful add redirects to ?tab=<new name>,
@@ -1361,7 +1457,7 @@
       // created here stayed invisible until a full reload — and the picker
       // could not offer the profile the operator had just made.
       var doc = parseHTML(t);
-      applyDoc(doc,
+      applyDoc(doc, sections ||
         ["msg-slot", "secrets-list", "sessions-list", "profiles-list",
          "profile-picker", "webhook-endpoint", "webhooks-list",
          "connect-list", "tab-bar"]);
@@ -1395,8 +1491,12 @@
     // the settings page once zero sessions remain.
     function post() {
       var here = window.location.pathname;
+      var done = markBusy(f, submitter);
       return settleRedirect(
-        fetch(f.getAttribute("action"), { method: "POST", body: body }), here);
+        fetch(f.getAttribute("action"),
+              { method: "POST", body: body, headers: sectionHeaders(sections) }),
+        here).then(function (t) { done(); return t; },
+                   function (err) { done(); throw err; });
     }
 
     // The two Danger-zone actions get a long-polled progress line;

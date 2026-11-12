@@ -165,6 +165,8 @@ ul.tbl.subs li { padding-left: 40px; }
        border-radius: 6px; border: 1px solid #30363d; background: #21262d;
        color: #e6edf3; cursor: pointer; white-space: nowrap; }
 .btn:hover { background: #30363d; }
+/* A form whose answer is still on its way (settings.js markBusy). */
+form[aria-busy="true"] [type="submit"] { opacity: 0.6; cursor: progress; }
 .btn.small { padding: 3px 10px; font-size: 12px; }
 /* Not button.icon: the transcript download (issue #248) is a GET, so it is
    an <a> and has to sit in the same row of icons as the delete button. */

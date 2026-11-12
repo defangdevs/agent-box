@@ -2967,6 +2967,28 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # Partial page renders (X-Agent-Box-Sections) and the live feed's
+          # resources/connect topics. Same subject as settings-json above:
+          # the golden payload, the daemon as it actually ships.
+          settings-sections =
+            pkgs.runCommand "agent-box-settings-sections"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-settings-sections.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-settings-sections.py
+              python3 repo/tests/test-settings-sections.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # connect_start()'s install half: resolving nix at use, and
           # letting a failed install reach the exit marker (issue #544).
           # Same shape and same subject as connect-card above - the GOLDEN

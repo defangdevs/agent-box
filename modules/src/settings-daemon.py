@@ -4439,6 +4439,25 @@ EVENTS_TICK = 1.0         # how often the watcher samples session state
 EVENTS_SLICE = 1.0        # how often a stream re-checks that its client is there
 EVENTS_KEEPALIVE = 20.0   # comment frame so idle proxies keep the stream
 EVENTS_MAX_STREAMS = 8    # a stream costs a thread; past this, clients poll
+# Two more topics share the stream, each on its own clock, and a stream
+# names the ones it wants (?topics=resources,connect). Without the
+# parameter it gets "sessions" alone, which is all an older page knew.
+#
+#   resources - the Resource usage panel's numbers, sent whole (host
+#               readings only, the same JSON {BASE}/resources answers).
+#               Replaces the page's 5s poll of that route.
+#   connect   - the sign-in cards' fingerprint (connect_fingerprint()).
+#               Replaces the 2.5s {BASE}/status poll a busy card ran.
+#
+# connect_state() is not a pure read: it answers a CLI's prompt, reaps a
+# finished pane and expires a stale one. So it is sampled only while a sign-in
+# is in flight, which is when the poll it replaces used to run: a render that
+# shows a busy card opens a CONNECT_ACTIVE window, a sample that still finds
+# one busy extends it, and once every card has settled sampling stops.
+EVENTS_TOPICS = ("sessions", "resources", "connect")
+EVENTS_RESOURCES_TICK = 5.0
+EVENTS_CONNECT_TICK = 2.5
+EVENTS_CONNECT_ACTIVE = 15.0
 
 
 def session_view():
@@ -4546,50 +4565,101 @@ def session_fingerprint():
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
+def connect_busy(states):
+    """True while any sign-in card is mid-flow (its pane is live, or its
+    exchange is still unconfirmed): the states the page keeps watching."""
+    return any(
+        s["state"] in ("starting", "waiting", "checking", "exchanging")
+        for s in states)
+
+
+def connect_sample():
+    """(fingerprint, busy) of every sign-in card, sharing one env read and
+    one `tmux list-sessions` between them as render_connect() does."""
+    flows = connect_flows()
+    if not flows:
+        return "", False
+    keys = read_keys()
+    tmux_state = tmux_sessions()
+    states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
+              for flow in flows]
+    return connect_fingerprint(states), connect_busy(states)
+
+
+def parse_topics(value):
+    """The topics one stream asked for; "sessions" when it named none."""
+    wanted = tuple(t for t in EVENTS_TOPICS
+                   if t in re.split(r"[\s,]+", value or ""))
+    return wanted or ("sessions",)
+
+
 class SessionWatcher:
     """One sampler thread shared by every open stream.
 
     A sample forks `tmux list-sessions`, so sampling per client would
     scale with open browser tabs; instead a single thread samples while
     at least one stream is connected and hands them all the same
-    fingerprint through a condition variable. With nothing connected the
+    values through a condition variable. With nothing connected the
     thread exits, so an idle box spawns nothing at all.
+
+    `values` maps each topic to the frame payload last sampled for it
+    ("" until the first sample). `seq` moves whenever any of them changes;
+    each stream remembers what it last sent per topic and sends only the
+    topics it follows that moved. A topic nobody follows is not sampled.
     """
 
     def __init__(self):
         self.cond = threading.Condition()
-        self.fingerprint = ""
+        self.values = {topic: "" for topic in EVENTS_TOPICS}
         self.seq = 0
         self.streams = 0
+        self.wants = {topic: 0 for topic in EVENTS_TOPICS}
+        self.connect_until = 0.0
         self.thread = None
 
-    def subscribe(self):
-        """Reserve a stream slot. Returns (sequence, fingerprint) to start
-        from, or None when EVENTS_MAX_STREAMS are already open. The
-        fingerprint is empty until the first sample lands."""
+    @property
+    def fingerprint(self):
+        return self.values["sessions"]
+
+    def subscribe(self, topics=("sessions",)):
+        """Reserve a stream slot. Returns (sequence, values) to start
+        from, or None when EVENTS_MAX_STREAMS are already open. A value is
+        empty until the first sample of its topic lands."""
         with self.cond:
             if self.streams >= EVENTS_MAX_STREAMS:
                 return None
             self.streams += 1
+            for topic in topics:
+                self.wants[topic] += 1
             if self.thread is None:
                 self.thread = threading.Thread(target=self._sample, daemon=True)
                 self.thread.start()
-            return self.seq, self.fingerprint
+            return self.seq, dict(self.values)
 
-    def release(self):
+    def release(self, topics=("sessions",)):
         with self.cond:
             self.streams -= 1
+            for topic in topics:
+                self.wants[topic] -= 1
 
     def wait(self, seq, timeout):
-        """Block until the fingerprint changes or timeout expires, then
-        return (sequence, fingerprint). An unchanged sequence means the
-        caller timed out and should send a keep-alive."""
+        """Block until a value changes or timeout expires, then return
+        (sequence, values). An unchanged sequence means the caller timed
+        out and should send a keep-alive."""
         with self.cond:
             if self.seq == seq:
                 self.cond.wait(timeout)
-            return self.seq, self.fingerprint
+            return self.seq, dict(self.values)
+
+    def connect_active(self):
+        """A sign-in is in flight: sample the cards for the next
+        EVENTS_CONNECT_ACTIVE seconds. Cheap, and safe to call from any
+        render; it starts nothing when no stream follows the cards."""
+        with self.cond:
+            self.connect_until = time.monotonic() + EVENTS_CONNECT_ACTIVE
 
     def _sample(self):
+        next_resources = next_connect = 0.0
         while True:
             with self.cond:
                 if not self.streams:
@@ -4598,10 +4668,37 @@ class SessionWatcher:
                     # subscribe() racing in to start a fresh thread.
                     self.thread = None
                     return
-            current = session_fingerprint()
+                want_resources = self.wants["resources"] > 0
+                want_connect = (self.wants["connect"] > 0
+                                and time.monotonic() < self.connect_until)
+            updates = {"sessions": session_fingerprint()}
+            now = time.monotonic()
+            # A failure in either extra topic must not end this thread: it
+            # would stay registered as running and no stream would ever
+            # hear of a session change again.
+            if want_resources and now >= next_resources:
+                next_resources = now + EVENTS_RESOURCES_TICK
+                try:
+                    updates["resources"] = json.dumps(
+                        resources_payload(), sort_keys=True,
+                        separators=(",", ":"))
+                except Exception:
+                    pass
+            if want_connect and now >= next_connect:
+                next_connect = now + EVENTS_CONNECT_TICK
+                try:
+                    fingerprint, busy = connect_sample()
+                    updates["connect"] = json.dumps(
+                        {"fp": fingerprint}, separators=(",", ":"))
+                    if busy:
+                        self.connect_active()
+                except Exception:
+                    pass
             with self.cond:
-                if current != self.fingerprint:
-                    self.fingerprint = current
+                changed = {topic: value for topic, value in updates.items()
+                           if value != self.values[topic]}
+                if changed:
+                    self.values.update(changed)
                     self.seq += 1
                     self.cond.notify_all()
             time.sleep(EVENTS_TICK)
@@ -5033,7 +5130,7 @@ BODY = """<main>
           <textarea name="value" class="secret-value" rows="2" spellcheck="false"
                     placeholder="value"
                     autocomplete="off" required></textarea>
-          <button type="submit" class="btn">Save</button>
+          <button type="submit" class="btn" data-busy-label="Saving&hellip;">Save</button>
         </div>
         <p class="note">Saving a secret with the same name replaces its
         current value. Stored values cannot be viewed from this page.
@@ -6750,10 +6847,10 @@ def render_connect(flows=None):
     tmux_state = tmux_sessions()
     states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
               for flow in flows]
-    busy = "1" if any(
-        s["state"] in ("starting", "waiting", "checking", "exchanging")
-        for s in states
-    ) else "0"
+    busy = "1" if connect_busy(states) else "0"
+    if busy == "1":
+        # The live feed watches the cards for as long as one is mid-flow.
+        WATCHER.connect_active()
     cards = "".join(render_connect_card(s) for s in states)
     section = CONNECT_SECTION_TPL.format(
         cards='<ul class="tbl">' + cards + "</ul>", busy=busy,
@@ -7096,7 +7193,36 @@ def render_head(title):
     )
 
 
-def render_page(message="", kind="ok", prefer_connect_feedback=False):
+# Partial page renders. Every action and every live-feed refresh used to
+# fetch the WHOLE settings page and then keep one or two of its regions:
+# saving one secret forked the webhook CLI once per session, the email CLI
+# and the WhatsApp bridge, for a list it then threw away - one to several
+# seconds per click, with nothing on screen to say a save was under way.
+# A request that names the regions it will keep, in this header, gets a
+# page with only those regions filled in; the rest render empty. The client
+# applies exactly the regions it asked for, so an empty one never reaches the
+# screen. No header (or no known name in it) is the full page, as before:
+# the no-JS form flow and every other client see no difference.
+SECTIONS_HEADER = "X-Agent-Box-Sections"
+PAGE_SECTIONS = frozenset((
+    "msg-slot", "secrets-list", "sessions-list", "profile-picker",
+    "profiles-list", "webhook-endpoint", "webhooks-list", "connect-list",
+))
+_request_local = threading.local()
+_FROM_REQUEST = object()
+
+
+def parse_sections(value):
+    """The known region ids named in a SECTIONS_HEADER value, or None (the
+    full page) when it names none."""
+    wanted = frozenset(
+        name for name in re.split(r"[\s,]+", value or "")
+        if name in PAGE_SECTIONS)
+    return wanted or None
+
+
+def render_page(message="", kind="ok", prefer_connect_feedback=False,
+                sections=_FROM_REQUEST):
     """Render settings, promoting any completed connection action to feedback.
 
     An explicit action message normally wins so an unrelated render cannot
@@ -7104,10 +7230,17 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False):
     exception: its URL remains in place while the connection poll runs, so the
     later completion result must replace it rather than stay hidden behind it.
     """
-    flows = connect_flows()
-    connect_section, connect_feedback = (
-        render_connect(flows) if flows else ("", [])
-    )
+    if sections is _FROM_REQUEST:
+        sections = getattr(_request_local, "sections", None)
+
+    def want(*ids):
+        return sections is None or not sections.isdisjoint(ids)
+
+    connect_section, connect_feedback = "", []
+    if want("connect-list"):
+        flows = connect_flows()
+        if flows:
+            connect_section, connect_feedback = render_connect(flows)
     if connect_feedback and (not message or prefer_connect_feedback):
         message = take_connect_feedback(connect_feedback)
         kind = "ok"
@@ -7115,17 +7248,33 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False):
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
     # rows and the standing watches must not each pay for their own.
-    unavailable = webhook_unavailable()
-    subs, watches = webhook_view() if not unavailable else (None, [])
+    # It is also the most expensive thing on the page, so a partial render
+    # that keeps none of the panels it feeds skips it entirely.
+    unavailable, subs, watches = "", None, []
+    if want("sessions-list", "profiles-list", "webhook-endpoint",
+            "webhooks-list"):
+        unavailable = webhook_unavailable()
+        if not unavailable and want("sessions-list", "profiles-list",
+                                    "webhooks-list"):
+            subs, watches = webhook_view()
     # One directory scan per render, feeding the picker in the Sessions row
     # and the panel below it — the same rule the subscription pass above
     # states, for the same reason.
-    profiles = read_profiles()
+    profiles = read_profiles() if want(
+        "sessions-list", "profile-picker", "profiles-list") else {}
     # Which of those profiles a standing watch is actually spending right
     # now (#582) - computed once here, from the same `watches` the webhooks
     # panel below already walks, so the profiles panel's delete warning and
     # that panel's per-row badge never disagree about what "in use" means.
-    usage = profile_usage(watches)
+    usage = profile_usage(watches) if want("profiles-list") else {}
+    if unavailable:
+        webhooks_section = WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)
+    elif want("webhook-endpoint", "webhooks-list"):
+        webhooks_section = WEBHOOKS_SECTION_TPL.format(
+            endpoint=render_webhook_endpoint() if want("webhook-endpoint") else "",
+            webhooks=render_webhooks(watches) if want("webhooks-list") else "")
+    else:
+        webhooks_section = ""
     return (
         render_head("Settings &mdash; " + html.escape(USER))
         + STYLE
@@ -7134,38 +7283,36 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False):
             base=html.escape(BASE),
             term_home=html.escape(TERM_HOME),
             mark=POTATO_SVG,
-            keys=render_keys(read_keys()),
+            keys=render_keys(read_keys()) if want("secrets-list") else "",
             # Every user, primary included: the HOME root page is the
             # terminal workspace, so session CRUD lives here.
-            sessions_section=render_sessions_section(subs, profiles),
+            sessions_section=(
+                render_sessions_section(subs, profiles)
+                if want("sessions-list", "profile-picker") else ""),
             profiles_section=PROFILES_SECTION_TPL.format(
                 base=html.escape(BASE),
                 harnesses=render_harness_options(),
                 effort=render_effort_options(),
                 profiles=render_profiles(profiles, usage),
                 modelhints=render_model_hints(profiles),
-            ),
-            webhooks_section=(
-                WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)
-                if unavailable else
-                WEBHOOKS_SECTION_TPL.format(
-                    endpoint=render_webhook_endpoint(),
-                    webhooks=render_webhooks(watches))
-            ),
+            ) if want("profiles-list") else "",
+            webhooks_section=webhooks_section,
             connect_section=connect_section,
             message=msg_html,
             password_section=(
                 PASSWORD_SECTION.format(base=html.escape(BASE))
                 if PASSWORD_CMD else ""
             ),
+            # Neither row is a region a partial render can keep, and each
+            # asks systemd for its unit's state.
             update_row=(
                 UPDATE_ROW.format(base=html.escape(BASE), update_line=render_update_line())
-                if UPDATE_CMD else ""
+                if UPDATE_CMD and sections is None else ""
             ),
             reboot_row=(
                 REBOOT_ROW.format(base=html.escape(BASE),
                                   reboot_line=render_reboot_line())
-                if REBOOT_CMD else ""
+                if REBOOT_CMD and sections is None else ""
             ),
         )
         + SCRIPT
@@ -9157,25 +9304,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             return True
 
-    def _send_event(self, fingerprint):
-        payload = json.dumps({"fp": fingerprint}).encode("utf-8")
-        self.wfile.write(b"event: sessions\ndata: " + payload + b"\n\n")
+    def _send_event(self, topic, value):
+        """One frame. `value` is the topic's payload, already JSON: the
+        session fingerprint's travels as {"fp": ...}, as it always has."""
+        if topic == "sessions":
+            value = json.dumps({"fp": value})
+        self.wfile.write(b"event: " + topic.encode("ascii") + b"\ndata: "
+                         + value.encode("utf-8") + b"\n\n")
 
-    def _send_events(self):
+    def _send_events(self, topics=("sessions",)):
         """Stream session-state changes as Server-Sent Events.
 
         Held open for the life of the page, so it costs one thread —
         capped at EVENTS_MAX_STREAMS, past which the client keeps its
         polling fallback rather than pinning threads here. Frames are
-        `event: sessions` with a fingerprint payload; a `:` comment
-        every EVENTS_KEEPALIVE seconds keeps idle intermediaries (and
-        the write that notices a vanished client) alive.
+        `event: <topic>` with that topic's payload (see EVENTS_TOPICS);
+        a `:` comment every EVENTS_KEEPALIVE seconds keeps idle
+        intermediaries (and the write that notices a vanished client)
+        alive.
         """
-        start = WATCHER.subscribe()
+        start = WATCHER.subscribe(topics)
         if start is None:
             self._send_json({"ok": False, "reason": "busy"}, status=503)
             return
         seq, known = start
+        sent = dict.fromkeys(topics, "")
+
+        def send_moved(values):
+            moved = False
+            for topic in topics:
+                if values[topic] and values[topic] != sent[topic]:
+                    sent[topic] = values[topic]
+                    self._send_event(topic, values[topic])
+                    moved = True
+            return moved
+
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -9189,24 +9352,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Reconnect delay for the browser, and an immediate byte so it
             # marks the stream open instead of waiting for the first change.
             self.wfile.write(b"retry: 3000\n\n")
-            # Replay the current fingerprint straight away: state can have
+            # Replay the current values straight away: state can have
             # moved between rendering the page and connecting here, and a
             # watcher already running for another tab would have counted
             # that change before this stream existed. The client ignores a
             # fingerprint it is already showing. Empty only while the first
             # sample is still pending, which lands within EVENTS_TICK.
-            if known:
-                self._send_event(known)
+            send_moved(known)
             self.wfile.flush()
             quiet = 0.0
             while True:
-                latest, fingerprint = WATCHER.wait(seq, EVENTS_SLICE)
+                latest, values = WATCHER.wait(seq, EVENTS_SLICE)
                 if self._peer_gone():
                     return
-                if latest != seq:
-                    seq = latest
+                # A change to a topic this stream does not follow wakes it
+                # too; that is neither a frame nor a reason to skip the
+                # keep-alive.
+                seq = latest
+                if send_moved(values):
                     quiet = 0.0
-                    self._send_event(fingerprint)
                 else:
                     quiet += EVENTS_SLICE
                     if quiet < EVENTS_KEEPALIVE:
@@ -9219,7 +9383,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # report, the client reconnects if it still wants the feed.
             pass
         finally:
-            WATCHER.release()
+            WATCHER.release(topics)
 
     def _wants_json(self):
         """A portal caller (issue #787): it asks for JSON, so a refusal
@@ -9608,7 +9772,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _note_sections(self):
+        """Record, for this request's thread, which page regions the client
+        will keep (SECTIONS_HEADER). render_page() reads it, so the many
+        POST error paths that answer with a re-rendered page honour it too
+        without each passing it along."""
+        _request_local.sections = parse_sections(
+            self.headers.get(SECTIONS_HEADER))
+
     def do_GET(self):
+        self._note_sections()
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
         # The receiver page is intentionally reachable without the box's web
@@ -9688,7 +9861,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if params.get("poll"):
                 self._send_json({"fp": session_fingerprint()})
             else:
-                self._send_events()
+                self._send_events(parse_topics(params.get("topics", [""])[0]))
             return
         message = ""
         kind = "ok"
@@ -9890,6 +10063,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Validate and apply a settings-page form submission."""
+        self._note_sections()
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
         receive_match = RECEIVE_CREATE_RE.fullmatch(parsed.path)
