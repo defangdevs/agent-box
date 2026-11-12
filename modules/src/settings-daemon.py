@@ -4668,10 +4668,13 @@ class SessionWatcher:
                     # subscribe() racing in to start a fresh thread.
                     self.thread = None
                     return
+                want_sessions = self.wants["sessions"] > 0
                 want_resources = self.wants["resources"] > 0
                 want_connect = (self.wants["connect"] > 0
                                 and time.monotonic() < self.connect_until)
-            updates = {"sessions": session_fingerprint()}
+            updates = {}
+            if want_sessions:
+                updates["sessions"] = session_fingerprint()
             now = time.monotonic()
             # A failure in either extra topic must not end this thread: it
             # would stay registered as running and no stream would ever
@@ -7241,7 +7244,10 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False,
         flows = connect_flows()
         if flows:
             connect_section, connect_feedback = render_connect(flows)
-    if connect_feedback and (not message or prefer_connect_feedback):
+    # Promoting a notice CONSUMES it, so only a response that carries the
+    # banner may take it; a cards-only render leaves it for the next one.
+    if connect_feedback and want("msg-slot") and (
+            not message or prefer_connect_feedback):
         message = take_connect_feedback(connect_feedback)
         kind = "ok"
     msg_html = render_msg(message, BASE + "/", kind)

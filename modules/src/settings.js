@@ -481,20 +481,42 @@
   }
   // Fetch only the cards (and the banner a settled sign-in can raise) when
   // the cards' fingerprint moved. Shared by the poll below and the feed.
+  //
+  // One fetch at a time: two in flight can land out of order, and the older
+  // answer would morph a finished sign-in back to an earlier step with no
+  // later frame to correct it (the daemon sends a fingerprint once). A
+  // fingerprint that arrives meanwhile is remembered and fetched next. A
+  // failed fetch is retried a few times, for the same reason: nothing else
+  // would send that fingerprint again while the stream stays up.
+  var connectWanted = null, connectBusyFetch = null, connectRetries = 0;
+  var CONNECT_RETRY_MS = 2500, CONNECT_RETRY_MAX = 4;
   function connectSaw(fp) {
+    if (fp) { connectWanted = fp; }
+    if (connectBusyFetch) { return connectBusyFetch; }
     var el = document.getElementById("connect-list");
-    if (!el || !fp || fp === el.getAttribute("data-fp")) {
+    var asked = connectWanted;
+    if (!el || !asked || asked === el.getAttribute("data-fp")) {
       return Promise.resolve();
     }
-    return fetchPage(CONNECT_REGIONS)
+    connectBusyFetch = fetchPage(CONNECT_REGIONS)
       // A settled connection can produce page-level feedback (for
       // example, which sessions a fresh sign-in restarted). Morph the
       // banner slot with the card state so that result appears where every
       // other transient action message lives (issue #835).
       .then(function (t) {
         if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
-      })
-      .catch(function () {});
+        connectRetries = 0;
+        return true;
+      }, function () { return false; })
+      .then(function (ok) {
+        connectBusyFetch = null;
+        if (connectWanted !== asked) { return connectSaw(); }
+        if (!ok && connectRetries < CONNECT_RETRY_MAX) {
+          connectRetries += 1;
+          window.setTimeout(function () { connectSaw(); }, CONNECT_RETRY_MS);
+        }
+      });
+    return connectBusyFetch;
   }
   // The fallback for a page with no live feed: with the feed carrying the
   // "connect" topic, the daemon watches a busy card itself and this stops.
@@ -592,6 +614,11 @@
     if (document.querySelector("[data-resources-url]")) { topics.push("resources"); }
     if (document.getElementById("connect-list")) { topics.push("connect"); }
     var es = new EventSource(url + "?topics=" + topics.join(","));
+    // feedCarries() calls a stream stale after FEED_STALE_MS; check that
+    // often enough that a busy card goes back to its poll promptly, rather
+    // than at the next 30s backstop probe. connectPoll() is a no-op unless a
+    // card is busy and the feed is not carrying it.
+    window.setInterval(connectPoll, NO_FEED_MS);
     es.onopen = function () {
       liveFeed = true;
       lastFrame = Date.now();
@@ -1391,10 +1418,15 @@
   // Which page regions a form's answer can change, when that is known to be
   // fewer than all of them: the daemon then renders only those. A secret
   // changes its own list and the sign-in cards (a stored key can shadow a
-  // sign-in); a sign-in action changes its card and the banner. Every other
+  // sign-in); a sign-in action changes its card, the banner and maybe a
+  // stored key (sign-out deletes one). Every other
   // form still gets, and applies, the whole page.
   function formSections(f) {
-    if (f.closest("#connect-list")) { return CONNECT_REGIONS; }
+    // Signing out deletes a provider's keys (GH_TOKEN) and starting WhatsApp
+    // stores its phone number, so a card's own form keeps the secrets too.
+    if (f.closest("#connect-list")) {
+      return ["msg-slot", "connect-list", "secrets-list"];
+    }
     if (f.closest("#secret-editor, #secrets-list")) {
       return ["msg-slot", "secrets-list", "connect-list"];
     }
@@ -1434,6 +1466,9 @@
     var body = new URLSearchParams();
     new FormData(f).forEach(function (v, k) { body.append(k, v); });
     var sections = formSections(f);
+    // Busy from the first moment: the Update branch below awaits a status
+    // read before it posts, and a second submit must not slip into that gap.
+    var done = markBusy(f, submitter);
     // On the workspace, adding a session should focus its new tab. The
     // name is auto-derived by the daemon, so the page only learns it
     // from the answer: a successful add redirects to ?tab=<new name>,
@@ -1491,7 +1526,6 @@
     // the settings page once zero sessions remain.
     function post() {
       var here = window.location.pathname;
-      var done = markBusy(f, submitter);
       return settleRedirect(
         fetch(f.getAttribute("action"),
               { method: "POST", body: body, headers: sectionHeaders(sections) }),

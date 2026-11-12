@@ -174,6 +174,24 @@ class SectionsTest(unittest.TestCase):
         self.assertEqual(caught.exception.code, 400)
         self.assertIn("Invalid key name", region(page, "msg-slot"))
 
+    def test_sign_in_feedback_is_consumed_only_with_the_banner(self):
+        # Promoting a notice consumes it. A cards-only answer cannot show the
+        # banner, so it must leave the notice for a response that can.
+        cards = ('<div id="connect-list"></div>', [("claude", "Restarted 1")])
+        with mock.patch.object(self.daemon, "connect_flows",
+                               return_value=[{"id": "claude"}]), \
+                mock.patch.object(self.daemon, "render_connect",
+                                  return_value=cards), \
+                mock.patch.object(self.daemon, "take_connect_feedback",
+                                  return_value="Restarted 1") as take:
+            page = self.daemon.render_page(sections=frozenset({"connect-list"}))
+            take.assert_not_called()
+            self.assertIn('id="connect-list"', page)
+            page = self.daemon.render_page(
+                sections=frozenset({"msg-slot", "connect-list"}))
+            take.assert_called_once()
+            self.assertIn("Restarted 1", region(page, "msg-slot"))
+
     def test_the_header_does_not_leak_into_the_next_request(self):
         # Keep-alive reuses one handler thread; each request sets its own.
         self.request("GET", "/", "secrets-list")
@@ -241,6 +259,15 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(self.resource_calls, 0)
         self.assertEqual(self.connect_calls, 0)
 
+    def test_a_resources_only_stream_does_not_sample_sessions(self):
+        # A session sample forks tmux; nobody would receive this one.
+        with mock.patch.object(self.daemon, "session_fingerprint",
+                               side_effect=AssertionError("sampled")) as fp:
+            values = self.run_for(self.daemon.SessionWatcher(),
+                                  ("resources",), 0.15)
+        fp.assert_not_called()
+        self.assertTrue(values["resources"])
+
     def test_resources_follow_their_own_clock(self):
         watcher = self.daemon.SessionWatcher()
         values = self.run_for(watcher, ("sessions", "resources"), 0.3)
@@ -306,10 +333,11 @@ class StreamTest(unittest.TestCase):
         cls.server.server_close()
         os.unlink(cls.env_file)
 
-    def frames(self, query, topics):
+    def frames(self, query, topics, hold=0.0):
         """The latest frame per topic, read until every topic in `topics`
         has sent one. The watcher is module-wide, so a stream can also see
-        a fingerprint left over from the previous test first."""
+        a fingerprint left over from the previous test first. `hold` keeps
+        the stream open that much longer, so the sampler runs for it."""
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
         conn.request("GET", "/agent/settings/sessions/events" + query)
         answer = conn.getresponse()
@@ -325,18 +353,21 @@ class StreamTest(unittest.TestCase):
             elif line.startswith("data: ") and event:
                 found[event] = json.loads(line[len("data: "):])
                 event = None
+        time.sleep(hold)
         conn.close()
         return found
 
     def test_default_stream_is_sessions_only(self):
+        # The sampler swallows a failing topic, so an exception would prove
+        # nothing: count calls instead, across more than one sampler tick.
         with mock.patch.object(self.daemon, "session_fingerprint",
                                return_value="s1"), \
                 mock.patch.object(self.daemon, "resources_payload",
-                                  side_effect=AssertionError("sampled")):
-            got = self.frames("", ["sessions"])
-            # Give a stray resources frame time to (wrongly) arrive.
-            time.sleep(0.2)
+                                  return_value={"ok": True}) as resources:
+            got = self.frames("", ["sessions"],
+                              hold=self.daemon.EVENTS_TICK * 2.5)
         self.assertEqual(set(got), {"sessions"})
+        resources.assert_not_called()
 
     def test_resources_frames_carry_the_reading(self):
         with mock.patch.object(self.daemon, "session_fingerprint",
