@@ -222,7 +222,15 @@ def write_addresses(user, data):
 def address_watch(cfg, user, address, route):
     """Use the bus's exact-topic dispatcher, including its durable batching."""
     account = pwd.getpwnam(user)
-    profile = Path(account.pw_dir) / ".config/agent-box/profiles" / (route["profile"] + ".env")
+    # Check the name here too, not only in the caller: this function builds
+    # a path from it, so it must not depend on every caller validating it.
+    if not PROFILE_NAME.fullmatch(route["profile"]):
+        raise ValueError("invalid email worker profile")
+    profiles = os.path.abspath(os.path.join(account.pw_dir, ".config/agent-box/profiles"))
+    candidate = os.path.abspath(os.path.join(profiles, route["profile"] + ".env"))
+    if os.path.dirname(candidate) != profiles:
+        raise ValueError("invalid email worker profile")
+    profile = Path(candidate)
     if not profile.is_file():
         raise ValueError("email worker profile does not exist")
     with profile.open(encoding="utf-8", errors="replace") as source:

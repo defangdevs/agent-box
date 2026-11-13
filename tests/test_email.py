@@ -244,6 +244,16 @@ class PurposeAddresses(unittest.TestCase):
                 self.manage(**changes)
         self.assertEqual(mail.read_addresses(self.cfg, self.user), {})
 
+    def test_handler_refuses_a_profile_path_outside_profiles(self):
+        # address_watch builds a file path from the profile name, so it must
+        # refuse a bad name itself, even when a caller skipped the check.
+        (self.root / '.config/agent-box/elsewhere.env').write_text('HARNESS=claude\n')
+        with mock.patch.object(mail.subprocess, 'run') as run:
+            for name in ('../elsewhere', '/etc/passwd', 'a/b', '', '.'):
+                with self.subTest(profile=name), self.assertRaises(ValueError):
+                    mail.address_watch(self.cfg, self.user, self.address, dict(self.route, profile=name))
+            self.assertEqual(run.call_count, 0)
+
     def test_unreadable_unsafe_and_malformed_registries_temporarily_refuse(self):
         path = mail.address_path(self.user)
         for body in ('[]', '{', '{"other@box.test":{}}', 'x' * (mail.MAX_ADDRESS_BYTES + 1)):
