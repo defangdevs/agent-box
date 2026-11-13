@@ -138,6 +138,35 @@
           ]
         },
         {
+          "name": "AGENT_BOX_WEBHOOK_BIN",
+          "kind": "cli",
+          "program": "agent-box-webhook",
+          "why": [
+            "A codex watch that resolves to a daemon-thread placement",
+            "(remoteControl:true standing watches share the box's codex",
+            "remote-control daemon instead of spawning a standalone agent-box",
+            "session) seeds its claim and starts its delivery peer with",
+            "'agent-box-webhook subscribe ...",
+            "--codex-thread ID', the same call an interactively-subscribed codex",
+            "session makes. There is no agent-box-session row for that case, so",
+            "it cannot come from the session CLI's own PATH the way an ordinary",
+            "hook session's later subscribe would; pinned for the same reason",
+            "AGENT_BOX_SESSION_BIN is."
+          ]
+        },
+        {
+          "name": "AGENT_BOX_PYTHON_BIN",
+          "kind": "bin",
+          "program": "python3",
+          "why": [
+            "The codex daemon-thread placement talks WebSocket JSON-RPC to the",
+            "daemon's control socket with a small embedded python client (the",
+            "shell has no WebSocket transport, and 'codex app-server proxy' only",
+            "forwards raw bytes). The receiver unit's PATH carries jq and",
+            "coreutils but not python3, so pin the interpreter."
+          ]
+        },
+        {
           "name": "AGENT_BOX_DEFAULT_AGENT",
           "kind": "config",
           "key": "defaultAgent",
