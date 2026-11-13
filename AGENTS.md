@@ -572,7 +572,7 @@ CodeRabbit reviews every PR in this repo, and pushing the fix does not clear the
          }' | jq -r '.[].data.repository.pullRequest.reviewThreads.nodes[].id'
        gh api graphql -f query='mutation{resolveReviewThread(input:{threadId:"THREAD_ID"}){thread{isResolved}}}'
 
-2. **Dismiss the review itself.** A `CHANGES_REQUESTED` verdict outlives both the resolved threads and the new commits, so the PR keeps showing changes requested until the review is dismissed:
+2. **Dismiss the review itself once all its comments have been addressed.** A `CHANGES_REQUESTED` verdict outlives both the resolved threads and the new commits, so the PR keeps showing changes requested until the review is dismissed:
 
        gh api -X PUT repos/defangdevs/agent-box/pulls/NNN/reviews/REVIEW_ID/dismissals \
          -f event=DISMISS -f message='addressed in <sha>'
