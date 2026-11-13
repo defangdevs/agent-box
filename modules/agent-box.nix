@@ -7782,6 +7782,34 @@ case "$cmd" in
           [ -z "$th" ] || kind="$kind (thread $th; hand over with codex queue --thread ID --message TEXT)"
         fi
       fi
+      # A plain Codex TUI is not in ListAgents either, so SendMessage cannot
+      # reach it; `codex queue --thread` can, once the thread is known. The
+      # supervisor records it (#1031): SessionStart's live id follows /new and
+      # /resume, the launch-time nativeSessionId is the fallback.
+      if [ "$harness" = codex ] && [ "$rc" != true ]; then
+        sf="$(session_state_file "$n")"
+        th=""
+        lid="$("$JQ" -r '.launchSessionId // empty' "$sf" 2>/dev/null)" || lid=""
+        case "$lid" in
+          (*[!0-9a-fA-F-]*|"") ;;
+          (????????-????-????-????-????????????)
+            read -r th 2>/dev/null < "$HOME/.local/state/agent-box/live-session-id/$lid" || th="" ;;
+        esac
+        case "$th" in
+          (*[!0-9a-fA-F-]*|"") th="" ;;
+          (????????-????-????-????-????????????) ;;
+          (*) th="" ;;
+        esac
+        if [ -z "$th" ]; then
+          th="$("$JQ" -r '.nativeSessionId // empty' "$sf" 2>/dev/null)" || th=""
+          case "$th" in
+            (*[!0-9a-fA-F-]*|"") th="" ;;
+            (????????-????-????-????-????????????) ;;
+            (*) th="" ;;
+          esac
+        fi
+        [ -z "$th" ] || kind="$kind (thread $th; hand over with codex queue --thread ID --message TEXT)"
+      fi
       # A session whose agent CRASHED is still a live tmux session, because
       # the pane it left behind is a post-mortem shell (issue #516). Nobody
       # is working in it, so it is not a peer to yield to — and yielding to
@@ -14330,8 +14358,8 @@ whether one of them already has this object: its claim, its note, its working \
 directory and its pane (tmux -L agent-box capture-pane -pt NAME | tail -40) \
 are the evidence, and a claude session can also be asked directly (ListAgents, \
 then SendMessage to the name ListAgents PRINTS - a Remote Control name such \
-as agent-claude@host, never the tmux name in the list below; a Codex Remote \
-Control daemon is not in ListAgents - hand over to its thread with codex queue \
+as agent-claude@host, never the tmux name in the list below; a Codex session, \
+plain TUI or Remote Control daemon, is not in ListAgents - hand over to its thread with codex queue \
 --thread THREAD_ID --message TEXT, where THREAD_ID is the thread agent-box-session \
 peers prints, and a non-zero exit means nobody was told). If one of them \
 has it — or is working on the branch or in the git worktree you would use — \

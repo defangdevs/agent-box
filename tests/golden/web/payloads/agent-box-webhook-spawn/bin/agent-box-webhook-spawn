@@ -319,8 +319,8 @@ whether one of them already has this object: its claim, its note, its working \
 directory and its pane (tmux -L agent-box capture-pane -pt NAME | tail -40) \
 are the evidence, and a claude session can also be asked directly (ListAgents, \
 then SendMessage to the name ListAgents PRINTS - a Remote Control name such \
-as agent-claude@host, never the tmux name in the list below; a Codex Remote \
-Control daemon is not in ListAgents - hand over to its thread with codex queue \
+as agent-claude@host, never the tmux name in the list below; a Codex session, \
+plain TUI or Remote Control daemon, is not in ListAgents - hand over to its thread with codex queue \
 --thread THREAD_ID --message TEXT, where THREAD_ID is the thread agent-box-session \
 peers prints, and a non-zero exit means nobody was told). If one of them \
 has it — or is working on the branch or in the git worktree you would use — \
