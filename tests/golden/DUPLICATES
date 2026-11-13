@@ -32,6 +32,7 @@ web/payloads/agent-box-harness/bin/agent-box-harness -> vm/payloads/agent-box-ha
 web/payloads/agent-box-nixpkgs-cache -> vm/payloads/agent-box-nixpkgs-cache
 web/payloads/agent-box-profile/bin/agent-box-profile -> vm/payloads/agent-box-profile/bin/agent-box-profile
 web/payloads/agent-box-receive/bin/agent-box-receive -> vm/payloads/agent-box-receive/bin/agent-box-receive
+web/payloads/agent-box-secret-candidates-report/bin/agent-box-secret-candidates-report -> vm/payloads/agent-box-secret-candidates-report/bin/agent-box-secret-candidates-report
 web/payloads/agent-box-secret/bin/agent-box-secret -> vm/payloads/agent-box-secret/bin/agent-box-secret
 web/payloads/agent-box-secrets-mcp/bin/agent-box-secrets-mcp -> vm/payloads/agent-box-secrets-mcp/bin/agent-box-secrets-mcp
 web/payloads/agent-box-session-capacity/bin/agent-box-session-capacity -> vm/payloads/agent-box-session-capacity/bin/agent-box-session-capacity

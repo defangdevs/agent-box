@@ -4844,7 +4844,7 @@ def advisory_units(spec, notes):
     return advisory
 
 
-def activate(spec, tree, removed, advisory, act):
+def activate(spec, tree, removed, advisory, act, profile):
     """Make the committed configuration the box's running state.
 
     Returns the units whose start command failed, so the verification pass
@@ -5067,6 +5067,17 @@ def activate(spec, tree, removed, advisory, act):
                             ["systemctl", "reload", "caddy.service"]):
             act.require("restart caddy.service",
                         ["systemctl", "restart", "caddy.service"])
+    # Advisory, not gated on any option (issue #922): which of each
+    # configured user's env-store/profile names look like credentials and
+    # are not yet in the broker - see secret-candidates-report.py's own
+    # header for why this runs on every apply rather than assuming a
+    # shared release cadence. Checked for existence first: an older,
+    # already-installed profile mid-upgrade may not carry this binary yet,
+    # and a missing advisory tool is not itself a failure to report.
+    report_bin = profile / "bin" / "agent-box-secret-candidates-report"
+    if report_bin.exists() and spec.users:
+        act.optional("secret candidates report",
+                     [str(report_bin), *(u.name for u in spec.users)])
     return failed_starts
 
 
@@ -5187,7 +5198,7 @@ def cmd_apply(args):
 
     if not args.dry_run:
         advisory = advisory_units(spec, rend.notes)
-        failed_starts = activate(spec, tree, removed, advisory, act)
+        failed_starts = activate(spec, tree, removed, advisory, act, profile)
         verify_units(tree.units, advisory, act, skip=failed_starts)
     if str(Path(MEMORY_SYSCTL)) in removed:
         # The file is gone, so the values do not come back at the next

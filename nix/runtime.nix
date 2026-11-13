@@ -404,6 +404,14 @@ let
       libraries = [ pkgs.python3Packages.cryptography pkgs.python3Packages.mcp ];
       flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
     } (secretProtocolLib + "\n\n" + readSrc "secrets-mcp.py"))
+    # Advisory-only plaintext-credential scanner (issue #922), run on every
+    # `agentbox apply` over every configured user - see its own header for
+    # why this is not a migration and not gated on secrets.enable.
+    (pkgs.writers.writePython3Bin "agent-box-secret-candidates-report" {
+      libraries = [ pkgs.python3Packages.cryptography ];
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (envStoreLib + "\n\n" + secretProtocolLib + "\n\n" + secretCandidatesLib
+       + "\n\n" + readSrc "secret-candidates-report.py"))
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-bare" "webhook-cli.sh")
     # The GitHub login this box acts as. env-exec runs it at every session

@@ -525,6 +525,23 @@ let
 
 @@include:src/secrets-mcp.py@@
   '');
+  # Advisory-only plaintext-credential scanner (issue #922), run on every
+  # activation - see its own header for why this is not a migration and
+  # not gated on services.agent-box.secrets.enable.
+  secretCandidatesReport = pkgs.writers.writePython3Bin "agent-box-secret-candidates-report" {
+    libraries = [ pkgs.python3Packages.cryptography ];
+    flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+  } (envStoreLib + ''
+
+
+  '' + secretProtocolLib + ''
+
+
+  '' + secretCandidatesLib + ''
+
+
+@@include:src/secret-candidates-report.py@@
+  '');
 
   # Buzz remains the ACP client and session router; this endpoint supplies one
   # fixed profile as remote compute over a non-PTY SSH forced command (#300).
@@ -890,7 +907,7 @@ let
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
     ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli transcribeCli
-         harnessCli secretCli secretsMcpBin ]
+         harnessCli secretCli secretsMcpBin secretCandidatesReport ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli webhookAckCli ]
@@ -3941,7 +3958,23 @@ in
       map (name: "agent-box-secret-broker@${name}.service") (lib.attrNames cfg.users);
     systemd.targets.sockets.wants =
       map (name: "agent-box-secret-broker@${name}.socket") (lib.attrNames cfg.users);
-  }) (lib.mkIf cfg.selfUpdate.enable {
+  }) {
+    # Advisory-only, deliberately NOT an mkIf on secretsEnabled (issue
+    # #922): the hint is most useful BEFORE a box owner has even turned
+    # secrets.enable on, so they can see what they would be moving over.
+    # Runs on every activation, for every configured user regardless of
+    # a web front door - same lib.attrNames cfg.users as the broker block
+    # just above. `|| true` plus the script's own always-0 exit is belt
+    # and suspenders: this must never be the reason a switch fails.
+    system.activationScripts.agent-box-secret-candidates-report = {
+      text = ''
+        ${secretCandidatesReport}/bin/agent-box-secret-candidates-report ${
+          lib.concatStringsSep " " (map lib.escapeShellArg (lib.attrNames cfg.users))
+        } || true
+      '';
+      deps = [ "users" ];
+    };
+  } (lib.mkIf cfg.selfUpdate.enable {
     # The shared unit file (shipped in agentBoxUnitsPackage above) names a
     # bare program, exactly as agent-box@ does; this per-instance drop-in
     # resolves it to the generated wrapper's store path. Nothing WANTS these
