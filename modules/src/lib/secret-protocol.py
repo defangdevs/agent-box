@@ -47,11 +47,15 @@ SECRET_MAX_JOBS_PER_USER = 2
 SECRET_MAX_OUTPUT_BYTES = 64 * 1024
 SECRET_JOB_RETENTION_SECONDS = 24 * 60 * 60
 
-# The reserved namespace name for secrets set with no --profile. A profile a
-# human names this is a storage-bucket collision, not a security hole (both
-# just name a directory), but agent-box-profile should steer people away from
-# it; see profile-cli.sh.
-GLOBAL_PROFILE = "_global"
+# Where agent-box-profile's own default pointer lives (profile-cli.sh's
+# DIR/DEFAULT_FILE). Secrets have no separate "global" bucket (deprecated in
+# favor of the box's actual default profile, 2026-11-13): a request naming no
+# --profile resolves to whichever profile `agent-box-profile default` names,
+# exactly like a session agent-box-session add starts with neither --profile
+# nor --harness already does. A box with no default profile has no secret
+# request without --profile to fall back to at all.
+PROFILES_DIR_PARTS = (".config", "agent-box", "profiles")
+DEFAULT_PROFILE_FILE = ".default"
 
 SECRET_OPS = ("list", "set", "remove", "exec", "status", "cancel")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -76,16 +80,40 @@ def valid_profile(name):
     return isinstance(name, str) and PROFILE_NAME_RE.match(name) is not None
 
 
-def normalize_profile(profile):
-    """None/absent means the deprecated global scope; anything else must be
-    a legal profile-shaped name. Never silently coerce an invalid name to
-    global - that would let a typo land secrets somewhere the caller did
-    not ask for."""
-    if profile is None:
-        return GLOBAL_PROFILE
-    if not valid_profile(profile):
-        raise SecretError("invalid profile")
-    return profile
+def resolve_profile(explicit, home=None):
+    """Turn "no --profile given" into a concrete name, the way
+    `agent-box-session add` already resolves no --profile/--harness into
+    the box's default profile: there is no OTHER fallback. Secrets have no
+    separate global scope - the issue's original plan deferred per-profile
+    scope and kept one bucket per Linux user; in review, lionello deprecated
+    that bucket outright in favor of resolving straight to whichever profile
+    `agent-box-profile default` currently names (2026-11-13), with layered
+    profile overlays left for later (cf. Nix overlays).
+
+    Used by the CLI, the MCP adapter, and env-exec.py - all of which run as
+    the ordinary agent user and can read agent-box-profile's own pointer
+    file themselves, exactly as profile-cli.sh's default_name() does. The
+    broker never parses this file: every request it receives already names
+    a concrete profile, resolved by the caller before it was sent."""
+    if explicit is not None:
+        if not valid_profile(explicit):
+            raise SecretError("invalid profile")
+        return explicit
+    home = home or os.path.expanduser("~")
+    no_default = SecretError(
+        "no --profile given and no default profile is set "
+        "(see `agent-box-profile default`)")
+    pointer = os.path.join(home, *PROFILES_DIR_PARTS, DEFAULT_PROFILE_FILE)
+    try:
+        with open(pointer, "r") as handle:
+            name = handle.readline().rstrip("\n")
+    except OSError:
+        raise no_default
+    if not valid_profile(name):
+        raise no_default
+    if not os.path.isfile(os.path.join(home, *PROFILES_DIR_PARTS, f"{name}.env")):
+        raise no_default
+    return name
 
 
 def recv_exact(conn, count):
@@ -184,7 +212,10 @@ def validate_request(req):
     }[op]
     if set(req) - allowed:
         raise SecretError("unexpected field")
-    if "profile" in req and req["profile"] is not None and not valid_profile(req["profile"]):
+    # Always required: there is no "no profile" scope on the wire. A caller
+    # with no --profile resolves one client-side (resolve_profile, above)
+    # before building the request at all.
+    if not valid_profile(req.get("profile")):
         raise SecretError("invalid profile")
     if op in ("set", "remove") and not valid_secret_name(req.get("name")):
         raise SecretError("invalid name")
@@ -329,9 +360,11 @@ class Store:
     """Root-only records for ONE (user, profile) namespace.
 
     Layout: <root>/<namespace>/{meta.json,.lock,<NAME>.rec}, where <root> is
-    this user's own directory and <namespace> is the profile (or
-    GLOBAL_PROFILE). Every access goes through a directory fd with
-    O_NOFOLLOW, so a planted symlink is an error and never a redirect; every
+    this user's own directory and <namespace> is always a concrete profile
+    name - callers resolve "no --profile given" before this is ever
+    constructed (see resolve_profile). Every access goes through a
+    directory fd with O_NOFOLLOW, so a planted symlink is an error and
+    never a redirect; every
     write is temp-file + fsync + rename, so a crash leaves the old record or
     the new one. Values are encrypted before they ever reach _write (see
     set/get below); _read/_write themselves do not know about secrecy, only

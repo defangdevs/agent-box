@@ -81,6 +81,11 @@ class Broker:
             raise RuntimeError(self.proc.stderr.read().decode())
 
     def ask(self, req):
+        # Every request now names a concrete profile (no more "global";
+        # see resolve_profile). These tests exercise the wire protocol
+        # directly, under one fixed namespace unless a test overrides it.
+        req = dict(req)
+        req.setdefault("profile", "testprofile")
         conn = socket.socket(socket.AF_UNIX)
         conn.settimeout(15)
         conn.connect(self.sock)
@@ -89,7 +94,7 @@ class Broker:
         conn.close()
         return out
 
-    def wait_job(self, job_id, timeout=5, profile=None):
+    def wait_job(self, job_id, timeout=5, profile="testprofile"):
         deadline = time.time() + timeout
         while time.time() < deadline:
             resp = self.ask({"op": "status", "jobId": job_id, "profile": profile})
@@ -127,9 +132,9 @@ class Custody(unittest.TestCase):
 
     def test_records_are_private_files_and_hold_no_plaintext(self):
         self.broker.ask({"op": "set", "name": "TOKEN", "value": CANARY})
-        rec_path = Path(self.broker.root) / "_global" / "TOKEN.rec"
+        rec_path = Path(self.broker.root) / "testprofile" / "TOKEN.rec"
         self.assertEqual(rec_path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual((Path(self.broker.root) / "_global").stat().st_mode & 0o777, 0o700)
+        self.assertEqual((Path(self.broker.root) / "testprofile").stat().st_mode & 0o777, 0o700)
         raw = rec_path.read_bytes()
         self.assertNotIn(CANARY.encode(), raw)
         rec = json.loads(raw)
@@ -151,8 +156,8 @@ class Custody(unittest.TestCase):
         # than silently returning the wrong plaintext.
         self.broker.ask({"op": "set", "name": "A", "value": "value-a"})
         self.broker.ask({"op": "set", "name": "B", "value": "value-b"})
-        rec_a = Path(self.broker.root) / "_global" / "A.rec"
-        rec_b = Path(self.broker.root) / "_global" / "B.rec"
+        rec_a = Path(self.broker.root) / "testprofile" / "A.rec"
+        rec_b = Path(self.broker.root) / "testprofile" / "B.rec"
         rec_b.write_bytes(rec_a.read_bytes())
         resp = self.broker.ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": ["B"]})
         status = self.broker.wait_job(resp["jobId"])
@@ -207,16 +212,79 @@ class Custody(unittest.TestCase):
             self.assertIsNone(self.broker.proc.poll(), "broker exited")
             self.assertTrue(self.broker.ask({"op": "list"})["ok"])
 
+    # --- resolve_profile: "no --profile" means the box's default profile,
+    # not a separate global bucket (deprecated 2026-11-13) ------------------
+
+    def test_resolve_profile_explicit_name_passes_through(self):
+        self.assertEqual(ns["resolve_profile"]("work"), "work")
+        with self.assertRaises(ns["SecretError"]):
+            ns["resolve_profile"]("../etc")
+
+    def test_resolve_profile_refuses_with_no_default_set(self):
+        home = tempfile.mkdtemp()
+        with self.assertRaises(ns["SecretError"]):
+            ns["resolve_profile"](None, home=home)
+
+    def test_resolve_profile_resolves_the_default_profile(self):
+        home = tempfile.mkdtemp()
+        profiles = Path(home) / ".config" / "agent-box" / "profiles"
+        profiles.mkdir(parents=True)
+        (profiles / "work.env").write_text("HARNESS=claude\n")
+        (profiles / ".default").write_text("work\n")
+        self.assertEqual(ns["resolve_profile"](None, home=home), "work")
+
+    def test_resolve_profile_refuses_a_stale_default_pointer(self):
+        # The profile the pointer names was since deleted - profile-cli.sh's
+        # own default_name() treats that as "no default", not as the dead
+        # name; resolve_profile must agree.
+        home = tempfile.mkdtemp()
+        profiles = Path(home) / ".config" / "agent-box" / "profiles"
+        profiles.mkdir(parents=True)
+        (profiles / ".default").write_text("deleted-profile\n")
+        with self.assertRaises(ns["SecretError"]):
+            ns["resolve_profile"](None, home=home)
+
+    def test_cli_uses_the_default_profile_when_none_given(self):
+        home = tempfile.mkdtemp()
+        profiles = Path(home) / ".config" / "agent-box" / "profiles"
+        profiles.mkdir(parents=True)
+        (profiles / "work.env").write_text("HARNESS=claude\n")
+        (profiles / ".default").write_text("work\n")
+        cli = Path(self.tmp) / "cli.py"
+        cli.write_text(CLI)
+        env = dict(os.environ, HOME=home)
+
+        def run(*args, stdin=None):
+            return subprocess.run([PYBIN, "-I", str(cli), "--socket",
+                                   self.broker.sock, *args], input=stdin,
+                                  capture_output=True, text=True, env=env)
+        self.assertEqual(run("set", "TOKEN", "--stdin", stdin="v\n").returncode, 0)
+        listed = run("list")
+        self.assertIn("TOKEN\tv1\tconfigured", listed.stdout)
+        # It really did land in "work"'s own bucket, not a separate one.
+        direct = self.broker.ask({"op": "list", "profile": "work"})
+        self.assertEqual([s["name"] for s in direct["secrets"]], ["TOKEN"])
+
+    def test_cli_refuses_cleanly_with_no_profile_and_no_default(self):
+        home = tempfile.mkdtemp()
+        cli = Path(self.tmp) / "cli.py"
+        cli.write_text(CLI)
+        result = subprocess.run(
+            [PYBIN, "-I", str(cli), "--socket", self.broker.sock, "list"],
+            capture_output=True, text=True, env=dict(os.environ, HOME=home))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no default profile", result.stderr)
+
     def test_namespace_bound_to_identity(self):
         self.broker.ask({"op": "set", "name": "A", "value": "v"})
         with self.assertRaises(ns["SecretError"]):
-            ns["Store"](self.broker.root, "_global", "agent", os.getuid() + 1, b"\x00" * 32)
+            ns["Store"](self.broker.root, "testprofile", "agent", os.getuid() + 1, b"\x00" * 32)
 
     def test_symlinked_record_is_not_followed(self):
         self.broker.ask({"op": "set", "name": "A", "value": "v"})
         victim = Path(self.tmp) / "victim"
         victim.write_text("untouched")
-        rec = Path(self.broker.root) / "_global" / "A.rec"
+        rec = Path(self.broker.root) / "testprofile" / "A.rec"
         rec.unlink()
         rec.symlink_to(victim)
         self.broker.ask({"op": "set", "name": "A", "value": "w"})
@@ -228,8 +296,8 @@ class Custody(unittest.TestCase):
 
         def run(*args, stdin=None):
             return subprocess.run([PYBIN, "-I", str(cli), "--socket",
-                                   self.broker.sock, *args], input=stdin,
-                                  capture_output=True, text=True)
+                                   self.broker.sock, "--profile", "testprofile", *args],
+                                  input=stdin, capture_output=True, text=True)
         self.assertEqual(run("set", "TOKEN", "--stdin", stdin=CANARY + "\n").returncode, 0)
         listed = run("list")
         self.assertIn("TOKEN\tv1\tconfigured", listed.stdout)
@@ -237,31 +305,31 @@ class Custody(unittest.TestCase):
         self.assertNotEqual(run("set", "TOKEN", CANARY).returncode, 0)
         self.assertEqual(run("remove", "TOKEN").returncode, 0)
 
-    def test_cli_profile_flag_warns_without_it(self):
+    def test_cli_with_explicit_profile_never_needs_a_default(self):
+        # An explicit --profile must not depend on ~/.config/agent-box
+        # existing at all - resolve_profile's explicit-name path never
+        # touches the filesystem. A HOME with nothing in it proves it.
         cli = Path(self.tmp) / "cli.py"
         cli.write_text(CLI)
-
-        def run(*args, stdin=None):
-            return subprocess.run([PYBIN, "-I", str(cli), "--socket",
-                                   self.broker.sock, *args], input=stdin,
-                                  capture_output=True, text=True)
-        no_profile = run("set", "A", "--stdin", stdin="v\n")
-        self.assertIn("deprecated", no_profile.stderr.lower())
-        with_profile = run("--profile", "work", "set", "A", "--stdin", stdin="v\n")
-        self.assertNotIn("deprecated", with_profile.stderr.lower())
+        env = dict(os.environ, HOME=tempfile.mkdtemp())
+        result = subprocess.run(
+            [PYBIN, "-I", str(cli), "--socket", self.broker.sock,
+             "--profile", "work", "set", "A", "--stdin"],
+            input="v\n", capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     # --- Per-profile isolation --------------------------------------------
 
     def test_profiles_do_not_see_each_others_secrets(self):
         self.broker.ask({"op": "set", "profile": "work", "name": "TOKEN", "value": "work-value"})
         self.broker.ask({"op": "set", "profile": "play", "name": "TOKEN", "value": "play-value"})
-        self.broker.ask({"op": "set", "name": "TOKEN", "value": "global-value"})
+        self.broker.ask({"op": "set", "name": "TOKEN", "value": "default-value"})  # profile="testprofile"
         work = self.broker.ask({"op": "list", "profile": "work"})["secrets"]
         play = self.broker.ask({"op": "list", "profile": "play"})["secrets"]
-        glob = self.broker.ask({"op": "list"})["secrets"]
+        default = self.broker.ask({"op": "list"})["secrets"]
         self.assertEqual([s["name"] for s in work], ["TOKEN"])
         self.assertEqual([s["name"] for s in play], ["TOKEN"])
-        self.assertEqual([s["name"] for s in glob], ["TOKEN"])
+        self.assertEqual([s["name"] for s in default], ["TOKEN"])
         # Each namespace's own version counter is independent.
         self.assertEqual(work[0]["version"], 1)
         self.assertEqual(play[0]["version"], 1)
@@ -344,7 +412,7 @@ class Custody(unittest.TestCase):
 
     def test_corrupt_record_refuses_the_request_without_crashing_broker(self):
         self.broker.ask({"op": "set", "name": "TOKEN", "value": "v"})
-        rec = Path(self.broker.root) / "_global" / "TOKEN.rec"
+        rec = Path(self.broker.root) / "testprofile" / "TOKEN.rec"
         for garbage in (b"not json at all", b'"a json string, not an object"',
                        b'{"version": 1}',  # missing nonce/ct
                        b'{"version": "not an int", "nonce": "AA==", "ct": "AA=="}'):
@@ -405,17 +473,17 @@ class Custody(unittest.TestCase):
             return out
 
         for _ in range(ns["SECRET_MAX_JOBS_PER_USER"] + 1):
-            resp = ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": tmp})
+            resp = ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": tmp, "profile": "testprofile"})
             self.assertTrue(resp["ok"], resp)
             deadline = time.time() + 5
             status = {"state": "pending"}
             while status["state"] in ("pending", "running") and time.time() < deadline:
-                status = ask({"op": "status", "jobId": resp["jobId"]})
+                status = ask({"op": "status", "jobId": resp["jobId"], "profile": "testprofile"})
                 time.sleep(0.05)
             self.assertEqual(status["state"], "error")
         # If a failed start had left its job "running" forever, this next
         # one would be refused with "too many active jobs".
-        last = ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": tmp})
+        last = ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": tmp, "profile": "testprofile"})
         self.assertTrue(last["ok"], last)
 
     def test_exec_concurrency_cap_per_user(self):

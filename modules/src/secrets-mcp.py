@@ -9,7 +9,9 @@ exec_with_secrets_cancel from the issue; there is deliberately no tool that
 can read or export a value.
 
 Scope: this process's AGENT_BOX_PROFILE (the supervisor already exports it
-into every session - see env-exec.py). No tool argument can select a
+into every session - see env-exec.py), or the box's current default
+profile when that is unset (resolve_profile, lib/secret-protocol.py) -
+there is no separate global scope. No tool argument can select a
 different profile; that is routing, not a security boundary, exactly like
 every other per-profile value in this codebase (see env-exec.py's own
 "Convenience, NOT isolation" note on profile env) - the broker only ever
@@ -27,7 +29,6 @@ import time
 from mcp.server.fastmcp import FastMCP
 
 SOCKET_PATH = os.environ.get("AGENT_BOX_SECRET_SOCKET")
-PROFILE = os.environ.get("AGENT_BOX_PROFILE") or None
 POLL_INTERVAL_S = 0.1
 INLINE_WAIT_BUDGET_S = 3.0
 
@@ -35,7 +36,14 @@ mcp = FastMCP("agent-box-secrets")
 
 
 def _call(req):
-    return connect_and_call(SOCKET_PATH, dict(req, profile=PROFILE))
+    # Resolved per call, not once at import: a box with no default profile
+    # and no AGENT_BOX_PROFILE must not fail to even START this server over
+    # it - each tool call reports the refusal instead.
+    try:
+        profile = resolve_profile(os.environ.get("AGENT_BOX_PROFILE") or None)
+    except SecretError as exc:
+        return {"ok": False, "error": str(exc)}
+    return connect_and_call(SOCKET_PATH, dict(req, profile=profile))
 
 
 @mcp.tool()

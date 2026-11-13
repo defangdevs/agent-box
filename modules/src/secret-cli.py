@@ -11,13 +11,14 @@
 Talks to the root broker over its Unix socket. There is deliberately no verb
 that prints a value.
 
---profile NAME puts a value in one agent-box profile's own secret bucket
-instead of the GLOBAL one every profile's sessions can request by default -
-narrower by default, not a security boundary: the broker only checks which
-Linux user is asking, so any process of this user can still pass a
-different --profile explicitly. Omitting --profile prints a one-line
-deprecation warning and uses the global bucket. Prefer a profile:
-`agent-box-profile ls` lists the ones you have.
+--profile NAME puts a value in one agent-box profile's own secret bucket.
+There is no separate global bucket: omitting --profile resolves to the
+box's current default profile (`agent-box-profile default`), the same one
+a session started with neither --profile nor --harness gets - and refuses
+if none is set. Scoping is routing, not a security boundary: the broker
+only checks which Linux user is asking, so any process of this user can
+still pass a different --profile explicitly. `agent-box-profile ls` lists
+the ones you have.
 """
 import argparse
 import json
@@ -28,8 +29,8 @@ def main():
     parser = argparse.ArgumentParser(prog="agent-box-secret")
     parser.add_argument("--socket", default=os.environ.get("AGENT_BOX_SECRET_SOCKET"))
     parser.add_argument("--profile",
-                        help="scope to this agent-box profile's own secrets; omit for the "
-                             "deprecated global bucket shared by every profile")
+                        help="scope to this agent-box profile's own secrets; omit to use "
+                             "the box's current default profile (agent-box-profile default)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="verb", required=True)
     sub.add_parser("list")
@@ -55,26 +56,26 @@ def main():
     if not args.socket:
         sys.stderr.write("agent-box-secret: secrets are not enabled on this box\n")
         return 2
-    if args.profile is None and args.verb in ("list", "set", "remove", "exec"):
-        sys.stderr.write(
-            "agent-box-secret: no --profile given; using the deprecated global secret "
-            "bucket, which every profile's sessions can request. Pass --profile NAME "
-            "(see `agent-box-profile ls`).\n")
+    try:
+        profile = resolve_profile(args.profile)
+    except SecretError as exc:
+        sys.stderr.write(f"agent-box-secret: {exc}\n")
+        return 2
 
     if args.verb == "list":
-        req = {"op": "list", "profile": args.profile}
+        req = {"op": "list", "profile": profile}
     elif args.verb == "set":
         value = sys.stdin.read()
         if value.endswith("\n"):
             value = value[:-1]
-        req = {"op": "set", "profile": args.profile, "name": args.name, "value": value}
+        req = {"op": "set", "profile": profile, "name": args.name, "value": value}
     elif args.verb == "remove":
-        req = {"op": "remove", "profile": args.profile, "name": args.name}
+        req = {"op": "remove", "profile": profile, "name": args.name}
     elif args.verb == "exec":
         if bool(args.command) == bool(args.argv):
             sys.stderr.write("agent-box-secret: give either a literal argv or --command, not both\n")
             return 2
-        req = {"op": "exec", "profile": args.profile, "secretNames": args.secrets}
+        req = {"op": "exec", "profile": profile, "secretNames": args.secrets}
         if args.command:
             req["command"] = args.command
             req["shell"] = args.shell
@@ -87,9 +88,9 @@ def main():
         if args.idempotency_key:
             req["idempotencyKey"] = args.idempotency_key
     elif args.verb == "status":
-        req = {"op": "status", "profile": args.profile, "jobId": args.job_id}
+        req = {"op": "status", "profile": profile, "jobId": args.job_id}
     else:
-        req = {"op": "cancel", "profile": args.profile, "jobId": args.job_id}
+        req = {"op": "cancel", "profile": profile, "jobId": args.job_id}
 
     resp = connect_and_call(args.socket, req)
     if not resp.get("ok"):

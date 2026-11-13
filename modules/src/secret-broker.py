@@ -115,7 +115,10 @@ class Broker:
         self._stores_lock = threading.Lock()
 
     def _store(self, profile):
-        namespace = normalize_profile(profile)
+        # Already validated by validate_request (every request names a
+        # concrete profile - see resolve_profile's docstring): "profile" is
+        # the namespace, with no further resolution needed here.
+        namespace = profile
         with self._stores_lock:
             store = self._stores.pop(namespace, None)
             if store is None:
