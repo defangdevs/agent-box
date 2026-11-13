@@ -24,10 +24,11 @@ export AGENT_BOX_FLOCK_BIN=@PROFILE@/bin/flock
 # caller). Every jq use in this script is guarded, so an unfound
 # binary would report the wrong worker rather than fail - pin it.
 export AGENT_BOX_JQ_BIN=@PROFILE@/bin/jq
-# A codex watch that resolves to a daemon-thread placement (visible
-# standing watches share the box's codex remote-control daemon
-# instead of spawning a standalone agent-box session) seeds its claim
-# and starts its delivery peer with 'agent-box-webhook subscribe ...
+# A codex watch that resolves to a daemon-thread placement
+# (remoteControl:true standing watches share the box's codex
+# remote-control daemon instead of spawning a standalone agent-box
+# session) seeds its claim and starts its delivery peer with
+# 'agent-box-webhook subscribe ...
 # --codex-thread ID', the same call an interactively-subscribed codex
 # session makes. There is no agent-box-session row for that case, so
 # it cannot come from the session CLI's own PATH the way an ordinary

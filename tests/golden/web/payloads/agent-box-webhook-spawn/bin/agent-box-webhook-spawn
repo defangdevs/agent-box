@@ -17,10 +17,11 @@ export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linu
 # caller). Every jq use in this script is guarded, so an unfound
 # binary would report the wrong worker rather than fail - pin it.
 export AGENT_BOX_JQ_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin/bin/jq
-# A codex watch that resolves to a daemon-thread placement (visible
-# standing watches share the box's codex remote-control daemon
-# instead of spawning a standalone agent-box session) seeds its claim
-# and starts its delivery peer with 'agent-box-webhook subscribe ...
+# A codex watch that resolves to a daemon-thread placement
+# (remoteControl:true standing watches share the box's codex
+# remote-control daemon instead of spawning a standalone agent-box
+# session) seeds its claim and starts its delivery peer with
+# 'agent-box-webhook subscribe ...
 # --codex-thread ID', the same call an interactively-subscribed codex
 # session makes. There is no agent-box-session row for that case, so
 # it cannot come from the session CLI's own PATH the way an ordinary
@@ -557,23 +558,29 @@ if [ -n "$watch_config" ]; then
     <<<"$watch_config" 2>/dev/null) || watch_profile=""
 fi
 
-# `.visible` picks placement, not just a flag Claude happens to understand:
-# codex has no per-session mirror the way `claude --remote-control` does, so
-# "visible" for codex means routing into the box's own codex remote-control
-# daemon as a new thread there instead of a standalone agent-box session (see
-# codex_daemon_start_thread below) - the only way a codex conversation is ever
-# visible in the paired app. Unresolved (unset, or neither "true" nor "false")
-# must fall back to each harness's OWN current default rather than one shared
-# guess: `agent-box-session add` already defaults remote_control to true for
-# claude and false for codex when no flag is given, and silently overriding
-# that box-wide would change every existing watch's visibility the moment
-# this wrapper updates. Resolved below, once the harness is known.
-watch_visible=""
+# `.remoteControl` picks placement, not just a flag Claude happens to
+# understand - named after the exact feature it maps to (`agent-box-session
+# add --remote-control`), not "visible": a dispatched session or thread is
+# always visible in the agent-box web UI (agent-box-session ls, the workspace
+# tab) whether or not this is set, so an operator who only ever uses that UI
+# would find "visible" answering a question they never asked. Codex has no
+# per-session mirror the way `claude --remote-control` does, so
+# remoteControl=true for codex means routing into the box's own codex
+# remote-control daemon as a new thread there instead of a standalone
+# agent-box session (see codex_daemon_start_thread below) - the only way a
+# codex conversation ever reaches that app. Unresolved (unset, or neither
+# "true" nor "false") must fall back to each harness's OWN current default
+# rather than one shared guess: `agent-box-session add` already defaults
+# remote_control to true for claude and false for codex when no flag is
+# given, and silently overriding that box-wide would change every existing
+# watch's reachability the moment this wrapper updates. Resolved below, once
+# the harness is known.
+watch_remote_control=""
 if [ -n "$watch_config" ]; then
   v=$("$JQ" -r \
-    'if type == "object" and (.visible == "true" or .visible == "false") then .visible else empty end' \
+    'if type == "object" and (.remoteControl == "true" or .remoteControl == "false") then .remoteControl else empty end' \
     <<<"$watch_config" 2>/dev/null) || v=""
-  watch_visible="$v"
+  watch_remote_control="$v"
 fi
 
 # '' when NAME can be launched, else why not. Checked HERE, not left to
@@ -630,7 +637,7 @@ fi
 # Which harness this match actually starts, resolved the SAME way
 # `agent-box-session add --profile` itself would (the profile's own HARNESS
 # wins; no profile falls back to the box default) - needed here, ahead of
-# that call, because visibility's meaning and the standalone/daemon-thread
+# that call, because remoteControl's meaning and the standalone/daemon-thread
 # choice both turn on it. Read directly from the profile file with the
 # already-pinned env store, the same access profile_problem() already uses,
 # rather than a new agent-box-profile dependency for one field.
@@ -640,16 +647,17 @@ if [ -n "$hook_profile" ]; then
     && [ -n "$h" ] && hook_harness="$h"
 fi
 
-# The resolved visibility: the watch's own answer if it gave one, else this
-# harness's EXISTING default (claude: remote_control defaults to true;
-# codex: to false - session-cli.sh's own precedence, matched here so a box
-# that never sets spawnConfig.visible sees no behavior change at all).
-if [ -n "$watch_visible" ]; then
-  hook_visible="$watch_visible"
+# The resolved remote-control setting: the watch's own answer if it gave one,
+# else this harness's EXISTING default (claude: remote_control defaults to
+# true; codex: to false - session-cli.sh's own precedence, matched here so a
+# box that never sets spawnConfig.remoteControl sees no behavior change at
+# all).
+if [ -n "$watch_remote_control" ]; then
+  hook_remote_control="$watch_remote_control"
 elif [ "$hook_harness" = claude ]; then
-  hook_visible=true
+  hook_remote_control=true
 else
-  hook_visible=false
+  hook_remote_control=false
 fi
 
 extra=()
@@ -782,7 +790,7 @@ fi
 
 # --- Codex remote-control daemon-thread placement ------------------------
 #
-# A watch whose resolved harness is codex and whose visibility resolves to
+# A watch whose resolved harness is codex and whose remote-control setting resolves to
 # true does not go through `agent-box-session add` at all: that would start a
 # WHOLE NEW app-server daemon per event batch (one more OS process, one more
 # agent-box row) - the opposite of what sharing the daemon is for. Instead
@@ -1278,7 +1286,7 @@ if [ "$advice_src" != github ] && { [ -z "$seeded" ] || [ -z "$include" ]; }; th
   advice_src=unclaimed
 fi
 daemon_placement=false
-[ "$hook_harness" = codex ] && [ "$hook_visible" = true ] && daemon_placement=true
+[ "$hook_harness" = codex ] && [ "$hook_remote_control" = true ] && daemon_placement=true
 
 if [ "$daemon_placement" = true ]; then
   # A thread in the shared daemon has no agent-box-session row, so the
@@ -1328,11 +1336,11 @@ elif [ -n "${AGENT_BOX_DEFAULT_AGENT:-}" ]; then
   pflag=(--harness "$AGENT_BOX_DEFAULT_AGENT")
 fi
 # Explicit on every standalone spawn, not just when a watch names one: a
-# resolved value exists either way (hook_visible above already fell back to
-# this harness's own current default), and naming it here means the box's
-# visible/invisible behavior stops being an implicit property of whatever
+# resolved value exists either way (hook_remote_control above already fell
+# back to this harness's own current default), and naming it here means the
+# box's remote-control behavior stops being an implicit property of whatever
 # `agent-box-session add` happens to default to today.
-pflag=(--remote-control "$hook_visible" "${pflag[@]+"${pflag[@]}"}")
+pflag=(--remote-control "$hook_remote_control" "${pflag[@]+"${pflag[@]}"}")
 # --ephemeral: a hook session exists to work ONE event batch, and nobody
 # resumes it afterwards. Without it a hook agent that finishes and quits
 # cleanly is PARKED (mark-stopped records stopped=true, src/supervisor.sh),
