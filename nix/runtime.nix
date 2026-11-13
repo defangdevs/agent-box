@@ -387,7 +387,7 @@ let
     # the broker by hand to try the feature before the unit lands.
     (pkgs.writers.writePython3Bin "agent-box-secret-broker" {
       libraries = [ pkgs.python3Packages.cryptography ];
-      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+      flakeIgnore = [ "E402" "F811" "E501" "E302" "E305" "W503" "W504" ];
     } (secretProtocolLib + "\n\n" + secretJobsLib + "\n\n" + readSrc "secret-broker.py"))
     (pkgs.writers.writePython3Bin "agent-box-secret-worker" {
       flakeIgnore = [ "E501" "E302" "E305" ];
