@@ -665,8 +665,36 @@ case "$cmd" in
             [ "$(t display-message -p -t "$pane" '#S' 2>/dev/null)" = "$n" ] || continue
             th="${th:+$th, }$t1"
           done
-          [ -z "$th" ] || kind="$kind (thread $th; hand over with codex queue --thread ID --message TEXT)"
+          [ -z "$th" ] || kind="$kind (thread $th)"
         fi
+      fi
+      # A plain Codex TUI is not in ListAgents either, so SendMessage cannot
+      # reach it; `codex queue --thread` can, once the thread is known. The
+      # supervisor records it (#1031): SessionStart's live id follows /new and
+      # /resume, the launch-time nativeSessionId is the fallback.
+      if [ "$harness" = codex ] && [ "$rc" != true ]; then
+        sf="$(session_state_file "$n")"
+        th=""
+        lid="$("$JQ" -r '.launchSessionId // empty' "$sf" 2>/dev/null)" || lid=""
+        case "$lid" in
+          (*[!0-9a-fA-F-]*|"") ;;
+          (????????-????-????-????-????????????)
+            read -r th 2>/dev/null < "$HOME/.local/state/agent-box/live-session-id/$lid" || th="" ;;
+        esac
+        case "$th" in
+          (*[!0-9a-fA-F-]*|"") th="" ;;
+          (????????-????-????-????-????????????) ;;
+          (*) th="" ;;
+        esac
+        if [ -z "$th" ]; then
+          th="$("$JQ" -r '.nativeSessionId // empty' "$sf" 2>/dev/null)" || th=""
+          case "$th" in
+            (*[!0-9a-fA-F-]*|"") th="" ;;
+            (????????-????-????-????-????????????) ;;
+            (*) th="" ;;
+          esac
+        fi
+        [ -z "$th" ] || kind="$kind (thread $th)"
       fi
       # A session whose agent CRASHED is still a live tmux session, because
       # the pane it left behind is a post-mortem shell (issue #516). Nobody
