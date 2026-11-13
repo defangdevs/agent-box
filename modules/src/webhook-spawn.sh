@@ -118,7 +118,10 @@ no other session will look at the others. List them all - every page: gh api \
 --paginate 'repos/OWNER/REPO/commits/SHA/status?per_page=100' for commit \
 statuses - and settle \
 each one - including checks from outside apps such as a code scanner or a \
-quality gate - not only the one you recognize. Report any you leave red, and \
+quality gate - not only the one you recognize. A check still queued or in \
+progress has not settled yet: wait for it to finish, then list the checks \
+again and settle any new failure before you remove this session. Report any \
+you leave red, and \
 say why. What it does NOT cover is the next run: a later failure on the same ref is a \
 different commit and gets a session of its own, which is deliberate, because a \
 red trunk has to reach somebody whatever else is running."
