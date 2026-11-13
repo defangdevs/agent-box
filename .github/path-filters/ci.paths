@@ -71,3 +71,6 @@ flake.lock
 # Discover all native checks, including newly added tests and validators.
 tests/**
 scripts/**
+
+# Provider bootstrap shell is covered by the hetzner-deploy native check.
+deploy/hetzner/**

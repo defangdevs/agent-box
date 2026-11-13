@@ -8,6 +8,7 @@ the cost breakdown and what to do when a deployment fails.
 |---|---|---|---|
 | [`aws/`](./aws/README.md) | AWS | `template.yaml` (EC2), `lightsail-template.yaml` (Lightsail) | S3, pinned to the publishing commit by `publish-template.yml` |
 | [`azure/`](./azure/README.md) | Azure | `agent-box.bicep` → `agent-box.json` | `raw.githubusercontent.com` at `master`, unpinned |
+| [`hetzner/`](./hetzner/README.md) | Hetzner Cloud | `deploy.sh` + cloud-init | CLI, pinned to the checkout commit by default |
 | [`gcp/`](./gcp/README.md) | Google Compute Engine | `launch.sh` + `bootstrap.sh.in` | no button: `gcloud` script run in the user's Cloud Shell |
 
 The templates are the *deployment* layer only. What they install is the
@@ -20,3 +21,8 @@ was launched in.
 A new provider gets a sibling directory here, not a new top-level one.
 Give it a README with the same sections as the two above, and add its
 CI workflow to `.github/workflows/` keyed on `deploy/<provider>/**`.
+
+New portable cloud deployments target the native ordinary-Linux backend first;
+NixOS remains available for appliance-style deployments. The rationale,
+tradeoffs, and criteria for choosing between them are recorded in
+[`docs/deployment-model.md`](../docs/deployment-model.md).
