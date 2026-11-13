@@ -2408,6 +2408,53 @@ let
       KillMode=mixed
       StandardInput=null
     ''} $out/etc/systemd/system/agent-box-docker@.service
+  '' + lib.optionalString secretsEnabled ''
+    install -m444 ${pkgs.writeText "agent-box-secret-broker@.service" ''
+      [Unit]
+      Description=Secret custody broker for %i (issue #922)
+      After=agent-box-secret-broker@%i.socket
+      Requires=agent-box-secret-broker@%i.socket
+
+      [Service]
+      # Root, deliberately: this is the whole point (a Linux user boundary around
+      # the record store and the root key), so there is no User= here. The actual
+      # workload a job runs always drops to %i - see secret-worker.py and
+      # SystemdLauncher in secret-broker.py, which is what the transient
+      # agent-box-secret-job-* units this spawns carry User= on.
+      #
+      # Config is environment, not argv, matching agent-box-webhook-receiver's own
+      # shape: AGENT_BOX_SECRET_USER/_STORE_ROOT are %i-derived right here, so
+      # neither renderer has to know this unit's command line at all. The broker
+      # resolves %i's numeric uid itself (pwd.getpwnam) rather than being handed
+      # one: NixOS allocates a normal user's uid at ACTIVATION, after this unit is
+      # already rendered, so no Nix expression here could know it ahead of time.
+      Restart=always
+      RestartSec=5s
+      Environment=AGENT_BOX_SECRET_USER=%i
+      Environment=AGENT_BOX_SECRET_STORE_ROOT=/var/lib/agent-box-secrets/%i
+      ExecStart=agent-box-secret-broker
+      StandardInput=null
+      ProtectSystem=strict
+      ReadWritePaths=/var/lib/agent-box-secrets
+      ProtectHome=true
+      PrivateDevices=true
+      ProtectKernelTunables=true
+      ProtectKernelModules=true
+      ProtectControlGroups=true
+      RestrictSUIDSGID=true
+      RestrictRealtime=true
+      LockPersonality=true
+      NoNewPrivileges=true
+    ''} $out/etc/systemd/system/agent-box-secret-broker@.service
+    install -m444 ${pkgs.writeText "agent-box-secret-broker@.socket" ''
+      [Unit]
+      Description=Secret custody socket for %i
+
+      [Socket]
+      ListenStream=/run/agent-box-secrets/%i.sock
+      SocketUser=%i
+      SocketMode=0600
+    ''} $out/etc/systemd/system/agent-box-secret-broker@.socket
   '');
   # Shared by the "agent-box@" host-level ExecSearchPath (below) and the
   # per-user "agent-box@<name>" instance drop-in's environment.PATH — they
@@ -2541,6 +2588,9 @@ let
   # answers every POST with 404/401 — it becomes reachable only once a user
   # deliberately writes a secret.
   webhookEnabled = cfg.webhook.enable && cfg.web.enable;
+  # No web.enable dependency, unlike webhookEnabled above: this is a plain
+  # Unix socket, not an HTTP endpoint behind the per-user Caddy vhost.
+  secretsEnabled = cfg.secrets.enable;
   webhookSocketDir = "/run/agent-box-webhook";
   webhookSocketOf = name: "${webhookSocketDir}/${name}.sock";
   webhookStateDirOf = name: "/home/${name}/.local/state/local-webhook";
@@ -3344,6 +3394,1538 @@ if __name__ == "__main__":
         sys.exit(main(sys.argv[1:]))
     except EnvStoreError as error:
         die(str(error))
+  '');
+
+  # Secret custody (issue #922): secret-cli.py, secret-broker.py, secret-
+  # worker.py and secrets-mcp.py all splice lib/secret-protocol.py the same
+  # way envStoreLib is spliced above; secret-broker.py additionally needs
+  # lib/secret-jobs.py (the exec_with_secrets job engine) between the two.
+  # secret-worker.py stays unspliced (see its own header) - it runs as the
+  # agent user and has no need of `cryptography`, so keeping it standalone
+  # keeps its dependency closure as small as a bare python3.
+  #
+  # Shipped the same way regardless of services.agent-box.secrets.enable:
+  # env-exec.py's `shutil.which("agent-box-secret")` runs on every session
+  # spawn whether or not the feature is on, and a box with it off simply
+  # has no AGENT_BOX_SECRET_SOCKET for the CLI to connect to (it refuses
+  # cleanly - "secrets are not enabled on this box"). Only the broker UNIT
+  # (below, secretBrokerContract and the systemd wiring) is gated.
+  secretProtocolLib = ''
+# Secret custody: the wire protocol, at-rest encryption, and the record
+# store (issue #922).
+#
+# One owner for the things the root broker, the worker, and the unprivileged
+# CLI and MCP adapter must agree on: how a request is framed, which names
+# are legal, how a value is protected on disk, and how a client calls the
+# broker's socket. The broker and worker use the Store below; the CLI and
+# MCP adapter never touch it, because the whole point is that the agent
+# user cannot read the records - they only ever call connect_and_call.
+#
+# Spliced ABOVE secret-broker.py, secret-cli.py, and secrets-mcp.py (with
+# secret-jobs.py spliced between protocol and broker) by the generated
+# module, so the names bind in all three; this file therefore has no
+# `if __name__` block.
+# secret-worker.py is NOT spliced with this file - it runs as the ordinary
+# agent user and has no need of `cryptography` or the Store, so keeping it
+# standalone keeps its dependency closure as small as a bare python3.
+import base64
+import binascii
+import contextlib
+import fcntl
+import json
+import os
+import re
+import socket
+import struct
+
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+SECRET_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+# Same charset agent-box-profile's valid_name already enforces (profile-
+# cli.sh), so a namespace is always a name that CLI could also have created.
+PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SECRET_MAX_FRAME = 64 * 1024
+SECRET_MAX_VALUE = 32 * 1024
+SECRET_MAX_NAMES = 256
+SECRET_MAX_ENV = 64
+SECRET_MAX_ARGV = 64
+SECRET_MAX_ARG_LEN = 4096
+SECRET_MAX_CWD_LEN = 4096
+SECRET_MAX_IDEMPOTENCY_LEN = 128
+SECRET_DEFAULT_TIMEOUT_MS = 10 * 60 * 1000
+SECRET_MAX_TIMEOUT_MS = 60 * 60 * 1000
+SECRET_MAX_JOBS_PER_USER = 2
+SECRET_MAX_OUTPUT_BYTES = 64 * 1024
+SECRET_JOB_RETENTION_SECONDS = 24 * 60 * 60
+
+# Where agent-box-profile's own default pointer lives (profile-cli.sh's
+# DIR/DEFAULT_FILE). Secrets have no separate "global" bucket (deprecated in
+# favor of the box's actual default profile, 2026-11-13): a request naming no
+# --profile resolves to whichever profile `agent-box-profile default` names,
+# exactly like a session agent-box-session add starts with neither --profile
+# nor --harness already does. A box with no default profile has no secret
+# request without --profile to fall back to at all.
+PROFILES_DIR_PARTS = (".config", "agent-box", "profiles")
+DEFAULT_PROFILE_FILE = ".default"
+
+SECRET_OPS = ("list", "set", "remove", "exec", "status", "cancel")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
+IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,%d}$" % SECRET_MAX_IDEMPOTENCY_LEN)
+
+
+class SecretError(Exception):
+    """A refusal the caller may be told about; never carries a value."""
+
+
+def valid_secret_name(name):
+    return isinstance(name, str) and SECRET_NAME_RE.match(name) is not None
+
+
+def valid_secret_value(value):
+    if not isinstance(value, str) or value == "" or "\0" in value:
+        return False
+    return len(value.encode("utf-8")) <= SECRET_MAX_VALUE
+
+
+def valid_profile(name):
+    return isinstance(name, str) and PROFILE_NAME_RE.match(name) is not None
+
+
+def resolve_profile(explicit, home=None):
+    """Turn "no --profile given" into a concrete name, the way
+    `agent-box-session add` already resolves no --profile/--harness into
+    the box's default profile: there is no OTHER fallback. Secrets have no
+    separate global scope - the issue's original plan deferred per-profile
+    scope and kept one bucket per Linux user; in review, lionello deprecated
+    that bucket outright in favor of resolving straight to whichever profile
+    `agent-box-profile default` currently names (2026-11-13), with layered
+    profile overlays left for later (cf. Nix overlays).
+
+    Used by the CLI, the MCP adapter, and env-exec.py - all of which run as
+    the ordinary agent user and can read agent-box-profile's own pointer
+    file themselves, exactly as profile-cli.sh's default_name() does. The
+    broker never parses this file: every request it receives already names
+    a concrete profile, resolved by the caller before it was sent."""
+    if explicit is not None:
+        if not valid_profile(explicit):
+            raise SecretError("invalid profile")
+        return explicit
+    home = home or os.path.expanduser("~")
+    no_default = SecretError(
+        "no --profile given and no default profile is set "
+        "(see `agent-box-profile default`)")
+    pointer = os.path.join(home, *PROFILES_DIR_PARTS, DEFAULT_PROFILE_FILE)
+    try:
+        with open(pointer, "r") as handle:
+            name = handle.readline().rstrip("\n")
+    except OSError:
+        raise no_default
+    if not valid_profile(name):
+        raise no_default
+    if not os.path.isfile(os.path.join(home, *PROFILES_DIR_PARTS, f"{name}.env")):
+        raise no_default
+    return name
+
+
+def recv_exact(conn, count):
+    chunks = []
+    while count:
+        chunk = conn.recv(count)
+        if not chunk:
+            raise SecretError("connection closed mid-frame")
+        chunks.append(chunk)
+        count -= len(chunk)
+    return b"".join(chunks)
+
+
+def send_frame(conn, obj):
+    body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+    if len(body) > SECRET_MAX_FRAME:
+        raise SecretError("response too large")
+    conn.sendall(struct.pack(">I", len(body)) + body)
+
+
+def connect_and_call(sock_path, req, timeout=15):
+    """One round trip to the broker: connect, send the request, read the
+    reply, close. The one client the CLI and the MCP adapter both need, so
+    a fix to one (a longer timeout for a slow systemd-run start, a retry) is
+    a fix to both rather than a fix that only one of them got. Never raises:
+    a transport failure comes back shaped exactly like a protocol refusal
+    ({"ok": False, "error": ...}), which is what every caller already
+    checks for."""
+    if not sock_path:
+        return {"ok": False, "error": "secrets are not enabled on this box"}
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(sock_path)
+        send_frame(conn, req)
+        return recv_frame(conn)
+    except (OSError, SecretError) as exc:
+        return {"ok": False, "error": f"broker unavailable: {exc}"}
+    finally:
+        conn.close()
+
+
+def recv_frame(conn):
+    (length,) = struct.unpack(">I", recv_exact(conn, 4))
+    # The length is checked BEFORE any allocation: a peer must not be able to
+    # make the root process reserve memory by lying in four bytes.
+    if length == 0 or length > SECRET_MAX_FRAME:
+        raise SecretError("bad frame length")
+    try:
+        obj = json.loads(recv_exact(conn, length).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise SecretError("malformed request")
+    if not isinstance(obj, dict):
+        raise SecretError("malformed request")
+    return obj
+
+
+def _valid_argv_item(item):
+    return (isinstance(item, str) and item != "" and "\0" not in item
+            and len(item.encode("utf-8")) <= SECRET_MAX_ARG_LEN)
+
+
+def _valid_env_map(env):
+    if not isinstance(env, dict) or len(env) > SECRET_MAX_ENV:
+        return False
+    for key, value in env.items():
+        if not ENV_KEY_RE.match(key):
+            return False
+        if not isinstance(value, str) or "\0" in value:
+            return False
+        if len(value.encode("utf-8")) > SECRET_MAX_VALUE:
+            return False
+    return True
+
+
+def _valid_name_list(names):
+    if not isinstance(names, list) or len(names) > SECRET_MAX_NAMES:
+        return False
+    return all(valid_secret_name(name) for name in names)
+
+
+def validate_request(req):
+    """Strict schema: unknown fields are refused, not ignored, so a caller
+    cannot smuggle a uid, a path, or a unit property past a future reader."""
+    op = req.get("op")
+    if op not in SECRET_OPS:
+        raise SecretError("unknown operation")
+    allowed = {
+        "list": {"op", "profile"},
+        "set": {"op", "profile", "name", "value"},
+        "remove": {"op", "profile", "name"},
+        "exec": {"op", "profile", "argv", "command", "shell", "secretNames",
+                 "cwd", "env", "timeoutMs", "idempotencyKey"},
+        "status": {"op", "profile", "jobId"},
+        "cancel": {"op", "profile", "jobId"},
+    }[op]
+    if set(req) - allowed:
+        raise SecretError("unexpected field")
+    # Always required: there is no "no profile" scope on the wire. A caller
+    # with no --profile resolves one client-side (resolve_profile, above)
+    # before building the request at all.
+    if not valid_profile(req.get("profile")):
+        raise SecretError("invalid profile")
+    if op in ("set", "remove") and not valid_secret_name(req.get("name")):
+        raise SecretError("invalid name")
+    if op == "set" and not valid_secret_value(req.get("value")):
+        raise SecretError("invalid value")
+    if op in ("status", "cancel"):
+        job_id = req.get("jobId")
+        if not isinstance(job_id, str) or not re.match(r"^[A-Za-z0-9_-]{1,64}$", job_id):
+            raise SecretError("invalid job id")
+    if op == "exec":
+        _validate_exec_request(req)
+    return op
+
+
+def _validate_exec_request(req):
+    has_argv = "argv" in req
+    has_command = "command" in req
+    if has_argv == has_command:
+        raise SecretError("exactly one of argv or command is required")
+    if has_argv:
+        argv = req["argv"]
+        if (not isinstance(argv, list) or not argv or len(argv) > SECRET_MAX_ARGV
+                or not all(_valid_argv_item(item) for item in argv)):
+            raise SecretError("invalid argv")
+        if "shell" in req:
+            raise SecretError("shell is only valid with command")
+    else:
+        if not _valid_argv_item(req.get("command")):
+            raise SecretError("invalid command")
+        if req.get("shell") not in ("bash", "sh"):
+            raise SecretError("shell must be bash or sh")
+    names = req.get("secretNames", [])
+    if not _valid_name_list(names):
+        raise SecretError("invalid secretNames")
+    if "cwd" in req:
+        cwd = req["cwd"]
+        if (not isinstance(cwd, str) or not cwd.startswith("/") or "\0" in cwd
+                or len(cwd.encode("utf-8")) > SECRET_MAX_CWD_LEN):
+            raise SecretError("invalid cwd")
+    if "env" in req and not _valid_env_map(req["env"]):
+        raise SecretError("invalid env")
+    if set(req.get("env", {})) & set(names):
+        raise SecretError("env may not name a requested secret")
+    if "timeoutMs" in req:
+        timeout = req["timeoutMs"]
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or not (0 < timeout <= SECRET_MAX_TIMEOUT_MS):
+            raise SecretError("invalid timeoutMs")
+    if "idempotencyKey" in req:
+        key = req["idempotencyKey"]
+        if not isinstance(key, str) or not IDEMPOTENCY_RE.match(key):
+            raise SecretError("invalid idempotencyKey")
+
+
+# --- At-rest encryption -----------------------------------------------------
+#
+# Phase 1 (this file): one root key, generated once, held in a root-only
+# file beside the per-user namespaces. It never leaves this box. A record's
+# value is AES-256-GCM under a key HKDF-derived per (user, namespace) from
+# that root key, with (user, namespace, name, version) as AAD so a ciphertext
+# copied into another slot fails to decrypt rather than silently decrypting
+# as something else.
+#
+# Phase 2 (tracked in issue #922's follow-up) replaces load_root_key with a
+# call to an external KMS/keyvault and nothing else here changes: every
+# caller already goes through this one function to get the bytes it derives
+# namespace keys from.
+ROOT_KEY_BYTES = 32
+
+
+def load_root_key(path):
+    """The box-wide root key, creating it on first use. Callers hold this in
+    memory only; it is never written anywhere but this one 0600 file."""
+    try:
+        with open(path, "rb") as handle:
+            key = handle.read()
+    except FileNotFoundError:
+        key = None
+    if key is not None:
+        if len(key) != ROOT_KEY_BYTES:
+            raise SecretError("root key corrupt")
+        return key
+    # Create it atomically. A loser of the race below simply re-reads the
+    # winner's file instead of overwriting it.
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        new_key = os.urandom(ROOT_KEY_BYTES)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(new_key)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+    return load_root_key(path)
+
+
+def _namespace_key(root_key, user, namespace):
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                info=f"agent-box-secret-v1:{user}:{namespace}".encode("utf-8"))
+    return hkdf.derive(root_key)
+
+
+def _aad(user, namespace, name, version):
+    return f"{user}:{namespace}:{name}:{version}".encode("utf-8")
+
+
+def _encrypt(key, aad, plaintext):
+    nonce = os.urandom(12)
+    ct = AESGCM(key).encrypt(nonce, plaintext.encode("utf-8"), aad)
+    return nonce, ct
+
+
+def _decrypt(key, aad, nonce, ct):
+    try:
+        return AESGCM(key).decrypt(nonce, ct, aad).decode("utf-8")
+    except Exception:
+        raise SecretError("decryption failed")
+
+
+def _next_version(old_record):
+    """old_record is whatever _read() handed back for a slot that may never
+    have been written, or may have been written by code this broker no
+    longer recognizes. Either way, a version counter that cannot be trusted
+    must not raise - it starts over at 1 rather than crash the request."""
+    try:
+        version = old_record.get("version", 0)
+        if not isinstance(version, int) or isinstance(version, bool):
+            return 1
+        return version + 1
+    except AttributeError:
+        return 1
+
+
+class Store:
+    """Root-only records for ONE (user, profile) namespace.
+
+    Layout: <root>/<namespace>/{meta.json,.lock,<NAME>.rec}, where <root> is
+    this user's own directory and <namespace> is always a concrete profile
+    name - callers resolve "no --profile given" before this is ever
+    constructed (see resolve_profile). Every access goes through a
+    directory fd with O_NOFOLLOW, so a planted symlink is an error and
+    never a redirect; every
+    write is temp-file + fsync + rename, so a crash leaves the old record or
+    the new one. Values are encrypted before they ever reach _write (see
+    set/get below); _read/_write themselves do not know about secrecy, only
+    about atomic JSON records.
+    """
+
+    def __init__(self, root, namespace, user, uid, root_key):
+        if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", namespace) or namespace in (".", ".."):
+            raise SecretError("invalid namespace")
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            try:
+                os.mkdir(namespace, 0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            self.dir_fd = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                  dir_fd=root_fd)
+        finally:
+            os.close(root_fd)
+        self.user = user
+        self.namespace = namespace
+        self._key = _namespace_key(root_key, user, namespace)
+        self._bind(user, uid)
+
+    def close(self):
+        os.close(self.dir_fd)
+
+    def _read(self, name):
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.dir_fd)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise SecretError("store entry unreadable")
+        with os.fdopen(fd, "rb") as handle:
+            try:
+                obj = json.loads(handle.read(SECRET_MAX_FRAME * 2))
+            except ValueError:
+                raise SecretError("store entry corrupt")
+        if not isinstance(obj, dict):
+            raise SecretError("store entry corrupt")
+        return obj
+
+    def _write(self, name, obj):
+        tmp = f".{name}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                     0o600, dir_fd=self.dir_fd)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(json.dumps(obj).encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(tmp, name, src_dir_fd=self.dir_fd, dst_dir_fd=self.dir_fd)
+        os.fsync(self.dir_fd)
+
+    def _bind(self, user, uid):
+        # A namespace is bound to the identity it was created for. A uid that
+        # was recycled for a different account must not inherit the records.
+        meta = self._read("meta.json")
+        if meta is None:
+            self._write("meta.json", {"user": user, "uid": uid})
+        elif meta.get("user") != user or meta.get("uid") != uid:
+            raise SecretError("namespace belongs to another identity")
+
+    def _locked(self):
+        fd = os.open(".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600,
+                     dir_fd=self.dir_fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def list(self):
+        """Names and metadata only; no value is ever decrypted here."""
+        out = []
+        for entry in sorted(os.listdir(self.dir_fd)):
+            if not entry.endswith(".rec") or not valid_secret_name(entry[:-4]):
+                continue
+            rec = self._read(entry) or {}
+            out.append({"name": entry[:-4], "version": rec.get("version", 0),
+                        "configured": not rec.get("tombstone", False)})
+        return out
+
+    def set(self, name, value):
+        lock = self._locked()
+        try:
+            old = self._read(name + ".rec") or {}
+            version = _next_version(old)
+            nonce, ct = _encrypt(self._key, _aad(self.user, self.namespace, name, version), value)
+            self._write(name + ".rec", {
+                "version": version,
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+                "ct": base64.b64encode(ct).decode("ascii"),
+            })
+            return version
+        finally:
+            os.close(lock)
+
+    def get(self, name):
+        """Decrypt one value. Only the exec path calls this - list/set/
+        remove never see plaintext. Raises SecretError (never a bare
+        KeyError/ValueError/binascii.Error) for anything short of a valid
+        record, including one written by an incompatible earlier format -
+        the caller must be able to treat "cannot resolve this name" as one
+        kind of failure, not crash the whole process on it."""
+        rec = self._read(name + ".rec")
+        if rec is None or rec.get("tombstone"):
+            return None
+        try:
+            nonce = base64.b64decode(rec["nonce"], validate=True)
+            ct = base64.b64decode(rec["ct"], validate=True)
+            version = rec["version"]
+            if not isinstance(version, int) or isinstance(version, bool):
+                raise ValueError("bad version")
+        except (KeyError, ValueError, TypeError, binascii.Error):
+            raise SecretError("store entry corrupt")
+        aad = _aad(self.user, self.namespace, name, version)
+        return _decrypt(self._key, aad, nonce, ct)
+
+    def remove(self, name):
+        """Delete the value but keep a tombstone, so a retired name stays
+        protected rather than reappearing from a stale legacy copy."""
+        lock = self._locked()
+        try:
+            old = self._read(name + ".rec")
+            if old is None:
+                raise SecretError("no such secret")
+            version = _next_version(old)
+            self._write(name + ".rec", {"version": version, "tombstone": True})
+            return version
+        finally:
+            os.close(lock)
+
+
+def handle_request(store, req):
+    """Handles the non-exec ops. exec/status/cancel are dispatched by the
+    broker directly (they need the job manager, not just a Store)."""
+    op = validate_request(req)
+    if op == "list":
+        return {"ok": True, "secrets": store.list()[:SECRET_MAX_NAMES]}
+    if op == "set":
+        return {"ok": True, "version": store.set(req["name"], req["value"])}
+    if op == "remove":
+        return {"ok": True, "version": store.remove(req["name"])}
+    raise SecretError("unsupported here")
+  '';
+  secretJobsLib = ''
+# Secret custody: bounded command jobs (issue #922, PR 2 slice).
+#
+# exec_with_secrets runs the caller's command with ONLY the requested values
+# injected, as a job the broker tracks by id so start/status/cancel survive
+# an MCP adapter reconnect. The actual child always runs as the unprivileged
+# agent user - the Launcher below is what decides HOW: production launches a
+# systemd transient unit with User=<agent> (SystemdLauncher); tests and a
+# root-less dev box use DirectLauncher, which spawns the same
+# secret-worker.py directly. Business logic (idempotency, timeouts,
+# redaction, output caps) lives here once and is identical either way - only
+# "how is the child's uid actually dropped" differs, and that is exactly the
+# one thing a unit test on this box cannot prove (see tests/secrets.nix).
+#
+# Spliced ABOVE secret-broker.py by the generated module, after
+# secret-protocol.py; this file therefore has no `if __name__` block and
+# reuses SecretError, SECRET_MAX_OUTPUT_BYTES, etc. from that file.
+import contextlib
+import hashlib
+import json
+import os
+import secrets as _secrets_module
+import signal
+import subprocess
+import threading
+import time
+
+JOB_STATES = ("pending", "running", "done", "error", "cancelled", "timeout")
+ACTIVE_STATES = ("pending", "running")
+
+
+def new_job_id():
+    return _secrets_module.token_hex(12)
+
+
+def redact(data, values):
+    """Replace every exact occurrence of a secret value with a fixed-width
+    marker. Order matters: redact longer values first so one value that is a
+    substring of another cannot partially unmask it."""
+    if not values:
+        return data
+    out = data
+    for value in sorted(set(values), key=len, reverse=True):
+        if value:
+            out = out.replace(value.encode("utf-8"), b"***redacted***")
+    return out
+
+
+def fingerprint_request(req):
+    """What makes two exec requests "the same" for idempotency: everything
+    that affects what runs, nothing that affects bookkeeping (jobId,
+    idempotencyKey itself)."""
+    material = {
+        "profile": req.get("profile"),
+        "argv": req.get("argv"),
+        "command": req.get("command"),
+        "shell": req.get("shell"),
+        "secretNames": sorted(req.get("secretNames", [])),
+        "cwd": req.get("cwd"),
+        "env": req.get("env", {}),
+        "timeoutMs": req.get("timeoutMs"),
+    }
+    blob = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+class Job:
+    def __init__(self, job_id, namespace, fingerprint, request, created_at):
+        self.id = job_id
+        self.namespace = namespace
+        self.fingerprint = fingerprint
+        self.idempotency_key = request.get("idempotencyKey")
+        self.timeout_ms = request.get("timeoutMs") or SECRET_DEFAULT_TIMEOUT_MS
+        self.created_at = created_at
+        self.started_at = None
+        self.finished_at = None
+        self.state = "pending"
+        self.exit_code = None
+        self.stdout = b""
+        self.stderr = b""
+        self.stdout_truncated = False
+        self.stderr_truncated = False
+        self.handle = None  # set by the Launcher; opaque to everything else
+        self.lock = threading.Lock()
+
+    def public(self):
+        with self.lock:
+            return {
+                "jobId": self.id,
+                "state": self.state,
+                "exitCode": self.exit_code,
+                "stdout": self.stdout.decode("utf-8", "replace"),
+                "stderr": self.stderr.decode("utf-8", "replace"),
+                "stdoutTruncated": self.stdout_truncated,
+                "stderrTruncated": self.stderr_truncated,
+            }
+
+def encode_worker_frame(argv_or_command, shell, secret_values, nonsecret_env, cwd):
+    """The one place that builds secret-worker.py's stdin frame, so a field
+    added to it cannot land in one Launcher and not the other - the two
+    launchers differ in how the child's uid is dropped, nothing about the
+    request it is handed."""
+    frame = json.dumps({
+        "argv": argv_or_command if shell is None else None,
+        "command": argv_or_command if shell is not None else None,
+        "shell": shell,
+        "secrets": secret_values,
+        "env": nonsecret_env,
+        "cwd": cwd,
+    }).encode("utf-8")
+    return len(frame).to_bytes(4, "big") + frame
+
+
+def spawn_worker(argv, frame_bytes):
+    """subprocess.Popen plus the frame handoff, shared by both launchers.
+    Raises on any failure to start or to hand off the frame - the caller
+    (JobManager._dispatch) is what turns that into a job error rather than
+    an unhandled exception."""
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        proc.stdin.write(frame_bytes)
+        proc.stdin.close()
+    except OSError:
+        proc.kill()
+        proc.wait()
+        raise
+    return proc
+
+
+class Launcher:
+    """How a job's child actually starts. Subclasses own the uid drop."""
+
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+        raise NotImplementedError
+
+    def poll(self, job):
+        raise NotImplementedError
+
+    def kill(self, job):
+        raise NotImplementedError
+
+
+class DirectLauncher(Launcher):
+    """Dev/test launcher: runs secret-worker.py directly, as whatever user
+    this broker process itself runs as. This is what every unit test and a
+    root-less dev-mode broker use - it proves the protocol, the redaction,
+    the timeouts and the idempotency, and nothing about the uid boundary.
+    Production (SystemdLauncher, in secret-broker.py) is the only launcher
+    that proves that; see the module's VM test."""
+
+    def __init__(self, worker_path, python_bin="python3"):
+        self.worker_path = worker_path
+        self.python_bin = python_bin
+
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+        frame_bytes = encode_worker_frame(argv_or_command, shell, secret_values,
+                                          nonsecret_env, cwd)
+        job.handle = spawn_worker([self.python_bin, self.worker_path], frame_bytes)
+        return job.handle
+
+    def poll(self, job):
+        return job.handle.poll()
+
+    def kill(self, job):
+        if job.handle is None:
+            # _dispatch only calls kill() through cancel()/the timeout path,
+            # both of which happen after a successful start() set this - but
+            # guard it anyway, since "no handle" must never raise past here.
+            return
+        try:
+            os.killpg(job.handle.pid, signal.SIGKILL)
+        except OSError:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                job.handle.kill()
+
+
+class JobManager:
+    """One per (broker process, user). Tracks every job across every profile
+    of that user - the "2 active jobs per user" limit in the issue is a
+    per-user limit, not per-profile."""
+
+    def __init__(self, launcher, max_output_bytes, max_jobs):
+        self.launcher = launcher
+        self.max_output_bytes = max_output_bytes
+        self.max_jobs = max_jobs
+        self._jobs = {}
+        self._by_idempotency = {}  # (namespace, key) -> job id
+        self._lock = threading.Lock()
+
+    def _active_count(self):
+        return sum(1 for j in self._jobs.values() if j.state in ACTIVE_STATES)
+
+    def start(self, namespace, req, resolve_secret):
+        fingerprint = fingerprint_request(req)
+        key = req.get("idempotencyKey")
+        with self._lock:
+            if key is not None:
+                existing_id = self._by_idempotency.get((namespace, key))
+                if existing_id is not None:
+                    existing = self._jobs[existing_id]
+                    if existing.fingerprint != fingerprint:
+                        raise SecretError("idempotency key conflict")
+                    return existing.id
+            if self._active_count() >= self.max_jobs:
+                raise SecretError("too many active jobs")
+            job = Job(new_job_id(), namespace, fingerprint, req, time.time())
+            self._jobs[job.id] = job
+            if key is not None:
+                self._by_idempotency[(namespace, key)] = job.id
+        self._dispatch(job, req, resolve_secret)
+        return job.id
+
+    def _dispatch(self, job, req, resolve_secret):
+        names = req.get("secretNames", [])
+        secret_values = {}
+        for name in names:
+            try:
+                value = resolve_secret(name)
+            except SecretError as exc:
+                value = None
+                failure = str(exc)
+            else:
+                failure = f"no such secret: {name}"
+            if value is None:
+                job.state = "error"
+                job.stderr = failure.encode("utf-8")
+                job.finished_at = time.time()
+                return
+            secret_values[name] = value
+        argv_or_command = req["argv"] if "argv" in req else req["command"]
+        shell = req.get("shell")
+        job.started_at = time.time()
+        job.state = "running"
+        try:
+            self.launcher.start(job, argv_or_command, shell, secret_values,
+                                req.get("env", {}), req.get("cwd"))
+        except Exception as exc:
+            # A job that failed to even START (systemd-run missing, a fork
+            # failure, a frame too large for the pipe) must not stay
+            # "running" forever: that leaks one of this user's 2 job slots
+            # permanently, and a later cancel()/kill() on a job with no
+            # handle would crash the broker (see Launcher.kill below).
+            job.state = "error"
+            job.stderr = f"failed to start: {exc}".encode("utf-8")
+            job.finished_at = time.time()
+            return
+        redact_values = list(secret_values.values())
+        threading.Thread(target=self._drain, args=(job, redact_values), daemon=True).start()
+
+    def _drain(self, job, redact_values):
+        proc = job.handle
+        timeout = (job.timeout_ms / 1000.0) if job.timeout_ms else None
+        deadline = (time.time() + timeout) if timeout else None
+        # A secret can straddle two 4 KiB reads, so the redaction scan has
+        # to see a value whole to catch it - which means not committing the
+        # tail of what has been read so far until it either resolves into a
+        # redacted match or there is nothing more that could still extend
+        # it into one. The simplest way to get that right is to never hold
+        # back a PARTIAL raw buffer at all: keep the whole raw buffer (it is
+        # cheap, because it is capped) and redact it afresh each time, so a
+        # match that only completes on a later read is still found whole
+        # the next time this runs. Capping it is what keeps this bounded
+        # instead of the unbounded "keep every byte ever produced" the
+        # first cut of this function did: `yes` with a 1-hour timeout no
+        # longer grows this process's memory without limit, nor does the
+        # redaction scan run against more than this many bytes at a time.
+        longest_value = max((len(v.encode("utf-8")) for v in redact_values), default=0)
+        raw_cap = self.max_output_bytes + longest_value
+
+        def pump(stream, attr):
+            raw = bytearray()
+            truncated = False
+            while True:
+                # Keep reading even once the cap below is hit, so a child
+                # that fills its pipe buffer never blocks on a reader that
+                # has stopped reading; the extra bytes are simply discarded.
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                room = raw_cap - len(raw)
+                if room <= 0:
+                    truncated = True
+                    with job.lock:
+                        setattr(job, attr + "_truncated", True)
+                    continue
+                if len(chunk) > room:
+                    raw.extend(chunk[:room])
+                    truncated = True
+                else:
+                    raw.extend(chunk)
+                clean = redact(bytes(raw), redact_values)
+                if len(clean) > self.max_output_bytes:
+                    clean = clean[:self.max_output_bytes]
+                    truncated = True
+                with job.lock:
+                    setattr(job, attr, clean)
+                    setattr(job, attr + "_truncated", truncated)
+
+        out_thread = threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True)
+        err_thread = threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True)
+        out_thread.start()
+        err_thread.start()
+        timed_out = False
+        while True:
+            rc = self.launcher.poll(job)
+            if rc is not None:
+                break
+            if deadline is not None and time.time() >= deadline:
+                timed_out = True
+                self.launcher.kill(job)
+                break
+            time.sleep(0.05)
+        out_thread.join(timeout=5)
+        err_thread.join(timeout=5)
+        with job.lock:
+            job.finished_at = time.time()
+            if timed_out:
+                job.state = "timeout"
+                job.exit_code = None
+            elif job.state == "running":
+                rc = self.launcher.poll(job)
+                job.exit_code = rc
+                job.state = "done" if rc == 0 else "error"
+
+    def status(self, namespace, job_id):
+        job = self._jobs.get(job_id)
+        if job is None or job.namespace != namespace:
+            raise SecretError("no such job")
+        return job.public()
+
+    def cancel(self, namespace, job_id):
+        job = self._jobs.get(job_id)
+        if job is None or job.namespace != namespace:
+            raise SecretError("no such job")
+        with job.lock:
+            already_terminal = job.state not in ACTIVE_STATES
+        if already_terminal:
+            return job.public()
+        self.launcher.kill(job)
+        with job.lock:
+            if job.state == "running":
+                job.state = "cancelled"
+                job.finished_at = time.time()
+        return job.public()
+
+    def sweep(self, retention_seconds):
+        """Drop finished jobs older than the retention window, so memory and
+        the idempotency map do not grow without bound (issue #922: "24-hour
+        result retention")."""
+        now = time.time()
+        with self._lock:
+            stale = [
+                jid for jid, job in self._jobs.items()
+                if job.state not in ACTIVE_STATES
+                and job.finished_at is not None
+                and now - job.finished_at > retention_seconds
+            ]
+            for jid in stale:
+                job = self._jobs.pop(jid)
+                if job.idempotency_key is not None:
+                    self._by_idempotency.pop((job.namespace, job.idempotency_key), None)
+  '';
+  secretCli = pkgs.writers.writePython3Bin "agent-box-secret" {
+    libraries = [ pkgs.python3Packages.cryptography ];
+    flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+  } (secretProtocolLib + ''
+
+
+"""agent-box-secret - manage this user's protected secrets (#922).
+
+  list                       names and versions; never a value
+  set NAME --stdin           write-only: the value comes from stdin, never argv
+  remove NAME                delete the value, keeping a protected-name tombstone
+  exec (--argv ... | --command CMD --shell bash|sh) --secret NAME...
+                             run a command with only the named secrets injected
+  status JOBID               poll a job started by exec
+  cancel JOBID               stop a running job
+
+Talks to the root broker over its Unix socket. There is deliberately no verb
+that prints a value.
+
+--profile NAME puts a value in one agent-box profile's own secret bucket.
+There is no separate global bucket: omitting --profile resolves to the
+box's current default profile (`agent-box-profile default`), the same one
+a session started with neither --profile nor --harness gets - and refuses
+if none is set. Scoping is routing, not a security boundary: the broker
+only checks which Linux user is asking, so any process of this user can
+still pass a different --profile explicitly. `agent-box-profile ls` lists
+the ones you have.
+"""
+import argparse
+import json
+import sys
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="agent-box-secret")
+    parser.add_argument("--socket", default=os.environ.get("AGENT_BOX_SECRET_SOCKET"))
+    parser.add_argument("--profile",
+                        help="scope to this agent-box profile's own secrets; omit to use "
+                             "the box's current default profile (agent-box-profile default)")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    sub = parser.add_subparsers(dest="verb", required=True)
+    sub.add_parser("list")
+    set_p = sub.add_parser("set")
+    set_p.add_argument("name")
+    set_p.add_argument("--stdin", action="store_true", required=True)
+    sub.add_parser("remove").add_argument("name")
+
+    exec_p = sub.add_parser("exec")
+    exec_p.add_argument("--secret", dest="secrets", action="append", default=[],
+                        help="a secret name to inject; repeat for more than one")
+    exec_p.add_argument("--cwd")
+    exec_p.add_argument("--timeout-ms", type=int)
+    exec_p.add_argument("--idempotency-key")
+    exec_p.add_argument("--command", help="run via a shell instead of a literal argv")
+    exec_p.add_argument("--shell", choices=("bash", "sh"), default="sh")
+    exec_p.add_argument("argv", nargs="*", help="literal argv, if --command is not given")
+
+    sub.add_parser("status").add_argument("job_id")
+    sub.add_parser("cancel").add_argument("job_id")
+
+    args = parser.parse_args()
+    if not args.socket:
+        sys.stderr.write("agent-box-secret: secrets are not enabled on this box\n")
+        return 2
+    try:
+        profile = resolve_profile(args.profile)
+    except SecretError as exc:
+        sys.stderr.write(f"agent-box-secret: {exc}\n")
+        return 2
+
+    if args.verb == "list":
+        req = {"op": "list", "profile": profile}
+    elif args.verb == "set":
+        value = sys.stdin.read()
+        if value.endswith("\n"):
+            value = value[:-1]
+        req = {"op": "set", "profile": profile, "name": args.name, "value": value}
+    elif args.verb == "remove":
+        req = {"op": "remove", "profile": profile, "name": args.name}
+    elif args.verb == "exec":
+        if bool(args.command) == bool(args.argv):
+            sys.stderr.write("agent-box-secret: give either a literal argv or --command, not both\n")
+            return 2
+        req = {"op": "exec", "profile": profile, "secretNames": args.secrets}
+        if args.command:
+            req["command"] = args.command
+            req["shell"] = args.shell
+        else:
+            req["argv"] = args.argv
+        if args.cwd:
+            req["cwd"] = args.cwd
+        if args.timeout_ms:
+            req["timeoutMs"] = args.timeout_ms
+        if args.idempotency_key:
+            req["idempotencyKey"] = args.idempotency_key
+    elif args.verb == "status":
+        req = {"op": "status", "profile": profile, "jobId": args.job_id}
+    else:
+        req = {"op": "cancel", "profile": profile, "jobId": args.job_id}
+
+    resp = connect_and_call(args.socket, req)
+    if not resp.get("ok"):
+        sys.stderr.write(f"agent-box-secret: {resp.get('error', 'refused')}\n")
+        return 1
+    if args.json:
+        print(json.dumps(resp))
+    elif args.verb == "list":
+        for item in resp["secrets"]:
+            state = "configured" if item["configured"] else "removed"
+            print(f"{item['name']}\tv{item['version']}\t{state}")
+    elif args.verb in ("set", "remove"):
+        print(f"{args.verb} ok (v{resp['version']})")
+    elif args.verb == "exec":
+        print(resp["jobId"])
+    else:
+        print(f"{resp['state']}\texit={resp.get('exitCode')}")
+        if resp.get("stdout"):
+            sys.stdout.write(resp["stdout"])
+        if resp.get("stderr"):
+            sys.stderr.write(resp["stderr"])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+  '');
+  secretBrokerBin = pkgs.writers.writePython3Bin "agent-box-secret-broker" {
+    libraries = [ pkgs.python3Packages.cryptography ];
+    flakeIgnore = [ "E402" "F811" "E501" "E302" "E305" "W503" "W504" ];
+  } (secretProtocolLib + ''
+
+  '' + secretJobsLib + ''
+
+
+"""agent-box-secret-broker - root custodian for ONE agent user's secrets
+(#922).
+
+Runs as root from a socket-activated unit, one instance per configured user.
+The socket's directory is root-owned and only that user can connect; on top
+of that every connection is checked against the kernel's SO_PEERCRED uid, so
+a mis-set mode cannot widen access. The request cannot name a uid, a path,
+or a namespace outside this user's own: the user/uid come from this
+process's own arguments, and "namespace" is just which of THIS user's
+profile buckets a request names.
+
+The protocol (src/lib/secret-protocol.py) has no list/set/remove operation
+that returns a value. exec/status/cancel (src/lib/secret-jobs.py) are the
+only ops that ever let a value leave this process, and they hand it to a
+worker that is already running as the unprivileged agent user by the time it
+sees it - never back to the caller.
+"""
+import argparse
+import os
+import pwd
+import subprocess
+import sys
+import threading
+import time
+
+
+def peer_uid(conn):
+    cred = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    return struct.unpack("3i", cred)[1]
+
+
+def drain_request(conn):
+    """Read the peer's frame before refusing it. Closing with the request
+    still unread resets the connection, so the peer sees EPIPE or ECONNRESET
+    instead of the refusal."""
+    try:
+        recv_frame(conn)
+    except (SecretError, OSError):
+        pass
+
+
+class SystemdLauncher(Launcher):
+    """Production launcher: a systemd transient service with User=<agent>,
+    one per job. `systemd-run --pipe` relays the unit's stdio to this
+    process's own pipes, so from JobManager's point of view this behaves
+    exactly like DirectLauncher's subprocess.Popen - poll()/kill() apply to
+    the systemd-run process, which blocks for the unit's whole lifetime.
+
+    Unproven on this box: there is no root and no KVM here, so this class
+    has never been exercised end to end. The OS boundary it is supposed to
+    give (uid, cgroup, NoNewPrivileges) is exactly what tests/secrets.nix is
+    for; see the issue and the PR description before trusting it in
+    production. DirectLauncher is what every unit test in this repository
+    actually runs.
+    """
+
+    def __init__(self, user, worker_path, python_bin="python3"):
+        self.user = user
+        self.worker_path = worker_path
+        self.python_bin = python_bin
+
+    @staticmethod
+    def _unit_name(job):
+        return f"agent-box-secret-job-{job.id}"
+
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+        frame_bytes = encode_worker_frame(argv_or_command, shell, secret_values,
+                                          nonsecret_env, cwd)
+        cmd = [
+            "systemd-run", "--pipe", "--quiet", "--collect",
+            f"--unit={self._unit_name(job)}",
+            f"--property=User={self.user}",
+            "--property=KillMode=control-group",
+            "--property=NoNewPrivileges=yes",
+            "--property=PrivateTmp=yes",
+            "--property=TimeoutStopSec=5",
+            "--",
+            self.python_bin, self.worker_path,
+        ]
+        job.handle = spawn_worker(cmd, frame_bytes)
+        return job.handle
+
+    def poll(self, job):
+        return job.handle.poll()
+
+    def kill(self, job):
+        if job.handle is None:
+            return
+        subprocess.run(["systemctl", "kill", "--signal=SIGKILL", self._unit_name(job)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            job.handle.kill()
+        except OSError:
+            pass
+
+
+class Broker:
+    # A profile name is cheap for a CALLER to mint (any string matching
+    # PROFILE_NAME_RE), and each new one costs this process a directory, a
+    # meta.json, a lock fd and a cached Store with its own open dir_fd. None
+    # of that is reclaimed on its own, so without a bound the agent user can
+    # exhaust this root process's file descriptors (and, at the fs level,
+    # fill /var/lib/agent-box-secrets with empty namespaces) just by asking
+    # `list` for enough distinct names. Evicting the least-recently-used
+    # Store when the cache is full bounds both; a profile that is actually
+    # in use stays resident because it keeps getting touched.
+    MAX_OPEN_STORES = 64
+
+    def __init__(self, user, uid, store_root, root_key, job_manager):
+        self.user = user
+        self.uid = uid
+        self.store_root = store_root
+        self.root_key = root_key
+        self.job_manager = job_manager
+        self._stores = {}
+        self._stores_lock = threading.Lock()
+
+    def _store(self, profile):
+        # Already validated by validate_request (every request names a
+        # concrete profile - see resolve_profile's docstring): "profile" is
+        # the namespace, with no further resolution needed here.
+        namespace = profile
+        with self._stores_lock:
+            store = self._stores.pop(namespace, None)
+            if store is None:
+                store = Store(self.store_root, namespace, self.user, self.uid, self.root_key)
+            self._stores[namespace] = store  # re-insert: most-recently-used
+            while len(self._stores) > self.MAX_OPEN_STORES:
+                evicted_name = next(iter(self._stores))
+                if evicted_name == namespace:
+                    break
+                self._stores.pop(evicted_name).close()
+            return store
+
+    def handle(self, req):
+        op = validate_request(req)
+        store = self._store(req.get("profile"))
+        if op in ("list", "set", "remove"):
+            return handle_request(store, req)
+        if op == "exec":
+            job_id = self.job_manager.start(store.namespace, req, store.get)
+            return {"ok": True, "jobId": job_id}
+        if op == "status":
+            return {"ok": True, **self.job_manager.status(store.namespace, req["jobId"])}
+        if op == "cancel":
+            return {"ok": True, **self.job_manager.cancel(store.namespace, req["jobId"])}
+        raise SecretError("unsupported operation")
+
+
+def _safe_send(conn, reply):
+    """send_frame itself can refuse (SecretError("response too large")) -
+    a job's own (already-capped) output can still JSON-escape past
+    SECRET_MAX_FRAME in the pathological case (every byte a control
+    character escapes to \\u00NN, a 6x blow-up). Fall back to a reply that
+    is guaranteed small rather than let that escape as an exception."""
+    try:
+        send_frame(conn, reply)
+    except SecretError:
+        send_frame(conn, {"ok": reply.get("ok", False),
+                          "error": "response too large to return in full",
+                          "jobId": reply.get("jobId"), "state": reply.get("state")})
+
+
+def serve_one(listener, broker, expect_uid):
+    try:
+        conn, _ = listener.accept()
+    except OSError:
+        return
+    with conn:
+        conn.settimeout(10)
+        try:
+            if peer_uid(conn) != expect_uid:
+                drain_request(conn)
+                _safe_send(conn, {"ok": False, "error": "forbidden"})
+                return
+            try:
+                reply = broker.handle(recv_frame(conn))
+            except SecretError as exc:
+                reply = {"ok": False, "error": str(exc)}
+            except Exception as exc:  # noqa: BLE001 - see comment below
+                # Anything else is a bug in this request's handling, not a
+                # reason to take every OTHER connection down with it: this
+                # is a long-lived root process serving every session of one
+                # user, and "the broker died" means every one of that
+                # user's in-flight jobs and secrets becomes unreachable
+                # until something restarts it. Never let an unanticipated
+                # exception propagate out of one connection.
+                reply = {"ok": False, "error": f"internal error: {type(exc).__name__}"}
+            _safe_send(conn, reply)
+        except (OSError, socket.timeout):
+            # A peer that vanished mid-exchange must never stop the broker.
+            pass
+
+
+def _sweeper(job_manager):
+    while True:
+        time.sleep(300)
+        try:
+            job_manager.sweep(SECRET_JOB_RETENTION_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - a daemon thread must not die silently
+            sys.stderr.write(f"agent-box-secret-broker: sweep failed: {exc}\n")
+
+
+def main():
+    # Config is environment, not argv, in production - the unit sets
+    # AGENT_BOX_SECRET_USER/_STORE_ROOT/_WORKER_BIN from %i and the
+    # contract (see units/agent-box-secret-broker@.service and
+    # contract/agent-box-secret-broker.json). Explicit flags remain for
+    # direct/test invocation, same pattern as secret-cli.py's --socket.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--user", default=os.environ.get("AGENT_BOX_SECRET_USER"))
+    parser.add_argument("--uid", type=int, default=None,
+                        help="defaults to --user's real uid (pwd.getpwnam); pass this "
+                             "explicitly only to test the SO_PEERCRED mismatch path")
+    parser.add_argument("--store-root", default=os.environ.get("AGENT_BOX_SECRET_STORE_ROOT"),
+                        help="this user's own directory, e.g. /var/lib/agent-box-secrets/<user>")
+    parser.add_argument("--root-key-path",
+                        help="box-wide key file; defaults beside --store-root's parent")
+    parser.add_argument("--worker",
+                        default=os.environ.get("AGENT_BOX_SECRET_WORKER_BIN",
+                                               "/run/current-system/sw/bin/agent-box-secret-worker"),
+                        help="path to the fixed worker executable")
+    parser.add_argument("--socket", help="bind this path instead of using systemd's fd 3")
+    parser.add_argument("--dev-direct-launcher", action="store_true",
+                        help="DEV/TEST ONLY: run jobs with the broker's own uid instead of "
+                             "systemd User=<agent>. Refused when this process is root (it would "
+                             "execute the workload AS ROOT), and refused unless "
+                             "AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER=1 is also set.")
+    args = parser.parse_args()
+
+    if not args.user or not args.store_root:
+        sys.stderr.write(
+            "agent-box-secret-broker: --user and --store-root are required "
+            "(directly, or via AGENT_BOX_SECRET_USER/AGENT_BOX_SECRET_STORE_ROOT)\n")
+        return 2
+    if args.uid is None:
+        try:
+            args.uid = pwd.getpwnam(args.user).pw_uid
+        except KeyError:
+            sys.stderr.write(f"agent-box-secret-broker: no such user: {args.user}\n")
+            return 2
+
+    if args.dev_direct_launcher:
+        # Two independent gates, not one: a single stray argv flag (a typo'd
+        # unit override, a copy-pasted systemd drop-in) must not be enough
+        # to make a production broker run every job as ITS OWN uid instead
+        # of dropping to the agent user. The env var is the one a real
+        # deployment's unit file never sets.
+        if os.getuid() == 0:
+            sys.stderr.write(
+                "agent-box-secret-broker: --dev-direct-launcher refused while running as root "
+                "(it would execute jobs as root, defeating the whole feature)\n")
+            return 2
+        if os.environ.get("AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER") != "1":
+            sys.stderr.write(
+                "agent-box-secret-broker: --dev-direct-launcher also needs "
+                "AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER=1 in the environment\n")
+            return 2
+
+    if args.socket:
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(args.socket)
+        os.chmod(args.socket, 0o660)
+        listener.listen(8)
+    elif os.environ.get("LISTEN_FDS") == "1" and os.environ.get("LISTEN_PID") == str(os.getpid()):
+        listener = socket.socket(fileno=3)
+    else:
+        sys.stderr.write("agent-box-secret-broker: no listening socket\n")
+        return 2
+
+    root_key_path = args.root_key_path or os.path.join(
+        os.path.dirname(os.path.normpath(args.store_root)), ".rootkey")
+    root_key = load_root_key(root_key_path)
+
+    if args.dev_direct_launcher:
+        launcher = DirectLauncher(args.worker)
+    else:
+        launcher = SystemdLauncher(args.user, args.worker)
+    job_manager = JobManager(launcher, SECRET_MAX_OUTPUT_BYTES, SECRET_MAX_JOBS_PER_USER)
+    threading.Thread(target=_sweeper, args=(job_manager,), daemon=True).start()
+
+    broker = Broker(args.user, args.uid, args.store_root, root_key, job_manager)
+    while True:
+        serve_one(listener, broker, args.uid)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+  '');
+  secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+"""agent-box-secret-worker - the fixed, unprivileged executable a job runs
+as (issue #922, PR 2 slice).
+
+Launched already as the agent user (systemd's `User=` in production,
+DirectLauncher's plain subprocess in dev/test mode - see
+lib/secret-jobs.py). It reads ONE length-prefixed JSON frame from its own
+stdin - the request plus the resolved secret values, never a uid, a path,
+or anything the caller chose beyond what the broker already validated - then
+resets stdin to /dev/null (there is no interactive stdin or TTY in v1) and
+execs the real command. Everything after that point is the workload: its
+stdout/stderr flow back to the broker exactly the way any child process's
+would, through the pipes the launcher already wired up, which is also where
+redaction happens (lib/secret-jobs.py's _drain), not here - this process
+never needs to know which of its own bytes happen to be secret.
+
+Never logs, never writes the frame or the resolved values anywhere but the
+child's own environment.
+
+Deliberately standalone: this file needs nothing from secret-protocol.py (no
+`cryptography`, no Store) and is not spliced with it, so its own dependency
+closure stays as small as the ordinary agent user's own python3 - the broker
+and the crypto library are what need isolating, not this one.
+"""
+import json
+import os
+import struct
+import sys
+
+
+def read_frame(stream):
+    header = stream.read(4)
+    if len(header) != 4:
+        sys.stderr.write("agent-box-secret-worker: no request frame\n")
+        raise SystemExit(2)
+    (length,) = struct.unpack(">I", header)
+    body = stream.read(length)
+    return json.loads(body.decode("utf-8"))
+
+
+def main():
+    frame = read_frame(sys.stdin.buffer)
+
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+
+    env = {}
+    for key in ("HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "LANG"):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    env.update(frame.get("env") or {})
+    env.update(frame["secrets"])
+
+    cwd = frame.get("cwd") or env.get("HOME") or "/"
+    try:
+        os.chdir(cwd)
+    except OSError as error:
+        sys.stderr.write(f"agent-box-secret-worker: cannot chdir to {cwd}: {error}\n")
+        raise SystemExit(126)
+
+    if frame.get("shell"):
+        shell = "/bin/bash" if frame["shell"] == "bash" else "/bin/sh"
+        argv = [shell, "-c", frame["command"]]
+    else:
+        argv = frame["argv"]
+
+    try:
+        os.execvpe(argv[0], argv, env)
+    except OSError as error:
+        sys.stderr.write(f"agent-box-secret-worker: cannot exec {argv[0]}: {error}\n")
+        raise SystemExit(127)
+
+
+if __name__ == "__main__":
+    main()
+  '';
+  secretsMcpBin = pkgs.writers.writePython3Bin "agent-box-secrets-mcp" {
+    libraries = [ pkgs.python3Packages.cryptography pkgs.python3Packages.mcp ];
+    flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+  } (secretProtocolLib + ''
+
+
+"""agent-box-secrets-mcp - the box-local MCP adapter (#922, PR 3 slice).
+
+An unprivileged stdio server. It never sees a value except as it flows back
+from a job's own (already redacted) stdout/stderr - it talks to the root
+broker over its per-user Unix socket exactly like the CLI does, using the
+same request schema (lib/secret-protocol.py). Four tools only, matching
+list_secret_names / exec_with_secrets / exec_with_secrets_status /
+exec_with_secrets_cancel from the issue; there is deliberately no tool that
+can read or export a value.
+
+Scope: this process's AGENT_BOX_PROFILE (the supervisor already exports it
+into every session - see env-exec.py), or the box's current default
+profile when that is unset (resolve_profile, lib/secret-protocol.py) -
+there is no separate global scope. No tool argument can select a
+different profile; that is routing, not a security boundary, exactly like
+every other per-profile value in this codebase (see env-exec.py's own
+"Convenience, NOT isolation" note on profile env) - the broker only ever
+checks SO_PEERCRED uid, so any process of this user could ask for another
+profile's secrets by naming it explicitly. What scoping buys is that an
+ordinary tool call never reaches across profiles by accident.
+
+Spliced ABOVE this file by the generated module, after secret-protocol.py,
+so SecretError/connect_and_call/SECRET_* already exist when this runs.
+"""
+import os
+import sys
+import time
+
+from mcp.server.fastmcp import FastMCP
+
+SOCKET_PATH = os.environ.get("AGENT_BOX_SECRET_SOCKET")
+POLL_INTERVAL_S = 0.1
+INLINE_WAIT_BUDGET_S = 3.0
+
+mcp = FastMCP("agent-box-secrets")
+
+
+def _call(req):
+    # Resolved per call, not once at import: a box with no default profile
+    # and no AGENT_BOX_PROFILE must not fail to even START this server over
+    # it - each tool call reports the refusal instead.
+    try:
+        profile = resolve_profile(os.environ.get("AGENT_BOX_PROFILE") or None)
+    except SecretError as exc:
+        return {"ok": False, "error": str(exc)}
+    return connect_and_call(SOCKET_PATH, dict(req, profile=profile))
+
+
+@mcp.tool()
+def list_secret_names() -> dict:
+    """List this profile's configured secret names and versions. Never a
+    value - use exec_with_secrets to run a command with one injected."""
+    return _call({"op": "list"})
+
+
+@mcp.tool()
+def exec_with_secrets(
+    secretNames: list[str],
+    argv: list[str] | None = None,
+    command: str | None = None,
+    shell: str | None = None,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    timeoutMs: int | None = None,
+    idempotencyKey: str | None = None,
+) -> dict:
+    """Run a command with ONLY the named secrets injected into its
+    environment. Give either argv (a literal argument list, preferred) or
+    command+shell ("bash" or "sh"). secretNames must come from
+    list_secret_names. The command's own environment never contains a
+    secret this call did not name. Output is captured with every selected
+    value's exact text redacted. Returns before the job may have finished
+    for a long-running command; poll with exec_with_secrets_status using
+    the returned jobId. idempotencyKey makes a retried call with the exact
+    same request return the original job instead of starting a second one."""
+    req = {"op": "exec", "secretNames": secretNames}
+    if argv is not None:
+        req["argv"] = argv
+    if command is not None:
+        req["command"] = command
+    if shell is not None:
+        req["shell"] = shell
+    if cwd is not None:
+        req["cwd"] = cwd
+    if env is not None:
+        req["env"] = env
+    if timeoutMs is not None:
+        req["timeoutMs"] = timeoutMs
+    if idempotencyKey is not None:
+        req["idempotencyKey"] = idempotencyKey
+    resp = _call(req)
+    if not resp.get("ok"):
+        return resp
+    job_id = resp["jobId"]
+    deadline = time.time() + INLINE_WAIT_BUDGET_S
+    status = _call({"op": "status", "jobId": job_id})
+    # Not lib/secret-jobs.py's ACTIVE_STATES: this file only splices with
+    # secret-protocol.py (see the header), to keep the unprivileged adapter's
+    # dependency closure small - a second literal here is cheaper than
+    # pulling in the whole job-manager module for one tuple.
+    while status.get("ok") and status.get("state") in ("pending", "running") and time.time() < deadline:
+        time.sleep(POLL_INTERVAL_S)
+        status = _call({"op": "status", "jobId": job_id})
+    status["jobId"] = job_id
+    return status
+
+
+@mcp.tool()
+def exec_with_secrets_status(jobId: str) -> dict:
+    """Poll a job started by exec_with_secrets."""
+    return _call({"op": "status", "jobId": jobId})
+
+
+@mcp.tool()
+def exec_with_secrets_cancel(jobId: str) -> dict:
+    """Stop a running job started by exec_with_secrets. A job that already
+    finished is returned unchanged; cancellation cannot undo an effect the
+    command already caused outside this box (e.g. a detached deployment)."""
+    return _call({"op": "cancel", "jobId": jobId})
+
+
+def main():
+    if not SOCKET_PATH:
+        sys.stderr.write(
+            "agent-box-secrets-mcp: AGENT_BOX_SECRET_SOCKET is not set; "
+            "every tool call will report secrets as disabled\n")
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
   '');
 
   # Buzz remains the ACP client and session router; this endpoint supplies one
@@ -6394,7 +7976,7 @@ done
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
     ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli transcribeCli
-         harnessCli ]
+         harnessCli secretCli secretsMcpBin ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli webhookAckCli ]
@@ -15631,6 +17213,20 @@ esac
   ]
 }
   '';
+  # modules/src/contract/agent-box-secret-broker.json (issue #922): the
+  # secret-custody broker's unit, resolved the same way webhookContract is.
+  secretBrokerContract = builtins.fromJSON ''
+{
+  "unit": "agent-box-secret-broker@",
+  "condition": "secrets",
+  "env": [
+    { "name": "AGENT_BOX_SECRET_WORKER_BIN", "kind": "bin", "program": "agent-box-secret-worker", "condition": "always" }
+  ],
+  "execStart": [
+    { "kind": "bin", "program": "agent-box-secret-broker" }
+  ]
+}
+  '';
   # modules/src/contract/agent-box.json — the same treatment for the
   # per-session agent-box@ unit's fixed-program bindings (issue #451, PR 2's
   # second unit family). The per-instance URL/path/username values on this
@@ -15914,6 +17510,7 @@ esac
     else if cond == "web" then cfg.web.enable
     else if cond == "no-sudo-allowlist" then !sudoGranted
     else if cond == "protect-memory" then cfg.protectMemory
+    else if cond == "secrets" then secretsEnabled
     else throw "agent-box: contract entry has unknown condition '${cond}'";
   # A non-env serviceConfig field (ReadWritePaths/NoNewPrivileges/
   # OOMScoreAdjust, issue #451's OP) named in a contract's "directives"
@@ -15970,6 +17567,8 @@ esac
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
     python3 = webhookPython;
+    "agent-box-secret-broker" = "${secretBrokerBin}/bin/agent-box-secret-broker";
+    "agent-box-secret-worker" = "${secretWorkerBin}/bin/agent-box-secret-worker";
   };
   # Resolve one manifest entry to the value this backend binds it to. An
   # unknown kind or program is a hard error at eval time (the whole point of
@@ -20387,6 +21986,52 @@ in
       };
     };
 
+    secrets = {
+      # OFF by default, unlike containers/webhook above (issue #922): this
+      # is a root-privileged custodian daemon whose OS boundary - the one
+      # thing the whole feature is for - has no VM test yet
+      # (tests/secrets.nix does not exist), so it has never been proven on
+      # a real two-user box. "Default off during rollout" is the issue's
+      # own instruction. Flip this only once that test exists and passes.
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        example = true;
+        description = ''
+          Start a root-owned secret-custody broker per configured terminal
+          user (issue #922): `agent-box-secret-broker@<user>.service`,
+          socket-activated at /run/agent-box-secrets/<user>.sock, 0600
+          <user>-only. It stores secret values AES-256-GCM encrypted under
+          a root-only key, and lets a session run a command with ONLY
+          explicitly named secrets injected (`exec_with_secrets`, exposed
+          to claude/codex as box-local MCP tools and as the
+          `agent-box-secret` CLI, which this module ships regardless of
+          this setting - it refuses cleanly with "secrets are not enabled
+          on this box" when it is not).
+
+          When enabled, AGENT_BOX_SECRET_SOCKET is exported into every
+          session of that user, and env-exec.py strips every secret name
+          the broker protects from the session's own environment -
+          regardless of which file (the legacy env store, a profile)
+          would otherwise have set it.
+
+          The guarantee ends at secret-enabled code: a selected command
+          runs as the agent user and can disclose the values it was
+          handed, including through transformed output or a network
+          request; same-uid processes can still inspect that one
+          workload's own environment while it runs. What this narrows is
+          ordinary tool use never seeing a secret it was not handed -
+          not a sandbox around code that was deliberately given one.
+
+          The root/agent-user boundary itself - that the agent cannot
+          read the store, the root key, or another user's socket - is
+          unproven on THIS kind of box (no VM test exists yet to prove it
+          in CI either). Treat this as a feature preview until
+          tests/secrets.nix lands and this default flips.
+        '';
+      };
+    };
+
     web = {
       enable = lib.mkEnableOption ''
         browser terminals (one ttyd per user with web.passwordHashFile set)
@@ -21556,7 +23201,13 @@ in
         # socket is exempt from a read-only mount, which the agent unit's
         # ProtectSystem=strict otherwise puts over /run.
         + lib.optionalString cfg.containers.enable
-            "DOCKER_HOST=unix://${containerSocketOf name}\n";
+            "DOCKER_HOST=unix://${containerSocketOf name}\n"
+        # Secret custody (issue #922). Read by env-exec.py (to strip every
+        # name the broker protects) and by the CLI/MCP adapter (to find the
+        # broker at all) - absent entirely when secrets.enable is false, so
+        # both already-no-op by construction.
+        + lib.optionalString secretsEnabled
+            "AGENT_BOX_SECRET_SOCKET=/run/agent-box-secrets/${name}.sock\n";
     }) cfg.users
     # Codex autonomy for the WHOLE box (issue 234, see codexFullAccess).
     # codex reads /etc/codex/config.toml as its system layer, below the
@@ -21963,6 +23614,47 @@ in
     # races user creation on a fresh boot ("Failed to resolve group
     # 'agent': Unknown group") and /run has no second chance - see the
     # shared unit for the whole reason.
+  }) (lib.mkIf secretsEnabled {
+    # Secret custody broker (issue #922), one per configured user - same
+    # shape as containers.enable just above, and for the same reason: no
+    # web.enable dependency (this is a plain Unix socket, not HTTP behind
+    # the per-user Caddy vhost), so it cannot live in the terminalUsers-
+    # keyed, web-gated block the webhook/settings units are instantiated
+    # in further down. Every configured user gets one, not just the ones
+    # with a web front door.
+    systemd.tmpfiles.rules = [
+      # Root-only store parent (the broker creates its own per-user
+      # subdirectory under this at startup) and a world-traversable
+      # socket dir - listing a socket's NAME is not a secret, its 0600
+      # mode is what gates connect().
+      "d /var/lib/agent-box-secrets 0700 root root - -"
+      "d /run/agent-box-secrets 0755 root root - -"
+    ];
+    systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
+      overrideStrategy = "asDropin";
+      # Same restart-in-one-step reasoning as the webhook receiver's own
+      # drop-in (see its comment below): this is also socket-activated,
+      # and the stale-survivor window is the same shape.
+      stopIfChanged = false;
+      # Config is environment, not argv (see the unit template's own
+      # header), so this override only needs the ExecStart resolution and
+      # the one contract env var (the worker's store path);
+      # AGENT_BOX_SECRET_USER/_STORE_ROOT are already baked into the
+      # packaged unit text via systemd's own %i expansion.
+      environment = lib.listToAttrs (map
+        (e: lib.nameValuePair e.name (contractBin e))
+        secretBrokerContract.env);
+      serviceConfig = {
+        ExecStart = [ "" (contractBin (lib.elemAt secretBrokerContract.execStart 0)) ];
+      };
+    }) (lib.attrNames cfg.users));
+    # One instance per configured user. The unit is a template, and a
+    # template's own wantedBy instantiates nothing - same shape as the
+    # containers.enable wants just above.
+    systemd.targets.multi-user.wants =
+      map (name: "agent-box-secret-broker@${name}.service") (lib.attrNames cfg.users);
+    systemd.targets.sockets.wants =
+      map (name: "agent-box-secret-broker@${name}.socket") (lib.attrNames cfg.users);
   }) (lib.mkIf cfg.selfUpdate.enable {
     # The shared unit file (shipped in agentBoxUnitsPackage above) names a
     # bare program, exactly as agent-box@ does; this per-instance drop-in

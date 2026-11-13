@@ -17,6 +17,7 @@ sees it - never back to the caller.
 """
 import argparse
 import os
+import pwd
 import subprocess
 import sys
 import threading
@@ -201,15 +202,23 @@ def _sweeper(job_manager):
 
 
 def main():
+    # Config is environment, not argv, in production - the unit sets
+    # AGENT_BOX_SECRET_USER/_STORE_ROOT/_WORKER_BIN from %i and the
+    # contract (see units/agent-box-secret-broker@.service and
+    # contract/agent-box-secret-broker.json). Explicit flags remain for
+    # direct/test invocation, same pattern as secret-cli.py's --socket.
     parser = argparse.ArgumentParser()
-    parser.add_argument("--user", required=True)
-    parser.add_argument("--uid", type=int, required=True)
-    parser.add_argument("--store-root", required=True,
+    parser.add_argument("--user", default=os.environ.get("AGENT_BOX_SECRET_USER"))
+    parser.add_argument("--uid", type=int, default=None,
+                        help="defaults to --user's real uid (pwd.getpwnam); pass this "
+                             "explicitly only to test the SO_PEERCRED mismatch path")
+    parser.add_argument("--store-root", default=os.environ.get("AGENT_BOX_SECRET_STORE_ROOT"),
                         help="this user's own directory, e.g. /var/lib/agent-box-secrets/<user>")
     parser.add_argument("--root-key-path",
                         help="box-wide key file; defaults beside --store-root's parent")
     parser.add_argument("--worker",
-                        default="/run/current-system/sw/bin/agent-box-secret-worker",
+                        default=os.environ.get("AGENT_BOX_SECRET_WORKER_BIN",
+                                               "/run/current-system/sw/bin/agent-box-secret-worker"),
                         help="path to the fixed worker executable")
     parser.add_argument("--socket", help="bind this path instead of using systemd's fd 3")
     parser.add_argument("--dev-direct-launcher", action="store_true",
@@ -218,6 +227,18 @@ def main():
                              "execute the workload AS ROOT), and refused unless "
                              "AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER=1 is also set.")
     args = parser.parse_args()
+
+    if not args.user or not args.store_root:
+        sys.stderr.write(
+            "agent-box-secret-broker: --user and --store-root are required "
+            "(directly, or via AGENT_BOX_SECRET_USER/AGENT_BOX_SECRET_STORE_ROOT)\n")
+        return 2
+    if args.uid is None:
+        try:
+            args.uid = pwd.getpwnam(args.user).pw_uid
+        except KeyError:
+            sys.stderr.write(f"agent-box-secret-broker: no such user: {args.user}\n")
+            return 2
 
     if args.dev_direct_launcher:
         # Two independent gates, not one: a single stray argv flag (a typo'd
