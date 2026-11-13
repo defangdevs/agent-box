@@ -233,6 +233,13 @@ let
     install -m444 ${pkgs.writeText "agent-box-docker@.service" ''
       @@include:src/units/agent-box-docker@.service@@
     ''} $out/etc/systemd/system/agent-box-docker@.service
+  '' + lib.optionalString secretsEnabled ''
+    install -m444 ${pkgs.writeText "agent-box-secret-broker@.service" ''
+      @@include:src/units/agent-box-secret-broker@.service@@
+    ''} $out/etc/systemd/system/agent-box-secret-broker@.service
+    install -m444 ${pkgs.writeText "agent-box-secret-broker@.socket" ''
+      @@include:src/units/agent-box-secret-broker@.socket@@
+    ''} $out/etc/systemd/system/agent-box-secret-broker@.socket
   '');
   # Shared by the "agent-box@" host-level ExecSearchPath (below) and the
   # per-user "agent-box@<name>" instance drop-in's environment.PATH — they
@@ -366,6 +373,9 @@ let
   # answers every POST with 404/401 — it becomes reachable only once a user
   # deliberately writes a secret.
   webhookEnabled = cfg.webhook.enable && cfg.web.enable;
+  # No web.enable dependency, unlike webhookEnabled above: this is a plain
+  # Unix socket, not an HTTP endpoint behind the per-user Caddy vhost.
+  secretsEnabled = cfg.secrets.enable;
   webhookSocketDir = "/run/agent-box-webhook";
   webhookSocketOf = name: "${webhookSocketDir}/${name}.sock";
   webhookStateDirOf = name: "/home/${name}/.local/state/local-webhook";
@@ -450,6 +460,87 @@ let
 
 
 @@include:src/envstore-cli.py@@
+  '');
+
+  # Secret custody (issue #922): secret-cli.py, secret-broker.py, secret-
+  # worker.py and secrets-mcp.py all splice lib/secret-protocol.py the same
+  # way envStoreLib is spliced above; secret-broker.py additionally needs
+  # lib/secret-jobs.py (the exec_with_secrets job engine) between the two.
+  # secret-worker.py stays unspliced (see its own header) - it runs as the
+  # agent user and has no need of `cryptography`, so keeping it standalone
+  # keeps its dependency closure as small as a bare python3.
+  #
+  # Shipped the same way regardless of services.agent-box.secrets.enable:
+  # env-exec.py's `shutil.which("agent-box-secret")` runs on every session
+  # spawn whether or not the feature is on, and a box with it off simply
+  # has no AGENT_BOX_SECRET_SOCKET for the CLI to connect to (it refuses
+  # cleanly - "secrets are not enabled on this box"). Only the broker UNIT
+  # (below, secretBrokerContract and the systemd wiring) is gated.
+  secretProtocolLib = ''
+@@include:src/lib/secret-protocol.py@@
+  '';
+  secretJobsLib = ''
+@@include:src/lib/secret-jobs.py@@
+  '';
+  # The plaintext-candidate scanner (issue #922): advisory only, never a
+  # migration - see its own header. Only secret-cli.py needs it; the
+  # broker/worker/MCP adapter never touch the env store.
+  secretCandidatesLib = ''
+@@include:src/lib/secret-candidates.py@@
+  '';
+  secretCli = pkgs.writers.writePython3Bin "agent-box-secret" {
+    libraries = [ pkgs.python3Packages.cryptography ];
+    flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+  } (envStoreLib + ''
+
+
+  '' + secretProtocolLib + ''
+
+
+  '' + secretCandidatesLib + ''
+
+
+@@include:src/secret-cli.py@@
+  '');
+  secretBrokerBin = pkgs.writers.writePython3Bin "agent-box-secret-broker" {
+    libraries = [ pkgs.python3Packages.cryptography ];
+    flakeIgnore = [ "E402" "F811" "E501" "E302" "E305" "W503" "W504" ];
+  } (secretProtocolLib + ''
+
+  '' + secretJobsLib + ''
+
+
+@@include:src/secret-broker.py@@
+  '');
+  secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/secret-worker.py@@
+  '';
+  secretsMcpBin = pkgs.writers.writePython3Bin "agent-box-secrets-mcp" {
+    libraries = [ pkgs.python3Packages.cryptography pkgs.python3Packages.mcp ];
+    flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+  } (secretProtocolLib + ''
+
+
+@@include:src/secrets-mcp.py@@
+  '');
+  # Advisory-only plaintext-credential scanner (issue #922), run on every
+  # activation - see its own header for why this is not a migration and
+  # not gated on services.agent-box.secrets.enable.
+  secretCandidatesReport = pkgs.writers.writePython3Bin "agent-box-secret-candidates-report" {
+    libraries = [ pkgs.python3Packages.cryptography ];
+    flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+  } (envStoreLib + ''
+
+
+  '' + secretProtocolLib + ''
+
+
+  '' + secretCandidatesLib + ''
+
+
+@@include:src/secret-candidates-report.py@@
   '');
 
   # Buzz remains the ACP client and session router; this endpoint supplies one
@@ -816,7 +907,7 @@ let
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
     ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli transcribeCli
-         harnessCli ]
+         harnessCli secretCli secretsMcpBin secretCandidatesReport ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
     ++ lib.optionals webhookEnabled [ webhookCli webhookSelfCli webhookBackfillCli webhookAckCli ]
@@ -1135,6 +1226,11 @@ GH_BIN = "${pkgs.gh}/bin/gh"
   webhookContract = builtins.fromJSON ''
 @@include:src/contract/agent-box-webhook.json@@
   '';
+  # modules/src/contract/agent-box-secret-broker.json (issue #922): the
+  # secret-custody broker's unit, resolved the same way webhookContract is.
+  secretBrokerContract = builtins.fromJSON ''
+@@include:src/contract/agent-box-secret-broker.json@@
+  '';
   # modules/src/contract/agent-box.json — the same treatment for the
   # per-session agent-box@ unit's fixed-program bindings (issue #451, PR 2's
   # second unit family). The per-instance URL/path/username values on this
@@ -1183,6 +1279,7 @@ GH_BIN = "${pkgs.gh}/bin/gh"
     else if cond == "web" then cfg.web.enable
     else if cond == "no-sudo-allowlist" then !sudoGranted
     else if cond == "protect-memory" then cfg.protectMemory
+    else if cond == "secrets" then secretsEnabled
     else throw "agent-box: contract entry has unknown condition '${cond}'";
   # A non-env serviceConfig field (ReadWritePaths/NoNewPrivileges/
   # OOMScoreAdjust, issue #451's OP) named in a contract's "directives"
@@ -1239,6 +1336,8 @@ GH_BIN = "${pkgs.gh}/bin/gh"
     "agent-box-env-exec" = "${envExecWrapper}";
     "agent-box-supervisor" = "${supervisorScript}/bin/agent-box-supervisor";
     python3 = webhookPython;
+    "agent-box-secret-broker" = "${secretBrokerBin}/bin/agent-box-secret-broker";
+    "agent-box-secret-worker" = "${secretWorkerBin}/bin/agent-box-secret-worker";
   };
   # Resolve one manifest entry to the value this backend binds it to. An
   # unknown kind or program is a hard error at eval time (the whole point of
@@ -2197,6 +2296,52 @@ in
           range, so they isolate the user from the box and never a
           session from its siblings (see the Users-vs-Sessions wiki
           page).
+        '';
+      };
+    };
+
+    secrets = {
+      # OFF by default, unlike containers/webhook above (issue #922): this
+      # is a root-privileged custodian daemon whose OS boundary - the one
+      # thing the whole feature is for - has no VM test yet
+      # (tests/secrets.nix does not exist), so it has never been proven on
+      # a real two-user box. "Default off during rollout" is the issue's
+      # own instruction. Flip this only once that test exists and passes.
+      enable = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        example = true;
+        description = ''
+          Start a root-owned secret-custody broker per configured terminal
+          user (issue #922): `agent-box-secret-broker@<user>.service`,
+          socket-activated at /run/agent-box-secrets/<user>.sock, 0600
+          <user>-only. It stores secret values AES-256-GCM encrypted under
+          a root-only key, and lets a session run a command with ONLY
+          explicitly named secrets injected (`exec_with_secrets`, exposed
+          to claude/codex as box-local MCP tools and as the
+          `agent-box-secret` CLI, which this module ships regardless of
+          this setting - it refuses cleanly with "secrets are not enabled
+          on this box" when it is not).
+
+          When enabled, AGENT_BOX_SECRET_SOCKET is exported into every
+          session of that user, and env-exec.py strips every secret name
+          the broker protects from the session's own environment -
+          regardless of which file (the legacy env store, a profile)
+          would otherwise have set it.
+
+          The guarantee ends at secret-enabled code: a selected command
+          runs as the agent user and can disclose the values it was
+          handed, including through transformed output or a network
+          request; same-uid processes can still inspect that one
+          workload's own environment while it runs. What this narrows is
+          ordinary tool use never seeing a secret it was not handed -
+          not a sandbox around code that was deliberately given one.
+
+          The root/agent-user boundary itself - that the agent cannot
+          read the store, the root key, or another user's socket - is
+          unproven on THIS kind of box (no VM test exists yet to prove it
+          in CI either). Treat this as a feature preview until
+          tests/secrets.nix lands and this default flips.
         '';
       };
     };
@@ -3359,7 +3504,13 @@ in
         # socket is exempt from a read-only mount, which the agent unit's
         # ProtectSystem=strict otherwise puts over /run.
         + lib.optionalString cfg.containers.enable
-            "DOCKER_HOST=unix://${containerSocketOf name}\n";
+            "DOCKER_HOST=unix://${containerSocketOf name}\n"
+        # Secret custody (issue #922). Read by env-exec.py (to strip every
+        # name the broker protects) and by the CLI/MCP adapter (to find the
+        # broker at all) - absent entirely when secrets.enable is false, so
+        # both already-no-op by construction.
+        + lib.optionalString secretsEnabled
+            "AGENT_BOX_SECRET_SOCKET=/run/agent-box-secrets/${name}.sock\n";
     }) cfg.users
     # Codex autonomy for the WHOLE box (issue 234, see codexFullAccess).
     # codex reads /etc/codex/config.toml as its system layer, below the
@@ -3766,7 +3917,64 @@ in
     # races user creation on a fresh boot ("Failed to resolve group
     # 'agent': Unknown group") and /run has no second chance - see the
     # shared unit for the whole reason.
-  }) (lib.mkIf cfg.selfUpdate.enable {
+  }) (lib.mkIf secretsEnabled {
+    # Secret custody broker (issue #922), one per configured user - same
+    # shape as containers.enable just above, and for the same reason: no
+    # web.enable dependency (this is a plain Unix socket, not HTTP behind
+    # the per-user Caddy vhost), so it cannot live in the terminalUsers-
+    # keyed, web-gated block the webhook/settings units are instantiated
+    # in further down. Every configured user gets one, not just the ones
+    # with a web front door.
+    systemd.tmpfiles.rules = [
+      # Root-only store parent (the broker creates its own per-user
+      # subdirectory under this at startup) and a world-traversable
+      # socket dir - listing a socket's NAME is not a secret, its 0600
+      # mode is what gates connect().
+      "d /var/lib/agent-box-secrets 0700 root root - -"
+      "d /run/agent-box-secrets 0755 root root - -"
+    ];
+    systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
+      overrideStrategy = "asDropin";
+      # Same restart-in-one-step reasoning as the webhook receiver's own
+      # drop-in (see its comment below): this is also socket-activated,
+      # and the stale-survivor window is the same shape.
+      stopIfChanged = false;
+      # Config is environment, not argv (see the unit template's own
+      # header), so this override only needs the ExecStart resolution and
+      # the one contract env var (the worker's store path);
+      # AGENT_BOX_SECRET_USER/_STORE_ROOT are already baked into the
+      # packaged unit text via systemd's own %i expansion.
+      environment = lib.listToAttrs (map
+        (e: lib.nameValuePair e.name (contractBin e))
+        secretBrokerContract.env);
+      serviceConfig = {
+        ExecStart = [ "" (contractBin (lib.elemAt secretBrokerContract.execStart 0)) ];
+      };
+    }) (lib.attrNames cfg.users));
+    # One instance per configured user. The unit is a template, and a
+    # template's own wantedBy instantiates nothing - same shape as the
+    # containers.enable wants just above.
+    systemd.targets.multi-user.wants =
+      map (name: "agent-box-secret-broker@${name}.service") (lib.attrNames cfg.users);
+    systemd.targets.sockets.wants =
+      map (name: "agent-box-secret-broker@${name}.socket") (lib.attrNames cfg.users);
+  }) {
+    # Advisory-only, deliberately NOT an mkIf on secretsEnabled (issue
+    # #922): the hint is most useful BEFORE a box owner has even turned
+    # secrets.enable on, so they can see what they would be moving over.
+    # Runs on every activation, for every configured user regardless of
+    # a web front door - same lib.attrNames cfg.users as the broker block
+    # just above. `|| true` plus the script's own always-0 exit is belt
+    # and suspenders: this must never be the reason a switch fails.
+    system.activationScripts.agent-box-secret-candidates-report = {
+      text = ''
+        ${secretCandidatesReport}/bin/agent-box-secret-candidates-report ${
+          lib.concatStringsSep " " (map lib.escapeShellArg (lib.attrNames cfg.users))
+        } || true
+      '';
+      deps = [ "users" ];
+    };
+  } (lib.mkIf cfg.selfUpdate.enable {
     # The shared unit file (shipped in agentBoxUnitsPackage above) names a
     # bare program, exactly as agent-box@ does; this per-instance drop-in
     # resolves it to the generated wrapper's store path. Nothing WANTS these

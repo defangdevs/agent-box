@@ -176,6 +176,13 @@ UIDMAP_PROGRAMS = (("newuidmap", "cap_setuid"),
 # XDG_RUNTIME_DIR for a user's daemon, and the socket inside it that the
 # CLI reaches it through. Also fixed by the shared unit.
 DOCKER_RUNTIME_DIR = "/run/agent-box-docker"
+# Secret custody broker (issue #922). The unit is SHARED (same
+# share/agent-box/units provenance as the docker comment above), so only
+# the host-side paths are named here - they must match
+# modules/src/units/agent-box-secret-broker@.{service,socket} exactly.
+SECRET_BROKER_UNIT_PREFIX = "agent-box-secret-broker@"
+SECRET_STORE_ROOT = "/var/lib/agent-box-secrets"
+SECRET_SOCKET_DIR = "/run/agent-box-secrets"
 # Ubuntu 23.10 and later refuse an unprivileged user namespace outright
 # unless an AppArmor profile grants the binary `userns`. This sysctl is
 # the capability probe as well as the reason: a box that does not have it
@@ -736,6 +743,14 @@ BOX_SCHEMA = _Obj({
         {"enable": BOOL},
         hint=" - to turn the container runtime off, write "
              "`containers: {enable: false}`"),
+    # secrets.enable: the root-owned custody broker (issue #922). Same
+    # _Obj-with-a-hint shape as containers above, but OFF by default (see
+    # Spec.__init__) - unlike containers, this one is a feature preview
+    # with no VM test yet, not an established capability.
+    "secrets": _Obj(
+        {"enable": BOOL},
+        hint=" - to turn the secret broker on, write "
+             "`secrets: {enable: true}`"),
     "users": _Map("user", USER_SCHEMA),
 })
 
@@ -897,6 +912,14 @@ class Spec:
         # default straight back to true - the same trap osUpdates has.
         containers = data.get("containers") or {}
         self.containers_enable = bool(containers.get("enable", True))
+        # Secret custody (issue #922). OFF by default, unlike containers
+        # above: the OS boundary this feature is for has no VM test yet
+        # (tests/secrets.nix does not exist), so it has never been proven
+        # on a real two-user box - "Default off during rollout" is the
+        # issue's own instruction, matching services.agent-box.secrets.
+        # enable's default on the NixOS side.
+        secrets = data.get("secrets") or {}
+        self.secrets_enable = bool(secrets.get("enable", False))
         # Base-OS patching (see APT_CONF). Default on, because the failure
         # it prevents is silent: an unattended patch run that installs a
         # fix and restarts nothing looks exactly like one that worked.
@@ -1416,6 +1439,8 @@ class Renderer:
             self.web_off(t)
         if not self.spec.webhook_enable:
             self.webhook_off(t)
+        if not self.spec.secrets_enable:
+            self.secrets_off(t)
         self.email(t)
         self.tls_policy(t)
         return t
@@ -2099,6 +2124,20 @@ class Renderer:
                           "10-host.conf"))
         t.gone(self.p("/usr/local/bin/agent-box-webhook"))
 
+    def secrets_off(self, t):
+        """secrets.enable: false, the same shape as webhook_off above.
+
+        Stored secrets and the root key are left alone (removing a unit
+        is not a migration), and that is the whole point of a custody
+        feature - turning the daemon off must not make its data
+        disappear, let alone print it anywhere.
+        """
+        self.gone_shared_units(t, (SECRET_BROKER_UNIT_PREFIX,))
+        for u in self.spec.users:
+            t.gone(self.p("/etc/systemd/system",
+                          f"{SECRET_BROKER_UNIT_PREFIX}{u.name}.service.d",
+                          "10-host.conf"))
+
     def gone_shared_units(self, t, prefixes):
         """Queue the profile-installed %i templates matching `prefixes`.
 
@@ -2612,6 +2651,9 @@ class Renderer:
             if unit.name.startswith(DOCKER_UNIT_PREFIX) and \
                     not self.spec.containers_enable:
                 continue
+            if unit.name.startswith(SECRET_BROKER_UNIT_PREFIX) and \
+                    not self.spec.secrets_enable:
+                continue
             t.file(self.p("/etc/systemd/system", unit.name),
                    unit.read_text(), 0o444)
         # The shared unit names a bare program, exactly as agent-box@ does,
@@ -2776,6 +2818,9 @@ class Renderer:
                 sockets.append(f"agent-box-webhook@{u.name}.socket")
             if self.spec.containers_enable:
                 units.append(f"{DOCKER_UNIT_PREFIX}{u.name}.service")
+            if self.spec.secrets_enable:
+                units.append(f"{SECRET_BROKER_UNIT_PREFIX}{u.name}.service")
+                sockets.append(f"{SECRET_BROKER_UNIT_PREFIX}{u.name}.socket")
         for target, wants in (("multi-user.target", units),
                               ("sockets.target", sockets)):
             if not wants:
@@ -2932,6 +2977,8 @@ class Renderer:
                 t.units.append(f"agent-box-settings@{u.name}.socket")
             if self.spec.webhook_enable:
                 t.units.append(f"agent-box-webhook@{u.name}.socket")
+            if self.spec.secrets_enable:
+                t.units.append(f"{SECRET_BROKER_UNIT_PREFIX}{u.name}.socket")
         if self.spec.web_enable:
             # Before caddy: enabling it installs the .requires symlink that
             # makes caddy depend on it.
@@ -3018,6 +3065,16 @@ class Renderer:
             # server inside the unit, so every pane inherits it.
             pairs.append(("DOCKER_HOST",
                           f"unix://{DOCKER_RUNTIME_DIR}/{u.name}/docker.sock"))
+        if self.spec.secrets_enable:
+            # Read by env-exec.py (strips every name the broker protects)
+            # and by the CLI/MCP adapter (to find the broker at all) -
+            # issue #922. A plain filesystem path, not a DOCKER_HOST-style
+            # unix:// URL: this is consumed by our own socket.connect(),
+            # not a CLI with its own URL-scheme convention. Absent entirely
+            # when secrets_enable is false, so both are already a no-op by
+            # construction.
+            pairs.append(("AGENT_BOX_SECRET_SOCKET",
+                          f"{SECRET_SOCKET_DIR}/{u.name}.sock"))
         # Arbitrary per-user extras (the module's u.environment) join the
         # generated file rather than needing a drop-in.
         pairs += sorted(u.environment.items())
@@ -3362,6 +3419,32 @@ class Renderer:
                        # unit crash-looped on ExecStartPre 203/EXEC forever.
                        "ExecStartPre=",
                        f"ExecStartPre={self.contract_bin(contract['execStartPre'][0])}",
+                   ]))
+        if self.spec.secrets_enable:
+            # Secret custody broker (issue #922). Config is environment,
+            # not argv (see the shared unit template's own header) -
+            # AGENT_BOX_SECRET_USER/_STORE_ROOT are %i-derived on the
+            # NixOS side via systemd's own specifier expansion, which this
+            # renderer has to do by hand since it writes the drop-in
+            # itself rather than relying on systemd to substitute %i.
+            # Only the worker's path needs the shared binding contract -
+            # the broker binary's own path is the unit's bare ExecStart
+            # (agent-box-secret-broker), already resolvable on PATH, same
+            # as every other shared-unit %i template.
+            contract = self.load_contract("agent-box-secret-broker")
+            t.file(self.p("/etc/systemd/system",
+                          f"{SECRET_BROKER_UNIT_PREFIX}{u.name}.service.d",
+                          "10-host.conf"),
+                   dropin([
+                       f'Environment="AGENT_BOX_SECRET_USER={u.name}"',
+                       f'Environment="AGENT_BOX_SECRET_STORE_ROOT='
+                       f'{SECRET_STORE_ROOT}/{u.name}"',
+                   ] + [
+                       f'Environment="{e["name"]}={self.contract_bin(e)}"'
+                       for e in contract["env"]
+                   ] + [
+                       "ExecStart=",
+                       f"ExecStart={self.contract_bin(contract['execStart'][0])}",
                    ]))
 
     def render_guide(self, text):
@@ -3712,6 +3795,15 @@ class Renderer:
             ]
         if self.spec.webhook_enable:
             lines.append("d /run/agent-box-webhook 0755 root root - -")
+        if self.spec.secrets_enable:
+            # Root-only store parent (the broker creates its own per-user
+            # subdirectory under this at startup) and a world-traversable
+            # socket dir - listing a socket's NAME is not a secret, its
+            # 0600 mode is what gates connect() (issue #922).
+            lines += [
+                f"d {SECRET_STORE_ROOT} 0700 root root - -",
+                f"d {SECRET_SOCKET_DIR} 0755 root root - -",
+            ]
         t.file(self.p("/etc/tmpfiles.d/agent-box.conf"),
                "\n".join(lines) + "\n")
 
@@ -4752,7 +4844,7 @@ def advisory_units(spec, notes):
     return advisory
 
 
-def activate(spec, tree, removed, advisory, act):
+def activate(spec, tree, removed, advisory, act, profile):
     """Make the committed configuration the box's running state.
 
     Returns the units whose start command failed, so the verification pass
@@ -4975,6 +5067,17 @@ def activate(spec, tree, removed, advisory, act):
                             ["systemctl", "reload", "caddy.service"]):
             act.require("restart caddy.service",
                         ["systemctl", "restart", "caddy.service"])
+    # Advisory, not gated on any option (issue #922): which of each
+    # configured user's env-store/profile names look like credentials and
+    # are not yet in the broker - see secret-candidates-report.py's own
+    # header for why this runs on every apply rather than assuming a
+    # shared release cadence. Checked for existence first: an older,
+    # already-installed profile mid-upgrade may not carry this binary yet,
+    # and a missing advisory tool is not itself a failure to report.
+    report_bin = profile / "bin" / "agent-box-secret-candidates-report"
+    if report_bin.exists() and spec.users:
+        act.optional("secret candidates report",
+                     [str(report_bin), *(u.name for u in spec.users)])
     return failed_starts
 
 
@@ -5095,7 +5198,7 @@ def cmd_apply(args):
 
     if not args.dry_run:
         advisory = advisory_units(spec, rend.notes)
-        failed_starts = activate(spec, tree, removed, advisory, act)
+        failed_starts = activate(spec, tree, removed, advisory, act, profile)
         verify_units(tree.units, advisory, act, skip=failed_starts)
     if str(Path(MEMORY_SYSCTL)) in removed:
         # The file is gone, so the values do not come back at the next

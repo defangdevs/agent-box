@@ -723,7 +723,7 @@ class NativeEmail(unittest.TestCase):
                     mock.patch.object(mod, 'systemd_units_live', side_effect=live), \
                     mock.patch.object(mod, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run, \
                     contextlib.redirect_stdout(io.StringIO()):
-                failures = mod.activate(spec, tree, [], set(), act)
+                failures = mod.activate(spec, tree, [], set(), act, profile)
             commands = [call.args[0] for call in run.call_args_list]
             self.assertEqual(failures, set())
             self.assertEqual(act.failures, [])
