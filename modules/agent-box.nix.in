@@ -482,10 +482,22 @@ let
   secretJobsLib = ''
 @@include:src/lib/secret-jobs.py@@
   '';
+  # The plaintext-candidate scanner (issue #922): advisory only, never a
+  # migration - see its own header. Only secret-cli.py needs it; the
+  # broker/worker/MCP adapter never touch the env store.
+  secretCandidatesLib = ''
+@@include:src/lib/secret-candidates.py@@
+  '';
   secretCli = pkgs.writers.writePython3Bin "agent-box-secret" {
     libraries = [ pkgs.python3Packages.cryptography ];
     flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
-  } (secretProtocolLib + ''
+  } (envStoreLib + ''
+
+
+  '' + secretProtocolLib + ''
+
+
+  '' + secretCandidatesLib + ''
 
 
 @@include:src/secret-cli.py@@

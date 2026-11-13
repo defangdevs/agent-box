@@ -2962,16 +2962,20 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                   pkgs.coreutils
                   pkgs.bash
                 ];
+                envstore = ./modules/src/lib/envstore.py;
                 protocol = ./modules/src/lib/secret-protocol.py;
                 jobs = ./modules/src/lib/secret-jobs.py;
+                candidates = ./modules/src/lib/secret-candidates.py;
                 broker = ./modules/src/secret-broker.py;
                 cli = ./modules/src/secret-cli.py;
                 worker = ./modules/src/secret-worker.py;
                 tests = ./tests/test-secret-custody.py;
               } ''
               install -d repo/modules/src/lib repo/tests
+              cp "$envstore" repo/modules/src/lib/envstore.py
               cp "$protocol" repo/modules/src/lib/secret-protocol.py
               cp "$jobs" repo/modules/src/lib/secret-jobs.py
+              cp "$candidates" repo/modules/src/lib/secret-candidates.py
               cp "$broker" repo/modules/src/secret-broker.py
               cp "$cli" repo/modules/src/secret-cli.py
               cp "$worker" repo/modules/src/secret-worker.py

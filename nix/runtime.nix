@@ -218,6 +218,9 @@ let
   # neither `cryptography` nor the heavier interpreter below.
   secretProtocolLib = readSrc "lib/secret-protocol.py";
   secretJobsLib = readSrc "lib/secret-jobs.py";
+  # The plaintext-candidate scanner (issue #922): advisory only, never a
+  # migration - see its own header. Only secret-cli.py needs it.
+  secretCandidatesLib = readSrc "lib/secret-candidates.py";
   envExecWrapper = pkgs.writers.writePython3Bin "agent-box-env-exec" {
     flakeIgnore = [ "E402" "E501" ];
   } (envStoreLib + "\n\n" + readSrc "env-exec.py");
@@ -380,7 +383,8 @@ let
     (pkgs.writers.writePython3Bin "agent-box-secret" {
       libraries = [ pkgs.python3Packages.cryptography ];
       flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
-    } (secretProtocolLib + "\n\n" + readSrc "secret-cli.py"))
+    } (envStoreLib + "\n\n" + secretProtocolLib + "\n\n" + secretCandidatesLib
+       + "\n\n" + readSrc "secret-cli.py"))
     # The root broker and its fixed worker (issue #922). Not yet started by
     # any unit on this backend - that is the next slice - but shipped here
     # so the binaries exist on PATH ahead of it, and so an operator can run

@@ -29,11 +29,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "modules" / "src"
+ENVSTORE = (SRC / "lib" / "envstore.py").read_text()
 PROTOCOL = (SRC / "lib" / "secret-protocol.py").read_text()
 JOBS = (SRC / "lib" / "secret-jobs.py").read_text()
+CANDIDATES = (SRC / "lib" / "secret-candidates.py").read_text()
 LIB = PROTOCOL + "\n" + JOBS
 BROKER = LIB + "\n" + (SRC / "secret-broker.py").read_text()
-CLI = PROTOCOL + "\n" + (SRC / "secret-cli.py").read_text()
+CLI = ENVSTORE + "\n" + PROTOCOL + "\n" + CANDIDATES + "\n" + (SRC / "secret-cli.py").read_text()
 # secret-worker.py is standalone (see its own header) and runs under a bare
 # python3, deliberately without `cryptography` - do not prepend PROTOCOL here.
 WORKER = (SRC / "secret-worker.py").read_text()
@@ -42,7 +44,10 @@ CANARY = "canary-7f3a9-not-a-real-secret"
 PYBIN = os.environ.get("AGENT_BOX_TEST_PYBIN", sys.executable)
 
 ns = {"__name__": "secret_lib"}
-exec(compile(LIB, "secret-lib.py", "exec"), ns)
+# LIB (protocol + jobs) is also what composes BROKER below, so it stays
+# minimal; ENVSTORE/CANDIDATES are only for this process's own direct calls
+# (ns["scan"](...), etc.), not for anything shipped to a subprocess.
+exec(compile(ENVSTORE + "\n" + LIB + "\n" + CANDIDATES, "secret-lib.py", "exec"), ns)
 
 
 def check_crypto_available():
@@ -214,6 +219,103 @@ class Custody(unittest.TestCase):
 
     # --- resolve_profile: "no --profile" means the box's default profile,
     # not a separate global bucket (deprecated 2026-11-13) ------------------
+
+    # --- secret-candidates: advisory plaintext detection, never an action -
+
+    def test_scan_finds_a_secret_shaped_name_in_the_env_file(self):
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        (config / "env").write_text("GH_TOKEN=ghp_notreal\nHARNESS=claude\n")
+        found = ns["scan"](home)
+        self.assertEqual([c["name"] for c in found], ["GH_TOKEN"])
+        self.assertEqual(found[0]["scope"], "env")
+
+    def test_scan_finds_a_secret_shaped_name_in_a_profile(self):
+        home = tempfile.mkdtemp()
+        profiles = Path(home) / ".config" / "agent-box" / "profiles"
+        profiles.mkdir(parents=True)
+        (profiles / "work.env").write_text("ANTHROPIC_API_KEY=sk-notreal\n")
+        found = ns["scan"](home)
+        self.assertEqual([c["name"] for c in found], ["ANTHROPIC_API_KEY"])
+        self.assertEqual(found[0]["scope"], "profile:work")
+
+    def test_scan_excludes_names_already_known_to_the_broker(self):
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        (config / "env").write_text("GH_TOKEN=ghp_notreal\n")
+        found = ns["scan"](home, known_by_namespace={None: {"GH_TOKEN"}})
+        self.assertEqual(found, [])
+
+    def test_scan_excludes_names_already_in_the_store_root(self):
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        (config / "env").write_text("GH_TOKEN=ghp_notreal\n")
+        store_root = tempfile.mkdtemp()
+        namespace_dir = Path(store_root) / "work"
+        namespace_dir.mkdir()
+        (namespace_dir / "GH_TOKEN.rec").write_text("{}")  # names only, never read
+        found = ns["scan"](home, store_root=store_root, default_profile="work")
+        self.assertEqual(found, [])
+
+    def test_scan_against_store_root_with_no_default_profile_reports_env_candidates(self):
+        # No default_profile given: the env file's own candidates cannot be
+        # checked against any particular namespace, so they are reported
+        # (the documented "safe over-estimate", never an under-one).
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        (config / "env").write_text("GH_TOKEN=ghp_notreal\n")
+        store_root = tempfile.mkdtemp()
+        found = ns["scan"](home, store_root=store_root)
+        self.assertEqual([c["name"] for c in found], ["GH_TOKEN"])
+
+    def test_scan_ignores_ordinary_names(self):
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        (config / "env").write_text("HARNESS=claude\nMODEL=sonnet\n")
+        self.assertEqual(ns["scan"](home), [])
+
+    def test_format_hint_never_includes_a_value(self):
+        hint = ns["format_hint"]([{"name": "GH_TOKEN", "scope": "env", "path": "/x"}])
+        self.assertIn("GH_TOKEN", hint)
+        self.assertNotIn("ghp_", hint)
+        self.assertIn("rotate", hint.lower())
+        self.assertEqual(ns["format_hint"]([]), "")
+
+    def test_cli_list_prints_the_hint_for_an_unprotected_plaintext_secret(self):
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        (config / "env").write_text("GH_TOKEN=ghp_notreal\n")
+        cli = Path(self.tmp) / "cli.py"
+        cli.write_text(CLI)
+        result = subprocess.run(
+            [PYBIN, "-I", str(cli), "--socket", self.broker.sock,
+             "--profile", "testprofile", "list"],
+            capture_output=True, text=True, env=dict(os.environ, HOME=home))
+        self.assertIn("GH_TOKEN", result.stderr)
+        self.assertIn("rotate", result.stderr.lower())
+        self.assertNotIn("ghp_notreal", result.stderr)
+
+    def test_cli_list_json_mode_has_no_hint_text(self):
+        # --json output must stay machine-parseable; the hint is stderr-only
+        # and only in the human-readable path.
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        (config / "env").write_text("GH_TOKEN=ghp_notreal\n")
+        cli = Path(self.tmp) / "cli.py"
+        cli.write_text(CLI)
+        result = subprocess.run(
+            [PYBIN, "-I", str(cli), "--json", "--profile", "testprofile",
+             "--socket", self.broker.sock, "list"],
+            capture_output=True, text=True, env=dict(os.environ, HOME=home))
+        json.loads(result.stdout)  # must still be valid, bare JSON
+        self.assertNotIn("GH_TOKEN", result.stdout)
 
     def test_resolve_profile_explicit_name_passes_through(self):
         self.assertEqual(ns["resolve_profile"]("work"), "work")

@@ -102,6 +102,19 @@ def main():
         for item in resp["secrets"]:
             state = "configured" if item["configured"] else "removed"
             print(f"{item['name']}\tv{item['version']}\t{state}")
+        # Advisory only (see lib/secret-candidates.py's header): this never
+        # acts on what it finds, so it costs nothing to check on every plain
+        # `list`. known_by_namespace[profile] is exactly what the broker
+        # just answered; if --profile was never given, "profile" is also
+        # what the shared env file's own candidates should be checked
+        # against, since that is what "no --profile" now means for secrets.
+        known = {item["name"] for item in resp["secrets"]}
+        known_by_namespace = {profile: known}
+        if args.profile is None:
+            known_by_namespace[None] = known
+        hint = format_hint(scan(os.path.expanduser("~"), known_by_namespace=known_by_namespace))
+        if hint:
+            sys.stderr.write("\n" + hint + "\n")
     elif args.verb in ("set", "remove"):
         print(f"{args.verb} ok (v{resp['version']})")
     elif args.verb == "exec":
