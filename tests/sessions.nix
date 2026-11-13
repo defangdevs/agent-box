@@ -1071,6 +1071,39 @@ in
         as_agent("rm ~/.local/state/local-webhook/filter.agent-helper.json")
     )
 
+    # An entry past its TTL stays in the filter file until a later write prunes
+    # it, and it claims nothing (#1031). peers must judge expiry as the
+    # receiver does for a session filter: a file ttlHours that is absent is 1,
+    # 0 or above 8 is clamped to 8, and a negative per-entry value is invalid
+    # and falls back to the file value.
+    machine.succeed(as_agent(
+        "mkdir -p ~/.local/state/local-webhook; "
+        "h2=$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ); "
+        "h9=$(date -u -d '-9 hours' +%Y-%m-%dT%H:%M:%SZ); "
+        "m5=$(date -u -d '-5 minutes' +%Y-%m-%dT%H:%M:%SZ); "
+        "cat > ~/.local/state/local-webhook/filter.agent-helper.json <<EOF\n"
+        '{"enabled":true,"topics":['
+        '{"topic":"github:t/fresh","subscribedAt":"$m5","include":{"all":[]}},'
+        '{"topic":"github:t/lapsed","subscribedAt":"$h2","include":{"all":[]}},'
+        '{"topic":"github:t/negative","subscribedAt":"$h2","ttlHours":-1,'
+        '"include":{"all":[]}},'
+        '{"topic":"github:t/pinned","subscribedAt":"$h9","ttlHours":0,'
+        '"include":{"all":[]}},'
+        '{"topic":"github:t/long","subscribedAt":"$h2","ttlHours":24,'
+        '"include":{"all":[]}}]}\n'
+        "EOF"
+    ))
+    exp_out = machine.succeed(as_agent("agent-box-session peers"))
+    assert "CLAIMS github:t/fresh" in exp_out, exp_out
+    assert "CLAIMS github:t/long" in exp_out, exp_out
+    for t in ("lapsed", "negative", "pinned"):
+        assert re.search(r"subscription to github:t/%s expired \dh ago" % t,
+                         exp_out), exp_out
+        assert "CLAIMS github:t/%s" % t not in exp_out, exp_out
+    machine.succeed(
+        as_agent("rm ~/.local/state/local-webhook/filter.agent-helper.json")
+    )
+
     # The rank the yield rule turns on is read off the NAME: hook-* is what
     # every webhook-dispatched session is called, and it must be told apart
     # from a session a person or the config started — a dispatched session

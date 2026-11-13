@@ -1416,7 +1416,7 @@ case "$cmd" in
             def cap: if . == 0 or . > 8 then 8 else . end;
             ((.ttlHours | if type == "number" and . >= 0 then . else 1 end) | cap) as $ft
             | .topics[]
-            | (if (.ttlHours | type) == "number" then (.ttlHours | cap) else $ft end) as $ttl
+            | (if (.ttlHours | type) == "number" and .ttlHours >= 0 then (.ttlHours | cap) else $ft end) as $ttl
             | (try ((.subscribedAt | sub("\\.[0-9]+Z$"; "Z") | fromdate)) catch null) as $at
             | if $ttl > 0 and $at != null and ($now - $at) > ($ttl * 3600) then
                 "    claims nothing — its subscription to " + (.topic // "?")
