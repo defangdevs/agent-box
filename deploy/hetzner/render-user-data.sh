@@ -66,7 +66,7 @@ config_yaml="$(printf '%s\n' \
   'web:' \
   '  enable: true' \
   'users:' \
-  "  $user_name:" \
+  "  \"$user_name\":" \
   '    root: true')"
 
 encode() {

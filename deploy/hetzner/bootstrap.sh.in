@@ -15,7 +15,9 @@ AGENT_BOX_FLAKE_REF_B64='@@FLAKE_REF_B64@@'
 AGENT_BOX_NIX_INSTALLER_B64='@@NIX_INSTALLER_B64@@'
 AGENT_BOX_CONFIG_B64='@@CONFIG_B64@@'
 AGENT_BOX_AGENTS_MD_B64='@@AGENTS_MD_B64@@'
+set +x
 AGENT_BOX_WEB_PASSWORD_HASH_B64='@@WEB_PASSWORD_HASH_B64@@'
+set -x
 AGENT_BOX_IMAGE_INCLUDES_RUNTIME='@@IMAGE_INCLUDES_RUNTIME@@'
 
 decode() {
@@ -64,6 +66,13 @@ AGENTBOX=/nix/var/nix/profiles/agent-box/bin/agentbox
 if [ "$AGENT_BOX_IMAGE_INCLUDES_RUNTIME" = true ]; then
   if [ ! -x "$AGENTBOX" ]; then
     echo 'imageIncludesRuntime is true but the runtime profile is absent' >&2
+    exit 1
+  fi
+  # A stale snapshot must fail here rather than apply an older release.
+  expected_runtime="$(nix eval --raw "$flake_ref#runtime.outPath")"
+  if ! nix profile list --profile /nix/var/nix/profiles/agent-box --json \
+      | grep -qF "$expected_runtime"; then
+    echo "image runtime profile does not contain $expected_runtime (stale image?)" >&2
     exit 1
   fi
   echo 'using image-provided agent-box runtime'

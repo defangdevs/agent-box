@@ -583,7 +583,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             rendered="$TMPDIR/hetzner-user-data"
             bash ${./deploy/hetzner/render-user-data.sh} > "$rendered"
             bash -n "$rendered"
-            ! grep -q '@@' "$rendered"
+            if grep -q '@@' "$rendered"; then
+              echo "rendered user data contains unresolved placeholders" >&2
+              exit 1
+            fi
             test "$(wc -c < "$rendered")" -le 32768
 
             config_b64="$(sed -n "s/^AGENT_BOX_CONFIG_B64='\([^']*\)'$/\1/p" "$rendered")"
