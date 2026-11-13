@@ -730,9 +730,14 @@ case "$cmd" in
             # until a later write prunes it. An expired entry claims nothing,
             # so say that instead of CLAIMS, and how long ago it lapsed: it
             # reads differently from "never subscribed" (#1031).
-            (.ttlHours // 0) as $ft
+            # Match local-webhook read_filter for a SESSION filter: an absent
+            # or invalid file ttlHours is 1, and 0 or anything above 8 is
+            # clamped to 8 (capped_ttl), pinned entries included. An entry
+            # without its own ttlHours takes the clamped file value.
+            def cap: if . == 0 or . > 8 then 8 else . end;
+            ((.ttlHours | if type == "number" and . >= 0 then . else 1 end) | cap) as $ft
             | .topics[]
-            | (if .ttlHours == null then $ft else .ttlHours end) as $ttl
+            | (if (.ttlHours | type) == "number" then (.ttlHours | cap) else $ft end) as $ttl
             | (try ((.subscribedAt | sub("\\.[0-9]+Z$"; "Z") | fromdate)) catch null) as $at
             | if $ttl > 0 and $at != null and ($now - $at) > ($ttl * 3600) then
                 "    claims nothing — its subscription to " + (.topic // "?")
