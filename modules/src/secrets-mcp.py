@@ -10,14 +10,17 @@ can read or export a value.
 
 Scope: this process's AGENT_BOX_PROFILE (the supervisor already exports it
 into every session - see env-exec.py). No tool argument can select a
-different profile or user; that would defeat the whole per-profile
-boundary this adapter exists to keep.
+different profile; that is routing, not a security boundary, exactly like
+every other per-profile value in this codebase (see env-exec.py's own
+"Convenience, NOT isolation" note on profile env) - the broker only ever
+checks SO_PEERCRED uid, so any process of this user could ask for another
+profile's secrets by naming it explicitly. What scoping buys is that an
+ordinary tool call never reaches across profiles by accident.
 
 Spliced ABOVE this file by the generated module, after secret-protocol.py,
-so SecretError/send_frame/recv_frame/SECRET_* already exist when this runs.
+so SecretError/connect_and_call/SECRET_* already exist when this runs.
 """
 import os
-import socket
 import sys
 import time
 
@@ -32,19 +35,7 @@ mcp = FastMCP("agent-box-secrets")
 
 
 def _call(req):
-    if not SOCKET_PATH:
-        return {"ok": False, "error": "secrets are not enabled on this box"}
-    req = dict(req, profile=PROFILE)
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.settimeout(15)
-    try:
-        conn.connect(SOCKET_PATH)
-        send_frame(conn, req)
-        return recv_frame(conn)
-    except (OSError, SecretError) as exc:
-        return {"ok": False, "error": f"broker unavailable: {exc}"}
-    finally:
-        conn.close()
+    return connect_and_call(SOCKET_PATH, dict(req, profile=PROFILE))
 
 
 @mcp.tool()
@@ -95,6 +86,10 @@ def exec_with_secrets(
     job_id = resp["jobId"]
     deadline = time.time() + INLINE_WAIT_BUDGET_S
     status = _call({"op": "status", "jobId": job_id})
+    # Not lib/secret-jobs.py's ACTIVE_STATES: this file only splices with
+    # secret-protocol.py (see the header), to keep the unprivileged adapter's
+    # dependency closure small - a second literal here is cheaper than
+    # pulling in the whole job-manager module for one tuple.
     while status.get("ok") and status.get("state") in ("pending", "running") and time.time() < deadline:
         time.sleep(POLL_INTERVAL_S)
         status = _call({"op": "status", "jobId": job_id})

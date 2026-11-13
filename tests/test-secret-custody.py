@@ -68,9 +68,11 @@ class Broker:
         args = [PYBIN, "-I", script, "--user", user, "--uid", str(self.uid),
                "--store-root", self.root, "--socket", self.sock,
                "--worker", worker]
+        env = dict(os.environ)
         if direct_launcher:
             args.append("--dev-direct-launcher")
-        self.proc = subprocess.Popen(args, stderr=subprocess.PIPE)
+            env["AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER"] = "1"
+        self.proc = subprocess.Popen(args, stderr=subprocess.PIPE, env=env)
         for _ in range(100):
             if os.path.exists(self.sock):
                 break
@@ -170,8 +172,15 @@ class Custody(unittest.TestCase):
                     {"op": "exec", "command": "echo hi"},
                     {"op": "exec", "argv": ["echo"], "secretNames": ["not valid!"]},
                     {"op": "exec", "argv": ["echo"], "env": {"TOKEN": "x"},
-                     "secretNames": ["TOKEN"]}):
+                     "secretNames": ["TOKEN"]},
+                    {"op": "exec", "argv": ["echo"], "secretNames": [],
+                     "idempotencyKey": 5},
+                    {"op": "exec", "argv": ["echo"], "secretNames": [],
+                     "idempotencyKey": None}):
             self.assertFalse(self.broker.ask(req)["ok"], req)
+        # A wrong-typed field must refuse the ONE request, not kill the
+        # broker: every refusal above shared one connection with the next.
+        self.assertTrue(self.broker.ask({"op": "list"})["ok"])
 
     def test_oversize_frame_is_refused_without_allocating(self):
         conn = socket.socket(socket.AF_UNIX)
@@ -265,7 +274,7 @@ class Custody(unittest.TestCase):
         resp = self.broker.ask({
             "op": "exec",
             "argv": ["sh", "-c", f'printf %s "$TOKEN" > {out_file}'],
-            "secretNames": ["TOKEN"],
+            "secretNames": ["TOKEN"], "cwd": self.tmp,
         })
         self.assertTrue(resp["ok"], resp)
         status = self.broker.wait_job(resp["jobId"])
@@ -281,7 +290,7 @@ class Custody(unittest.TestCase):
         self.broker.ask({"op": "set", "name": "TOKEN", "value": CANARY})
         resp = self.broker.ask({
             "op": "exec", "argv": ["sh", "-c", 'echo "token is $TOKEN"'],
-            "secretNames": ["TOKEN"],
+            "secretNames": ["TOKEN"], "cwd": self.tmp,
         })
         status = self.broker.wait_job(resp["jobId"])
         self.assertEqual(status["state"], "done")
@@ -296,43 +305,128 @@ class Custody(unittest.TestCase):
 
     def test_exec_idempotency_key_replays_the_same_job(self):
         first = self.broker.ask({
-            "op": "exec", "argv": ["echo", "hi"], "secretNames": [],
+            "op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": self.tmp,
             "idempotencyKey": "run-1",
         })
         second = self.broker.ask({
-            "op": "exec", "argv": ["echo", "hi"], "secretNames": [],
+            "op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": self.tmp,
             "idempotencyKey": "run-1",
         })
         self.assertEqual(first["jobId"], second["jobId"])
         conflicting = self.broker.ask({
-            "op": "exec", "argv": ["echo", "different"], "secretNames": [],
+            "op": "exec", "argv": ["echo", "different"], "secretNames": [], "cwd": self.tmp,
             "idempotencyKey": "run-1",
         })
         self.assertFalse(conflicting["ok"])
+        status = self.broker.wait_job(first["jobId"])
+        self.assertEqual(status["state"], "done")
 
     def test_exec_timeout_kills_the_job(self):
         resp = self.broker.ask({
-            "op": "exec", "argv": ["sleep", "30"], "secretNames": [],
+            "op": "exec", "argv": ["sleep", "30"], "secretNames": [], "cwd": self.tmp,
             "timeoutMs": 300,
         })
         status = self.broker.wait_job(resp["jobId"], timeout=10)
         self.assertEqual(status["state"], "timeout")
 
     def test_exec_cancel_stops_a_running_job(self):
-        resp = self.broker.ask({"op": "exec", "argv": ["sleep", "30"], "secretNames": []})
+        resp = self.broker.ask({"op": "exec", "argv": ["sleep", "30"], "secretNames": [],
+                                "cwd": self.tmp})
         time.sleep(0.2)
         cancelled = self.broker.ask({"op": "cancel", "jobId": resp["jobId"]})
         self.assertIn(cancelled["state"], ("cancelled", "done", "error"))
         status = self.broker.wait_job(resp["jobId"], timeout=10)
+        # Not strictly "cancelled": cancel() and _drain() race to set the
+        # final state after the kill signal lands (see secret-jobs.py's
+        # cancel()), so "error" (exit code from the SIGKILL) is an
+        # acceptable outcome too - the job is dead either way.
         self.assertIn(status["state"], ("cancelled", "error"))
+
+    def test_corrupt_record_refuses_the_request_without_crashing_broker(self):
+        self.broker.ask({"op": "set", "name": "TOKEN", "value": "v"})
+        rec = Path(self.broker.root) / "_global" / "TOKEN.rec"
+        for garbage in (b"not json at all", b'"a json string, not an object"',
+                       b'{"version": 1}',  # missing nonce/ct
+                       b'{"version": "not an int", "nonce": "AA==", "ct": "AA=="}'):
+            rec.write_bytes(garbage)
+            resp = self.broker.ask({"op": "exec", "argv": ["echo", "hi"],
+                                    "secretNames": ["TOKEN"], "cwd": self.tmp})
+            self.assertTrue(resp["ok"], resp)
+            status = self.broker.wait_job(resp["jobId"])
+            self.assertEqual(status["state"], "error")
+            self.assertIsNone(self.broker.proc.poll(), "broker exited on a corrupt record")
+        self.assertTrue(self.broker.ask({"op": "list"})["ok"])
+
+    def test_large_job_output_does_not_crash_the_broker(self):
+        # Every byte a control character is close to worst-case for JSON
+        # escaping (each can become a 6-byte \\u00NN), which can make an
+        # already-capped stream's reply bigger than the wire frame limit.
+        resp = self.broker.ask({
+            "op": "exec", "cwd": self.tmp, "secretNames": [],
+            "argv": ["python3", "-c",
+                    "import sys; sys.stdout.buffer.write(b'\\x01' * 70000); "
+                    "sys.stderr.buffer.write(b'\\x01' * 70000)"],
+        })
+        self.assertTrue(resp["ok"], resp)
+        status = self.broker.wait_job(resp["jobId"], timeout=10)
+        self.assertIn(status["state"], ("done", "error"))
+        self.assertIsNone(self.broker.proc.poll(), "broker exited on oversized job output")
+        self.assertTrue(self.broker.ask({"op": "list"})["ok"])
+
+    def test_failed_job_start_does_not_leak_a_job_slot(self):
+        # A worker path that cannot be exec'd at all, the way a
+        # misconfigured unit or a missing systemd-run would look.
+        tmp = tempfile.mkdtemp()
+        script = os.path.join(tmp, "broker.py")
+        Path(script).write_text(BROKER)
+        sock = os.path.join(tmp, "b.sock")
+        env = dict(os.environ, AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER="1")
+        proc = subprocess.Popen(
+            [PYBIN, "-I", script, "--user", "agent", "--uid", str(os.getuid()),
+             "--store-root", os.path.join(tmp, "store"), "--socket", sock,
+             "--worker", os.path.join(tmp, "does-not-exist.py"),
+             "--dev-direct-launcher"],
+            stderr=subprocess.PIPE, env=env)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stderr.close()))
+        for _ in range(100):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.05)
+        else:
+            raise RuntimeError(proc.stderr.read().decode())
+
+        def ask(req):
+            conn = socket.socket(socket.AF_UNIX)
+            conn.settimeout(15)
+            conn.connect(sock)
+            ns["send_frame"](conn, req)
+            out = ns["recv_frame"](conn)
+            conn.close()
+            return out
+
+        for _ in range(ns["SECRET_MAX_JOBS_PER_USER"] + 1):
+            resp = ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": tmp})
+            self.assertTrue(resp["ok"], resp)
+            deadline = time.time() + 5
+            status = {"state": "pending"}
+            while status["state"] in ("pending", "running") and time.time() < deadline:
+                status = ask({"op": "status", "jobId": resp["jobId"]})
+                time.sleep(0.05)
+            self.assertEqual(status["state"], "error")
+        # If a failed start had left its job "running" forever, this next
+        # one would be refused with "too many active jobs".
+        last = ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": tmp})
+        self.assertTrue(last["ok"], last)
 
     def test_exec_concurrency_cap_per_user(self):
         jobs = []
         for _ in range(ns["SECRET_MAX_JOBS_PER_USER"]):
-            resp = self.broker.ask({"op": "exec", "argv": ["sleep", "5"], "secretNames": []})
+            resp = self.broker.ask({"op": "exec", "argv": ["sleep", "5"], "secretNames": [],
+                                    "cwd": self.tmp})
             self.assertTrue(resp["ok"], resp)
             jobs.append(resp["jobId"])
-        over = self.broker.ask({"op": "exec", "argv": ["sleep", "5"], "secretNames": []})
+        over = self.broker.ask({"op": "exec", "argv": ["sleep", "5"], "secretNames": [],
+                                "cwd": self.tmp})
         self.assertFalse(over["ok"])
         for job_id in jobs:
             self.broker.ask({"op": "cancel", "jobId": job_id})

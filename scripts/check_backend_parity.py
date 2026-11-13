@@ -267,6 +267,15 @@ KNOWN_GAPS = {
     "AGENT_BOX_CHECKOUT_DIR": ("module", CHECKOUT_GAP),
     "AGENT_BOX_CHECKOUT_REV": ("module", CHECKOUT_GAP),
     "AGENT_BOX_CHECKOUT_URL": ("module", CHECKOUT_GAP),
+    "AGENT_BOX_SECRET_SOCKET": (
+        "module",
+        "issue #922: env-exec.py already reads this name (so it strips every "
+        "secret the broker protects from a session's environment when it is "
+        "set), but no unit on EITHER backend exports it into a session yet - "
+        "the secret broker's own systemd unit, socket, and services.agent-box"
+        ".secrets.enable option are a later slice of #922. This entry is a "
+        "placeholder for that wiring, not a permanent asymmetry: delete it "
+        "once both backends render the broker unit and export this name."),
 }
 
 # Units, by family (instance and template spellings normalized away).

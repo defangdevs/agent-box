@@ -25,6 +25,7 @@ import threading
 import time
 
 JOB_STATES = ("pending", "running", "done", "error", "cancelled", "timeout")
+ACTIVE_STATES = ("pending", "running")
 
 
 def new_job_id():
@@ -68,7 +69,7 @@ class Job:
         self.namespace = namespace
         self.fingerprint = fingerprint
         self.idempotency_key = request.get("idempotencyKey")
-        self.timeout_ms = request.get("timeoutMs") or 0
+        self.timeout_ms = request.get("timeoutMs") or SECRET_DEFAULT_TIMEOUT_MS
         self.created_at = created_at
         self.started_at = None
         self.finished_at = None
@@ -93,26 +94,39 @@ class Job:
                 "stderrTruncated": self.stderr_truncated,
             }
 
-    def to_record(self):
-        """Durable state (issue #922: "Persist an opaque job ID, request
-        fingerprint, owner namespace, and accepted state before dispatch").
-        Never includes argv, command, env, or secret values."""
-        with self.lock:
-            return {
-                "id": self.id,
-                "namespace": self.namespace,
-                "fingerprint": self.fingerprint,
-                "idempotencyKey": self.idempotency_key,
-                "createdAt": self.created_at,
-                "startedAt": self.started_at,
-                "finishedAt": self.finished_at,
-                "state": self.state,
-                "exitCode": self.exit_code,
-                "stdout": self.stdout.decode("utf-8", "replace"),
-                "stderr": self.stderr.decode("utf-8", "replace"),
-                "stdoutTruncated": self.stdout_truncated,
-                "stderrTruncated": self.stderr_truncated,
-            }
+def encode_worker_frame(argv_or_command, shell, secret_values, nonsecret_env, cwd):
+    """The one place that builds secret-worker.py's stdin frame, so a field
+    added to it cannot land in one Launcher and not the other - the two
+    launchers differ in how the child's uid is dropped, nothing about the
+    request it is handed."""
+    frame = json.dumps({
+        "argv": argv_or_command if shell is None else None,
+        "command": argv_or_command if shell is not None else None,
+        "shell": shell,
+        "secrets": secret_values,
+        "env": nonsecret_env,
+        "cwd": cwd,
+    }).encode("utf-8")
+    return len(frame).to_bytes(4, "big") + frame
+
+
+def spawn_worker(argv, frame_bytes):
+    """subprocess.Popen plus the frame handoff, shared by both launchers.
+    Raises on any failure to start or to hand off the frame - the caller
+    (JobManager._dispatch) is what turns that into a job error rather than
+    an unhandled exception."""
+    proc = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        proc.stdin.write(frame_bytes)
+        proc.stdin.close()
+    except OSError:
+        proc.kill()
+        proc.wait()
+        raise
+    return proc
 
 
 class Launcher:
@@ -133,36 +147,28 @@ class DirectLauncher(Launcher):
     this broker process itself runs as. This is what every unit test and a
     root-less dev-mode broker use - it proves the protocol, the redaction,
     the timeouts and the idempotency, and nothing about the uid boundary.
-    Production (SystemdLauncher, below) is the only launcher that proves
-    that; see the module's VM test."""
+    Production (SystemdLauncher, in secret-broker.py) is the only launcher
+    that proves that; see the module's VM test."""
 
     def __init__(self, worker_path, python_bin="python3"):
         self.worker_path = worker_path
         self.python_bin = python_bin
 
     def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
-        frame = json.dumps({
-            "argv": argv_or_command if shell is None else None,
-            "command": argv_or_command if shell is not None else None,
-            "shell": shell,
-            "secrets": secret_values,
-            "env": nonsecret_env,
-            "cwd": cwd,
-        }).encode("utf-8")
-        proc = subprocess.Popen(
-            [self.python_bin, self.worker_path],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        proc.stdin.write(len(frame).to_bytes(4, "big") + frame)
-        proc.stdin.close()
-        job.handle = proc
-        return proc
+        frame_bytes = encode_worker_frame(argv_or_command, shell, secret_values,
+                                          nonsecret_env, cwd)
+        job.handle = spawn_worker([self.python_bin, self.worker_path], frame_bytes)
+        return job.handle
 
     def poll(self, job):
         return job.handle.poll()
 
     def kill(self, job):
+        if job.handle is None:
+            # _dispatch only calls kill() through cancel()/the timeout path,
+            # both of which happen after a successful start() set this - but
+            # guard it anyway, since "no handle" must never raise past here.
+            return
         try:
             os.killpg(job.handle.pid, signal.SIGKILL)
         except OSError:
@@ -184,7 +190,7 @@ class JobManager:
         self._lock = threading.Lock()
 
     def _active_count(self):
-        return sum(1 for j in self._jobs.values() if j.state in ("pending", "running"))
+        return sum(1 for j in self._jobs.values() if j.state in ACTIVE_STATES)
 
     def start(self, namespace, req, resolve_secret):
         fingerprint = fingerprint_request(req)
@@ -227,8 +233,19 @@ class JobManager:
         shell = req.get("shell")
         job.started_at = time.time()
         job.state = "running"
-        self.launcher.start(job, argv_or_command, shell, secret_values,
-                            req.get("env", {}), req.get("cwd"))
+        try:
+            self.launcher.start(job, argv_or_command, shell, secret_values,
+                                req.get("env", {}), req.get("cwd"))
+        except Exception as exc:
+            # A job that failed to even START (systemd-run missing, a fork
+            # failure, a frame too large for the pipe) must not stay
+            # "running" forever: that leaks one of this user's 2 job slots
+            # permanently, and a later cancel()/kill() on a job with no
+            # handle would crash the broker (see Launcher.kill below).
+            job.state = "error"
+            job.stderr = f"failed to start: {exc}".encode("utf-8")
+            job.finished_at = time.time()
+            return
         redact_values = list(secret_values.values())
         threading.Thread(target=self._drain, args=(job, redact_values), daemon=True).start()
 
@@ -236,16 +253,44 @@ class JobManager:
         proc = job.handle
         timeout = (job.timeout_ms / 1000.0) if job.timeout_ms else None
         deadline = (time.time() + timeout) if timeout else None
+        # A secret can straddle two 4 KiB reads, so the redaction scan has
+        # to see a value whole to catch it - which means not committing the
+        # tail of what has been read so far until it either resolves into a
+        # redacted match or there is nothing more that could still extend
+        # it into one. The simplest way to get that right is to never hold
+        # back a PARTIAL raw buffer at all: keep the whole raw buffer (it is
+        # cheap, because it is capped) and redact it afresh each time, so a
+        # match that only completes on a later read is still found whole
+        # the next time this runs. Capping it is what keeps this bounded
+        # instead of the unbounded "keep every byte ever produced" the
+        # first cut of this function did: `yes` with a 1-hour timeout no
+        # longer grows this process's memory without limit, nor does the
+        # redaction scan run against more than this many bytes at a time.
+        longest_value = max((len(v.encode("utf-8")) for v in redact_values), default=0)
+        raw_cap = self.max_output_bytes + longest_value
 
         def pump(stream, attr):
-            buf = b""
+            raw = bytearray()
             truncated = False
             while True:
+                # Keep reading even once the cap below is hit, so a child
+                # that fills its pipe buffer never blocks on a reader that
+                # has stopped reading; the extra bytes are simply discarded.
                 chunk = stream.read(4096)
                 if not chunk:
                     break
-                buf += chunk
-                clean = redact(buf, redact_values)
+                room = raw_cap - len(raw)
+                if room <= 0:
+                    truncated = True
+                    with job.lock:
+                        setattr(job, attr + "_truncated", True)
+                    continue
+                if len(chunk) > room:
+                    raw.extend(chunk[:room])
+                    truncated = True
+                else:
+                    raw.extend(chunk)
+                clean = redact(bytes(raw), redact_values)
                 if len(clean) > self.max_output_bytes:
                     clean = clean[:self.max_output_bytes]
                     truncated = True
@@ -290,7 +335,7 @@ class JobManager:
         if job is None or job.namespace != namespace:
             raise SecretError("no such job")
         with job.lock:
-            already_terminal = job.state not in ("pending", "running")
+            already_terminal = job.state not in ACTIVE_STATES
         if already_terminal:
             return job.public()
         self.launcher.kill(job)
@@ -308,7 +353,7 @@ class JobManager:
         with self._lock:
             stale = [
                 jid for jid, job in self._jobs.items()
-                if job.state not in ("pending", "running")
+                if job.state not in ACTIVE_STATES
                 and job.finished_at is not None
                 and now - job.finished_at > retention_seconds
             ]

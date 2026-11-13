@@ -58,20 +58,16 @@ class SystemdLauncher(Launcher):
         self.worker_path = worker_path
         self.python_bin = python_bin
 
+    @staticmethod
+    def _unit_name(job):
+        return f"agent-box-secret-job-{job.id}"
+
     def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
-        frame = json.dumps({
-            "argv": argv_or_command if shell is None else None,
-            "command": argv_or_command if shell is not None else None,
-            "shell": shell,
-            "secrets": secret_values,
-            "env": nonsecret_env,
-            "cwd": cwd,
-        }).encode("utf-8")
-        unit = f"agent-box-secret-job-{job.id}"
-        job.unit_name = unit
+        frame_bytes = encode_worker_frame(argv_or_command, shell, secret_values,
+                                          nonsecret_env, cwd)
         cmd = [
             "systemd-run", "--pipe", "--quiet", "--collect",
-            f"--unit={unit}",
+            f"--unit={self._unit_name(job)}",
             f"--property=User={self.user}",
             "--property=KillMode=control-group",
             "--property=NoNewPrivileges=yes",
@@ -80,22 +76,17 @@ class SystemdLauncher(Launcher):
             "--",
             self.python_bin, self.worker_path,
         ]
-        proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        proc.stdin.write(len(frame).to_bytes(4, "big") + frame)
-        proc.stdin.close()
-        job.handle = proc
-        return proc
+        job.handle = spawn_worker(cmd, frame_bytes)
+        return job.handle
 
     def poll(self, job):
         return job.handle.poll()
 
     def kill(self, job):
-        unit = getattr(job, "unit_name", None)
-        if unit:
-            subprocess.run(["systemctl", "kill", "--signal=SIGKILL", unit],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if job.handle is None:
+            return
+        subprocess.run(["systemctl", "kill", "--signal=SIGKILL", self._unit_name(job)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             job.handle.kill()
         except OSError:
@@ -103,6 +94,17 @@ class SystemdLauncher(Launcher):
 
 
 class Broker:
+    # A profile name is cheap for a CALLER to mint (any string matching
+    # PROFILE_NAME_RE), and each new one costs this process a directory, a
+    # meta.json, a lock fd and a cached Store with its own open dir_fd. None
+    # of that is reclaimed on its own, so without a bound the agent user can
+    # exhaust this root process's file descriptors (and, at the fs level,
+    # fill /var/lib/agent-box-secrets with empty namespaces) just by asking
+    # `list` for enough distinct names. Evicting the least-recently-used
+    # Store when the cache is full bounds both; a profile that is actually
+    # in use stays resident because it keeps getting touched.
+    MAX_OPEN_STORES = 64
+
     def __init__(self, user, uid, store_root, root_key, job_manager):
         self.user = user
         self.uid = uid
@@ -115,10 +117,15 @@ class Broker:
     def _store(self, profile):
         namespace = normalize_profile(profile)
         with self._stores_lock:
-            store = self._stores.get(namespace)
+            store = self._stores.pop(namespace, None)
             if store is None:
                 store = Store(self.store_root, namespace, self.user, self.uid, self.root_key)
-                self._stores[namespace] = store
+            self._stores[namespace] = store  # re-insert: most-recently-used
+            while len(self._stores) > self.MAX_OPEN_STORES:
+                evicted_name = next(iter(self._stores))
+                if evicted_name == namespace:
+                    break
+                self._stores.pop(evicted_name).close()
             return store
 
     def handle(self, req):
@@ -136,6 +143,20 @@ class Broker:
         raise SecretError("unsupported operation")
 
 
+def _safe_send(conn, reply):
+    """send_frame itself can refuse (SecretError("response too large")) -
+    a job's own (already-capped) output can still JSON-escape past
+    SECRET_MAX_FRAME in the pathological case (every byte a control
+    character escapes to \\u00NN, a 6x blow-up). Fall back to a reply that
+    is guaranteed small rather than let that escape as an exception."""
+    try:
+        send_frame(conn, reply)
+    except SecretError:
+        send_frame(conn, {"ok": reply.get("ok", False),
+                          "error": "response too large to return in full",
+                          "jobId": reply.get("jobId"), "state": reply.get("state")})
+
+
 def serve_one(listener, broker, expect_uid):
     try:
         conn, _ = listener.accept()
@@ -146,13 +167,22 @@ def serve_one(listener, broker, expect_uid):
         try:
             if peer_uid(conn) != expect_uid:
                 drain_request(conn)
-                send_frame(conn, {"ok": False, "error": "forbidden"})
+                _safe_send(conn, {"ok": False, "error": "forbidden"})
                 return
             try:
                 reply = broker.handle(recv_frame(conn))
             except SecretError as exc:
                 reply = {"ok": False, "error": str(exc)}
-            send_frame(conn, reply)
+            except Exception as exc:  # noqa: BLE001 - see comment below
+                # Anything else is a bug in this request's handling, not a
+                # reason to take every OTHER connection down with it: this
+                # is a long-lived root process serving every session of one
+                # user, and "the broker died" means every one of that
+                # user's in-flight jobs and secrets becomes unreachable
+                # until something restarts it. Never let an unanticipated
+                # exception propagate out of one connection.
+                reply = {"ok": False, "error": f"internal error: {type(exc).__name__}"}
+            _safe_send(conn, reply)
         except (OSError, socket.timeout):
             # A peer that vanished mid-exchange must never stop the broker.
             pass
@@ -161,7 +191,10 @@ def serve_one(listener, broker, expect_uid):
 def _sweeper(job_manager):
     while True:
         time.sleep(300)
-        job_manager.sweep(SECRET_JOB_RETENTION_SECONDS)
+        try:
+            job_manager.sweep(SECRET_JOB_RETENTION_SECONDS)
+        except Exception as exc:  # noqa: BLE001 - a daemon thread must not die silently
+            sys.stderr.write(f"agent-box-secret-broker: sweep failed: {exc}\n")
 
 
 def main():
@@ -178,15 +211,27 @@ def main():
     parser.add_argument("--socket", help="bind this path instead of using systemd's fd 3")
     parser.add_argument("--dev-direct-launcher", action="store_true",
                         help="DEV/TEST ONLY: run jobs with the broker's own uid instead of "
-                             "systemd User=<agent>. Refused when this process is root, because "
-                             "that would execute the workload AS ROOT.")
+                             "systemd User=<agent>. Refused when this process is root (it would "
+                             "execute the workload AS ROOT), and refused unless "
+                             "AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER=1 is also set.")
     args = parser.parse_args()
 
-    if args.dev_direct_launcher and os.getuid() == 0:
-        sys.stderr.write(
-            "agent-box-secret-broker: --dev-direct-launcher refused while running as root "
-            "(it would execute jobs as root, defeating the whole feature)\n")
-        return 2
+    if args.dev_direct_launcher:
+        # Two independent gates, not one: a single stray argv flag (a typo'd
+        # unit override, a copy-pasted systemd drop-in) must not be enough
+        # to make a production broker run every job as ITS OWN uid instead
+        # of dropping to the agent user. The env var is the one a real
+        # deployment's unit file never sets.
+        if os.getuid() == 0:
+            sys.stderr.write(
+                "agent-box-secret-broker: --dev-direct-launcher refused while running as root "
+                "(it would execute jobs as root, defeating the whole feature)\n")
+            return 2
+        if os.environ.get("AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER") != "1":
+            sys.stderr.write(
+                "agent-box-secret-broker: --dev-direct-launcher also needs "
+                "AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER=1 in the environment\n")
+            return 2
 
     if args.socket:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

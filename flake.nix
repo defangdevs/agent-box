@@ -2942,22 +2942,39 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
-          # The secret custody broker and CLI (#922): composed from the same
-          # sources the generated module will embed, run over a real Unix
-          # socket. Registered here so the discovered ci-native runs it.
+          # The secret custody broker, job engine, worker, and CLI (#922):
+          # composed from the same sources the generated module will embed,
+          # run over a real Unix socket and real (same-uid) child processes.
+          # Registered here so the discovered ci-native runs it. Needs
+          # `cryptography` (secret-protocol.py's at-rest encryption) in the
+          # SAME interpreter that imports it at module load - a bare
+          # pkgs.python3 makes the whole file fail to import before the
+          # test's own documented skip path can run, so this must not drift
+          # back to that.
           secret-custody =
             pkgs.runCommand "agent-box-secret-custody"
               {
-                nativeBuildInputs = [ pkgs.python3 ];
+                # coreutils/bash: the tests exec real jobs ("sh", "sleep",
+                # "echo") through secret-worker.py's own PATH lookup, which
+                # a bare python3 nativeBuildInput does not put on PATH.
+                nativeBuildInputs = [
+                  (pkgs.python3.withPackages (ps: [ ps.cryptography ]))
+                  pkgs.coreutils
+                  pkgs.bash
+                ];
                 protocol = ./modules/src/lib/secret-protocol.py;
+                jobs = ./modules/src/lib/secret-jobs.py;
                 broker = ./modules/src/secret-broker.py;
                 cli = ./modules/src/secret-cli.py;
+                worker = ./modules/src/secret-worker.py;
                 tests = ./tests/test-secret-custody.py;
               } ''
               install -d repo/modules/src/lib repo/tests
               cp "$protocol" repo/modules/src/lib/secret-protocol.py
+              cp "$jobs" repo/modules/src/lib/secret-jobs.py
               cp "$broker" repo/modules/src/secret-broker.py
               cp "$cli" repo/modules/src/secret-cli.py
+              cp "$worker" repo/modules/src/secret-worker.py
               cp "$tests" repo/tests/test-secret-custody.py
               python3 repo/tests/test-secret-custody.py > log 2>&1 || {
                 cat log

@@ -11,29 +11,17 @@
 Talks to the root broker over its Unix socket. There is deliberately no verb
 that prints a value.
 
---profile NAME scopes every operation to one agent-box profile's own secret
-bucket. Without it, operations use the GLOBAL bucket, which every profile's
-sessions can request - exactly the thing this feature exists to narrow, so
-each such call prints a one-line deprecation warning. Prefer a profile:
+--profile NAME puts a value in one agent-box profile's own secret bucket
+instead of the GLOBAL one every profile's sessions can request by default -
+narrower by default, not a security boundary: the broker only checks which
+Linux user is asking, so any process of this user can still pass a
+different --profile explicitly. Omitting --profile prints a one-line
+deprecation warning and uses the global bucket. Prefer a profile:
 `agent-box-profile ls` lists the ones you have.
 """
 import argparse
 import json
 import sys
-
-
-def call(sock_path, req):
-    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    conn.settimeout(15)
-    try:
-        conn.connect(sock_path)
-        send_frame(conn, req)
-        return recv_frame(conn)
-    except (OSError, SecretError) as exc:
-        sys.stderr.write(f"agent-box-secret: broker unavailable: {exc}\n")
-        raise SystemExit(1)
-    finally:
-        conn.close()
 
 
 def main():
@@ -103,7 +91,7 @@ def main():
     else:
         req = {"op": "cancel", "profile": args.profile, "jobId": args.job_id}
 
-    resp = call(args.socket, req)
+    resp = connect_and_call(args.socket, req)
     if not resp.get("ok"):
         sys.stderr.write(f"agent-box-secret: {resp.get('error', 'refused')}\n")
         return 1

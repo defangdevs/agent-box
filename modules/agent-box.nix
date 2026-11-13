@@ -2635,8 +2635,8 @@ Best effort by construction: a missing, unreadable or half-corrupt store
 costs the keys it holds, never the session. The exec at the bottom is the only
 step allowed to fail.
 """
-# The library above already imported os; only what it does not is imported
-# here.
+# The library above already imported os and json; only what it does not is
+# imported here.
 import shutil
 import subprocess
 import sys
@@ -2667,6 +2667,14 @@ def main(argv):
     resolver = shutil.which("agent-box-webhook-self")
     sweeper = shutil.which("agent-box-webhook-backfill")
 
+    # Captured before the env store and profile loads below can touch
+    # os.environ, not read back out of it afterwards: a profile is user-
+    # writable content (issue #321 - "every other key becomes session
+    # environment"), and `AGENT_BOX_SECRET_SOCKET=` in one would otherwise
+    # turn this session's own secret stripping off from inside the very
+    # file it is supposed to protect.
+    secret_socket = os.environ.get("AGENT_BOX_SECRET_SOCKET")
+
     # The per-user secrets file the settings page and `agent-box-session env`
     # manage.
     load_into(os.environ, os.path.join(config, "env"))
@@ -2692,6 +2700,56 @@ def main(argv):
             os.path.join(config, "profiles", f"{profile}.env"),
             skip=PROFILE_RESERVED,
         )
+
+    # Secret custody (issue #922): a box with the broker enabled strips every
+    # name IT knows about from this session's environment, regardless of
+    # which file above set it (a legacy copy in the env store or a profile
+    # is not migrated away by this alone - see agent-box-secret's migrate
+    # verb). EVERY name `list` returns is stripped, tombstoned ones
+    # included: a tombstone exists precisely so a retired name does not
+    # reappear from a stale legacy copy (Store.remove's own docstring), and
+    # stripping only "configured" names would defeat that the moment
+    # someone ran `agent-box-secret remove`. Absent, not a placeholder: a
+    # nonempty value in an auth variable such as ANTHROPIC_API_KEY can make
+    # a harness think it is already signed in and then fail on the first
+    # call with a confusing error (issue #922 thread).
+    #
+    # A box with secrets disabled has no AGENT_BOX_SECRET_SOCKET, so this
+    # whole block is a no-op - existing launches are unaffected by
+    # construction. Every failure here (no CLI, broker unreachable, a slow
+    # or corrupt reply) is silent and leaves the environment exactly as the
+    # loads above left it: this is the same best-effort posture the rest of
+    # this file documents ("a missing, unreadable or half-corrupt store
+    # costs the keys it holds, never the session"), applied to the one
+    # query that can also fail. There is no stronger guarantee to fall back
+    # on without making a hung or restarting broker block every session on
+    # this user's box from starting at all.
+    secret_cli = shutil.which("agent-box-secret")
+    if secret_cli and secret_socket:
+        env = dict(os.environ, AGENT_BOX_SECRET_SOCKET=secret_socket)
+        protected = set()
+        queries = [["--json", "list"]]
+        if profile:
+            queries.append(["--json", "--profile", profile, "list"])
+        for query in queries:
+            try:
+                result = subprocess.run(
+                    [secret_cli, *query],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, timeout=10, env=env,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode != 0:
+                continue
+            try:
+                payload = json.loads(result.stdout)
+            except ValueError:
+                continue
+            for item in payload.get("secrets", []):
+                protected.add(item["name"])
+        for name in protected:
+            os.environ.pop(name, None)
 
     # A Defang access token is minted for one fixed workspace. v3.15.5
     # rejects a conflicting DEFANG_WORKSPACE instead of silently deploying

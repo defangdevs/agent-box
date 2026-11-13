@@ -2,18 +2,21 @@
 # store (issue #922).
 #
 # One owner for the things the root broker, the worker, and the unprivileged
-# CLI must agree on: how a request is framed, which names are legal, and how
-# a value is protected on disk. The broker and worker use the Store below;
-# the CLI never touches it, because the whole point is that the agent user
-# cannot read the records.
+# CLI and MCP adapter must agree on: how a request is framed, which names
+# are legal, how a value is protected on disk, and how a client calls the
+# broker's socket. The broker and worker use the Store below; the CLI and
+# MCP adapter never touch it, because the whole point is that the agent
+# user cannot read the records - they only ever call connect_and_call.
 #
-# Spliced ABOVE secret-broker.py and secret-cli.py (with secret-jobs.py
-# spliced between protocol and broker) by the generated module, so the names
-# bind in both; this file therefore has no `if __name__` block.
+# Spliced ABOVE secret-broker.py, secret-cli.py, and secrets-mcp.py (with
+# secret-jobs.py spliced between protocol and broker) by the generated
+# module, so the names bind in all three; this file therefore has no
+# `if __name__` block.
 # secret-worker.py is NOT spliced with this file - it runs as the ordinary
 # agent user and has no need of `cryptography` or the Store, so keeping it
 # standalone keeps its dependency closure as small as a bare python3.
 import base64
+import binascii
 import contextlib
 import fcntl
 import json
@@ -101,6 +104,28 @@ def send_frame(conn, obj):
     if len(body) > SECRET_MAX_FRAME:
         raise SecretError("response too large")
     conn.sendall(struct.pack(">I", len(body)) + body)
+
+
+def connect_and_call(sock_path, req, timeout=15):
+    """One round trip to the broker: connect, send the request, read the
+    reply, close. The one client the CLI and the MCP adapter both need, so
+    a fix to one (a longer timeout for a slow systemd-run start, a retry) is
+    a fix to both rather than a fix that only one of them got. Never raises:
+    a transport failure comes back shaped exactly like a protocol refusal
+    ({"ok": False, "error": ...}), which is what every caller already
+    checks for."""
+    if not sock_path:
+        return {"ok": False, "error": "secrets are not enabled on this box"}
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(timeout)
+    try:
+        conn.connect(sock_path)
+        send_frame(conn, req)
+        return recv_frame(conn)
+    except (OSError, SecretError) as exc:
+        return {"ok": False, "error": f"broker unavailable: {exc}"}
+    finally:
+        conn.close()
 
 
 def recv_frame(conn):
@@ -207,8 +232,10 @@ def _validate_exec_request(req):
         timeout = req["timeoutMs"]
         if not isinstance(timeout, int) or isinstance(timeout, bool) or not (0 < timeout <= SECRET_MAX_TIMEOUT_MS):
             raise SecretError("invalid timeoutMs")
-    if "idempotencyKey" in req and not IDEMPOTENCY_RE.match(req["idempotencyKey"]):
-        raise SecretError("invalid idempotencyKey")
+    if "idempotencyKey" in req:
+        key = req["idempotencyKey"]
+        if not isinstance(key, str) or not IDEMPOTENCY_RE.match(key):
+            raise SecretError("invalid idempotencyKey")
 
 
 # --- At-rest encryption -----------------------------------------------------
@@ -284,6 +311,20 @@ def _decrypt(key, aad, nonce, ct):
         raise SecretError("decryption failed")
 
 
+def _next_version(old_record):
+    """old_record is whatever _read() handed back for a slot that may never
+    have been written, or may have been written by code this broker no
+    longer recognizes. Either way, a version counter that cannot be trusted
+    must not raise - it starts over at 1 rather than crash the request."""
+    try:
+        version = old_record.get("version", 0)
+        if not isinstance(version, int) or isinstance(version, bool):
+            return 1
+        return version + 1
+    except AttributeError:
+        return 1
+
+
 class Store:
     """Root-only records for ONE (user, profile) namespace.
 
@@ -328,9 +369,12 @@ class Store:
             raise SecretError("store entry unreadable")
         with os.fdopen(fd, "rb") as handle:
             try:
-                return json.loads(handle.read(SECRET_MAX_FRAME * 2))
+                obj = json.loads(handle.read(SECRET_MAX_FRAME * 2))
             except ValueError:
                 raise SecretError("store entry corrupt")
+        if not isinstance(obj, dict):
+            raise SecretError("store entry corrupt")
+        return obj
 
     def _write(self, name, obj):
         tmp = f".{name}.tmp"
@@ -373,7 +417,7 @@ class Store:
         lock = self._locked()
         try:
             old = self._read(name + ".rec") or {}
-            version = int(old.get("version", 0)) + 1
+            version = _next_version(old)
             nonce, ct = _encrypt(self._key, _aad(self.user, self.namespace, name, version), value)
             self._write(name + ".rec", {
                 "version": version,
@@ -386,13 +430,23 @@ class Store:
 
     def get(self, name):
         """Decrypt one value. Only the exec path calls this - list/set/
-        remove never see plaintext."""
+        remove never see plaintext. Raises SecretError (never a bare
+        KeyError/ValueError/binascii.Error) for anything short of a valid
+        record, including one written by an incompatible earlier format -
+        the caller must be able to treat "cannot resolve this name" as one
+        kind of failure, not crash the whole process on it."""
         rec = self._read(name + ".rec")
         if rec is None or rec.get("tombstone"):
             return None
-        nonce = base64.b64decode(rec["nonce"])
-        ct = base64.b64decode(rec["ct"])
-        aad = _aad(self.user, self.namespace, name, rec["version"])
+        try:
+            nonce = base64.b64decode(rec["nonce"], validate=True)
+            ct = base64.b64decode(rec["ct"], validate=True)
+            version = rec["version"]
+            if not isinstance(version, int) or isinstance(version, bool):
+                raise ValueError("bad version")
+        except (KeyError, ValueError, TypeError, binascii.Error):
+            raise SecretError("store entry corrupt")
+        aad = _aad(self.user, self.namespace, name, version)
         return _decrypt(self._key, aad, nonce, ct)
 
     def remove(self, name):
@@ -403,7 +457,7 @@ class Store:
             old = self._read(name + ".rec")
             if old is None:
                 raise SecretError("no such secret")
-            version = int(old.get("version", 0)) + 1
+            version = _next_version(old)
             self._write(name + ".rec", {"version": version, "tombstone": True})
             return version
         finally:
