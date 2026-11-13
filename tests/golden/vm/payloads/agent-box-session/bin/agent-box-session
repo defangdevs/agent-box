@@ -1344,7 +1344,7 @@ case "$cmd" in
             [ "$(t display-message -p -t "$pane" '#S' 2>/dev/null)" = "$n" ] || continue
             th="${th:+$th, }$t1"
           done
-          [ -z "$th" ] || kind="$kind (thread $th; hand over with codex queue --thread ID --message TEXT)"
+          [ -z "$th" ] || kind="$kind (thread $th)"
         fi
       fi
       # A plain Codex TUI is not in ListAgents either, so SendMessage cannot
@@ -1373,7 +1373,7 @@ case "$cmd" in
             (*) th="" ;;
           esac
         fi
-        [ -z "$th" ] || kind="$kind (thread $th; hand over with codex queue --thread ID --message TEXT)"
+        [ -z "$th" ] || kind="$kind (thread $th)"
       fi
       # A session whose agent CRASHED is still a live tmux session, because
       # the pane it left behind is a post-mortem shell (issue #516). Nobody
