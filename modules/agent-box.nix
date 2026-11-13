@@ -4655,13 +4655,13 @@ def main():
         sys.stderr.write(
             "agent-box-secret-broker: --user and --store-root are required "
             "(directly, or via AGENT_BOX_SECRET_USER/AGENT_BOX_SECRET_STORE_ROOT)\n")
-        return 2
+        raise SystemExit(2)
     if args.uid is None:
         try:
             args.uid = pwd.getpwnam(args.user).pw_uid
         except KeyError:
             sys.stderr.write(f"agent-box-secret-broker: no such user: {args.user}\n")
-            return 2
+            raise SystemExit(2)
 
     if args.dev_direct_launcher:
         # Two independent gates, not one: a single stray argv flag (a typo'd
@@ -4673,23 +4673,27 @@ def main():
             sys.stderr.write(
                 "agent-box-secret-broker: --dev-direct-launcher refused while running as root "
                 "(it would execute jobs as root, defeating the whole feature)\n")
-            return 2
+            raise SystemExit(2)
         if os.environ.get("AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER") != "1":
             sys.stderr.write(
                 "agent-box-secret-broker: --dev-direct-launcher also needs "
                 "AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER=1 in the environment\n")
-            return 2
+            raise SystemExit(2)
 
     if args.socket:
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(args.socket)
-        os.chmod(args.socket, 0o660)
+        # fchmod on the fd, not chmod on the path: bind() just created this
+        # exact file, so there is nothing left for a path-based chmod to buy
+        # and no window for it to be tricked by a symlink planted at that
+        # path between the two calls.
+        os.fchmod(listener.fileno(), 0o660)
         listener.listen(8)
     elif os.environ.get("LISTEN_FDS") == "1" and os.environ.get("LISTEN_PID") == str(os.getpid()):
         listener = socket.socket(fileno=3)
     else:
         sys.stderr.write("agent-box-secret-broker: no listening socket\n")
-        return 2
+        raise SystemExit(2)
 
     root_key_path = args.root_key_path or os.path.join(
         os.path.dirname(os.path.normpath(args.store_root)), ".rootkey")
@@ -4708,7 +4712,7 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
   '');
   secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
     flakeIgnore = [ "E501" "E302" "E305" ];
