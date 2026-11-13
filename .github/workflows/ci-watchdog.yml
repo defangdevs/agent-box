@@ -1,0 +1,45 @@
+name: CI watchdog
+
+# A CI run whose runner vanished can stay "in_progress" for hours, past every
+# job's timeout-minutes, because that timer needs the runner to report. ci.yml
+# keys its concurrency group on the ref with cancel-in-progress, so the stuck
+# run holds the group and every later run on that PR is reported "cancelled"
+# (#1035). This job force-cancels any CI run older than any healthy run can be.
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+concurrency:
+  group: ci-watchdog
+  cancel-in-progress: false
+
+jobs:
+  cancel-stuck:
+    name: Force-cancel CI runs stuck past their budget
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # The longest chain of jobs in ci.yml is well under 90 minutes.
+      MAX_AGE_MINUTES: '90'
+    steps:
+      - name: Cancel stale runs
+        run: |
+          set -euo pipefail
+          cutoff=$(date -u -d "-${MAX_AGE_MINUTES} minutes" +%Y-%m-%dT%H:%M:%SZ)
+          for status in in_progress queued; do
+            gh api --paginate \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?status=${status}&per_page=100" \
+              --jq ".workflow_runs[] | select(.run_started_at < \"${cutoff}\") | [.id, .head_branch, .run_started_at] | @tsv" |
+            while IFS=$'\t' read -r id branch started; do
+              echo "::warning::force-cancelling run ${id} (${branch}), started ${started}, older than ${MAX_AGE_MINUTES} min"
+              # force-cancel works when a plain cancel is ignored by a dead runner
+              gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/force-cancel" || \
+                gh run cancel "${id}" --repo "${GITHUB_REPOSITORY}"
+            done
+          done
