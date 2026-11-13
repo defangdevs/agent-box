@@ -28,6 +28,12 @@ export AGENT_BOX_JQ_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-jq-1.8.2-bin
 # hook session's later subscribe would; pinned for the same reason
 # AGENT_BOX_SESSION_BIN is.
 export AGENT_BOX_WEBHOOK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-webhook/bin/agent-box-webhook
+# The codex daemon-thread placement talks WebSocket JSON-RPC to the
+# daemon's control socket with a small embedded python client (the
+# shell has no WebSocket transport, and 'codex app-server proxy' only
+# forwards raw bytes). The receiver unit's PATH carries jq and
+# coreutils but not python3, so pin the interpreter.
+export AGENT_BOX_PYTHON_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3
 # Which agent a match really starts. The spawn calls
 # `agent-box-session add` with no --harness, so it is the box default -
 # and --preamble has to NAME it, because that is the half of 'what
@@ -826,9 +832,16 @@ codex_home_for_profile() {
 # fails when the daemon is not running - a precondition this placement cannot
 # work around, never a reason to fall back to standalone (that would silently
 # change a watch's resolved placement whenever the daemon happens to be down).
+# Codex releases differ on the pid file: older ones write a bare pid to
+# app-server.pid, newer ones a JSON object ({"pid":N,...}) to daemon.pid.
 # $1 = CODEX_HOME.
 codex_daemon_bin() {
-  pid=$(cat "$1/app-server-daemon/app-server.pid" 2>/dev/null) || return 1
+  pid=""
+  for pf in "$1/app-server-daemon/app-server.pid" "$1/app-server-daemon/daemon.pid"; do
+    [ -s "$pf" ] || continue
+    pid=$("$JQ" -r 'if type == "object" then .pid else . end' "$pf" 2>/dev/null) || pid=""
+    case "$pid" in (''|null|*[!0-9]*) pid="" ;; (*) break ;; esac
+  done
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || return 1
   bin=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || return 1
   [ -n "$bin" ] && [ -x "$bin" ] || return 1
@@ -837,93 +850,166 @@ codex_daemon_bin() {
 
 CODEX_DAEMON_THREAD_MAX="${AGENT_BOX_CODEX_DAEMON_THREAD_MAX:-4}"
 case "$CODEX_DAEMON_THREAD_MAX" in (*[!0-9]*|'') CODEX_DAEMON_THREAD_MAX=4 ;; esac
+PY="${AGENT_BOX_PYTHON_BIN:-python3}"
+
+# The daemon's control socket speaks WebSocket (HTTP Upgrade, then text
+# frames of JSON-RPC); `codex app-server proxy` only forwards raw bytes, so
+# no shell pipe can talk to it. This small client does the handshake,
+# counts the daemon's loaded threads across EVERY page of thread/list, and
+# creates one thread, all while holding an exclusive flock so two concurrent
+# spawn commands cannot both pass the ceiling check. Exit 0 prints the new
+# thread id; 75 means retry later (ceiling full, daemon unreachable, lock
+# busy); anything else is a hard refusal. argv: sock cwd model effort max lock.
+CODEX_RPC_PY=$(cat <<'PYEOF'
+import base64, fcntl, json, os, socket, struct, sys, time
+
+sock_path, cwd, model, effort, maxn, lock_path = sys.argv[1:7]
+maxn = int(maxn)
+
+
+def die(code, msg):
+    sys.stderr.write("agent-box-webhook-spawn: " + msg + "\n")
+    sys.exit(code)
+
+
+fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+deadline = time.monotonic() + 15
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError:
+        if time.monotonic() > deadline:
+            die(75, "daemon-thread admission lock is busy")
+        time.sleep(0.1)
+
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(10)
+try:
+    s.connect(sock_path)
+    key = base64.b64encode(os.urandom(16)).decode()
+    s.sendall(("GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\n"
+               "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+               "Sec-WebSocket-Version: 13\r\n\r\n" % key).encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
+        chunk = s.recv(4096)
+        if not chunk:
+            die(75, "daemon closed the socket during the WebSocket handshake")
+        head += chunk
+    if b" 101 " not in head.split(b"\r\n", 1)[0]:
+        die(75, "daemon refused the WebSocket upgrade")
+    buf = head.split(b"\r\n\r\n", 1)[1]
+except OSError as e:
+    die(75, "cannot reach the codex daemon socket: %s" % e)
+
+
+def need(n):
+    global buf
+    while len(buf) < n:
+        chunk = s.recv(65536)
+        if not chunk:
+            raise OSError("socket closed")
+        buf += chunk
+    out, buf = buf[:n], buf[n:]
+    return out
+
+
+def send(obj):
+    data = json.dumps(obj).encode()
+    mask = os.urandom(4)
+    n = len(data)
+    if n < 126:
+        hdr = bytes([0x81, 0x80 | n])
+    elif n < 65536:
+        hdr = bytes([0x81, 0x80 | 126]) + struct.pack(">H", n)
+    else:
+        hdr = bytes([0x81, 0x80 | 127]) + struct.pack(">Q", n)
+    s.sendall(hdr + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+
+def recv():
+    msg = b""
+    while True:
+        b0, b1 = need(2)
+        n = b1 & 0x7F
+        if n == 126:
+            n = struct.unpack(">H", need(2))[0]
+        elif n == 127:
+            n = struct.unpack(">Q", need(8))[0]
+        payload = need(n)
+        op = b0 & 0x0F
+        if op == 8:
+            raise OSError("daemon closed the connection")
+        if op in (9, 10):
+            continue
+        msg += payload
+        if b0 & 0x80:
+            return json.loads(msg)
+
+
+def rpc(rid, method, params):
+    send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+    while True:
+        m = recv()
+        if m.get("id") == rid:
+            if m.get("error") is not None:
+                die(1, "%s refused: %s" % (method, json.dumps(m["error"])))
+            return m.get("result") or {}
+
+
+try:
+    rpc(1, "initialize", {"clientInfo": {"name": "agent-box-webhook-spawn", "version": "0"}})
+    send({"jsonrpc": "2.0", "method": "initialized"})
+    live, cursor, pages = 0, None, 0
+    while True:
+        params = {"archived": False, "limit": 200}
+        if cursor:
+            params["cursor"] = cursor
+        res = rpc(10 + pages, "thread/list", params)
+        live += sum(1 for t in res.get("data") or []
+                    if (t.get("status") or {}).get("type") != "notLoaded")
+        cursor = res.get("nextCursor")
+        pages += 1
+        if not cursor or pages >= 100 or live >= maxn:
+            break
+    if live >= maxn:
+        die(75, "codex remote-control daemon has %d/%d live threads; deferring" % (live, maxn))
+    params = {"cwd": cwd, "approvalPolicy": "never", "ephemeral": False}
+    if model:
+        params["model"] = model
+    if effort:
+        params["config"] = {"model_reasoning_effort": effort}
+    res = rpc(1000, "thread/start", params)
+    tid = (res.get("thread") or {}).get("id")
+    if not tid:
+        die(1, "thread/start answered without result.thread.id")
+    sys.stdout.write(tid)
+except OSError as e:
+    die(75, "codex daemon connection failed: %s" % e)
+PYEOF
+)
 
 # Prints the new thread id on stdout and returns 0; otherwise prints nothing
 # and returns 75 (EX_TEMPFAIL - the ceiling is full, or the daemon is not up)
 # so the caller defers exactly like a standalone session-admission refusal,
 # never a hard failure that would drop the batch. $1 = CODEX_HOME, $2 = cwd
-# for the new thread, $3 = model (may be empty).
+# for the new thread, $3 = model (may be empty), $4 = reasoning effort (may
+# be empty).
 codex_daemon_start_thread() {
-  cdt_home=$1 cdt_cwd=$2 cdt_model=$3
+  cdt_home=$1
   cdt_sock="$cdt_home/app-server-control/app-server-control.sock"
   if [ ! -S "$cdt_sock" ]; then
     echo "agent-box-webhook-spawn: no codex remote-control daemon socket at $cdt_sock" >&2
     return 75
   fi
-  cdt_bin=$(codex_daemon_bin "$cdt_home") || {
+  codex_daemon_bin "$cdt_home" >/dev/null || {
     echo "agent-box-webhook-spawn: codex remote-control daemon is not running under $cdt_home" >&2
     return 75
   }
-
-  # Every bare jq assignment below is guarded with "|| :": under this
-  # wrapper's `set -eu`, an unguarded one that somehow failed (jq itself
-  # broken, not a realistic outcome for a static literal) would abort the
-  # whole script instead of falling through to the timeout-based cdt_rc=75
-  # default below and letting the cleanup at the end of this function run.
-  cdt_init=$("$JQ" -cn \
-    '{jsonrpc:"2.0", id:1, method:"initialize", params:{clientInfo:{name:"agent-box-webhook-spawn", version:"0"}}}') || :
-  cdt_list=$("$JQ" -cn \
-    '{jsonrpc:"2.0", id:2, method:"thread/list",
-      params:{archived:false, limit:200,
-        sourceKinds:["cli","vscode","exec","appServer","subAgent",
-                     "subAgentReview","subAgentCompact",
-                     "subAgentThreadSpawn","subAgentOther","unknown"]}}') || :
-
-  coproc CODEX_DAEMON_RPC {
-    exec env CODEX_HOME="$cdt_home" timeout --signal=TERM --kill-after=1s 10s \
-      "$cdt_bin" app-server proxy --sock "$cdt_sock" 2>/dev/null
-  }
-  cdt_pid="${CODEX_DAEMON_RPC_PID:-}"
-  cdt_out="${CODEX_DAEMON_RPC[0]:-}"
-  cdt_in="${CODEX_DAEMON_RPC[1]:-}"
-  if [ -z "$cdt_pid" ] || [ -z "$cdt_out" ] || [ -z "$cdt_in" ]; then
-    echo "agent-box-webhook-spawn: could not start codex app-server proxy" >&2
-    return 75
-  fi
-
-  cdt_rc=75
-  if printf '%s\n%s\n' "$cdt_init" "$cdt_list" >&"$cdt_in"; then
-    cdt_live="" cdt_deadline=$((SECONDS + 8))
-    while [ "$SECONDS" -lt "$cdt_deadline" ]; do
-      cdt_remaining=$((cdt_deadline - SECONDS))
-      IFS= read -r -t "$cdt_remaining" -u "$cdt_out" cdt_line || break
-      "$JQ" -e '.id == 2' >/dev/null 2>&1 <<<"$cdt_line" || continue
-      cdt_live=$("$JQ" '[.result.data[]? | select(.status.type != "notLoaded")] | length' \
-        <<<"$cdt_line" 2>/dev/null)
-      case "$cdt_live" in (''|*[!0-9]*) cdt_live=0 ;; esac
-      break
-    done
-    if [ -z "$cdt_live" ]; then
-      echo "agent-box-webhook-spawn: codex app-server proxy gave no thread/list answer" >&2
-    elif [ "$cdt_live" -ge "$CODEX_DAEMON_THREAD_MAX" ]; then
-      echo "agent-box-webhook-spawn: codex remote-control daemon has $cdt_live/$CODEX_DAEMON_THREAD_MAX live threads; deferring" >&2
-    else
-      cdt_params=$("$JQ" -cn --arg cwd "$cdt_cwd" --arg model "$cdt_model" \
-        '{cwd: $cwd, approvalPolicy: "never", ephemeral: false}
-         + (if $model == "" then {} else {model: $model} end)') || :
-      cdt_start=$("$JQ" -cn --argjson p "${cdt_params:-{\}}" \
-        '{jsonrpc:"2.0", id:3, method:"thread/start", params:$p}') || :
-      if printf '%s\n' "$cdt_start" >&"$cdt_in"; then
-        cdt_deadline=$((SECONDS + 10))
-        while [ "$SECONDS" -lt "$cdt_deadline" ]; do
-          cdt_remaining=$((cdt_deadline - SECONDS))
-          IFS= read -r -t "$cdt_remaining" -u "$cdt_out" cdt_line || break
-          if "$JQ" -e '.id == 3 and .result.id != null' >/dev/null 2>&1 <<<"$cdt_line"; then
-            printf '%s' "$("$JQ" -r '.result.id' <<<"$cdt_line")"
-            cdt_rc=0
-            break
-          fi
-          if "$JQ" -e '.id == 3 and .error != null' >/dev/null 2>&1 <<<"$cdt_line"; then
-            echo "agent-box-webhook-spawn: thread/start refused: $("$JQ" -c '.error' <<<"$cdt_line")" >&2
-            break
-          fi
-        done
-      fi
-    fi
-  fi
-  kill "$cdt_pid" 2>/dev/null || :
-  wait "$cdt_pid" 2>/dev/null || :
-  return "$cdt_rc"
+  mkdir -p "$HOME/.local/state/agent-box" 2>/dev/null || :
+  "$PY" -I -c "$CODEX_RPC_PY" "$cdt_sock" "$2" "$3" "$4" "$CODEX_DAEMON_THREAD_MAX" \
+    "$HOME/.local/state/agent-box/codex-daemon-admission.lock"
 }
 
 PROMPT="$(cat)"
@@ -1371,45 +1457,90 @@ $PROMPT" -- "${extra[@]}"
 # never routed through the hibernation arm below that path reuses.
 start_daemon_thread() {
   cxhome="$(codex_home_for_profile "$hook_profile")"
-  model=""
+  # The standalone path appends the hook args after the profile's own, so
+  # they win; resolve the same precedence here: profile first, then the last
+  # -m/--model and model_reasoning_effort override in extra[].
+  model="" effort=""
   if [ -n "$hook_profile" ]; then
-    model=$("$ENVSTORE" --file "$HOME/.config/agent-box/profiles/$hook_profile.env" get MODEL 2>/dev/null) || model=""
+    pfile="$HOME/.config/agent-box/profiles/$hook_profile.env"
+    model=$("$ENVSTORE" --file "$pfile" get MODEL 2>/dev/null) || model=""
+    effort=$("$ENVSTORE" --file "$pfile" get EFFORT 2>/dev/null) || effort=""
   fi
-  thread=$(codex_daemon_start_thread "$cxhome" "$HOME" "$model") || return $?
-  [ -n "$thread" ] || return 75
+  prev=""
+  for a in "${extra[@]+"${extra[@]}"}"; do
+    case "$prev" in
+      -m|--model) model=$a ;;
+      -c|--config) case "$a" in (model_reasoning_effort=*) effort=${a#model_reasoning_effort=}; effort=${effort//\"/} ;; esac ;;
+    esac
+    case "$a" in
+      --model=*) model=${a#--model=} ;;
+      -m?*) model=${a#-m} ;;
+    esac
+    prev=$a
+  done
+
+  # Retries must reuse the thread a failed attempt already created, and must
+  # not queue the first message twice: the receiver re-offers a deferred
+  # batch (status 75) with the same key and text, so a per-batch record under
+  # the box state dir carries the thread id and whether its first message
+  # already queued. Stale records (> 1 day) are pruned on every start.
+  dstate="$BOX_STATE/codex-daemon-threads"
+  mkdir -p "$dstate" 2>/dev/null || :
+  find "$dstate" -type f -mtime +1 -delete 2>/dev/null || :
+  rkey=$(printf '%s\n%s\n%s' "$name" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" "$PROMPT" | cksum | tr -d ' ')
+  tfile="$dstate/$rkey.thread"
+  qfile="$dstate/$rkey.queued"
+  thread=$(cat "$tfile" 2>/dev/null) || thread=""
+  if [ -z "$thread" ]; then
+    thread=$(codex_daemon_start_thread "$cxhome" "$HOME" "$model" "$effort") || return $?
+    [ -n "$thread" ] || return 75
+    printf '%s' "$thread" > "$tfile" || :
+  fi
 
   cbin=$(codex_daemon_bin "$cxhome") || return 75
-  if ! env CODEX_HOME="$cxhome" "$cbin" queue --thread "$thread" --message "$preamble
+  if [ ! -e "$qfile" ]; then
+    if ! env CODEX_HOME="$cxhome" "$cbin" queue --thread "$thread" --message "$preamble
 
 $PROMPT" >/dev/null 2>&1; then
-    echo "agent-box-webhook-spawn: thread $thread started but the first message did not queue" >&2
-    return 1
+      echo "agent-box-webhook-spawn: thread $thread started but the first message did not queue; will retry on the same thread" >&2
+      return 75
+    fi
+    : > "$qfile" || :
   fi
 
   if [ -n "$WEBHOOK_BIN" ]; then
     # Seeds the SAME claim (own/include/note) the pre-seeded filter above
     # already wrote under $name, and starts the delivery peer that keeps a
-    # later event on this object from spawning a duplicate — the one thing
-    # this placement cannot skip (issue: a thread with no claim behaves like
-    # a hook session that forgot to subscribe, except nothing ever reminds
-    # it, since nothing here resumes it to read the preamble again).
-    # $note was claim_note()'s own result once, but the script-level $note
-    # was reassigned to the human-readable topic note right after the
-    # seeding block above, so it is recomputed here rather than reused.
-    # claim_note() is a pure function of the same spawn env, so this agrees
-    # with what the pre-seeded filter above already wrote. $include has no
-    # such collision and is reused as-is.
+    # later event on this object from spawning a duplicate. $note was
+    # reassigned to the human-readable topic note after the seeding block, so
+    # claim_note() (a pure function of the same spawn env) is recomputed.
     daemon_note="$(claim_note "$LOCAL_WEBHOOK_SPAWN_KEY")" || daemon_note=""
     [ -n "$daemon_note" ] || daemon_note="daemon thread for $own"
-    sub_args=(subscribe "$topic" --deliver-to session \
+    # The event's concrete repository ($own), never $topic: a wildcard watch
+    # (github:acme/*) would otherwise claim the same number in every repo.
+    sub_args=(subscribe "${own:-$topic}" --deliver-to session \
       --codex-thread "$thread" --note "$daemon_note")
     [ -z "$include" ] || sub_args+=(--include "$include")
-    if ! LOCAL_WEBHOOK_SESSION="$(id -un)-$name" "$WEBHOOK_BIN" "${sub_args[@]}" >&2; then
-      echo "agent-box-webhook-spawn: thread $thread started, but its claim/peer could not be seeded; a later event on this object may spawn a duplicate" >&2
+    peer_ok=false
+    for _try in 1 2 3; do
+      env CODEX_HOME="$cxhome" LOCAL_WEBHOOK_CODEX_BIN="$cbin" \
+        LOCAL_WEBHOOK_SESSION="$(id -un)-$name" "$WEBHOOK_BIN" "${sub_args[@]}" >&2 || :
+      if env CODEX_HOME="$cxhome" LOCAL_WEBHOOK_CODEX_BIN="$cbin" \
+          LOCAL_WEBHOOK_SESSION="$(id -un)-$name" "$WEBHOOK_BIN" status 2>/dev/null \
+          | "$JQ" -e --arg t "$thread" '.codexThread == $t and .codexPeer != null' >/dev/null 2>&1; then
+        peer_ok=true
+        break
+      fi
+      sleep 1
+    done
+    if [ "$peer_ok" != true ]; then
+      echo "agent-box-webhook-spawn: thread $thread started, but its claim/delivery peer is not ready; will retry on the same thread" >&2
+      return 75
     fi
   else
     echo "agent-box-webhook-spawn: AGENT_BOX_WEBHOOK_BIN is not pinned; thread $thread started with no claim seeded" >&2
   fi
+  rm -f "$tfile" "$qfile"
   echo "agent-box-webhook-spawn: started codex thread $thread in the remote-control daemon ($cxhome)" >&2
   return 0
 }

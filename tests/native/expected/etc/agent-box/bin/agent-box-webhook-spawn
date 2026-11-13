@@ -35,6 +35,12 @@ export AGENT_BOX_JQ_BIN=@PROFILE@/bin/jq
 # hook session's later subscribe would; pinned for the same reason
 # AGENT_BOX_SESSION_BIN is.
 export AGENT_BOX_WEBHOOK_BIN=/usr/local/bin/agent-box-webhook
+# The codex daemon-thread placement talks WebSocket JSON-RPC to the
+# daemon's control socket with a small embedded python client (the
+# shell has no WebSocket transport, and 'codex app-server proxy' only
+# forwards raw bytes). The receiver unit's PATH carries jq and
+# coreutils but not python3, so pin the interpreter.
+export AGENT_BOX_PYTHON_BIN=@PROFILE@/bin/python3
 # Which agent a match really starts. The spawn calls
 # `agent-box-session add` with no --harness, so it is the box default -
 # and --preamble has to NAME it, because that is the half of 'what

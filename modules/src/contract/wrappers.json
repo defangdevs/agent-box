@@ -155,6 +155,18 @@
           ]
         },
         {
+          "name": "AGENT_BOX_PYTHON_BIN",
+          "kind": "bin",
+          "program": "python3",
+          "why": [
+            "The codex daemon-thread placement talks WebSocket JSON-RPC to the",
+            "daemon's control socket with a small embedded python client (the",
+            "shell has no WebSocket transport, and 'codex app-server proxy' only",
+            "forwards raw bytes). The receiver unit's PATH carries jq and",
+            "coreutils but not python3, so pin the interpreter."
+          ]
+        },
+        {
           "name": "AGENT_BOX_DEFAULT_AGENT",
           "kind": "config",
           "key": "defaultAgent",
