@@ -203,6 +203,21 @@ let
   # the module's envExecWrapper does. `payload` above would wrap it in a
   # bash shebang and hand bash a python file to parse.
   envStoreLib = readSrc "lib/envstore.py";
+
+  # Secret custody (issue #922). Spliced the same way: secret-cli.py,
+  # secret-broker.py and secrets-mcp.py all call into
+  # lib/secret-protocol.py (encryption, the wire protocol) without
+  # importing it, and secret-broker.py additionally needs lib/secret-jobs.py
+  # (the exec_with_secrets job engine) spliced between the two. Shipped
+  # unconditionally, like every other payload here - this file has no `cfg`
+  # to gate on, and a box with `services.agent-box.secrets.enable` unset
+  # simply has no socket for any of these to connect to
+  # (AGENT_BOX_SECRET_SOCKET unset; see env-exec.py and secret-cli.py's own
+  # "not enabled on this box" refusal). secret-worker.py is deliberately
+  # NOT spliced with this library - see its own header - so it needs
+  # neither `cryptography` nor the heavier interpreter below.
+  secretProtocolLib = readSrc "lib/secret-protocol.py";
+  secretJobsLib = readSrc "lib/secret-jobs.py";
   envExecWrapper = pkgs.writers.writePython3Bin "agent-box-env-exec" {
     flakeIgnore = [ "E402" "E501" ];
   } (envStoreLib + "\n\n" + readSrc "env-exec.py");
@@ -358,6 +373,33 @@ let
       flakeIgnore = [ "E501" "E302" "E305" ];
     } (readSrc "transcribe-cli.py"))
     receiveCli
+    # Secret custody (issue #922): the unprivileged CLI. Needs no env
+    # wrapper - it reads AGENT_BOX_SECRET_SOCKET straight from the
+    # environment env-exec.py already loaded, same as agent-box-upload's
+    # token above.
+    (pkgs.writers.writePython3Bin "agent-box-secret" {
+      libraries = [ pkgs.python3Packages.cryptography ];
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (secretProtocolLib + "\n\n" + readSrc "secret-cli.py"))
+    # The root broker and its fixed worker (issue #922). Not yet started by
+    # any unit on this backend - that is the next slice - but shipped here
+    # so the binaries exist on PATH ahead of it, and so an operator can run
+    # the broker by hand to try the feature before the unit lands.
+    (pkgs.writers.writePython3Bin "agent-box-secret-broker" {
+      libraries = [ pkgs.python3Packages.cryptography ];
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (secretProtocolLib + "\n\n" + secretJobsLib + "\n\n" + readSrc "secret-broker.py"))
+    (pkgs.writers.writePython3Bin "agent-box-secret-worker" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "secret-worker.py"))
+    # The box-local MCP adapter (issue #922). Needs the `mcp` SDK on top of
+    # `cryptography` - its own closure, not the broker's, so a box that
+    # never registers it with a harness does not pay for the SDK in the
+    # broker's otherwise-minimal interpreter.
+    (pkgs.writers.writePython3Bin "agent-box-secrets-mcp" {
+      libraries = [ pkgs.python3Packages.cryptography pkgs.python3Packages.mcp ];
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (secretProtocolLib + "\n\n" + readSrc "secrets-mcp.py"))
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-bare" "webhook-cli.sh")
     # The GitHub login this box acts as. env-exec runs it at every session
