@@ -20,6 +20,7 @@ step allowed to fail.
 """
 # The library above already imported os; only what it does not is imported
 # here.
+import json
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,43 @@ def main(argv):
             os.path.join(config, "profiles", f"{profile}.env"),
             skip=PROFILE_RESERVED,
         )
+
+    # Secret custody (issue #922): a box with the broker enabled strips every
+    # name IT protects from this session's environment, regardless of which
+    # file above set it (a legacy copy in the env store or a profile is not
+    # migrated away by this alone - see agent-box-secret's migrate verb).
+    # Absent, not a placeholder: a nonempty value in an auth variable such as
+    # ANTHROPIC_API_KEY can make a harness think it is already signed in and
+    # then fail on the first call with a confusing error (issue #922 thread).
+    # A box with secrets disabled has no AGENT_BOX_SECRET_SOCKET, so
+    # agent-box-secret's own "not enabled" refusal makes this whole block a
+    # no-op - existing launches are unaffected by construction.
+    secret_cli = shutil.which("agent-box-secret")
+    if secret_cli and os.environ.get("AGENT_BOX_SECRET_SOCKET"):
+        protected = set()
+        queries = [["--json", "list"]]
+        if profile:
+            queries.append(["--json", "--profile", profile, "list"])
+        for query in queries:
+            try:
+                result = subprocess.run(
+                    [secret_cli, *query],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    text=True, timeout=10,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if result.returncode != 0:
+                continue
+            try:
+                payload = json.loads(result.stdout)
+            except ValueError:
+                continue
+            for item in payload.get("secrets", []):
+                if item.get("configured"):
+                    protected.add(item["name"])
+        for name in protected:
+            os.environ.pop(name, None)
 
     # A Defang access token is minted for one fixed workspace. v3.15.5
     # rejects a conflicting DEFANG_WORKSPACE instead of silently deploying
