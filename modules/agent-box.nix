@@ -14371,8 +14371,9 @@ your seeded claim is the CI of that one COMMIT — every shape the same run \
 reports under, and nothing else — so the run in front of you reaches you \
 rather than a sibling, on master and on a tag exactly as on a topic branch. \
 Because that claim covers the whole commit, EVERY failed check on it is yours: \
-no other session will look at the others. List them all (gh api \
-repos/OWNER/REPO/commits/SHA/check-runs, plus its commit statuses) and settle \
+no other session will look at the others. List them all - every page: gh api \
+--paginate repos/OWNER/REPO/commits/SHA/check-runs?per_page=100, plus gh api \
+repos/OWNER/REPO/commits/SHA/status for commit statuses - and settle \
 each one - including checks from outside apps such as a code scanner or a \
 quality gate - not only the one you recognize. Report any you leave red, and \
 say why. What it does NOT cover is the next run: a later failure on the same ref is a \
