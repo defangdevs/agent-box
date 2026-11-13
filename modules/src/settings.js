@@ -4,6 +4,31 @@
   // settles. Only folds the operator opened themselves survive a morph whose
   // incoming HTML renders them closed.
   var manuallyOpenFolds = new WeakSet();
+  var initializedEditors = new WeakSet();
+  function syncEditors() {
+    document.querySelectorAll("[data-toggle]").forEach(function (button) {
+      var id = button.getAttribute("data-toggle");
+      var editor = document.getElementById(id);
+      if (!editor) { return; }
+      // The server leaves forms visible without JS. Initialize each new
+      // editor once, including one inserted when an unavailable list recovers.
+      if (!initializedEditors.has(editor)) {
+        editor.hidden = true;
+        initializedEditors.add(editor);
+      }
+      button.setAttribute("aria-controls", id);
+      button.setAttribute("aria-expanded", String(!editor.hidden));
+    });
+  }
+  function refreshEditorProfiles(editor, incoming) {
+    var current = editor.querySelector("select[name=profile]");
+    var choices = incoming.querySelector("select[name=profile]");
+    if (!current || !choices || current.innerHTML === choices.innerHTML) { return; }
+    var selected = current.value;
+    current.innerHTML = choices.innerHTML;
+    current.value = selected;
+    if (current.selectedIndex < 0) { current.value = ""; }
+  }
   // Patch the live DOM toward a freshly-rendered document, one region at a
   // time. Rendering stays entirely server-side; this only decides how the
   // new HTML replaces the old.
@@ -38,6 +63,14 @@
         // the top level — the fold below then closes under the operator with
         // nothing to show for it.
         callbacks: {
+          // Keep creation drafts and visibility, while updating the profile
+          // choices that another settings action may have added or removed.
+          beforeNodeMorphed: function (from, to) {
+            if (from.nodeType === 1 && from.matches("#watch-editor, #email-editor")) {
+              refreshEditorProfiles(from, to);
+              return false;
+            }
+          },
           // Which rows the operator folded open is state this HTML does not
           // carry: <details open> is reflected to the attribute when they
           // click it, and the server re-renders a row it is not driving as
@@ -59,6 +92,7 @@
         }
       });
     });
+    syncEditors();
   }
   function parseHTML(text) {
     return new DOMParser().parseFromString(text, "text/html");
@@ -117,6 +151,64 @@
       .then(function (r) { if (!r.ok) { throw new Error(); } return r.json(); })
       .catch(function () { return null; });
   }
+  var resourceShow = null;
+  function resourceUsage() {
+    var section = document.querySelector("[data-resources-url]");
+    if (!section) { return; }
+    var pending = false;
+    function space(reading, available) {
+      if (!reading) { return "Unavailable"; }
+      var total = reading.total_bytes;
+      var amount = available ? reading.available_bytes : total - reading.available_bytes;
+      var units = ["B", "KiB", "MiB", "GiB", "TiB"];
+      var unit = 0;
+      while (total >= 1024 && unit < units.length - 1) {
+        total /= 1024;
+        amount /= 1024;
+        unit += 1;
+      }
+      return amount.toFixed(1) + " / " + total.toFixed(1) + " " + units[unit]
+        + (available ? " available" : " used");
+    }
+    function show(s) {
+      s = s && s.ok ? s : {};
+      var values = {
+        cpu: s.cpu ? s.cpu.busy_percent + "% busy" : "Unavailable",
+        memory: space(s.memory),
+        disk: space(s.disk, true),
+        sessions: s.sessions ? s.sessions.used + " / " + s.sessions.limit + " in use" : "Unavailable"
+      };
+      Object.keys(values).forEach(function (name) {
+        section.querySelector('[data-resource="' + name + '"]').textContent = values[name];
+      });
+    }
+    // The live feed pushes the same reading every few seconds; the poll
+    // below is its fallback and stands down while the feed carries it.
+    resourceShow = show;
+    function refresh() {
+      if (document.hidden || pending || feedCarries("resources")) { return; }
+      pending = true;
+      var controller = new AbortController();
+      var timeout = window.setTimeout(function () { controller.abort(); }, 10000);
+      fetch(section.getAttribute("data-resources-url"), {
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+        signal: controller.signal
+      }).then(function (r) {
+        if (!r.ok) { throw new Error(); }
+        return r.json();
+      }).then(show).catch(function () {
+        show(null);
+      }).finally(function () {
+        window.clearTimeout(timeout);
+        pending = false;
+      });
+    }
+    refresh();
+    window.setInterval(refresh, 5000);
+    document.addEventListener("visibilitychange", refresh);
+  }
+
   // The daemon can decide the current URL is no longer the right page:
   // /<user>/ redirects to the settings page once the last session is gone.
   // Splicing fragments out of THAT answer patches nothing — applyDoc skips an
@@ -134,16 +226,30 @@
       return r.text();
     });
   }
-  // Re-fetch the page this script is running on.
-  function fetchPage() {
-    var here = window.location.pathname;
-    return settleRedirect(fetch(here + window.location.search), here);
+  // Re-fetch the page this script is running on. `sections` names the
+  // regions the caller will keep: the daemon then renders only those
+  // (X-Agent-Box-Sections), which skips the webhook, email and sign-in
+  // probes that a region nobody keeps would cost. A page that does not know
+  // the header (the workspace) answers in full, which is still correct.
+  var SECTIONS_HEADER = "X-Agent-Box-Sections";
+  function sectionHeaders(sections) {
+    var headers = {};
+    if (sections) { headers[SECTIONS_HEADER] = sections.join(" "); }
+    return headers;
   }
+  function fetchPage(sections) {
+    var here = window.location.pathname;
+    return settleRedirect(
+      fetch(here + window.location.search, { headers: sectionHeaders(sections) }),
+      here);
+  }
+  var SESSION_REGIONS = ["msg-slot", "sessions-list", "tab-bar"];
+  var CONNECT_REGIONS = ["msg-slot", "connect-list"];
   // Re-fetch the current page and patch the live session list/tabs, so
   // the visible list tracks a restart even when nothing was "starting"
   // at submit time (which is what otherwise gates schedulePoll).
   function pollPageOnce() {
-    return fetchPage()
+    return fetchPage(SESSION_REGIONS)
       .then(function (t) {
         if (t === null) { return; }
         applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
@@ -343,7 +449,7 @@
       pollTimer = null;
       // Keep the query string: on the workspace it carries ?tab=, so
       // the fetched tab bar marks the same tab current.
-      fetchPage()
+      fetchPage(SESSION_REGIONS)
         .then(function (t) {
           if (t === null) { return; }
           applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
@@ -373,27 +479,58 @@
     var el = document.getElementById("connect-list");
     return !!el && el.getAttribute("data-busy") === "1";
   }
+  // Fetch only the cards (and the banner a settled sign-in can raise) when
+  // the cards' fingerprint moved. Shared by the poll below and the feed.
+  //
+  // One fetch at a time: two in flight can land out of order, and the older
+  // answer would morph a finished sign-in back to an earlier step with no
+  // later frame to correct it (the daemon sends a fingerprint once). A
+  // fingerprint that arrives meanwhile is remembered and fetched next. A
+  // failed fetch is retried a few times, for the same reason: nothing else
+  // would send that fingerprint again while the stream stays up.
+  var connectWanted = null, connectBusyFetch = null, connectRetries = 0;
+  var CONNECT_RETRY_MS = 2500, CONNECT_RETRY_MAX = 4;
+  function connectSaw(fp) {
+    if (fp) { connectWanted = fp; }
+    if (connectBusyFetch) { return connectBusyFetch; }
+    var el = document.getElementById("connect-list");
+    var asked = connectWanted;
+    if (!el || !asked || asked === el.getAttribute("data-fp")) {
+      return Promise.resolve();
+    }
+    connectBusyFetch = fetchPage(CONNECT_REGIONS)
+      // A settled connection can produce page-level feedback (for
+      // example, which sessions a fresh sign-in restarted). Morph the
+      // banner slot with the card state so that result appears where every
+      // other transient action message lives (issue #835).
+      .then(function (t) {
+        if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
+        connectRetries = 0;
+        return true;
+      }, function () { return false; })
+      .then(function (ok) {
+        connectBusyFetch = null;
+        if (connectWanted !== asked) { return connectSaw(); }
+        if (!ok && connectRetries < CONNECT_RETRY_MAX) {
+          connectRetries += 1;
+          window.setTimeout(function () { connectSaw(); }, CONNECT_RETRY_MS);
+        }
+      });
+    return connectBusyFetch;
+  }
+  // The fallback for a page with no live feed: with the feed carrying the
+  // "connect" topic, the daemon watches a busy card itself and this stops.
   function connectPoll() {
-    if (connectTimer || !connectBusy()) { return; }
+    if (connectTimer || !connectBusy() || feedCarries("connect")) { return; }
     connectTimer = window.setTimeout(function () {
       connectTimer = null;
+      if (feedCarries("connect")) { return; }
       if (document.hidden) { connectPoll(); return; }
       var el = document.getElementById("connect-list");
       var url = el && el.getAttribute("data-status");
       if (!url) { connectPoll(); return; }
       fetchStatus(url)
-        .then(function (s) {
-          var fp = s && s.connect_fp;
-          if (!fp || fp === el.getAttribute("data-fp")) { return null; }
-          return fetchPage();
-        })
-        // A settled connection can produce page-level feedback (for
-        // example, which sessions a fresh sign-in restarted). Morph the
-        // banner slot with the card state so that result appears where every
-        // other transient action message lives (issue #835).
-        .then(function (t) {
-          if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
-        })
+        .then(function (s) { return connectSaw(s && s.connect_fp); })
         .catch(function () {})
         .then(function () { connectPoll(); });
     }, 2500);
@@ -414,6 +551,19 @@
   // posts do). The fingerprint, not the state itself, is what travels:
   // rendering stays server-side and nothing sensitive crosses the feed.
   var liveFeed = false;
+  // Which topics the open stream carries. The settings page also asks for
+  // "resources" (the usage panel's numbers) and "connect" (the sign-in
+  // cards' fingerprint), each of which replaces a poll. Resources frames
+  // arrive every few seconds, so they double as a heartbeat: a stream that
+  // went quiet for FEED_STALE_MS died without an error event, and the polls
+  // come back until it reconnects.
+  var feedTopics = {};
+  var lastFrame = 0;
+  var FEED_STALE_MS = 15000;
+  function feedCarries(topic) {
+    if (!feedTopics[topic]) { return false; }
+    return !feedTopics.resources || Date.now() - lastFrame < FEED_STALE_MS;
+  }
   var probeTimer = null, probeEvery = 0;
   var NO_FEED_MS = 5000;    // no stream: the fingerprint poll IS the feed
   var BACKSTOP_MS = 30000;  // stream up: slow re-check, so nothing can stick
@@ -447,6 +597,8 @@
       if (probeTimer) { window.clearInterval(probeTimer); }
       probeTimer = window.setInterval(function () {
         if (!document.hidden) { probe(); }
+        // A stream that went stale hands a busy card back to its poll.
+        connectPoll();
       }, ms);
     }
     document.addEventListener("visibilitychange", function () {
@@ -458,15 +610,36 @@
     // real box (Caddy always serves TLS); only a plain-HTTP dev rig
     // spends a whole connection out of the browser's per-origin six on
     // it, alongside each pane's terminal WebSocket.
-    var es = new EventSource(url);
+    var topics = ["sessions"];
+    if (document.querySelector("[data-resources-url]")) { topics.push("resources"); }
+    if (document.getElementById("connect-list")) { topics.push("connect"); }
+    var es = new EventSource(url + "?topics=" + topics.join(","));
+    // feedCarries() calls a stream stale after FEED_STALE_MS; check that
+    // often enough that a busy card goes back to its poll promptly, rather
+    // than at the next 30s backstop probe. connectPoll() is a no-op unless a
+    // card is busy and the feed is not carrying it.
+    window.setInterval(connectPoll, NO_FEED_MS);
     es.onopen = function () {
       liveFeed = true;
+      lastFrame = Date.now();
+      topics.forEach(function (t) { feedTopics[t] = true; });
       setProbe(BACKSTOP_MS);
     };
+    function frame(e) {
+      lastFrame = Date.now();
+      try { return JSON.parse(e.data); } catch (err) { return null; }
+    }
     es.addEventListener("sessions", function (e) {
-      var s = null;
-      try { s = JSON.parse(e.data); } catch (err) { return; }
+      var s = frame(e);
       saw(s && s.fp);
+    });
+    es.addEventListener("resources", function (e) {
+      var s = frame(e);
+      if (s && resourceShow) { resourceShow(s); }
+    });
+    es.addEventListener("connect", function (e) {
+      var s = frame(e);
+      connectSaw(s && s.fp);
     });
     es.onerror = function () {
       // A dropped stream reconnects on its own (a box update restarts
@@ -476,7 +649,9 @@
       // will not stream — and per spec it never retries, so the poll
       // goes back to being the feed.
       liveFeed = false;
+      feedTopics = {};
       if (es.readyState === EventSource.CLOSED) { setProbe(NO_FEED_MS); }
+      connectPoll();
     };
   }
 
@@ -733,6 +908,88 @@
       last.style.gridColumn = "span " + (spare + 1);
     }
   }
+  // ttyd's keys and mouse events stay inside its same-origin iframe. Listen
+  // there without cancelling anything: Ctrl+C must still reach the terminal,
+  // and clipboard shortcuts must keep the browser's normal behavior.
+  var copyHintFrames = new WeakSet(), copyHintDocs = new WeakSet();
+  var copyHint = null, copyHintTimer = null, copyHintPane = null;
+  var copyHintMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+  function hideCopyHint() {
+    if (copyHint) { copyHint.hidden = true; }
+    window.clearTimeout(copyHintTimer);
+    copyHintPane = null;
+  }
+  function placeCopyHint(frame, point) {
+    var rect = frame.getBoundingClientRect();
+    var x = rect.left + (point ? point.x : rect.width / 2);
+    var y = rect.top + (point ? point.y : rect.height / 2);
+    var w = copyHint.offsetWidth, h = copyHint.offsetHeight;
+    copyHint.style.left = Math.max(8, Math.min(x + 14, window.innerWidth - w - 8)) + "px";
+    // Flip above the pointer near the bottom edge.
+    y = y + 18 + h > window.innerHeight - 8 ? y - h - 12 : y + 18;
+    copyHint.style.top = Math.max(8, Math.min(y, window.innerHeight - h - 8)) + "px";
+  }
+  function watchCopyHint(frame) {
+    if (copyHintFrames.has(frame)) { return; }
+    copyHintFrames.add(frame);
+    function bind() {
+      var doc, win;
+      try { doc = frame.contentDocument; win = frame.contentWindow; }
+      catch (err) { return; }
+      if (!doc || copyHintDocs.has(doc)) { return; }
+      copyHintDocs.add(doc);
+      var point = null;
+      function selected() {
+        // xterm paints its own selection; window.getSelection alone misses
+        // it. ttyd exposes the terminal as window.term.
+        return (win.term && win.term.hasSelection()) ||
+          String(win.getSelection()).length > 0 ||
+          String(window.getSelection()).length > 0;
+      }
+      doc.addEventListener("mousemove", function (e) {
+        point = { x: e.clientX, y: e.clientY };
+        if (copyHintPane === frame) { placeCopyHint(frame, point); }
+      });
+      doc.addEventListener("keydown", function (e) {
+        var key = e.key.toLowerCase();
+        var shortcut = (key === "c" || key === "v" || e.code === "KeyC" || e.code === "KeyV") &&
+          (copyHintMac ? e.metaKey : e.ctrlKey);
+        var command = copyHintMac && key === "meta" && !e.shiftKey;
+        var field = e.target.closest && e.target.closest("input,textarea,select,[contenteditable]");
+        if (e.altKey || (copyHintMac && e.ctrlKey) ||
+            (!copyHintMac && e.metaKey) || !(shortcut || command) ||
+            (field && !field.closest(".xterm")) || selected()) {
+          hideCopyHint();
+          return;
+        }
+        if (e.repeat) { return; }
+        if (!copyHint) {
+          copyHint = document.createElement("div");
+          copyHint.id = "terminal-copy-hint";
+          copyHint.setAttribute("role", "status");
+          document.body.appendChild(copyHint);
+          copyHint.textContent = "Hold " + (copyHintMac ? "Option" : "Shift") +
+            " while dragging to select and copy terminal text.";
+        }
+        copyHint.hidden = false;
+        copyHintPane = frame;
+        placeCopyHint(frame, point);
+        window.clearTimeout(copyHintTimer);
+        copyHintTimer = window.setTimeout(hideCopyHint, 4000);
+      }, true);
+      doc.addEventListener("mousedown", hideCopyHint, true);
+      doc.addEventListener("selectionchange", function () {
+        if (selected()) { hideCopyHint(); }
+      });
+      doc.addEventListener("mouseleave", hideCopyHint);
+      win.addEventListener("blur", hideCopyHint);
+    }
+    frame.addEventListener("load", function () { hideCopyHint(); bind(); });
+    bind();
+  }
+  window.addEventListener("resize", hideCopyHint);
+  document.addEventListener("scroll", hideCopyHint, true);
+  document.addEventListener("mousedown", hideCopyHint, true);
   function ensurePane(name) {
     var cell = ensureCell(name);
     var cur = cell.querySelector('.pane[data-pane="' + name + '"]');
@@ -745,14 +1002,47 @@
     // iframe, which is what made a working Start look broken (issue #241).
     var want = paneState(name);
     // Panes rendered before this stamp existed are server-rendered iframes.
-    if (cur && (cur.getAttribute("data-ph") || "live") === want) { return cur; }
+    // The data-pane stamp is not enough for a live pane. An iframe's browsing
+    // context can be restored independently of the parent document (or left
+    // on an older history entry), so the node can still SAY `codex` while its
+    // src and loaded document point at `claude`. Reconciliation used to keep
+    // that lie forever, leaving two web tiles attached to the first tmux
+    // session (issue #855).
+    var liveSrc = tabBar().getAttribute("data-term-base") +
+                  encodeURIComponent(name) + "/";
+    var routeMatches = true;
+    if (cur && want === "live") {
+      routeMatches = cur.tagName === "IFRAME" &&
+        cur.getAttribute("src") === liveSrc;
+      // A restored subframe may have the right src ATTRIBUTE but a different
+      // live history entry. about:blank is the ordinary not-loaded-yet state,
+      // so accept it; every loaded ttyd document is same-origin and readable.
+      if (routeMatches) {
+        try {
+          var loaded = cur.contentWindow.location.href;
+          routeMatches = loaded === "about:blank" ||
+            cur.contentWindow.location.pathname ===
+              new URL(liveSrc, window.location.href).pathname;
+        } catch (err) { routeMatches = false; }
+      }
+    }
+    if (cur && (cur.getAttribute("data-ph") || "live") === want &&
+        routeMatches) {
+      // One cell owns one terminal. If an older reconciliation appended a
+      // second pane after failing to find this stamped one, retire that extra
+      // without touching the correctly routed iframe.
+      cell.querySelectorAll(".pane").forEach(function (pane) {
+        if (pane !== cur) { pane.remove(); }
+      });
+      if (cur.tagName === "IFRAME") { watchCopyHint(cur); }
+      return cur;
+    }
     var el;
     if (want === "live") {
       el = document.createElement("iframe");
       // data-term-base is this user's own path with its trailing slash;
       // a session hangs off it as a path segment, not a query.
-      el.src = tabBar().getAttribute("data-term-base") +
-               encodeURIComponent(name) + "/";
+      el.src = liveSrc;
       el.title = name + " terminal";
       el.setAttribute("allow", "clipboard-read; clipboard-write");
       el.className = "pane";
@@ -770,6 +1060,10 @@
     // `active` is the CELL's, so a pane swapped in here carries no state
     // of its own and cannot disagree with the cell it lands in.
     if (cur) { cur.replaceWith(el); } else { cell.appendChild(el); }
+    cell.querySelectorAll(".pane").forEach(function (pane) {
+      if (pane !== el) { pane.remove(); }
+    });
+    if (el.tagName === "IFRAME") { watchCopyHint(el); }
     return el;
   }
   function wsSelect(name, focus) {
@@ -1069,10 +1363,7 @@
 
   // The editors render expanded (no-JS fallback); collapse them once
   // JS is live so the page opens in list-only, GitHub-style form.
-  ["secret-editor", "session-editor", "password-editor", "profile-editor"].forEach(function (id) {
-    var el = document.getElementById(id);
-    if (el) { el.hidden = true; }
-  });
+  syncEditors();
 
   document.addEventListener("click", function (e) {
     var t = e.target && e.target.closest ? e.target.closest("[data-toggle],[data-edit]") : null;
@@ -1085,11 +1376,13 @@
       key.value = t.getAttribute("data-edit");
       key.readOnly = true;
       form.querySelector("[name=value]").focus();
+      syncEditors();
       return;
     }
     var el = document.getElementById(t.getAttribute("data-toggle"));
     if (!el) { return; }
     el.hidden = !el.hidden;
+    syncEditors();
     if (!el.hidden && el.id === "secret-editor") {
       form.reset();
       var ki = form.querySelector("input[name=key]");
@@ -1097,6 +1390,65 @@
       ki.focus();
     }
   });
+
+  // New profiles collect all settings in one save. Keep row indices unique
+  // after removals so the server can pair blank values with the right keys.
+  var profileEnvIndex = 0;
+  document.addEventListener("click", function (e) {
+    var add = e.target.closest("[data-add-profile-env]");
+    if (add) {
+      var rows = add.parentElement.querySelector("[data-profile-env-rows]");
+      var row = rows.querySelector("[data-profile-env-row]").cloneNode(true);
+      profileEnvIndex += 1;
+      row.querySelectorAll("input").forEach(function (input) {
+        input.name = input.name.replace(/_[0-9]+$/, "_" + profileEnvIndex);
+        input.value = "";
+      });
+      rows.appendChild(row);
+      row.querySelector("input").focus();
+      return;
+    }
+    var remove = e.target.closest("[data-remove-profile-env]");
+    if (!remove) { return; }
+    var row = remove.closest("[data-profile-env-row]");
+    if (row.parentElement.children.length > 1) { row.remove(); }
+    else { row.querySelectorAll("input").forEach(function (input) { input.value = ""; }); }
+  });
+
+  // Which page regions a form's answer can change, when that is known to be
+  // fewer than all of them: the daemon then renders only those. A secret
+  // changes its own list and the sign-in cards (a stored key can shadow a
+  // sign-in); a sign-in action changes its card, the banner and maybe a
+  // stored key (sign-out deletes one). Every other
+  // form still gets, and applies, the whole page.
+  function formSections(f) {
+    // Signing out deletes a provider's keys (GH_TOKEN) and starting WhatsApp
+    // stores its phone number, so a card's own form keeps the secrets too.
+    if (f.closest("#connect-list")) {
+      return ["msg-slot", "connect-list", "secrets-list"];
+    }
+    if (f.closest("#secret-editor, #secrets-list")) {
+      return ["msg-slot", "secrets-list", "connect-list"];
+    }
+    return null;
+  }
+  // Disable the form's submit buttons until its answer is in, and show a
+  // button's data-busy-label meanwhile. Returns the function that undoes
+  // it. The form is often replaced by the answer; undoing a detached form
+  // is harmless.
+  function markBusy(f, submitter) {
+    var buttons = Array.prototype.slice.call(f.querySelectorAll('[type="submit"]'));
+    var label = submitter && submitter.getAttribute("data-busy-label");
+    var text = submitter ? submitter.textContent : "";
+    f.setAttribute("aria-busy", "true");
+    buttons.forEach(function (b) { b.disabled = true; });
+    if (label) { submitter.textContent = label; }
+    return function () {
+      f.removeAttribute("aria-busy");
+      buttons.forEach(function (b) { b.disabled = false; });
+      if (label) { submitter.textContent = text; }
+    };
+  }
 
   document.addEventListener("submit", function (e) {
     var f = e.target;
@@ -1106,8 +1458,17 @@
     // can prompt for the new password; fetch() suppresses that UX.
     if (f.hasAttribute("data-native")) { return; }
     e.preventDefault();
+    // One submission at a time per form. The answer can take a moment, and
+    // a second press used to send the same POST again with nothing on
+    // screen to say the first one was still going.
+    if (f.getAttribute("aria-busy") === "true") { return; }
+    var submitter = e.submitter || f.querySelector('[type="submit"]');
     var body = new URLSearchParams();
     new FormData(f).forEach(function (v, k) { body.append(k, v); });
+    var sections = formSections(f);
+    // Busy from the first moment: the Update branch below awaits a status
+    // read before it posts, and a second submit must not slip into that gap.
+    var done = markBusy(f, submitter);
     // On the workspace, adding a session should focus its new tab. The
     // name is auto-derived by the daemon, so the page only learns it
     // from the answer: a successful add redirects to ?tab=<new name>,
@@ -1130,12 +1491,29 @@
       // it has an id of its own to be swapped by. Without them a profile
       // created here stayed invisible until a full reload — and the picker
       // could not offer the profile the operator had just made.
-      applyDoc(parseHTML(t),
+      var doc = parseHTML(t);
+      applyDoc(doc, sections ||
         ["msg-slot", "secrets-list", "sessions-list", "profiles-list",
          "profile-picker", "webhook-endpoint", "webhooks-list",
          "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
-      if (ed) { f.reset(); ed.hidden = true; }
+      if (ed) {
+        var creatingAutomation = ed.matches("#watch-editor, #email-editor");
+        // Rejections include webhook_invalid redirects and email HTTP 400s.
+        // A positive save banner is required before discarding either draft.
+        var creatingProfile = ed.id === "profile-editor";
+        var msg = doc.querySelector("#msg-slot .msg");
+        var saved = msg && (msg.dataset.kind === "ok" ||
+          (creatingProfile && msg.dataset.kind === "warn" &&
+           msg.textContent.indexOf("Profile saved, with a warning:") !== -1));
+        if ((!creatingAutomation && !creatingProfile) || saved) {
+          f.reset();
+          var rows = f.querySelectorAll("[data-profile-env-row]");
+          for (var i = 1; i < rows.length; i++) { rows[i].remove(); }
+          ed.hidden = true;
+        }
+      }
+      syncEditors();
       var added = wsActive();   // the tab the fetched page marks current
       connectPoll();
       if (tabsBefore && added && tabsBefore.indexOf(added) < 0) { wsSelect(added, true); }
@@ -1149,7 +1527,10 @@
     function post() {
       var here = window.location.pathname;
       return settleRedirect(
-        fetch(f.getAttribute("action"), { method: "POST", body: body }), here);
+        fetch(f.getAttribute("action"),
+              { method: "POST", body: body, headers: sectionHeaders(sections) }),
+        here).then(function (t) { done(); return t; },
+                   function (err) { done(); throw err; });
     }
 
     // The two Danger-zone actions get a long-polled progress line;
@@ -1393,6 +1774,7 @@
   });
 
   checkForUpdate();
+  resourceUsage();
   liveUpdates();
   connectPoll();
   // Land in the terminal: focus the server-selected tab's pane.

@@ -1,0 +1,260 @@
+#! /nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-python3-3.14.7/bin/python3.14
+"""agent-box-transcribe FILE: speech in an audio file, as text (issue #970).
+
+Claude cannot take audio, so a voice note is turned into text on this box and
+the audio never leaves it. Nothing is compiled here. Python, pip and ffmpeg come
+from the box's pinned nixpkgs (substitute only, so a missing cache entry fails
+fast instead of building). whisper.cpp comes from the prebuilt pywhispercpp
+wheel, installed by pip with --require-hashes from the pins in
+modules/src/transcribe/requirements.txt (Dependabot bumps them). The ggml model
+comes from Hugging Face, pinned by sha256. The first run downloads about 200 MB
+(with the default base.en model, 148 MB; small.en alone is 488 MB) into
+~/.cache/agent-box-transcribe; later runs only decode."""
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+
+CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache'),
+                     'agent-box-transcribe')
+MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-%s.bin'
+# name -> sha256 of ggml-NAME.bin, from the Hugging Face LFS pointer.
+MODELS = {
+    'base.en': 'a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002',
+    'small.en': 'c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d',
+    'base': '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe',
+    'small': '1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b',
+}
+MAX_SECONDS = 900
+# Pinned with hashes for pip --require-hashes: pywhispercpp and numpy, for each CPU.
+REQUIREMENTS = '''
+# Hash-pinned for pip --require-hashes (agent-box-transcribe). Dependabot bumps these.
+pywhispercpp==1.5.1 --hash=sha256:39813f1cd3b310c32bc98930f0547c8b2d63d17c8dabd21ec19c4ab23d2c7059 --hash=sha256:fb9d0ba10ddb7414ec0ce6f8c56d8cb3c0b156e6e68e771418a363af6891b321
+numpy==2.5.4 --hash=sha256:4054173604cd8658796053f1f3bc0befb68ec1c0762c57fdad61e199256a8617 --hash=sha256:d549420b8858885cea8838a727842249218b9c1da24dd517e25c9c7a948310a3
+'''
+
+# Runs under the nix python with only the pip --target directory on its path. The
+# C library logs to stderr; the text goes to a file so nothing mixes with it.
+WORKER = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import numpy as np
+import _pywhispercpp as pw
+model, pcm, out, lang, threads = sys.argv[2:7]
+audio = np.frombuffer(open(pcm, 'rb').read(), dtype=np.float32)
+ctx = pw.whisper_init_from_file_with_params(model, pw.whisper_context_default_params())
+p = pw.whisper_full_default_params(pw.whisper_sampling_strategy.WHISPER_SAMPLING_GREEDY)
+p.print_progress = p.print_realtime = p.print_timestamps = p.print_special = False
+p.n_threads = int(threads)
+p.language = lang
+rc = pw.whisper_full(ctx, p, audio, audio.size)
+if rc != 0:
+    sys.exit('whisper_full failed with status %s' % rc)
+segs = [pw.whisper_full_get_segment_text(ctx, i) for i in range(pw.whisper_full_n_segments(ctx))]
+text = ''.join(s.decode('utf-8', 'replace') if isinstance(s, bytes) else s for s in segs)
+json.dump({'text': text.strip()}, open(out, 'w'))
+'''
+
+
+def say(msg):
+    print('transcribe: ' + msg, file=sys.stderr)
+
+
+def die(msg):
+    say(msg)
+    sys.exit(1)
+
+
+# Only this host, over https, and a plain file name in the cache.
+URL_OK = re.compile(r'https://huggingface\.co/ggerganov/whisper\.cpp/resolve/main/ggml-[a-z.]+\.bin')
+NAME_OK = re.compile(r'[A-Za-z0-9][A-Za-z0-9._+-]*')
+
+
+def fetch(url, dest, sha256, size_cap):
+    """Download to dest.part, check the hash, rename. Skips a present file."""
+    if not URL_OK.fullmatch(url):
+        die('refusing to download from %s' % url)
+    name = os.path.basename(dest)
+    if not NAME_OK.fullmatch(name) or os.path.dirname(dest) != CACHE:
+        die('refusing to write outside the cache: %s' % dest)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if name in os.listdir(os.path.dirname(dest)):
+        return dest
+    # A name of our own per run: two voice notes on a fresh box fetch at once.
+    fd, part = tempfile.mkstemp(prefix=name + '.', suffix='.part', dir=os.path.dirname(dest))
+    os.close(fd)
+    h = hashlib.sha256()
+    req = urllib.request.Request(url, headers={'User-Agent': 'agent-box-transcribe'})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r, open(part, 'wb') as f:
+            n = 0
+            while True:
+                b = r.read(1 << 20)
+                if not b:
+                    break
+                n += len(b)
+                if n > size_cap:
+                    raise OSError('download is larger than %d bytes' % size_cap)
+                h.update(b)
+                f.write(b)
+    except (OSError, ValueError) as e:
+        if os.path.exists(part):
+            os.unlink(part)
+        die('download of %s failed: %s' % (url, e))
+    if sha256 and h.hexdigest() != sha256:
+        os.unlink(part)
+        die('%s does not match its pinned sha256' % url)
+    os.rename(part, dest)
+    return dest
+
+
+# The ref this box installs everything else from, so the package is the one
+# its binary cache has. A hand-run outside a box falls back to the registry.
+NIXPKGS = os.environ.get('AGENT_BOX_NIXPKGS') or 'nixpkgs'
+
+
+def nix_bin():
+    """The nix this box uses: AGENT_BOX_NIX_BIN, then PATH, then the standard profiles."""
+    for c in (os.environ.get('AGENT_BOX_NIX_BIN'), shutil.which('nix'),
+              '/nix/var/nix/profiles/default/bin/nix', os.path.expanduser('~/.nix-profile/bin/nix')):
+        if c and os.path.exists(c):
+            return c
+    die('nix was not found: set AGENT_BOX_NIX_BIN or put nix on PATH')
+
+
+def nix_out(attr, link_name, suffix=''):
+    """Store path of nixpkgs attr, substituted from the binary cache, never built.
+
+    nix appends the output name to the link when it is not `out`; suffix says which."""
+    # Keyed by the ref, so a changed AGENT_BOX_NIXPKGS never reuses an old pin's link.
+    link = os.path.join(CACHE, '%s-%s' % (link_name, hashlib.sha256(NIXPKGS.encode()).hexdigest()[:8]))
+    path = link + suffix
+    if not os.path.exists(path):
+        say('fetching %s from the nix binary cache (never built here)' % attr)
+        os.makedirs(CACHE, exist_ok=True)
+        # --max-jobs 0: substitute or fail. Compiling on a small box runs it out of memory.
+        try:
+            r = subprocess.run([nix_bin(), '--extra-experimental-features', 'nix-command flakes',
+                                'build', '--max-jobs', '0', '--out-link', link, '%s#%s' % (NIXPKGS, attr)],
+                               capture_output=True, text=True)
+        except OSError as e:
+            die('could not run nix: %s' % e)
+        if r.returncode != 0:
+            die('%s is not in the binary cache and was not built: %s' % (attr, r.stderr.strip()[-400:]))
+    return path
+
+
+def ensure_ffmpeg():
+    return shutil.which('ffmpeg') or os.path.join(nix_out('ffmpeg-headless^bin', 'ffmpeg', '-bin'), 'bin', 'ffmpeg')
+
+
+def ensure_engine():
+    """The nix python, the wheel directory pip made for it, and the libs the wheels need."""
+    python = os.path.join(nix_out('python3', 'python3'), 'bin', 'python3')
+    pip = os.path.join(nix_out('python3Packages.pip', 'pip'), 'bin', 'pip')
+    # The manylinux wheels expect a system libstdc++ and libz; nix has neither on a default path.
+    libs = ':'.join(os.path.join(nix_out(a, n, sfx), 'lib')
+                    for a, n, sfx in (('stdenv.cc.cc.lib', 'gcc', '-lib'), ('zlib', 'zlib', '')))
+    key = hashlib.sha256((REQUIREMENTS + os.path.realpath(python)).encode()).hexdigest()[:12]
+    site = os.path.join(CACHE, 'site-' + key)
+    if os.path.exists(os.path.join(site, '.ok')):
+        return python, site, libs
+    # Install into a private staging directory and publish it with one rename,
+    # so a concurrent run never imports a half-installed tree.
+    os.makedirs(CACHE, exist_ok=True)
+    stage = tempfile.mkdtemp(prefix='stage-', dir=CACHE)
+    try:
+        req = os.path.join(stage, 'requirements.txt')
+        with open(req, 'w') as f:
+            f.write(REQUIREMENTS)
+        # --no-deps: the worker needs only the C extension and numpy. --only-binary:
+        # never build from source. --require-hashes: refuse anything not pinned.
+        r = subprocess.run([pip, 'install', '--disable-pip-version-check', '--no-cache-dir', '--no-deps',
+                            '--only-binary', ':all:', '--require-hashes', '--target', os.path.join(stage, 'site'),
+                            '-r', req], capture_output=True, text=True)
+        if r.returncode != 0:
+            die('pip could not install the pinned wheels: ' + r.stderr.strip()[-400:])
+        open(os.path.join(stage, 'site', '.ok'), 'w').close()
+        try:
+            os.rename(os.path.join(stage, 'site'), site)
+        except OSError:
+            # Another run published first: keep a good one.
+            if not os.path.exists(os.path.join(site, '.ok')):
+                die('could not publish the installed wheels at %s' % site)
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    return python, site, libs
+
+
+def to_pcm(ffmpeg, src, out):
+    # The clip is copied to a name this program chose, so nothing the sender or
+    # the caller named ever reaches ffmpeg's argument list.
+    local = os.path.join(os.path.dirname(out), 'input.bin')
+    shutil.copyfile(src, local)
+    r = subprocess.run([ffmpeg, '-nostdin', '-loglevel', 'error', '-y', '-t', str(MAX_SECONDS), '-i', local,
+                        '-vn', '-f', 'f32le', '-ac', '1', '-ar', '16000', out], capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.getsize(out):
+        die('could not decode %s as audio: %s' % (src, r.stderr.strip()[-300:]))
+    if os.path.getsize(out) >= MAX_SECONDS * 16000 * 4:
+        say('WARNING: the audio is longer than %d minutes; only the first %d minutes were transcribed. '
+            'Split the recording to get the rest.' % (MAX_SECONDS // 60, MAX_SECONDS // 60))
+
+
+def run_engine(python, site, libs, model, pcm, lang):
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, 'out.json')
+        env = dict(os.environ, LD_LIBRARY_PATH=libs)
+        r = subprocess.run([python, '-I', '-c', WORKER, site, model, pcm, out, lang,
+                            str(max(1, min(os.cpu_count() or 1, 8)))], capture_output=True, text=True, env=env)
+        if r.returncode != 0 or not os.path.exists(out):
+            die('whisper failed: ' + r.stderr.strip()[-400:])
+        with open(out) as f:
+            return json.load(f)['text']
+
+
+def main(argv):
+    args, model_name, lang = [], 'base.en', None
+    it = iter(argv)
+    for a in it:
+        if a in ('-h', '--help'):
+            print('usage: agent-box-transcribe [--model %s] [--lang CODE|auto] FILE\n\n%s'
+                  % ('|'.join(MODELS), __doc__.strip()))
+            sys.exit(0)
+        if a == '--':
+            args.extend(it)
+        elif a == '--model':
+            model_name = next(it, '')
+        elif a == '--lang':
+            lang = next(it, '')
+        else:
+            args.append(a)
+    if len(args) != 1 or model_name not in MODELS:
+        die('usage: agent-box-transcribe [--model %s] [--lang CODE|auto] FILE' % '|'.join(MODELS))
+    src = args[0]
+    if not os.path.isfile(src):
+        die('%s is not a file' % src)
+    # An .en model only knows English; the others detect the language.
+    lang = lang or ('en' if model_name.endswith('.en') else 'auto')
+    if not (lang == 'auto' or (lang.isalpha() and lang.islower() and len(lang) in (2, 3))):
+        die('--lang must be auto or a language code such as en')
+    ffmpeg = ensure_ffmpeg()
+    model = fetch(MODEL_URL % model_name, os.path.join(CACHE, 'ggml-%s.bin' % model_name),
+                  MODELS[model_name], 600 << 20)
+    python, site, libs = ensure_engine()
+    with tempfile.TemporaryDirectory() as d:
+        pcm = os.path.join(d, 'a.f32')
+        to_pcm(ffmpeg, src, pcm)
+        text = run_engine(python, site, libs, model, pcm, lang)
+    # Words from a stranger's voice note: data, not instructions.
+    if not text:
+        die('no speech was recognized in %s' % src)
+    print(text)
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])

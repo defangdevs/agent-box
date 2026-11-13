@@ -75,7 +75,7 @@ fail() { printf 'FAIL %s\n' "$1"; fails=$((fails + 1)); }
 #   $1 the repo key, $2 the LOCAL_WEBHOOK_SPAWN_META json
 spawn() {
   rm -f "$LOCAL_WEBHOOK_STATE_DIR"/filter.*.json
-  env LOCAL_WEBHOOK_SPAWN_SOURCE=github \
+  env LOCAL_WEBHOOK_SPAWN_SOURCE=${SPAWN_SRC:-github} \
       LOCAL_WEBHOOK_SPAWN_KEY="$1" \
       LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*' \
       LOCAL_WEBHOOK_SPAWN_EVENT=workflow_run \
@@ -110,6 +110,29 @@ check_lease() {
   check "$4" "$lf" \
     "(.topic == $1) and (.object == $2) and (.outcome == null) and (.claimedAt != null)"
 }
+
+# --- a non-GitHub source (agent-box#875) ---
+#
+# A Slack event has no number and no sha, so it used to fall to the GitHub CI
+# claim: a predicate nothing in a Slack payload matches, and a note about
+# "topic branches". Every follow-up in the thread then started a session.
+SPAWN_SRC=slack
+f=$(spawn T1/C1 '{"event":"thread.settled","key":"T1/C1","identifier":"T1/C1/1700000000.000100"}')
+check "a slack spawn claims exactly its thread identifier" "$f" \
+  '.topics[0].topic == "slack:T1/C1"
+   and .topics[0].include == {path: "identifier", in: ["T1/C1/1700000000.000100"]}'
+check "a slack note names the object, not GitHub CI" "$f" \
+  '.topics[0].note | contains("T1/C1/1700000000.000100") and (contains("TOPIC BRANCHES") | not)'
+f=$(spawn T1/C1 '{"event":"thread.settled","key":"T1/C1"}')
+check "a slack spawn with no identifier claims nothing, honestly" "$f" \
+  '(.topics[0] | has("include") | not) and (.topics[0].note | contains("claims nothing"))'
+f=$(spawn T1/C1 '{"event":"thread.settled","identifier":"x\"} or {\"a"}')
+check "a malformed identifier is not turned into a predicate" "$f" \
+  '.topics[0] | has("include") | not'
+# spawn() clears earlier filters, so keep a copy for the matcher check below.
+slack_filter="$work/slack-filter.json"
+cp "$(spawn T1/C1 '{"event":"thread.settled","identifier":"T1/C1/1.5"}')" "$slack_filter"
+unset SPAWN_SRC
 
 # --- a numbered object: exactly that issue or PR, and never the repo's CI ---
 #
@@ -223,6 +246,25 @@ PY
     ok "webhook.py matches every shape of that run, and no later run"
   else
     fail "webhook.py matches every shape of that run, and no later run"
+    printf '%s\n' "$out" | sed 's/^/     /'
+  fi
+  if out=$(python3 - "$WEBHOOK_PY" "$slack_filter" 2>&1 <<'PY'
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('wh', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+claim = json.load(open(sys.argv[2]))['topics'][0]['include']
+assert m.predicate_error(claim) is None, m.predicate_error(claim)
+assert m.match_predicate(claim, {'identifier': 'T1/C1/1.5', 'action': 'message.posted'})
+assert m.match_predicate(claim, {'identifier': 'T1/C1/1.5', 'action': 'thread.settled'})
+assert not m.match_predicate(claim, {'identifier': 'T1/C1/2.5'})
+assert not m.match_predicate(claim, {'identifier': 'T1/C2/1.5'})
+print('ok')
+PY
+  ); then
+    ok "webhook.py matches later events of that thread, and no other thread"
+  else
+    fail "webhook.py matches later events of that thread, and no other thread"
     printf '%s\n' "$out" | sed 's/^/     /'
   fi
 else

@@ -46,6 +46,8 @@
 #   AGENT_BOX_SETTINGS_BASE      URL base path, e.g. /alice/settings
 #   AGENT_BOX_DOWNLOADS_DIR      the file drop served at /<user>/downloads/
 #                                 (empty = no drop, so the route 404s)
+#   AGENT_BOX_UPLOADS_DIR        destination for temporary-link uploads
+#   AGENT_BOX_RECEIVE_STATE_DIR  capability records and partial-file state
 #   AGENT_BOX_SETTINGS_PORT      dev fallback TCP port on 127.0.0.1
 #                                 (ignored when socket-activated)
 #   AGENT_BOX_TMUX_SOCKET        tmux -L socket name (e.g. agent-box)
@@ -68,6 +70,8 @@
 #                                 sign-in cards (claude, codex, github)
 #   AGENT_BOX_PORTAL_ISSUER      portal handover (issue #541): the `iss`
 #                                 a handover token must carry
+#   AGENT_BOX_PORTAL_REDIRECT_URL  optional return link for the 401 page
+#                                 (defaults to the issuer's origin)
 #   AGENT_BOX_PORTAL_JWKS_URL    where the portal publishes its signing
 #                                 keys; defaults to the issuer's
 #                                 /.well-known/jwks.json
@@ -85,6 +89,7 @@
 
 import base64
 import contextlib
+import email.utils
 import errno
 import fcntl
 import functools
@@ -109,6 +114,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 
@@ -267,6 +273,7 @@ HOOK_SPAWN_CMD = os.environ.get("AGENT_BOX_HOOK_SPAWN_CMD", "")
 # whether THIS user declares exactly that (sub, project) pair below. The
 # signature only proves the portal said it.
 PORTAL_ISSUER = os.environ.get("AGENT_BOX_PORTAL_ISSUER", "")
+PORTAL_REDIRECT_URL = os.environ.get("AGENT_BOX_PORTAL_REDIRECT_URL", "")
 # Where the portal publishes its signing keys. Derived from the ISSUER, not
 # from anything in the token: a `jku`/`kid` that could point the box at a
 # key server of the caller's choosing would make the signature check
@@ -280,6 +287,9 @@ PORTAL_JWKS_URL = os.environ.get("AGENT_BOX_PORTAL_JWKS_URL", "") or (
 # expires anyway, so this is the ceiling on how long a WITHDRAWN key stays
 # usable rather than how quickly a new one is picked up.
 JWKS_TTL = 3600
+# Hard ceiling on trusting a cached key set, outage or not (issue #634):
+# the TTL plus one hour of grace for a portal that is briefly unreachable.
+JWKS_MAX_STALE = 2 * JWKS_TTL
 # Floor between refetches triggered by an unknown `kid`. Without it the
 # unauthenticated handover route is an outbound-request amplifier: a caller
 # minting tokens with random `kid`s would have the box hammer the portal.
@@ -412,8 +422,8 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,%d}\Z" % NAME_MAX)
 # slash, which is the one shape a session path cannot be told apart from.
 # Mirrored by the CLI's own check and by the module's session-name
 # assertion, so a name is refused wherever it is typed.
-RESERVED_NAMES = frozenset(("settings", "downloads", "webhook", "sessions",
-                            "token", "ws", "auth"))
+RESERVED_NAMES = frozenset(("settings", "downloads", "receive", "webhook",
+                            "sessions", "token", "ws", "auth"))
 # Subscription topics: "source:owner/repo", or the prefix "source:owner/*"
 # (local-webhook 0.13.0 dropped "*" and "source:*" as topics). The
 # panel only ever posts back a topic it just rendered, and the CLI is
@@ -436,6 +446,11 @@ SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 HOME_DIR = os.path.realpath(
     os.environ.get("HOME") or os.path.expanduser("~" + USER)
 )
+
+# Temporary upload capabilities share their on-disk protocol with the CLI
+# that mints and revokes them. The include sits after HOME_DIR because that
+# is the one host-provided value the shared library deliberately consumes.
+@@include-verbatim:lib/receive.py@@
 
 
 def session_url(name):
@@ -563,6 +578,17 @@ def read_profiles():
             "env": sorted(k for k in data if k not in PROFILE_RESERVED),
         }
     return out
+
+
+def profile_env_key_error(key):
+    """Validate custom environment names consistently for both profile forms."""
+    if key in PROFILE_RESERVED:
+        return "%s is already a profile option. Set it in the form above." % (
+            PROFILE_RESERVED_LABELS.get(key, "That name"))
+    if not KEY_RE.match(key):
+        return ("Invalid setting name. Use letters, digits and underscores; "
+                "do not start with a digit.")
+    return None
 
 
 def profile_write(name, assignments, drop=(), must_exist=False):
@@ -993,6 +1019,8 @@ def ensure_harness_profile(agent):
 
 
 def ensure_harness_session(agent, remote_control, only_rc=False,
+                           remote_control_daemon=False,
+                           remote_control_server=False,
                            raise_capacity=False):
     """Auto-start one session for `agent` the moment its connect card
     signs in (issue #504), so install+login leaves an actual running
@@ -1008,20 +1036,19 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
     default exists, the starter becomes it; an existing default is a user
     choice and is never replaced.
 
-    `remote_control` is the one thing that differs by harness. claude's rc
-    is a flag on the ordinary TUI (supervisor.sh appends --remote-control),
-    so this session is both a normal worker AND immediately visible to
-    desktop/mobile. codex's rc replaces the process outright with the
-    app-server pairing daemon (codex-remote-control.sh). The connect card
+    `remote_control` defaults to each harness's original behavior. Claude's
+    is a flag on the ordinary TUI, so that session is both a normal worker
+    AND immediately visible to desktop/mobile. `remote_control_daemon` selects
+    the persistent process shared by the harness's app-created conversations.
+    `remote_control_server` remains a compatibility input for Claude. Codex's
+    legacy remote_control=true also selects its app-server pairing daemon
+    (codex-remote-control.sh). The connect card
     only SIGNS IN (`codex login --device-auth`); it pairs nothing. Pairing
     is the /codex/pairing API below, or Enter in an rc session's pane. So
     by default what closes issue #504's "a codex session running" is a real
     interactive session (remoteControl: false), and a box configured with
-    AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control gets the daemon instead
-    (issue #780). Written directly here rather than
-    through session-cli.sh/`/sessions/add`, both of which still hardcode
-    remoteControl: true unconditionally -- neither writer offers a way to
-    ask for false today.
+    AGENT_BOX_CODEX_SESSION_DEFAULT=daemon gets the daemon instead (issue
+    #780). The legacy `remote-control` value remains accepted.
 
     `only_rc` narrows "already has a session" to "already has a REMOTE-CONTROL
     one", for the pairing API (issue #780): a TUI codex session cannot be
@@ -1037,16 +1064,14 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
         # Profile storage failure must not undo a successful login or
         # prevent its worker from starting.
         pass
-    if agent == "codex" and remote_control:
-        # A remote-control codex session is the pairing daemon, which has no
-        # model, effort or profile of its own. The ensured profile still
-        # remains available (and can be the default) for worker sessions.
+    daemon = bool(remote_control_daemon or remote_control_server
+                  or (agent == "codex" and remote_control))
+    if daemon:
+        # A Remote Control server has no worker profile of its own. The
+        # connected app selects a conversation's model and settings. The
+        # ensured profile remains available as the default for normal workers.
         profile, args = None, []
     try:
-        # Read before the lock (issue #748): capacity_check's tmux spawn must
-        # not run while holding sessions_lock(), or a slow/contended tmux
-        # starves every other writer waiting on the same lock.
-        live = capacity_live_checked()
         with sessions_lock():
             sessions, version = load_sessions()
             if only_rc:
@@ -1056,9 +1081,11 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                 # that rather than wait on a daemon nobody will start.
                 rc = [s for s in sessions.values()
                       if isinstance(s, dict) and s.get("agent") == agent
-                      and s.get("remoteControl") is not False]
+                      and session_is_daemon(s)]
                 if rc and all(s.get("stopped") for s in rc):
                     rc[0].pop("stopped", None)
+                    rc[0].pop("hibernatedAt", None)
+                    rc[0].pop("hibernationGeneration", None)
                     write_sessions(sessions, version)
                 if rc:
                     return
@@ -1066,12 +1093,14 @@ def ensure_harness_session(agent, remote_control, only_rc=False,
                      for s in sessions.values()):
                 return
             name = gen_session_name(agent, sessions)
-            capacity_check(sessions, [name], live=live,
-                           exempt=[name] if agent == "shell" else ())
             sessions[name] = {
                 "agent": agent,
                 "skipPermissions": True,
                 "remoteControl": remote_control,
+                "remoteControlDaemon": daemon,
+                # Compatibility for releases before issue #915.
+                "remoteControlServer": bool(remote_control_server
+                                            or (daemon and agent == "claude")),
                 "remoteControlName": None,
                 "workingDirectory": None,
                 "extraArgs": args,
@@ -1384,6 +1413,11 @@ def transcript_of(name, entry):
     The launch id comes from the supervisor's own state file, falling back
     to the registry copy for a session that last spawned before #282 (and
     for the id `agent-box-session add` mints up front)."""
+    if (entry or {}).get("agent") == "claude" and session_is_daemon(entry):
+        # One Claude server owns several Claude-native conversations. The
+        # agent-box launch id identifies the server pane, not any one of
+        # those transcripts, so there is no honest single download target.
+        return None
     box_id = read_launch_id(name) or str((entry or {}).get("boxSessionId") or "")
     if not UUID_RE.match(box_id):
         # Never spawned, or a hand-written record: no id, so no transcript
@@ -1422,6 +1456,24 @@ def transcript_of(name, entry):
     except OSError:
         return None
     return path, info.st_size, info.st_mtime
+
+
+def claude_custom_title(path):
+    """The title a user gave a claude conversation with /rename, or from the
+    desktop app (issue #935), or "". claude rewrites
+    <projects>/<key>/<id>/custom-title.json on every rename (issue #587);
+    `path` is that conversation's <id>.jsonl. Only the explicit title is
+    read: the transcript's own custom-title lines are re-appended at each
+    start and the AI-generated title changes by itself. The file holds one
+    short object; the 64 KiB cap only bounds a corrupt or hostile file."""
+    base = os.path.splitext(path)[0]
+    try:
+        with open(os.path.join(base, "custom-title.json"), "rb") as handle:
+            record = json.loads(handle.read(65536))
+    except (OSError, ValueError, RecursionError):
+        return ""
+    title = record.get("customTitle") if isinstance(record, dict) else None
+    return " ".join(title.split()) if isinstance(title, str) else ""
 
 
 def human_size(size):
@@ -1834,6 +1886,8 @@ def webhook_save(form):
         return False
     if name and not WATCH_NAME_RE.fullmatch(name):
         return False
+    if topic.lower().startswith("email:") and name == "email-address":
+        return False
     if profile and (not PROFILE_NAME_RE.fullmatch(profile)
                     or profile not in read_profiles()):
         return False
@@ -1925,15 +1979,16 @@ def render_watch_editor(entry=None):
     else:
         fields += ('<p class="note">This unnamed rule keeps its existing event policy. '
                    'Add a named rule to choose different events.</p>')
+    wrapper = ('<div id="watch-editor" class="editor watch-editor">' if creating else
+               '<details class="watch-editor" data-fold="watch-editor-%s-%s">'
+               '<summary>Edit rule</summary>' % (esc(topic), esc(name)))
     return (
-        '<details class="watch-editor" data-fold="watch-editor-%s-%s">'
-        '<summary>%s</summary><form method="post" action="%s/webhooks/save">'
+        wrapper + '<form method="post" action="%s/webhooks/save">'
         '%s<p class="note">The first matching rule in the list wins. '
         'Choose events that do not overlap with earlier rules, including wildcard rules. '
         'Existing sessions that claimed the work still receive it.</p>'
-        '<button class="btn" type="submit">Save rule</button></form></details>'
-        % (esc(topic), esc(name), "Add automatic session rule" if creating else "Edit rule",
-           esc(BASE), fields))
+        '<button class="btn" type="submit">Save rule</button></form>%s'
+        % (esc(BASE), fields, "</div>" if creating else "</details>"))
 
 
 def hook_args_stamp():
@@ -2985,6 +3040,17 @@ def defang_stored_env():
     }
 
 
+def session_is_daemon(entry):
+    """Recognize the canonical daemon bit and both pre-#915 encodings."""
+    if not isinstance(entry, dict):
+        return False
+    agent = entry.get("agent")
+    return (entry.get("remoteControlDaemon") is True
+            or (agent == "claude"
+                and entry.get("remoteControlServer") is True)
+            or (agent == "codex" and entry.get("remoteControl") is True))
+
+
 def defang_workspaces():
     """Workspace rows with the Station's explicit selection marked current.
 
@@ -3305,16 +3371,20 @@ def connect_signed_in(flow):
     if signed_in_at is not None and flow_id in RELOGIN_CONFIG_DIRS:
         restart_login_sessions(flow, signed_in_at)
     # One session per harness, started the moment sign-in lands (issue
-    # #504). The sign-in pane only signs in; it never paired anything. So
-    # codex gets an interactive worker session (remote_control=False) unless
-    # the box asks for remote control (issue #780), whose daemon is what the
-    # Codex apps can see. claude's rc is a flag on the same worker session,
-    # so one session covers both being usable AND remote-visible.
+    # #504). The sign-in pane only signs in; it never paired anything. Each
+    # harness keeps its interactive default. A runtime env setting can
+    # instead make the completed sign-in start the explicit server entry,
+    # whose app-created conversations are intentionally not agent-box rows.
     if flow_id == "claude":
-        return ensure_harness_session("claude", remote_control=True)
+        daemon = claude_session_default() == "daemon"
+        return ensure_harness_session(
+            "claude", remote_control=True,
+            remote_control_daemon=daemon,
+            remote_control_server=daemon)
     if flow_id == "codex":
         return ensure_harness_session(
-            "codex", remote_control=codex_session_default() == "remote-control")
+            "codex", remote_control=codex_session_default() == "daemon",
+            remote_control_daemon=codex_session_default() == "daemon")
     return None
 
 
@@ -3332,6 +3402,7 @@ def connect_signed_in(flow):
 # lives in _codex_pairing in memory and is never logged, written to disk,
 # put in an error string, or echoed to the pane.
 
+CLAUDE_SESSION_DEFAULT_KEY = "AGENT_BOX_CLAUDE_SESSION_DEFAULT"
 CODEX_SESSION_DEFAULT_KEY = "AGENT_BOX_CODEX_SESSION_DEFAULT"
 CODEX_START_MIN_INTERVAL = 5.0
 CODEX_CACHE_TTL = 2.0
@@ -3351,7 +3422,7 @@ CODEX_REDACT_RES = (
 
 
 def codex_session_default():
-    """"remote-control" or "tui": what a finished Codex sign-in starts.
+    """"daemon" or "tui": what a finished Codex sign-in starts.
 
     A runtime setting read from the env store (the module deliberately has no
     option for it: `agent-box-session env set` needs no root and no rebuild).
@@ -3363,7 +3434,22 @@ def codex_session_default():
         value = as_dict(load(ENV_FILE)).get(CODEX_SESSION_DEFAULT_KEY, "")
     except (OSError, ValueError):
         pass
-    return "remote-control" if value.strip() == "remote-control" else "tui"
+    return "daemon" if value.strip() in ("daemon", "remote-control") else "tui"
+
+
+def claude_session_default():
+    """"daemon" or "tui": what a finished Claude sign-in starts.
+
+    The default stays the interactive TUI with its additive Remote Control
+    flag. This opt-in mirrors AGENT_BOX_CODEX_SESSION_DEFAULT without
+    reinterpreting existing Claude sessions after an update.
+    """
+    value = ""
+    try:
+        value = as_dict(load(ENV_FILE)).get(CLAUDE_SESSION_DEFAULT_KEY, "")
+    except (OSError, ValueError):
+        pass
+    return "daemon" if value.strip() in ("daemon", "remote-control") else "tui"
 
 
 def codex_redact(text):
@@ -3380,8 +3466,15 @@ def codex_redact(text):
     return CONNECT_SECRET_RE.sub("[redacted]", text)[:CODEX_ERROR_MAX]
 
 
+@@include-verbatim:lib/codex-pairing-errors.py@@
+
+
 class CodexRpcError(Exception):
     """A control-socket call that failed. str() is already redacted."""
+
+    def __init__(self, message):
+        self.error_code = codex_pairing_error_code(message)
+        super().__init__(codex_redact(message) or "request failed")
 
 
 def _codex_recv_exact(sock, count):
@@ -3477,9 +3570,9 @@ def codex_rc_rpc(socket_path, method, params=None, timeout=10):
                     continue    # a notification, not our answer
                 if "error" in reply:
                     detail = reply["error"]
-                    raise CodexRpcError(codex_redact(
+                    raise CodexRpcError(
                         detail.get("message") if isinstance(detail, dict)
-                        else detail) or "request failed")
+                        else detail)
                 return reply.get("result")
 
         call(1, "initialize", {
@@ -3501,7 +3594,7 @@ def codex_rc_rpc(socket_path, method, params=None, timeout=10):
 _codex_lock = threading.Lock()
 _codex_pairing = {
     "manual_code": None, "environment_id": None, "expires_at": None,
-    "claimed": False, "error": None, "started_at": None,
+    "claimed": False, "error": None, "error_code": None, "started_at": None,
     "last_start": 0.0, "last_poll": 0.0,
     # Bumped by every start and cancel. A start holds no lock while it waits
     # for the daemon, so it only writes its result if nothing superseded it:
@@ -3542,7 +3635,7 @@ def codex_cached(slot, fetch):
 
 
 def codex_status(flow):
-    """("ok", status dict) | ("down", None) | ("error", message)."""
+    """("ok", status dict) | ("down", None) | ("error", CodexRpcError)."""
     def fetch():
         sock = codex_control_socket(flow)
         if sock is None:
@@ -3550,7 +3643,7 @@ def codex_status(flow):
         try:
             return ("ok", codex_rc_rpc(sock, "remoteControl/status/read"), sock)
         except CodexRpcError as exc:
-            return ("error", str(exc), sock)
+            return ("error", exc, sock)
     return codex_cached("status", fetch)
 
 
@@ -3586,7 +3679,7 @@ def codex_pairing_state(flow):
     status = connect_status(flow) if flow["bin"] else (False, "")
     signed_in = bool(status and status[0])
     out = {"state": "signed_out", "server_name": None, "code": None,
-           "expires_at": None, "error": None, "devices": [],
+           "expires_at": None, "error": None, "error_code": None, "devices": [],
            "devices_error": None}
     if status is None:
         out["state"] = "starting"
@@ -3603,9 +3696,10 @@ def codex_pairing_state(flow):
             out["devices"], out["devices_error"] = codex_devices(sock, env_id)
     now = time.time()
     if rec["error"]:
-        out.update(state="failed", error=rec["error"])
+        out.update(state="failed", error=rec["error"],
+                   error_code=rec["error_code"])
     elif kind == "error":
-        out.update(state="failed", error=info)
+        out.update(state="failed", error=str(info), error_code=info.error_code)
     elif kind == "down":
         began = rec["started_at"]
         if began is not None and time.monotonic() - began > CODEX_STARTING_GRACE:
@@ -3668,6 +3762,7 @@ def codex_pairing_start(flow):
         _codex_pairing["last_start"] = time.monotonic()
         _codex_pairing.update(manual_code=None, environment_id=None,
                               expires_at=None, claimed=False, error=None,
+                              error_code=None,
                               started_at=time.monotonic())
         _codex_pairing["gen"] += 1
         gen = _codex_pairing["gen"]
@@ -3717,6 +3812,7 @@ def codex_pairing_start(flow):
         with _codex_lock:
             if _codex_pairing["gen"] == gen:
                 _codex_pairing["error"] = str(exc)
+                _codex_pairing["error_code"] = exc.error_code
         return 303, ""
     code = (result or {}).get("manualPairingCode")
     with _codex_lock:
@@ -3739,7 +3835,7 @@ def codex_rc_session_crashed():
         return False
     rc = [s for s in sessions.values()
           if isinstance(s, dict) and s.get("agent") == "codex"
-          and s.get("remoteControl") is not False]
+          and session_is_daemon(s)]
     return bool(rc) and all(crashed_status(s) is not None for s in rc)
 
 
@@ -3748,7 +3844,7 @@ def codex_pairing_cancel():
         _codex_pairing["gen"] += 1
         _codex_pairing.update(manual_code=None, environment_id=None,
                               expires_at=None, claimed=False, error=None,
-                              started_at=None)
+                              error_code=None, started_at=None)
 
 
 def codex_device_revoke(flow, client_id):
@@ -4307,6 +4403,9 @@ def session_counts():
     }
 
 
+@@include:lib/resources.py@@
+
+
 def status_payload():
     """Compact JSON the settings page long-polls for restart/update
     progress, and connectPoll checks before fetching the full page.
@@ -4340,6 +4439,25 @@ EVENTS_TICK = 1.0         # how often the watcher samples session state
 EVENTS_SLICE = 1.0        # how often a stream re-checks that its client is there
 EVENTS_KEEPALIVE = 20.0   # comment frame so idle proxies keep the stream
 EVENTS_MAX_STREAMS = 8    # a stream costs a thread; past this, clients poll
+# Two more topics share the stream, each on its own clock, and a stream
+# names the ones it wants (?topics=resources,connect). Without the
+# parameter it gets "sessions" alone, which is all an older page knew.
+#
+#   resources - the Resource usage panel's numbers, sent whole (host
+#               readings only, the same JSON {BASE}/resources answers).
+#               Replaces the page's 5s poll of that route.
+#   connect   - the sign-in cards' fingerprint (connect_fingerprint()).
+#               Replaces the 2.5s {BASE}/status poll a busy card ran.
+#
+# connect_state() is not a pure read: it answers a CLI's prompt, reaps a
+# finished pane and expires a stale one. So it is sampled only while a sign-in
+# is in flight, which is when the poll it replaces used to run: a render that
+# shows a busy card opens a CONNECT_ACTIVE window, a sample that still finds
+# one busy extends it, and once every card has settled sampling stops.
+EVENTS_TOPICS = ("sessions", "resources", "connect")
+EVENTS_RESOURCES_TICK = 5.0
+EVENTS_CONNECT_TICK = 2.5
+EVENTS_CONNECT_ACTIVE = 15.0
 
 
 def session_view():
@@ -4392,10 +4510,9 @@ def session_list_payload():
     limit = capacity["max"]
     pending = {n for n, e in sessions.items() if e.get("stopped") is not True}
     died = {n for n, e in sessions.items() if crashed_status(e) is not None}
-    shells = {n for n, e in sessions.items() if e.get("agent") == "shell"}
     # The same admission order capacity_check's spawn branch uses: a pending
     # name past the free slots is queued, not starting.
-    unmetered = died | shells
+    unmetered = capacity_unmetered(sessions, live)
     admitted = live | unmetered | set(
         sorted(pending - live - unmetered)[
             :max(0, limit - len(live - unmetered))])
@@ -4427,6 +4544,8 @@ def session_list_payload():
             "exit_status": crashed_status(entry) if state == "died" else None,
             "origin": origin if origin in SESSION_ORIGINS else None,
             "remote_control": entry.get("remoteControl") is not False,
+            "remote_control_daemon": session_is_daemon(entry),
+            "remote_control_server": entry.get("remoteControlServer") is True,
             "remote_control_name": rc_name if isinstance(rc_name, str) else None,
             "working_directory": cwd if isinstance(cwd, str) and cwd else os.path.expanduser("~"),
             "ephemeral": entry.get("ephemeral") is True,
@@ -4446,50 +4565,101 @@ def session_fingerprint():
     return hashlib.sha256(raw).hexdigest()[:16]
 
 
+def connect_busy(states):
+    """True while any sign-in card is mid-flow (its pane is live, or its
+    exchange is still unconfirmed): the states the page keeps watching."""
+    return any(
+        s["state"] in ("starting", "waiting", "checking", "exchanging")
+        for s in states)
+
+
+def connect_sample():
+    """(fingerprint, busy) of every sign-in card, sharing one env read and
+    one `tmux list-sessions` between them as render_connect() does."""
+    flows = connect_flows()
+    if not flows:
+        return "", False
+    keys = read_keys()
+    tmux_state = tmux_sessions()
+    states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
+              for flow in flows]
+    return connect_fingerprint(states), connect_busy(states)
+
+
+def parse_topics(value):
+    """The topics one stream asked for; "sessions" when it named none."""
+    wanted = tuple(t for t in EVENTS_TOPICS
+                   if t in re.split(r"[\s,]+", value or ""))
+    return wanted or ("sessions",)
+
+
 class SessionWatcher:
     """One sampler thread shared by every open stream.
 
     A sample forks `tmux list-sessions`, so sampling per client would
     scale with open browser tabs; instead a single thread samples while
     at least one stream is connected and hands them all the same
-    fingerprint through a condition variable. With nothing connected the
+    values through a condition variable. With nothing connected the
     thread exits, so an idle box spawns nothing at all.
+
+    `values` maps each topic to the frame payload last sampled for it
+    ("" until the first sample). `seq` moves whenever any of them changes;
+    each stream remembers what it last sent per topic and sends only the
+    topics it follows that moved. A topic nobody follows is not sampled.
     """
 
     def __init__(self):
         self.cond = threading.Condition()
-        self.fingerprint = ""
+        self.values = {topic: "" for topic in EVENTS_TOPICS}
         self.seq = 0
         self.streams = 0
+        self.wants = {topic: 0 for topic in EVENTS_TOPICS}
+        self.connect_until = 0.0
         self.thread = None
 
-    def subscribe(self):
-        """Reserve a stream slot. Returns (sequence, fingerprint) to start
-        from, or None when EVENTS_MAX_STREAMS are already open. The
-        fingerprint is empty until the first sample lands."""
+    @property
+    def fingerprint(self):
+        return self.values["sessions"]
+
+    def subscribe(self, topics=("sessions",)):
+        """Reserve a stream slot. Returns (sequence, values) to start
+        from, or None when EVENTS_MAX_STREAMS are already open. A value is
+        empty until the first sample of its topic lands."""
         with self.cond:
             if self.streams >= EVENTS_MAX_STREAMS:
                 return None
             self.streams += 1
+            for topic in topics:
+                self.wants[topic] += 1
             if self.thread is None:
                 self.thread = threading.Thread(target=self._sample, daemon=True)
                 self.thread.start()
-            return self.seq, self.fingerprint
+            return self.seq, dict(self.values)
 
-    def release(self):
+    def release(self, topics=("sessions",)):
         with self.cond:
             self.streams -= 1
+            for topic in topics:
+                self.wants[topic] -= 1
 
     def wait(self, seq, timeout):
-        """Block until the fingerprint changes or timeout expires, then
-        return (sequence, fingerprint). An unchanged sequence means the
-        caller timed out and should send a keep-alive."""
+        """Block until a value changes or timeout expires, then return
+        (sequence, values). An unchanged sequence means the caller timed
+        out and should send a keep-alive."""
         with self.cond:
             if self.seq == seq:
                 self.cond.wait(timeout)
-            return self.seq, self.fingerprint
+            return self.seq, dict(self.values)
+
+    def connect_active(self):
+        """A sign-in is in flight: sample the cards for the next
+        EVENTS_CONNECT_ACTIVE seconds. Cheap, and safe to call from any
+        render; it starts nothing when no stream follows the cards."""
+        with self.cond:
+            self.connect_until = time.monotonic() + EVENTS_CONNECT_ACTIVE
 
     def _sample(self):
+        next_resources = next_connect = 0.0
         while True:
             with self.cond:
                 if not self.streams:
@@ -4498,10 +4668,40 @@ class SessionWatcher:
                     # subscribe() racing in to start a fresh thread.
                     self.thread = None
                     return
-            current = session_fingerprint()
+                want_sessions = self.wants["sessions"] > 0
+                want_resources = self.wants["resources"] > 0
+                want_connect = (self.wants["connect"] > 0
+                                and time.monotonic() < self.connect_until)
+            updates = {}
+            if want_sessions:
+                updates["sessions"] = session_fingerprint()
+            now = time.monotonic()
+            # A failure in either extra topic must not end this thread: it
+            # would stay registered as running and no stream would ever
+            # hear of a session change again.
+            if want_resources and now >= next_resources:
+                next_resources = now + EVENTS_RESOURCES_TICK
+                try:
+                    updates["resources"] = json.dumps(
+                        resources_payload(), sort_keys=True,
+                        separators=(",", ":"))
+                except Exception:
+                    pass
+            if want_connect and now >= next_connect:
+                next_connect = now + EVENTS_CONNECT_TICK
+                try:
+                    fingerprint, busy = connect_sample()
+                    updates["connect"] = json.dumps(
+                        {"fp": fingerprint}, separators=(",", ":"))
+                    if busy:
+                        self.connect_active()
+                except Exception:
+                    pass
             with self.cond:
-                if current != self.fingerprint:
-                    self.fingerprint = current
+                changed = {topic: value for topic, value in updates.items()
+                           if value != self.values[topic]}
+                if changed:
+                    self.values.update(changed)
                     self.seq += 1
                     self.cond.notify_all()
             time.sleep(EVENTS_TICK)
@@ -4578,6 +4778,32 @@ STYLE = """<style>
 # assumed to load. Keep its palette and type scale aligned with the settings
 # and workspace pages without making a second request.
 AUTH_REQUIRED_BODY = """<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p></section></main></body></html>"""
+
+# The portal link (issue #937) the Caddy 401 page carries too, for a revoked
+# or expired portal session: forward_auth passes this daemon's refusal
+# through without Caddy's own error handler. Only the issuer's origin is
+# linked, and only when it is a plain http(s) origin.
+_PORTAL_ORIGIN_RE = (
+    r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])"
+    r"(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|"
+    r"[1-5]?[0-9]{1,4}))?)")
+# Same rules as the Caddy page (portal_hint / portalHint): a configured
+# return URL keeps its path, query and fragment; unset falls back to the
+# issuer's origin. Anything that could escape the attribute is refused.
+if PORTAL_REDIRECT_URL:
+    _PORTAL_TARGET = (PORTAL_REDIRECT_URL if re.fullmatch(
+        _PORTAL_ORIGIN_RE
+        + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?",
+        PORTAL_REDIRECT_URL) else "")
+else:
+    _m = re.fullmatch(_PORTAL_ORIGIN_RE + r"(?:[/?#].*)?", PORTAL_ISSUER)
+    _PORTAL_TARGET = _m.group(1) if _m else ""
+if _PORTAL_TARGET:
+    AUTH_REQUIRED_BODY = AUTH_REQUIRED_BODY.replace(
+        "</section>",
+        "<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
+        "style='color:#58a6ff'>Open this box from your portal page</a></p>"
+        "</section>" % html.escape(_PORTAL_TARGET, quote=True))
 
 # Shared by the settings-page and workspace add forms so their layout,
 # accessibility, and autocomplete behaviour cannot drift apart.
@@ -4665,17 +4891,21 @@ PROFILES_SECTION_TPL = """<section>
           <textarea name="SYSTEM_PROMPT" rows="2" spellcheck="false"
                     placeholder="instructions (optional) &mdash; used for every session with this profile"></textarea>
         </div>
-        <div class="row env-row">
-          <input type="text" name="key" placeholder="KEY_NAME (optional)"
-                 pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off"
-                 aria-label="Environment setting name">
-          <input type="password" name="value" placeholder="value"
-                 autocomplete="off" aria-label="Value for that setting">
+        <div data-profile-env-rows>
+          <div class="row env-row" data-profile-env-row>
+            <input type="text" name="env_key_0" placeholder="KEY_NAME (optional)"
+                   pattern="[A-Za-z_][A-Za-z0-9_]*" autocomplete="off"
+                   aria-label="Environment setting name">
+            <input type="password" name="env_value_0" placeholder="value"
+                   autocomplete="off" aria-label="Value for that setting">
+            <button type="button" class="btn" data-remove-profile-env>Remove</button>
+          </div>
         </div>
-        <p class="note">Saving a profile with the same name replaces it.
-        Leave an optional field blank to remove its current value. Add a
-        starting environment setting above, or more from the profile&rsquo;s
-        own row below once it is saved.</p>
+        <button type="button" class="btn" data-add-profile-env>Add setting</button>
+        <p class="note">Saving a profile with the same name updates it.
+        Leave an optional launch field blank to remove its current value.
+        Sessions under the same account can access one another&rsquo;s values;
+        profiles do not separate trusted and untrusted work.</p>
         <div class="row profile-actions">
           <button type="submit" class="btn">Save</button>
         </div>
@@ -4871,6 +5101,17 @@ BODY = """<main>
   <a class="back" href="{term_home}">&larr; workspace</a>
   <h1><span class="mark">{mark}</span>Settings</h1>
   <div id="msg-slot">{message}</div>
+  <section aria-labelledby="resource-usage" data-resources-url="{base}/resources">
+    <h2 id="resource-usage">Resource usage<a class="heading-anchor" href="#resource-usage" aria-label="Copy link to Resource usage" title="Copy link to Resource usage"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
+    <p class="note">Box CPU, memory and disk; hook session slots. Manual sessions bypass the limit. Refreshes every 5 seconds.</p>
+    <dl class="resource-grid">
+      <div><dt>CPU</dt><dd data-resource="cpu">Loading...</dd></div>
+      <div><dt>Memory</dt><dd data-resource="memory">Loading...</dd></div>
+      <div><dt>Disk</dt><dd data-resource="disk">Loading...</dd></div>
+      <div><dt>Hook sessions</dt><dd data-resource="sessions">Loading...</dd></div>
+    </dl>
+    <noscript><p class="note">Enable JavaScript to view resource usage.</p></noscript>
+  </section>
   {connect_section}
   {sessions_section}
   {profiles_section}
@@ -4892,7 +5133,7 @@ BODY = """<main>
           <textarea name="value" class="secret-value" rows="2" spellcheck="false"
                     placeholder="value"
                     autocomplete="off" required></textarea>
-          <button type="submit" class="btn">Save</button>
+          <button type="submit" class="btn" data-busy-label="Saving&hellip;">Save</button>
         </div>
         <p class="note">Saving a secret with the same name replaces its
         current value. Stored values cannot be viewed from this page.
@@ -5179,7 +5420,14 @@ SHELL_PSEUDO_PROFILE = ":shell"
 # branch), not a codex profile with a flag flipped -- it has no model,
 # effort or profile of its own, since the paired client decides those -- so
 # it gets its own pseudo-profile rather than overloading a real one.
-CODEX_RC_PSEUDO_PROFILE = ":codex-remote-control"
+CODEX_DAEMON_PSEUDO_PROFILE = ":codex-daemon"
+CODEX_RC_PSEUDO_PROFILE = ":codex-remote-control"  # compatibility
+
+# Claude's persistent server is also not a worker profile. Keep it distinct
+# from the older `--remote-control` TUI behavior so existing sessions do not
+# change programs when this feature lands (issue #383).
+CLAUDE_DAEMON_PSEUDO_PROFILE = ":claude-daemon"
+CLAUDE_RC_PSEUDO_PROFILE = ":claude-remote-control"  # compatibility
 
 
 def render_profile_options(profiles):
@@ -5207,14 +5455,20 @@ def render_profile_options(profiles):
     socket activated with stopIfChanged = false, so a daemon that survived
     an update can still be running on the environment it started with - and
     on one that predates AGENT_BOX_PROFILE_BIN every pick would fail. Such a
-    daemon can still start a shell, which is the one entry needing no
-    resolver, and says why the rest are missing.
+    daemon can still start the standalone Remote Control servers or a shell,
+    none of which needs a resolver, and says why the profiles are missing.
     """
     shell_opt = ('<option value="%s">shell (no assistant)</option>'
                  % SHELL_PSEUDO_PROFILE)
+    standalone = []
+    if "codex" in AGENTS:
+        standalone.append('<option value="%s">codex daemon (Remote Control, no profile)</option>' % CODEX_DAEMON_PSEUDO_PROFILE)
+    if "claude" in AGENTS:
+        standalone.append('<option value="%s">claude daemon (Remote Control, no profile)</option>' % CLAUDE_DAEMON_PSEUDO_PROFILE)
+    standalone.append(shell_opt)
     if not PROFILE_BIN:
         return ('<option value="" disabled selected>Restart the settings '
-                'service to list profiles</option>' + shell_opt)
+                'service to list profiles</option>' + "".join(standalone))
     default = default_profile(profiles)
     items = ['<option value="" disabled%s>Choose a profile</option>'
              % ("" if default else " selected")]
@@ -5226,11 +5480,9 @@ def render_profile_options(profiles):
             label += ", default"
         sel = " selected" if name == default else ""
         items.append(f'<option value="{safe}"{sel}>{label}</option>')
-    if "codex" in AGENTS:
-        # A real codex profile always opens the interactive TUI now (issue
-        # #623); the daemon is offered here instead, as its own entry.
-        items.append('<option value="%s">codex remote control (pairing daemon, no profile)</option>' % CODEX_RC_PSEUDO_PROFILE)
-    items.append(shell_opt)
+    # Real profiles open interactive workers; the standalone servers and
+    # shell are their own entries, independent of the profile resolver.
+    items.extend(standalone)
     return "".join(items)
 
 
@@ -5719,6 +5971,10 @@ def render_sessions(subs=None):
                 prof_tag = (f'<span class="meta prof-tag" '
                             f'title="Agent profile it was started with">'
                             f'{pf}</span>')
+            if session_is_daemon(entries[name]):
+                prof_tag = ('<span class="meta prof-tag" '
+                            'title="App-created conversations are served '
+                            'behind this pane">daemon</span>')
             cwd = html.escape(display_cwd(entries[name].get("workingDirectory")))
             # stopped = listed but deliberately down (clean agent exit or
             # agent-box-session stop); the same route revives it.
@@ -5780,6 +6036,10 @@ def render_sessions(subs=None):
             # chromium, and the same rule the Restart button relies on).
             found = transcript_of(name, entries[name])
             topic = transcript_topic(found[0], found[1]) if found else ""
+            # A name the user chose beats the opening prompt as the answer
+            # to "which conversation is this" (issue #935).
+            if found and entries[name].get("agent") == "claude":
+                topic = claude_custom_title(found[0]) or topic
             if found:
                 # Both halves of "which conversation is this": the opening
                 # prompt and when the file was last appended to. html.escape
@@ -6149,6 +6409,8 @@ def render_webhooks(watches):
     stamp = hook_args_stamp()
     for entry in watches:
         topic = str(entry.get("topic") or "")
+        if topic.startswith("email:") and entry.get("name") == "email-address":
+            continue  # Managed together with SMTP acceptance in the address editor.
         if not topic:
             continue
         note = str(entry.get("note") or "")
@@ -6170,8 +6432,79 @@ def render_webhooks(watches):
         ))
     if not rows:
         rows.append('<li class="empty">No automatic session rules.</li>')
-    return ('<ul class="tbl"><li class="tbl-head">Automatic session rule</li>'
-            + "".join(rows) + "</ul>" + render_watch_editor())
+    return ('<div class="sec-head"><h3>Automatic session rules</h3>'
+            '<button type="button" class="btn" data-toggle="watch-editor" aria-controls="watch-editor" aria-expanded="true">Add rule</button></div>'
+            + render_watch_editor() + '<ul class="tbl">'
+            + "".join(rows) + "</ul>" + render_email_addresses())
+
+
+EMAIL_COMMAND = "/etc/agent-box/bin/agent-box-email"
+
+
+def email_cli(args):
+    """All Settings address changes use the same validated CLI as a session."""
+    return subprocess.run([EMAIL_COMMAND, "addresses", *args],
+                          capture_output=True, text=True, timeout=40)
+
+
+def render_email_addresses():
+    if not os.path.isfile("/etc/agent-box/email.json"):
+        return ""
+    try:
+        result = email_cli(["list"])
+        if result.returncode:
+            raise ValueError("email registry unavailable")
+        data = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return '<h3 id="email">Email addresses</h3><p class="note">Email addresses are unavailable.</p>'
+    esc = html.escape
+    profiles = read_profiles()
+
+    def editor(address="", route=None):
+        route = route or {}
+        selected = route.get("profile", "")
+        choices = sorted(set(profiles) | ({selected} if selected else set()))
+        options = '<option value="">Choose a profile</option>' + "".join(
+            '<option value="%s"%s>%s</option>' % (
+                esc(p), " selected" if p == selected else "",
+                esc(p + (" (missing)" if p not in profiles else ""))) for p in choices)
+        return (
+            '<form method="post" action="%s/email/set">' % esc(BASE)
+            + '<label>Email address<input name="address" type="email" required maxlength="320" value="%s" '
+              'placeholder="%s+github@%s"%s></label>' % (
+                  esc(address), esc(data["user"]), esc(data["domains"][0]), " readonly" if address else "")
+            + '<label>Purpose<input name="purpose" required maxlength="500" value="%s" '
+              'placeholder="Triage GitHub notifications"></label>' % esc(route.get("purpose", ""))
+            + '<label>Worker profile<select name="profile" required>%s</select></label>' % options
+            + '<label>Batching window (seconds)<input name="batch_seconds" type="number" required '
+              'min="1" max="3600" value="%s"></label>' % route.get("batchSeconds", 60)
+            + '<button class="btn small" type="submit">%s</button></form>' % (
+                "Save and enable" if address else "Add address"))
+
+    rows = []
+    for address, route in sorted(data["addresses"].items()):
+        safe = esc(address)
+        heading = (
+            '<li class="foldrow prof-row"><details class="watch-editor" data-fold="email-%s">'
+            '<summary><span class="nm"><code>%s</code></span><span class="meta">%s</span></summary>'
+        ) % (safe, safe, "Deferred" if route.get("pending") else "Receiving" if route["enabled"] else "Disabled")
+        disable = ""
+        if route["enabled"] or route.get("pending"):
+            disable = (
+                '<form method="post" action="%s/email/disable">' % esc(BASE)
+                + '<input type="hidden" name="address" value="%s">' % safe
+                + '<button class="btn small" type="submit">Disable reception</button></form>')
+        rows.append(heading + '<div class="fold"><p>%s</p>' % esc(route["purpose"])
+                    + editor(address, route) + disable + '</div></details></li>')
+    return ('<div class="sec-head"><h3 id="email">Email addresses</h3>'
+            '<button type="button" class="btn" data-toggle="email-editor" aria-controls="email-editor" aria-expanded="true">Add email address</button></div>'
+            '<p class="note">Only registered, enabled addresses receive mail. Each address has its own purpose '
+            'and worker profile. The batching window groups notifications before starting a session. '
+            'Disabling reception keeps the handler for mail already accepted. '
+            'An incomplete handler update defers new mail until it is saved successfully.</p>'
+            + '<div id="email-editor" class="editor watch-editor">' + editor() + '</div>'
+            + '<ul class="tbl">' + ("".join(rows) or '<li class="empty">No email addresses registered.</li>')
+            + '</ul>')
 
 
 def render_reboot_line():
@@ -6380,12 +6713,15 @@ def render_connect_step(state):
     )
     if flow_id == "whatsapp":
         if state["state"] == "waiting" and state["code"]:
+            code = state["code"]
+            shown = (code[:4] + "-" + code[4:]
+                     if re.fullmatch(r"[A-Z0-9]{8}", code) else code)
             return (
                 '<div class="conn-step"><p class="note">On your phone, open '
                 'WhatsApp &rarr; Linked devices &rarr; Link a device &rarr; '
                 'Link with phone number instead. Enter this code:</p>'
-                f'<p><code class="conn-code">{html.escape(state["code"])}</code>'
-                f'{copy_button("the pairing code", value=state["code"])}</p>'
+                f'<p><code class="conn-code">{html.escape(shown)}</code>'
+                f'{copy_button("the pairing code", value=code)}</p>'
                 f'{cancel}</div>'
             )
         if state["state"] in ("starting", "exchanging", "waiting"):
@@ -6405,19 +6741,27 @@ def render_connect_step(state):
         if state["detail"]:
             return ('<div class="conn-step"><p class="note">'
                     + html.escape(state["detail"]) + '</p></div>')
+        saved_phone = re.sub(
+            r"\D", "", as_dict(load(ENV_FILE)).get("LOCAL_WHATSAPP_PHONE", ""))
+        required = "" if 7 <= len(saved_phone) <= 15 else " required"
         return (
             f'<div class="conn-step"><form method="post" action="{base}/connect/start" '
             'class="row conn-form">'
             f'<input type="hidden" name="flow" value="{flow_id}">'
-            '<label class="field conn-field"><span class="note">Your WhatsApp '
-            'number, starting with + and country code</span>'
-            '<input type="tel" name="phone" autocomplete="off" '
-            'inputmode="tel" enterkeyhint="go" '
-            'placeholder="+1 (555) 123-2435" aria-label="WhatsApp phone number"></label>'
+            '<label class="field conn-field conn-country"><span class="note">Country code</span>'
+            '<input type="tel" name="phone_country" autocomplete="tel-country-code" '
+            'inputmode="tel" maxlength="4" pattern="\\+[0-9]{1,3}" '
+            f'placeholder="+1" aria-label="WhatsApp country calling code"{required}></label>'
+            '<label class="field conn-field conn-national"><span class="note">WhatsApp '
+            'number</span><input type="tel" name="phone" autocomplete="tel-national" '
+            'inputmode="tel" enterkeyhint="go" placeholder="(555) 123-2435" '
+            f'aria-label="WhatsApp national phone number"{required}></label>'
             f'{render_whatsapp_profile_field()}'
             '<button type="submit" class="btn">Pair device</button></form>'
-            '<p class="note">Phone punctuation is accepted. Leave the number blank to use '
-            '<code>LOCAL_WHATSAPP_PHONE</code> saved under Secrets.</p></div>'
+            '<p class="note">Enter a country code and phone number to pair a new number. '
+            'You can include punctuation. Keep the country code in its own field so '
+            'autofill leaves it in place. Leave both fields blank to use the number saved '
+            'under Secrets.</p></div>'
         )
     if state["state"] == "starting":
         verb = ("Installing" if not state["installed"]
@@ -6506,10 +6850,10 @@ def render_connect(flows=None):
     tmux_state = tmux_sessions()
     states = [connect_state(flow, keys=keys, tmux_state=tmux_state)
               for flow in flows]
-    busy = "1" if any(
-        s["state"] in ("starting", "waiting", "checking", "exchanging")
-        for s in states
-    ) else "0"
+    busy = "1" if connect_busy(states) else "0"
+    if busy == "1":
+        # The live feed watches the cards for as long as one is mid-flow.
+        WATCHER.connect_active()
     cards = "".join(render_connect_card(s) for s in states)
     section = CONNECT_SECTION_TPL.format(
         cards='<ul class="tbl">' + cards + "</ul>", busy=busy,
@@ -6620,7 +6964,12 @@ def render_tabs(names, live, stopped, died, selected):
         # the tab's own attribute order stays as it was.
         ps = pane_state(name, live, stopped)
         items.append(
-            f'<span class="tab-wrap">'
+            # This id is the tab's morph key, not a styling hook. Without a
+            # stable identity Idiomorph may reuse a deleted tab's focused
+            # close button for the next sibling. ignoreActiveValue then
+            # preserves that button's client-only "Close?" text while its
+            # data-close/label move to another session (issue #579).
+            f'<span class="tab-wrap" id="tab-wrap-{safe}">'
             f'<a class="tab" data-tab="{safe}" href="{home}?tab={safe}"{cur}'
             f' title="{tip}">'
             f'<span class="state" data-state="{state}"'
@@ -6847,7 +7196,36 @@ def render_head(title):
     )
 
 
-def render_page(message="", kind="ok", prefer_connect_feedback=False):
+# Partial page renders. Every action and every live-feed refresh used to
+# fetch the WHOLE settings page and then keep one or two of its regions:
+# saving one secret forked the webhook CLI once per session, the email CLI
+# and the WhatsApp bridge, for a list it then threw away - one to several
+# seconds per click, with nothing on screen to say a save was under way.
+# A request that names the regions it will keep, in this header, gets a
+# page with only those regions filled in; the rest render empty. The client
+# applies exactly the regions it asked for, so an empty one never reaches the
+# screen. No header (or no known name in it) is the full page, as before:
+# the no-JS form flow and every other client see no difference.
+SECTIONS_HEADER = "X-Agent-Box-Sections"
+PAGE_SECTIONS = frozenset((
+    "msg-slot", "secrets-list", "sessions-list", "profile-picker",
+    "profiles-list", "webhook-endpoint", "webhooks-list", "connect-list",
+))
+_request_local = threading.local()
+_FROM_REQUEST = object()
+
+
+def parse_sections(value):
+    """The known region ids named in a SECTIONS_HEADER value, or None (the
+    full page) when it names none."""
+    wanted = frozenset(
+        name for name in re.split(r"[\s,]+", value or "")
+        if name in PAGE_SECTIONS)
+    return wanted or None
+
+
+def render_page(message="", kind="ok", prefer_connect_feedback=False,
+                sections=_FROM_REQUEST):
     """Render settings, promoting any completed connection action to feedback.
 
     An explicit action message normally wins so an unrelated render cannot
@@ -6855,28 +7233,54 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False):
     exception: its URL remains in place while the connection poll runs, so the
     later completion result must replace it rather than stay hidden behind it.
     """
-    flows = connect_flows()
-    connect_section, connect_feedback = (
-        render_connect(flows) if flows else ("", [])
-    )
-    if connect_feedback and (not message or prefer_connect_feedback):
+    if sections is _FROM_REQUEST:
+        sections = getattr(_request_local, "sections", None)
+
+    def want(*ids):
+        return sections is None or not sections.isdisjoint(ids)
+
+    connect_section, connect_feedback = "", []
+    if want("connect-list"):
+        flows = connect_flows()
+        if flows:
+            connect_section, connect_feedback = render_connect(flows)
+    # Promoting a notice CONSUMES it, so only a response that carries the
+    # banner may take it; a cards-only render leaves it for the next one.
+    if connect_feedback and want("msg-slot") and (
+            not message or prefer_connect_feedback):
         message = take_connect_feedback(connect_feedback)
         kind = "ok"
     msg_html = render_msg(message, BASE + "/", kind)
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
     # rows and the standing watches must not each pay for their own.
-    unavailable = webhook_unavailable()
-    subs, watches = webhook_view() if not unavailable else (None, [])
+    # It is also the most expensive thing on the page, so a partial render
+    # that keeps none of the panels it feeds skips it entirely.
+    unavailable, subs, watches = "", None, []
+    if want("sessions-list", "profiles-list", "webhook-endpoint",
+            "webhooks-list"):
+        unavailable = webhook_unavailable()
+        if not unavailable and want("sessions-list", "profiles-list",
+                                    "webhooks-list"):
+            subs, watches = webhook_view()
     # One directory scan per render, feeding the picker in the Sessions row
     # and the panel below it — the same rule the subscription pass above
     # states, for the same reason.
-    profiles = read_profiles()
+    profiles = read_profiles() if want(
+        "sessions-list", "profile-picker", "profiles-list") else {}
     # Which of those profiles a standing watch is actually spending right
     # now (#582) - computed once here, from the same `watches` the webhooks
     # panel below already walks, so the profiles panel's delete warning and
     # that panel's per-row badge never disagree about what "in use" means.
-    usage = profile_usage(watches)
+    usage = profile_usage(watches) if want("profiles-list") else {}
+    if unavailable:
+        webhooks_section = WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)
+    elif want("webhook-endpoint", "webhooks-list"):
+        webhooks_section = WEBHOOKS_SECTION_TPL.format(
+            endpoint=render_webhook_endpoint() if want("webhook-endpoint") else "",
+            webhooks=render_webhooks(watches) if want("webhooks-list") else "")
+    else:
+        webhooks_section = ""
     return (
         render_head("Settings &mdash; " + html.escape(USER))
         + STYLE
@@ -6885,38 +7289,36 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False):
             base=html.escape(BASE),
             term_home=html.escape(TERM_HOME),
             mark=POTATO_SVG,
-            keys=render_keys(read_keys()),
+            keys=render_keys(read_keys()) if want("secrets-list") else "",
             # Every user, primary included: the HOME root page is the
             # terminal workspace, so session CRUD lives here.
-            sessions_section=render_sessions_section(subs, profiles),
+            sessions_section=(
+                render_sessions_section(subs, profiles)
+                if want("sessions-list", "profile-picker") else ""),
             profiles_section=PROFILES_SECTION_TPL.format(
                 base=html.escape(BASE),
                 harnesses=render_harness_options(),
                 effort=render_effort_options(),
                 profiles=render_profiles(profiles, usage),
                 modelhints=render_model_hints(profiles),
-            ),
-            webhooks_section=(
-                WEBHOOK_UNAVAILABLE_TPL.format(text=unavailable)
-                if unavailable else
-                WEBHOOKS_SECTION_TPL.format(
-                    endpoint=render_webhook_endpoint(),
-                    webhooks=render_webhooks(watches))
-            ),
+            ) if want("profiles-list") else "",
+            webhooks_section=webhooks_section,
             connect_section=connect_section,
             message=msg_html,
             password_section=(
                 PASSWORD_SECTION.format(base=html.escape(BASE))
                 if PASSWORD_CMD else ""
             ),
+            # Neither row is a region a partial render can keep, and each
+            # asks systemd for its unit's state.
             update_row=(
                 UPDATE_ROW.format(base=html.escape(BASE), update_line=render_update_line())
-                if UPDATE_CMD else ""
+                if UPDATE_CMD and sections is None else ""
             ),
             reboot_row=(
                 REBOOT_ROW.format(base=html.escape(BASE),
                                   reboot_line=render_reboot_line())
-                if REBOOT_CMD else ""
+                if REBOOT_CMD and sections is None else ""
             ),
         )
         + SCRIPT
@@ -7077,40 +7479,66 @@ def portal_jwks_keys(kid, force=False):
     the cache goes stale into a fresh outbound fetch, which is the same
     lever on the portal this floor exists to deny.
     """
-    now = int(time.time())
-    cached = portal_jwks_read_cache() or {}
-    try:
-        fetched = int(cached.get("fetched", 0))
-    except (TypeError, ValueError):
-        fetched = 0
-    try:
-        attempted = int(cached.get("attempted", 0))
-    except (TypeError, ValueError):
-        attempted = 0
-    keys = cached.get("keys") or []
-    if not isinstance(keys, list):
-        keys = []
-    fresh = keys and now - fetched < JWKS_TTL
-    if fresh and not force:
-        return keys
-    if now - attempted < JWKS_REFETCH_FLOOR:
-        # An attempt happened too recently to try again, whether that was
-        # the ordinary refresh or a forced retry. Answer from what we have
-        # rather than making either path a lever on the portal.
-        return keys
-    document = portal_jwks_fetch()
-    if document is None:
-        # Fetch failed. Stale keys still beat none: the portal being briefly
-        # unreachable should not lock out a handover signed by a key we
-        # already hold. A withdrawn key outliving its withdrawal by up to
-        # JWKS_TTL is the cost, and it is why that value is not days.
-        # `attempted` still moves, so a persistent outage stays capped at
-        # one fetch per JWKS_REFETCH_FLOOR rather than one per request.
+    # The lock is held across the fetch: a concurrent request waits for the
+    # refresh in flight, then re-reads the cache and uses what it produced,
+    # instead of answering 401 or starting a second fetch. A failed attempt
+    # moves `attempted`, so a persistent outage costs one bounded wait per
+    # JWKS_REFETCH_FLOOR and every other request returns at once.
+    with portal_jwks_lock():
+        now = int(time.time())
+        cached = portal_jwks_read_cache() or {}
+        fetched, attempted, keys = portal_jwks_unpack(cached)
+        # Every return below passes through this bound: a key set older
+        # than JWKS_MAX_STALE is no key set, however the refresh went.
+        usable = keys if now - fetched < JWKS_MAX_STALE else []
+        fresh = usable and now - fetched < JWKS_TTL
+        if fresh and not force:
+            return usable
+        if now - attempted < JWKS_REFETCH_FLOOR:
+            # An attempt happened too recently to try again, whether that
+            # was the ordinary refresh or a forced retry. Answer from what
+            # we have rather than making either path a lever on the portal.
+            return usable
+        document = portal_jwks_fetch()
+        after = int(time.time())
+        if document is None:
+            # Fetch failed. Stale keys still beat none, but only until
+            # JWKS_MAX_STALE, measured again AFTER the fetch: it can take
+            # seconds, and must not carry an expiring set past the bound.
+            portal_jwks_write_cache(
+                {"fetched": fetched, "attempted": after, "keys": keys})
+            return keys if after - fetched < JWKS_MAX_STALE else []
         return portal_jwks_write_cache(
-            {"fetched": fetched, "attempted": now, "keys": keys})["keys"]
-    return portal_jwks_write_cache(
-        {"fetched": now, "attempted": now,
-         "keys": document.get("keys", [])})["keys"]
+            {"fetched": after, "attempted": after,
+             "keys": document.get("keys", [])})["keys"]
+
+
+def portal_jwks_unpack(cached):
+    """(fetched, attempted, keys) from a cache record, tolerating junk."""
+    def seconds(name):
+        try:
+            return int(cached.get(name, 0))
+        except (TypeError, ValueError):
+            return 0
+    keys = cached.get("keys") or []
+    return seconds("fetched"), seconds("attempted"), (
+        keys if isinstance(keys, list) else [])
+
+
+@contextlib.contextmanager
+def portal_jwks_lock():
+    """Serialize cache read-decide-reserve across threads and processes."""
+    with _PORTAL_JWKS_THREAD_LOCK:
+        fd = os.open(portal_jwks_cache_path() + ".lock",
+                     os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+
+_PORTAL_JWKS_THREAD_LOCK = threading.Lock()
 
 
 # SubjectPublicKeyInfo prefix for an Ed25519 key: SEQUENCE { SEQUENCE {
@@ -7907,6 +8335,333 @@ def render_download_index(rel, rows):
         ))
 
 
+# --- Temporary resumable uploads (issue #898) -------------------------
+
+RECEIVE_BASE = TERM_BASE + "/receive"
+RECEIVE_CHUNK_MAX = RECEIVE_CONTENT_BLOCK
+RECEIVE_IO_CHUNK = 64 << 10
+RECEIVE_PATCH_IDLE_SECONDS = 30
+RECEIVE_PATCH_TOTAL_SECONDS = 300
+RECEIVE_PRUNE_INTERVAL_SECONDS = 60
+RECEIVE_PAGE_RE = re.compile(
+    "^" + re.escape(RECEIVE_BASE) + r"/([A-Za-z0-9_-]{16,64})/?$"
+)
+RECEIVE_CREATE_RE = re.compile(
+    "^" + re.escape(RECEIVE_BASE)
+    + r"/([A-Za-z0-9_-]{16,64})/files/?$"
+)
+RECEIVE_FILE_RE = re.compile(
+    "^" + re.escape(RECEIVE_BASE)
+    + r"/([A-Za-z0-9_-]{16,64})/files/upload/?$"
+)
+
+# This page is intentionally public and inert. The capability lives after
+# the URL's #, which a browser never sends in an HTTP request, and JavaScript
+# attaches it explicitly to only the three TUS requests below. The page has
+# no ambient box credential and the capability cannot reach any other route.
+RECEIVE_PAGE = r'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Send a file to __USER__</title>
+<style nonce="__NONCE__">
+:root{color-scheme:light dark}body{margin:0;background:#0d1117;color:#e6edf3;
+font:15px/1.5 system-ui,sans-serif}.card{max-width:38rem;margin:8vh auto;
+padding:1.5rem;border:1px solid #30363d;border-radius:10px;background:#161b22}
+h1{font-size:1.35rem;margin:0 0 .5rem}p{color:#8b949e}input{display:block;
+margin:1rem 0;width:100%}.drop{display:block;margin:1rem 0;padding:2rem 1rem;
+border:2px dashed #484f58;border-radius:8px;text-align:center;cursor:pointer;
+transition:border-color .15s,background .15s}.drop strong,.drop span{display:block;
+overflow-wrap:anywhere}.drop span{margin-top:.25rem;color:#8b949e}.drop.dragging{
+border-color:#58a6ff;background:#1f6feb26}.drop:focus-within{outline:2px solid
+#58a6ff;outline-offset:2px}.drop.disabled{opacity:.6;cursor:not-allowed}
+#file{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;
+clip-path:inset(50%);white-space:nowrap;border:0}
+progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
+</style></head><body data-slot="__SLOT__"><main class="card">
+<h1>Send one file to __USER__</h1>
+<p>This private link accepts one resumable upload. It does not grant access
+to the terminal or any existing files.</p>
+<label id="drop" class="drop" for="file"><strong id="prompt">Drop a file here</strong>
+<span>or tap to choose one</span><input id="file" type="file"></label>
+<progress id="progress" aria-label="Upload progress" value="0" max="1"></progress>
+<p id="status" role="status"></p>
+</main><script nonce="__NONCE__">
+(() => {
+  'use strict';
+  const slot = document.body.dataset.slot;
+  const token = location.hash.slice(1);
+  const drop = document.getElementById('drop');
+  const input = document.getElementById('file');
+  const prompt = document.getElementById('prompt');
+  const progress = document.getElementById('progress');
+  const status = document.getElementById('status');
+  let uploading = false;
+  const collection = location.pathname.replace(/\/?$/, '/') + 'files';
+  const resource = collection + '/upload';
+  const validToken = token.startsWith(slot + '.') &&
+    /^[A-Za-z0-9_.-]+$/.test(token);
+  const auth = () => ({'Authorization': 'Bearer ' + token,
+                       'Tus-Resumable': '1.0.0'});
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const b64 = value => {
+    const bytes = new TextEncoder().encode(value);
+    let binary = '';
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary);
+  };
+  const metadata = (file, content) => 'filename ' + b64(file.name) +
+    ',fingerprint ' + b64(file.name + '\n' + file.size + '\n' +
+                          file.lastModified) + ',content ' + b64(content);
+  const contentEtag = content => '"' + content + '"';
+  const hex = bytes => Array.from(bytes, byte =>
+    byte.toString(16).padStart(2, '0')).join('');
+  const contentId = async file => {
+    const leaves = [];
+    let checked = 0;
+    show('Checking ' + file.name + '...', 0, file.size);
+    while (checked < file.size) {
+      const end = Math.min(checked + __HASH_CHUNK__, file.size);
+      const block = await file.slice(checked, end).arrayBuffer();
+      leaves.push(new Uint8Array(
+        await crypto.subtle.digest('SHA-256', block)));
+      checked = end;
+      show('Checking ' + file.name + '...', checked, file.size);
+    }
+    const prefix = new TextEncoder().encode(
+      'agent-box-content-v1\n' + file.size + '\n');
+    const tree = new Uint8Array(prefix.length + leaves.length * 32);
+    tree.set(prefix);
+    leaves.forEach((leaf, index) => tree.set(leaf, prefix.length + index * 32));
+    return 'sha256-tree-v1:' + hex(new Uint8Array(
+      await crypto.subtle.digest('SHA-256', tree)));
+  };
+  const fail = async response => {
+    let detail = '';
+    try { detail = (await response.text()).trim(); } catch (_) {}
+    throw new Error(detail || ('Upload request failed (' + response.status + ')'));
+  };
+  const head = async (file, content) => {
+    const response = await fetch(resource, {method: 'HEAD', headers: auth(),
+                                            cache: 'no-store'});
+    if (response.status === 404) return null;
+    if (!response.ok) return fail(response);
+    if (Number(response.headers.get('Upload-Length')) !== file.size) {
+      throw new Error('This link is already bound to a different file.');
+    }
+    if (response.headers.get('Upload-Complete') === '?1') {
+      const headers = auth();
+      headers['If-Match'] = contentEtag(content);
+      const verified = await fetch(resource, {
+        method: 'HEAD', headers, cache: 'no-store'
+      });
+      if (verified.status === 412) {
+        throw new Error('This link is already bound to a different file.');
+      }
+      if (!verified.ok) return fail(verified);
+      return Number(verified.headers.get('Upload-Offset'));
+    }
+    if (response.headers.get('Upload-Content') !== content) {
+      throw new Error('This link is already bound to a different file.');
+    }
+    return Number(response.headers.get('Upload-Offset'));
+  };
+  const create = async (file, details) => {
+    const headers = auth();
+    headers['Upload-Length'] = String(file.size);
+    headers['Upload-Metadata'] = details;
+    const response = await fetch(collection, {method: 'POST', headers});
+    if (!response.ok) return fail(response);
+    return Number(response.headers.get('Upload-Offset') || '0');
+  };
+  const show = (text, offset, size) => {
+    status.textContent = text;
+    progress.max = Math.max(size, 1);
+    progress.value = offset;
+  };
+  async function upload(file) {
+    const content = await contentId(file);
+    const details = metadata(file, content);
+    let offset = await head(file, content);
+    if (offset === null) offset = await create(file, details);
+    show('Uploading ' + file.name + '...', offset, file.size);
+    let failures = 0;
+    while (offset < file.size) {
+      const end = Math.min(offset + __CHUNK__, file.size);
+      const headers = auth();
+      headers['Upload-Offset'] = String(offset);
+      headers['Content-Type'] = 'application/offset+octet-stream';
+      try {
+        const response = await fetch(resource, {
+          method: 'PATCH', headers, body: file.slice(offset, end)
+        });
+        if (!response.ok) await fail(response);
+        offset = Number(response.headers.get('Upload-Offset'));
+        failures = 0;
+        show('Uploading ' + file.name + '...', offset, file.size);
+      } catch (error) {
+        if (++failures > 6) throw error;
+        show('Connection interrupted; resuming...', offset, file.size);
+        await sleep(Math.min(1000 * (2 ** failures), 15000));
+        const resumed = await head(file, content);
+        if (resumed === null) throw error;
+        // A timed-out or cut-off chunk can still persist bytes. Count only
+        // failures that made no progress, so a slow link is not abandoned.
+        if (resumed > offset) failures = 0;
+        offset = resumed;
+      }
+    }
+    show('Upload complete. You may close this page.', offset, file.size);
+  }
+  if (!validToken) {
+    status.textContent = 'This upload link is incomplete.';
+  } else {
+    const selectFile = async files => {
+      if (uploading) return;
+      if (files.length !== 1) {
+        input.value = '';
+        prompt.textContent = 'Drop a file here';
+        status.textContent = 'Choose exactly one file.';
+        return;
+      }
+      const file = files[0];
+      prompt.textContent = file.name;
+      uploading = true;
+      input.disabled = true;
+      drop.classList.add('disabled');
+      try { await upload(file); }
+      catch (error) {
+        uploading = false;
+        input.disabled = false;
+        input.value = '';
+        drop.classList.remove('disabled');
+        status.textContent = error.message;
+      }
+    };
+    const stopDrag = event => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    document.addEventListener('dragover', event => event.preventDefault());
+    document.addEventListener('drop', event => event.preventDefault());
+    drop.addEventListener('dragenter', event => {
+      stopDrag(event);
+      if (!uploading) drop.classList.add('dragging');
+    });
+    drop.addEventListener('dragover', event => {
+      stopDrag(event);
+      if (!uploading) drop.classList.add('dragging');
+    });
+    drop.addEventListener('dragleave', event => {
+      stopDrag(event);
+      drop.classList.remove('dragging');
+    });
+    drop.addEventListener('drop', event => {
+      stopDrag(event);
+      drop.classList.remove('dragging');
+      selectFile(event.dataTransfer.files);
+    });
+    input.addEventListener('change', () => selectFile(input.files));
+  }
+})();
+</script></body></html>'''
+
+
+def receive_page(slot, nonce):
+    return (RECEIVE_PAGE.replace("__USER__", html.escape(USER))
+            .replace("__SLOT__", slot)
+            .replace("__NONCE__", nonce)
+            .replace("__CHUNK__", str(RECEIVE_CHUNK_MAX))
+            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK)))
+
+
+def receive_metadata(raw):
+    """Parse the small TUS metadata header into decoded UTF-8 values."""
+    if not raw or len(raw) > 8192:
+        raise ValueError("missing or oversized upload metadata")
+    result = {}
+    for item in raw.split(","):
+        key, separator, encoded = item.strip().partition(" ")
+        if (not separator
+                or key not in ("filename", "fingerprint", "content")
+                or key in result):
+            raise ValueError("invalid upload metadata")
+        try:
+            value = base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            raise ValueError("invalid upload metadata")
+        if not value or len(value.encode("utf-8")) > 1024:
+            raise ValueError("invalid upload metadata")
+        result[key] = value
+    if set(result) != {"filename", "fingerprint", "content"}:
+        raise ValueError(
+            "filename, fingerprint, and content metadata are required")
+    if not RECEIVE_CONTENT_RE.fullmatch(result["content"]):
+        raise ValueError("invalid content fingerprint")
+    return result
+
+
+def receive_offset(record):
+    if record.get("status") == "complete":
+        return record["length"]
+    try:
+        value = os.path.getsize(receive_partial_path(record["slot"]))
+    except OSError:
+        return None
+    return value if value <= record.get("length", -1) else None
+
+
+class ReceiveContentMismatch(Exception):
+    pass
+
+
+class ReceiveRevoked(Exception):
+    pass
+
+
+def receive_finalize(record, offset):
+    """Publish a fully written partial, including after a daemon crash.
+
+    The file bytes are fsynced before the last PATCH response. If the process
+    stops between that fsync and publish(), the next HEAD observes a complete
+    partial and finishes the same idempotent link/write/unlink sequence.
+    """
+    if (record.get("status") == "uploading"
+            and offset == record.get("length")):
+        partial = receive_partial_path(record["slot"])
+        revoked = receive_revoked_path(record["slot"])
+        try:
+            content, sha256, size = receive_content_digests(
+                partial, cancel_path=revoked)
+        except InterruptedError:
+            receive_remove_locked(record["slot"], record)
+            raise ReceiveRevoked()
+        expected = record.get("content")
+        if (size != record["length"]
+                or (expected is not None
+                    and not secrets.compare_digest(content, expected))):
+            record.update({"status": "failed",
+                           "failure": "content_mismatch",
+                           "failed": int(time.time())})
+            receive_write(record)
+            with contextlib.suppress(OSError):
+                os.unlink(partial)
+            receive_fsync_dir(RECEIVE_PARTIAL_DIR)
+            raise ReceiveContentMismatch()
+        if receive_is_revoked(record["slot"]):
+            receive_remove_locked(record["slot"], record)
+            raise ReceiveRevoked()
+        final_name = receive_publish(partial, record["name"], record["slot"])
+        record.update({"status": "complete",
+                       "final_name": final_name,
+                       "sha256": sha256,
+                       "completed": int(time.time())})
+        receive_write(record)
+        with contextlib.suppress(OSError):
+            os.unlink(partial)
+        receive_fsync_dir(RECEIVE_PARTIAL_DIR)
+    return record
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     """Serve the authenticated settings UI and its actions."""
 
@@ -7941,6 +8696,387 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
+
+    def _send_empty(self, status, headers=None):
+        self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, str(value))
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _receive_error(self, status, message, extra=None):
+        data = (message + "\n").encode("utf-8")
+        try:
+            self.send_response(status)
+            for name, value in (extra or {}).items():
+                self.send_header(name, str(value))
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            # An interrupted PATCH is expected to disappear before its error
+            # response is written; its received bytes and offset are already
+            # durable. Do not turn a resumable network failure into a daemon
+            # traceback, or try to write a second error on the dead socket.
+            self.close_connection = True
+
+    def _receive_record(self, slot):
+        record = receive_authorized(
+            slot, self.headers.get("Authorization", ""))
+        if record is None:
+            self._receive_error(
+                403, "This upload link is invalid, expired, or revoked.")
+        return record
+
+    def _receive_verify(self):
+        """Caddy forward_auth check before it forwards an upload body."""
+        token_slot, _secret = receive_parse_authorization(
+            self.headers.get("Authorization", ""))
+        forwarded = urllib.parse.urlparse(
+            self.headers.get("X-Forwarded-Uri", "")).path
+        match = (RECEIVE_CREATE_RE.fullmatch(forwarded)
+                 or RECEIVE_FILE_RE.fullmatch(forwarded))
+        path_slot = match.group(1) if match else None
+        if (token_slot and token_slot == path_slot
+                and receive_authorized(
+                    token_slot, self.headers.get(
+                        "Authorization", "")) is not None):
+            self._send_empty(204)
+            return
+        self._receive_error(
+            403, "This upload link is invalid, expired, or revoked.")
+
+    def _receive_page(self, slot, send_body=True):
+        receive_prune()
+        nonce = secrets.token_urlsafe(18)
+        data = receive_page(slot, nonce).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'none'; script-src 'nonce-%s'; "
+            "style-src 'nonce-%s'; connect-src 'self'; base-uri 'none'; "
+            "form-action 'none'; frame-ancestors 'none'" % (nonce, nonce),
+        )
+        self.end_headers()
+        if send_body:
+            self.wfile.write(data)
+
+    def _receive_headers(self, record, offset):
+        headers = {
+            "Tus-Resumable": "1.0.0",
+            "Upload-Offset": offset,
+            "Upload-Length": record["length"],
+            "Upload-Metadata": record["metadata"],
+            "Upload-Expires": email.utils.formatdate(
+                record["expires"], usegmt=True),
+        }
+        if record.get("status") == "complete":
+            headers["Upload-Complete"] = "?1"
+            if record.get("content"):
+                headers["ETag"] = '"' + record["content"] + '"'
+            if record.get("sha256"):
+                headers["Upload-SHA256"] = record["sha256"]
+            # HTTP headers are Latin-1 in BaseHTTPRequestHandler. Percent
+            # encoding preserves an arbitrary UTF-8 browser filename while
+            # keeping this convenience response header ASCII-only.
+            headers["Upload-Filename"] = urllib.parse.quote(
+                record.get("final_name", ""), safe="")
+        elif record.get("content"):
+            # The partial upload changes after each PATCH, so its target
+            # identity is resume metadata rather than an HTTP entity tag.
+            headers["Upload-Content"] = record["content"]
+        return headers
+
+    def _receive_create(self, slot):
+        if self.headers.get("Tus-Resumable") != "1.0.0":
+            self._receive_error(412, "Unsupported resumable upload version.",
+                                {"Tus-Version": "1.0.0"})
+            return
+        try:
+            length = int(self.headers.get("Upload-Length", ""))
+        except ValueError:
+            length = -1
+        try:
+            creation_body = int(
+                self.headers.get("Content-Length", "0") or "0")
+        except ValueError:
+            creation_body = -1
+        if creation_body != 0:
+            self.close_connection = True
+            self._receive_error(400, "Upload creation must have an empty body.")
+            return
+        try:
+            metadata = receive_metadata(self.headers.get("Upload-Metadata", ""))
+        except ValueError as exc:
+            self._receive_error(400, str(exc))
+            return
+        try:
+            if self._receive_record(slot) is None:
+                return
+            receive_prune()
+            with receive_slot_lock(slot):
+                with receive_capacity_lock():
+                    record = self._receive_record(slot)
+                    if record is None:
+                        return
+                    if record["status"] != "waiting":
+                        self._receive_error(
+                            409, "This upload link is already bound to a file.",
+                            {"Location": RECEIVE_BASE + "/" + slot
+                             + "/files/upload"},
+                        )
+                        return
+                    if length < 0 or length > record["max_bytes"]:
+                        self._receive_error(
+                            413,
+                            "The selected file exceeds this link's size limit.",
+                            {"Tus-Max-Size": record["max_bytes"]},
+                        )
+                        return
+                    receive_ensure_dirs()
+                    free = shutil.disk_usage(RECEIVE_UPLOAD_DIR).free
+                    promised = receive_reserved_bytes(exclude=slot)
+                    if length + promised + RECEIVE_FREE_RESERVE > free:
+                        self._receive_error(
+                            507,
+                            "The box does not have enough unreserved space "
+                            "for this file.",
+                        )
+                        return
+                    partial = receive_partial_path(slot)
+                    try:
+                        fd = os.open(
+                            partial,
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            0o600,
+                        )
+                    except FileExistsError:
+                        # Recover the narrow crash window after the empty
+                        # partial was created but before the waiting record
+                        # became uploading. A non-empty or non-regular path
+                        # is never adopted.
+                        recovered_fd = None
+                        try:
+                            recovered_fd = os.open(
+                                partial,
+                                os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                            )
+                            info = os.fstat(recovered_fd)
+                            if not stat.S_ISREG(info.st_mode) or info.st_size:
+                                os.close(recovered_fd)
+                                self._receive_error(
+                                    409,
+                                    "This upload already has partial data.",
+                                )
+                                return
+                        except OSError:
+                            if recovered_fd is not None:
+                                with contextlib.suppress(OSError):
+                                    os.close(recovered_fd)
+                            self._receive_error(
+                                409, "This upload already has partial data.")
+                            return
+                        fd = recovered_fd
+                    os.close(fd)
+                    receive_fsync_dir(RECEIVE_PARTIAL_DIR)
+                    record.update({
+                        "status": "uploading",
+                        "length": length,
+                        "name": receive_safe_name(metadata["filename"]),
+                        "metadata": self.headers["Upload-Metadata"],
+                        "fingerprint": metadata["fingerprint"],
+                        "content": metadata["content"],
+                        "upload_created": int(time.time()),
+                    })
+                    receive_write(record)
+                    if length == 0:
+                        record = receive_finalize(record, 0)
+        except ReceiveContentMismatch:
+            self._receive_error(
+                422, "Uploaded bytes do not match the selected file.")
+            return
+        except ReceiveRevoked:
+            self._receive_error(410, "This upload link was revoked.")
+            return
+        except OSError:
+            self._receive_error(503, "The upload slot is temporarily unavailable.")
+            return
+        location = RECEIVE_BASE + "/" + slot + "/files/upload"
+        self._send_empty(201, dict(
+            self._receive_headers(record, 0), Location=location))
+
+    def _receive_head(self, slot):
+        try:
+            if self._receive_record(slot) is None:
+                return
+            with receive_slot_lock(slot):
+                record = self._receive_record(slot)
+                if record is None:
+                    return
+                if record["status"] == "waiting":
+                    self._receive_error(404, "No file has been started for this link.")
+                    return
+                if record["status"] == "failed":
+                    self._receive_error(
+                        422, "Uploaded bytes did not match the selected file.")
+                    return
+                offset = receive_offset(record)
+                if offset is None:
+                    self._receive_error(500, "The partial upload is inconsistent.")
+                    return
+                record = receive_finalize(record, offset)
+                headers = self._receive_headers(record, offset)
+                if_match = self.headers.get("If-Match")
+                if (if_match is not None
+                        and if_match.strip() != "*"
+                        and (record.get("status") != "complete"
+                             or if_match.strip() != headers.get("ETag"))):
+                    self._send_empty(412, headers)
+                    return
+                self._send_empty(200, headers)
+        except ReceiveContentMismatch:
+            self._receive_error(
+                422, "Uploaded bytes do not match the selected file.")
+        except ReceiveRevoked:
+            self._receive_error(410, "This upload link was revoked.")
+        except OSError:
+            self._receive_error(503, "The upload slot is temporarily unavailable.")
+
+    def _receive_patch(self, slot):
+        if self.headers.get("Tus-Resumable") != "1.0.0":
+            self._receive_error(412, "Unsupported resumable upload version.",
+                                {"Tus-Version": "1.0.0"})
+            return
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != \
+                "application/offset+octet-stream":
+            self._receive_error(415, "PATCH chunks must be offset octet streams.")
+            return
+        try:
+            declared = int(self.headers.get("Content-Length", ""))
+            wanted_offset = int(self.headers.get("Upload-Offset", ""))
+        except ValueError:
+            declared = wanted_offset = -1
+        if declared < 0 or declared > RECEIVE_CHUNK_MAX or wanted_offset < 0:
+            self.close_connection = True
+            self._receive_error(413 if declared > RECEIVE_CHUNK_MAX else 400,
+                                "Invalid upload chunk size or offset.")
+            return
+        try:
+            if self._receive_record(slot) is None:
+                return
+            with receive_slot_lock(slot):
+                record = self._receive_record(slot)
+                if record is None:
+                    return
+                if record["status"] == "waiting":
+                    self._receive_error(404, "No file has been started for this link.")
+                    return
+                if record["status"] == "failed":
+                    self._receive_error(
+                        422, "Uploaded bytes did not match the selected file.")
+                    return
+                offset = receive_offset(record)
+                if offset is None:
+                    self._receive_error(500, "The partial upload is inconsistent.")
+                    return
+                if wanted_offset != offset:
+                    self.close_connection = True
+                    self._receive_error(
+                        409, "Upload offset does not match the stored file.",
+                        {"Upload-Offset": offset, "Tus-Resumable": "1.0.0"},
+                    )
+                    return
+                if record["status"] == "complete":
+                    self._send_empty(204, self._receive_headers(record, offset))
+                    return
+                if declared > record["length"] - offset:
+                    self.close_connection = True
+                    self._receive_error(413, "Chunk exceeds the declared file size.")
+                    return
+                if declared + RECEIVE_FREE_RESERVE > \
+                        shutil.disk_usage(RECEIVE_UPLOAD_DIR).free:
+                    self.close_connection = True
+                    self._receive_error(507, "The box is too full to accept this chunk.")
+                    return
+                partial = receive_partial_path(slot)
+                fd = os.open(partial, os.O_WRONLY | os.O_APPEND
+                             | getattr(os, "O_NOFOLLOW", 0))
+                received = 0
+                timed_out = False
+                revoked = False
+                deadline = time.monotonic() + RECEIVE_PATCH_TOTAL_SECONDS
+                try:
+                    info = os.fstat(fd)
+                    if not stat.S_ISREG(info.st_mode) or info.st_size != offset:
+                        self._receive_error(409, "The partial upload changed.")
+                        return
+                    while received < declared:
+                        if receive_is_revoked(slot):
+                            revoked = True
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            timed_out = True
+                            break
+                        self.connection.settimeout(min(
+                            RECEIVE_PATCH_IDLE_SECONDS, remaining))
+                        try:
+                            chunk = self.rfile.read1(min(
+                                RECEIVE_IO_CHUNK, declared - received))
+                        except (socket.timeout, TimeoutError):
+                            timed_out = True
+                            break
+                        if not chunk:
+                            break
+                        view = memoryview(chunk)
+                        while view:
+                            view = view[os.write(fd, view):]
+                        received += len(chunk)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                new_offset = offset + received
+                if revoked:
+                    receive_remove_locked(slot, record)
+                    raise ReceiveRevoked()
+                if timed_out:
+                    self.close_connection = True
+                    self._receive_error(
+                        408, "Upload chunk timed out.",
+                        {"Upload-Offset": new_offset,
+                         "Tus-Resumable": "1.0.0"},
+                    )
+                    return
+                if received != declared:
+                    self.close_connection = True
+                    self._receive_error(
+                        400, "Upload chunk ended early.",
+                        {"Upload-Offset": new_offset,
+                         "Tus-Resumable": "1.0.0"},
+                    )
+                    return
+                if new_offset == record["length"]:
+                    record = receive_finalize(record, new_offset)
+                self._send_empty(
+                    204, self._receive_headers(record, new_offset))
+        except ReceiveContentMismatch:
+            self._receive_error(
+                422, "Uploaded bytes do not match the selected file.")
+        except ReceiveRevoked:
+            self._receive_error(410, "This upload link was revoked.")
+        except OSError:
+            self._receive_error(503, "The upload slot is temporarily unavailable.")
 
     def _send_transcript(self, name):
         """Stream one session's transcript to the browser as a download
@@ -8174,25 +9310,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except OSError:
             return True
 
-    def _send_event(self, fingerprint):
-        payload = json.dumps({"fp": fingerprint}).encode("utf-8")
-        self.wfile.write(b"event: sessions\ndata: " + payload + b"\n\n")
+    def _send_event(self, topic, value):
+        """One frame. `value` is the topic's payload, already JSON: the
+        session fingerprint's travels as {"fp": ...}, as it always has."""
+        if topic == "sessions":
+            value = json.dumps({"fp": value})
+        self.wfile.write(b"event: " + topic.encode("ascii") + b"\ndata: "
+                         + value.encode("utf-8") + b"\n\n")
 
-    def _send_events(self):
+    def _send_events(self, topics=("sessions",)):
         """Stream session-state changes as Server-Sent Events.
 
         Held open for the life of the page, so it costs one thread —
         capped at EVENTS_MAX_STREAMS, past which the client keeps its
         polling fallback rather than pinning threads here. Frames are
-        `event: sessions` with a fingerprint payload; a `:` comment
-        every EVENTS_KEEPALIVE seconds keeps idle intermediaries (and
-        the write that notices a vanished client) alive.
+        `event: <topic>` with that topic's payload (see EVENTS_TOPICS);
+        a `:` comment every EVENTS_KEEPALIVE seconds keeps idle
+        intermediaries (and the write that notices a vanished client)
+        alive.
         """
-        start = WATCHER.subscribe()
+        start = WATCHER.subscribe(topics)
         if start is None:
             self._send_json({"ok": False, "reason": "busy"}, status=503)
             return
         seq, known = start
+        sent = dict.fromkeys(topics, "")
+
+        def send_moved(values):
+            moved = False
+            for topic in topics:
+                if values[topic] and values[topic] != sent[topic]:
+                    sent[topic] = values[topic]
+                    self._send_event(topic, values[topic])
+                    moved = True
+            return moved
+
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -8206,24 +9358,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # Reconnect delay for the browser, and an immediate byte so it
             # marks the stream open instead of waiting for the first change.
             self.wfile.write(b"retry: 3000\n\n")
-            # Replay the current fingerprint straight away: state can have
+            # Replay the current values straight away: state can have
             # moved between rendering the page and connecting here, and a
             # watcher already running for another tab would have counted
             # that change before this stream existed. The client ignores a
             # fingerprint it is already showing. Empty only while the first
             # sample is still pending, which lands within EVENTS_TICK.
-            if known:
-                self._send_event(known)
+            send_moved(known)
             self.wfile.flush()
             quiet = 0.0
             while True:
-                latest, fingerprint = WATCHER.wait(seq, EVENTS_SLICE)
+                latest, values = WATCHER.wait(seq, EVENTS_SLICE)
                 if self._peer_gone():
                     return
-                if latest != seq:
-                    seq = latest
+                # A change to a topic this stream does not follow wakes it
+                # too; that is neither a frame nor a reason to skip the
+                # keep-alive.
+                seq = latest
+                if send_moved(values):
                     quiet = 0.0
-                    self._send_event(fingerprint)
                 else:
                     quiet += EVENTS_SLICE
                     if quiet < EVENTS_KEEPALIVE:
@@ -8236,7 +9389,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # report, the client reconnects if it still wants the feed.
             pass
         finally:
-            WATCHER.release()
+            WATCHER.release(topics)
 
     def _wants_json(self):
         """A portal caller (issue #787): it asks for JSON, so a refusal
@@ -8347,6 +9500,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                  "page. Open a session and run "
                                  "`agent-box-webhook rotate SOURCE`."), "error"),
         "webhook_saved": ("Automatic session rule saved. Changes apply to the next event.", "ok"),
+        "email_saved": ("Email address saved and reception enabled.", "ok"),
+        "email_disabled": ("Email reception disabled. The handler remains for already accepted mail.", "ok"),
         "webhook_invalid": (("Could not save the rule. Check its topic, name, profile and event predicate. "
                              "Rule names must be unique within a topic."), "error"),
         "webhook_deleted": ("Event rule deleted. The change applies to the next event.", "ok"),
@@ -8623,9 +9778,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _note_sections(self):
+        """Record, for this request's thread, which page regions the client
+        will keep (SECTIONS_HEADER). render_page() reads it, so the many
+        POST error paths that answer with a re-rendered page honour it too
+        without each passing it along."""
+        _request_local.sections = parse_sections(
+            self.headers.get(SECTIONS_HEADER))
+
     def do_GET(self):
+        self._note_sections()
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
+        # The receiver page is intentionally reachable without the box's web
+        # password. Its fragment capability is not present in this request;
+        # only the TUS API calls below carry it, and Caddy forward-authenticates
+        # those before forwarding a body. _verify is that internal subrequest.
+        if parsed.path.rstrip("/") == RECEIVE_BASE + "/_verify":
+            self._receive_verify()
+            return
+        receive_match = RECEIVE_PAGE_RE.fullmatch(parsed.path)
+        if receive_match:
+            if not parsed.path.endswith("/"):
+                self._redirect(page=parsed.path + "/")
+            else:
+                self._receive_page(receive_match.group(1))
+            return
         # Portal handover (issue #541), routed first and outside the BASE
         # tree: caddy sends the forward_auth subrequest here for every
         # request that carries a session cookie, so it must not depend on
@@ -8689,7 +9867,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if params.get("poll"):
                 self._send_json({"fp": session_fingerprint()})
             else:
-                self._send_events()
+                self._send_events(parse_topics(params.get("topics", [""])[0]))
             return
         message = ""
         kind = "ok"
@@ -8735,6 +9913,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if not self._under_base(parsed.path):
             self._send_html("<h1>404</h1>", status=404)
+            return
+        if parsed.path.rstrip("/") == BASE + "/resources":
+            self._send_json(resources_payload())
             return
         # Progress feed the page long-polls after a restart/update
         # (read-only, same auth block as the page it lives under).
@@ -8823,6 +10004,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         artifact). Every other path keeps the 501 the base class has
         always answered with -- nothing else here has a HEAD to give."""
         parsed = urllib.parse.urlparse(self.path)
+        receive_page_match = RECEIVE_PAGE_RE.fullmatch(parsed.path)
+        if receive_page_match:
+            self._receive_page(receive_page_match.group(1), send_body=False)
+            return
+        receive_match = RECEIVE_FILE_RE.fullmatch(parsed.path)
+        if receive_match:
+            self._receive_head(receive_match.group(1))
+            return
         if parsed.path == DL_BASE or parsed.path.startswith(DL_BASE + "/"):
             self._send_drop(parsed.path[len(DL_BASE):], body=False)
             return
@@ -8880,8 +10069,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         """Validate and apply a settings-page form submission."""
+        self._note_sections()
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/")
+        receive_match = RECEIVE_CREATE_RE.fullmatch(parsed.path)
+        if receive_match:
+            self._receive_create(receive_match.group(1))
+            return
         # Portal handover (issue #541), ahead of the CSRF guard because it
         # is cross-site by design — see _portal_handoff for why that is
         # safe here and nowhere else on this daemon. The route does not
@@ -9074,22 +10268,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if action == "start":
                 if flow["id"] == "whatsapp":
                     raw_phone = form.get("phone", [""])[0].strip()
+                    raw_country = form.get("phone_country", [""])[0].strip()
                     phone = ""
-                    if raw_phone:
-                        # `autocomplete="tel"` let Mobile Safari replace a
-                        # +1 contact number with its national form. The bridge
-                        # cannot infer the missing country code, so make the
-                        # international marker explicit and reject that lossy
-                        # substitution (issue #820). ASCII only: \D would keep
-                        # Unicode digits the bridge drops.
-                        phone = re.sub(r"[ ()+.-]", "", raw_phone)
-                        if not (raw_phone.startswith("+")
-                                and re.fullmatch(r"\+[0-9 ().-]+", raw_phone)
+                    if raw_country or raw_phone:
+                        # Safari can replace a full +1 contact value with its
+                        # national form even though autocomplete="tel" means
+                        # the full international number. The settings form
+                        # therefore uses separate standard country/national
+                        # controls. Keep accepting a lone full `phone` value
+                        # for Station and older clients, but never infer a
+                        # missing country (issue #820).
+                        combined = raw_phone
+                        if raw_country:
+                            if (not raw_phone
+                                    or not re.fullmatch(r"\+[0-9]{1,3}", raw_country)
+                                    or not re.fullmatch(r"[0-9 ().-]+", raw_phone)):
+                                combined = ""
+                            else:
+                                combined = raw_country + " " + raw_phone
+                        phone = re.sub(r"[ ()+.-]", "", combined)
+                        # ASCII only: \D would keep Unicode digits the bridge
+                        # drops.
+                        if not (combined.startswith("+")
+                                and re.fullmatch(r"\+[0-9 ().-]+", combined)
                                 and phone.isascii() and phone.isdigit()
                                 and 7 <= len(phone) <= 15):
                             self._send_html(render_page(
-                                "Enter a valid WhatsApp number starting with + "
-                                "and country code.",
+                                "Enter a valid country calling code and WhatsApp number.",
                                 kind="error"), status=400)
                             return
                     profile = form.get("profile", [""])[0].strip()
@@ -9198,22 +10403,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 key = (form.get("key", [""])[0]).strip()
                 value = form.get("value", [""])[0]
                 value = value.replace("\r\n", "\n").replace("\r", "\n")
-                if not KEY_RE.match(key) or key in PROFILE_RESERVED:
-                    if key in PROFILE_RESERVED:
-                        message = (
-                            "%s is already a profile option. Set it in the "
-                            "form above."
-                            % PROFILE_RESERVED_LABELS.get(key, "That name")
-                        )
-                    else:
-                        message = (
-                            "Invalid setting name. Use letters, digits and "
-                            "underscores; do not start with a digit."
-                        )
-                    self._send_html(
-                        render_page(message, kind="error"),
-                        status=400,
-                    )
+                message = profile_env_key_error(key)
+                if message:
+                    self._send_html(render_page(message, kind="error"), status=400)
                     return
                 # Same must_exist guard as delkey, for the same stale-tab
                 # reason: this form only ever appears inside an existing
@@ -9252,6 +10444,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     assignments.append((key, value))
                 else:
                     drop.append(key)
+            if (name.endswith("-daemon") and name[:-len("-daemon")] in AGENTS
+                    and not os.path.lexists(profile_path(name))):
+                # Reserved: `agent-box-session add --profile` resolves these
+                # itself (issue #942), so a file by that name is shadowed.
+                self._send_html(
+                    render_page("'%s' is reserved for the daemon "
+                                "pseudo-profile. Pick another name." % name,
+                                kind="error"),
+                    status=400)
+                return
             harness = dict(assignments).get("HARNESS", "")
             # Required, not optional (issue #493): there is no box-wide
             # default harness left to fall back to, and the resolver refuses
@@ -9275,36 +10477,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 + ", ".join(PROFILE_AGENTS), kind="error"),
                     status=400)
                 return
-            # An optional starting environment setting (issue #493): the "New
-            # profile" pane has no fold to add one to until the profile
-            # exists, so this one pair rides in on the same request and the
-            # same write as the launch config, rather than needing a second
-            # round trip through /profiles/setkey's must_exist gate. Blank
-            # key is the ordinary case (most profiles start with none) and is
-            # silently skipped; a stray value with no key name is meaningless
-            # and dropped with it.
-            env_key = (form.get("key", [""])[0]).strip()
-            if env_key:
-                env_value = form.get("value", [""])[0]
-                env_value = env_value.replace("\r\n", "\n").replace("\r", "\n")
-                if not KEY_RE.match(env_key) or env_key in PROFILE_RESERVED:
-                    if env_key in PROFILE_RESERVED:
-                        message = (
-                            "%s is already a profile option. Set it in the "
-                            "form above."
-                            % PROFILE_RESERVED_LABELS.get(env_key, "That name")
-                        )
-                    else:
-                        message = (
-                            "Invalid setting name. Use letters, digits and "
-                            "underscores; do not start with a digit."
-                        )
-                    self._send_html(
-                        render_page(message, kind="error"),
-                        status=400,
-                    )
+            # Indexed names keep each key paired with its value even when a
+            # blank form field is omitted by parse_qs. Validate every row
+            # before writing anything, so a bad later row cannot partly save.
+            pairs = [(form.get("key", [""])[0], form.get("value", [""])[0])]
+            indices = set()
+            for field in form:
+                match = re.fullmatch(r"env_(?:key|value)_([0-9]+)", field)
+                if match:
+                    indices.add(match.group(1))
+            for index in sorted(indices, key=int):
+                pairs.append((form.get("env_key_" + index, [""])[0],
+                              form.get("env_value_" + index, [""])[0]))
+            seen = set()
+            for raw_key, env_value in pairs:
+                env_key = raw_key.strip()
+                if not env_key:
+                    if env_value:
+                        self._send_html(render_page(
+                            "Enter a name for each environment setting value.",
+                            kind="error"), status=400)
+                        return
+                    continue
+                message = profile_env_key_error(env_key)
+                if not message and env_key in seen:
+                    message = "Each environment setting must have a different name."
+                if message:
+                    self._send_html(render_page(message, kind="error"), status=400)
                     return
-                assignments.append((env_key, env_value))
+                seen.add(env_key)
+                assignments.append((env_key, env_value.replace("\r\n", "\n").replace("\r", "\n")))
             try:
                 profile_write(name, assignments, drop=drop)
             except EnvStoreError as exc:
@@ -9351,10 +10553,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # to say the other thing from a shell.
             profile = (form.get("profile", [""])[0]).strip()
             agent = (form.get("agent", [""])[0]).strip()
-            # Captured before profile is cleared below: the one signal that
-            # this add asked for codex's pairing daemon rather than a TUI
-            # (issue #623), read again where remoteControl is decided.
-            codex_daemon = profile == CODEX_RC_PSEUDO_PROFILE
+            # Captured before profile is cleared below: these pseudo-profiles
+            # select a server program instead of one profile's worker TUI.
+            codex_daemon = profile in (CODEX_DAEMON_PSEUDO_PROFILE,
+                                       CODEX_RC_PSEUDO_PROFILE)
+            claude_daemon = profile in (CLAUDE_DAEMON_PSEUDO_PROFILE,
+                                        CLAUDE_RC_PSEUDO_PROFILE)
             if profile == SHELL_PSEUDO_PROFILE:
                 # The one entry that is not a profile file: a bare shell has
                 # no model, reasoning level or instructions to carry.
@@ -9364,6 +10568,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # or profile of its own, since the paired client decides
                 # those once it connects.
                 agent, profile = "codex", ""
+            elif claude_daemon:
+                # Claude's foreground server likewise owns app-created
+                # conversations rather than one profile's worker settings.
+                agent, profile = "claude", ""
             elif profile:
                 agent = ""      # resolved from the profile below
             elif not agent:
@@ -9457,17 +10665,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # before this value reaches the agent as one argv element.
             prompt = form.get("prompt", [""])[0].replace("\r\n", "\n")
             prompt = prompt.replace("\r", "\n").strip()
+            if claude_daemon and prompt:
+                self._send_html(
+                    render("Claude daemon mode cannot target one kickoff "
+                           "prompt; start the conversation from the Claude app.",
+                           kind="error"), status=400)
+                return
+            if (claude_daemon
+                    and form.get("whatsapp", [""])[0] == "on"):
+                self._send_html(
+                    render("WhatsApp cannot target a Claude daemon's "
+                           "app-created conversations.", kind="error"),
+                    status=400)
+                return
             # Read, name and write as one step (issue #254): the uniqueness
             # gen_session_name promises comes from the dict it was handed, so
             # a concurrent add — from another browser tab, this daemon's own
             # second thread, or the CLI — could pick the same free name, and
             # the later rename would drop the earlier session outright.
             try:
-                # Read before the lock (issue #748): capacity_check's tmux
-                # spawn must not run while holding sessions_lock(), or a
-                # slow/contended tmux starves every other writer waiting on
-                # the same lock.
-                live = capacity_live_checked()
                 with sessions_lock():
                     sessions, version = load_sessions()
                     # The name is always auto-derived: there is no name field
@@ -9478,20 +10694,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # inventing one AND guarantees a unique key, so no collision
                     # or accidental-overwrite (issue 100) is possible.
                     name = gen_session_name(profile or agent, sessions, cwd)
-                    capacity_check(sessions, [name], live=live,
-                                   exempt=[name] if agent == "shell" else ())
                     sessions[name] = {
                         "agent": agent,
                         "skipPermissions": True,
-                        # codex's remote control is a different PROGRAM
-                        # entirely (the pairing daemon, not a TUI flag -
-                        # see ensure_harness_session), so only the explicit
-                        # pseudo-profile above asks for it; a real codex
-                        # profile, or --harness codex with none, now opens
-                        # the interactive TUI instead (issue #623). claude's
-                        # own remote control is just a flag on its ordinary
-                        # TUI and keeps the old default.
-                        "remoteControl": codex_daemon or agent != "codex",
+                        # The pseudo-profiles select servers explicitly. A
+                        # real Codex profile opens its TUI; a real Claude
+                        # profile preserves the older additive RC flag.
+                        "remoteControl": (codex_daemon or claude_daemon
+                                          or agent != "codex"),
+                        "remoteControlDaemon": codex_daemon or claude_daemon,
+                        # Compatibility for releases before issue #915.
+                        "remoteControlServer": claude_daemon,
                         "whatsapp": (form.get("whatsapp", [""])[0] == "on"
                                      and agent in ("claude", "codex")),
                         "remoteControlName": None,
@@ -9553,6 +10766,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if state == "on" and entry.get("agent") not in ("claude", "codex"):
                         self._send_html(render_page("WhatsApp supports Claude and Codex sessions.",
                                                     kind="error"), status=400)
+                        return
+                    if (state == "on" and entry.get("agent") == "claude"
+                            and session_is_daemon(entry)):
+                        self._send_html(
+                            render_page(
+                                "WhatsApp cannot target a Claude daemon's "
+                                "app-created conversations.",
+                                kind="error"),
+                            status=400)
                         return
                     if state == "on":
                         for other in sessions.values():
@@ -9633,6 +10855,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     # name that is not there (issue #254).
                     if isinstance(entry, dict):
                         entry["stopped"] = True
+                        entry.pop("hibernatedAt", None)
+                        entry.pop("hibernationGeneration", None)
                         write_sessions(sessions, version)
             except RegistryBusy as exc:
                 self._registry_busy("stop", exc, self._sess_page(form))
@@ -9685,9 +10909,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             self._send_json({"ok": False, "reason": "No such session."},
                                             status=404)
                             return
-                        if isinstance(entry, dict) and entry.pop("stopped", None) is not None:
-                            write_sessions(sessions, version)
-                            ok = "ok=session_started"
+                        if isinstance(entry, dict):
+                            changed = entry.pop("stopped", None) is not None
+                            changed = entry.pop("hibernatedAt", None) is not None or changed
+                            changed = (entry.pop("hibernationGeneration", None)
+                                       is not None) or changed
+                            if changed:
+                                write_sessions(sessions, version)
+                                ok = "ok=session_started"
                 except SessionCapacityError as exc:
                     self._sess_error(form, str(exc), 503)
                     return
@@ -9713,6 +10942,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if back_page == TERM_HOME and SESSION_RE.match(name):
                 ok += "&tab=" + name
             self._redirect(ok, back_page)
+        elif path in (BASE + "/email/set", BASE + "/email/disable") and WEBHOOKS:
+            operation = path.rsplit("/", 1)[1]
+            args = [operation, form.get("address", [""])[0]]
+            if operation == "set":
+                args += ["--purpose", form.get("purpose", [""])[0],
+                         "--profile", form.get("profile", [""])[0],
+                         "--batch-seconds", form.get("batch_seconds", ["60"])[0]]
+            try:
+                result = email_cli(args)
+                if result.returncode:
+                    raise ValueError("Check the address, purpose, worker profile and batching window. "
+                                     "Remove any older automatic rule for the same address first. "
+                                     "If its handler could not be installed, reception has not been enabled.")
+            except (OSError, ValueError, subprocess.SubprocessError) as error:
+                self._send_html(render_page("Could not update email address. " + str(error),
+                                            kind="error"), status=400)
+                return
+            self._redirect("ok=email_saved" if operation == "set" else "ok=email_disabled")
         elif path == BASE + "/webhooks/save" and WEBHOOKS:
             ok = webhook_save(form)
             self._redirect("ok=webhook_saved" if ok else "ok=webhook_invalid")
@@ -9721,6 +10968,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             key = (form.get("key", [""])[0]).strip()
             dispatch = bool(form.get("dispatch", [""])[0])
             watch_name = form.get("watch_name", [""])[0]
+            if dispatch and topic.lower().startswith("email:") and watch_name == "email-address":
+                self._redirect("ok=webhook_kept")
+                return
             # The key names a filter file, so hold it to the shape the
             # supervisor mints: this user, and one of this user's own
             # sessions (or the bare user key, which only reads the shared
@@ -9773,6 +11023,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self._send_html("<h1>404</h1>", status=404)
 
+    def do_PATCH(self):
+        """Apply one bounded TUS chunk to a temporary upload slot."""
+        parsed = urllib.parse.urlparse(self.path)
+        receive_match = RECEIVE_FILE_RE.fullmatch(parsed.path)
+        if receive_match:
+            self._receive_patch(receive_match.group(1))
+            return
+        self._receive_error(404, "No such upload resource.")
+
+    def do_OPTIONS(self):
+        """Advertise only the small TUS subset this receiver implements."""
+        parsed = urllib.parse.urlparse(self.path)
+        if (RECEIVE_CREATE_RE.fullmatch(parsed.path)
+                or RECEIVE_FILE_RE.fullmatch(parsed.path)):
+            self._send_empty(204, {
+                "Tus-Version": "1.0.0",
+                "Tus-Resumable": "1.0.0",
+                "Tus-Extension": "creation,expiration",
+                "Tus-Max-Size": 1 << 40,
+            })
+            return
+        self._send_empty(404)
+
     def address_string(self):
         # AF_UNIX peers have no (host, port) client_address — the base class
         # would IndexError on the empty string it gets instead.
@@ -9792,13 +11065,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
 SD_LISTEN_FDS_START = 3
 
 
+class SettingsHTTPServer(http.server.ThreadingHTTPServer):
+    """Threaded daemon with deterministic upload-expiry cleanup."""
+
+    def __init__(self, *args, **kwargs):
+        self.receive_prune_at = 0
+        super().__init__(*args, **kwargs)
+
+    def service_actions(self):
+        super().service_actions()
+        now = time.monotonic()
+        if now >= self.receive_prune_at:
+            with contextlib.suppress(OSError):
+                receive_prune()
+            self.receive_prune_at = now + RECEIVE_PRUNE_INTERVAL_SECONDS
+
+
 def make_server():
     if int(os.environ.get("LISTEN_FDS", "0") or "0") >= 1:
         # Socket-activated (the module's only mode, issue #49): adopt the
         # unix socket systemd pre-bound with 0660 <user>:caddy permissions.
         # bind_and_activate=False skips bind/listen; the placeholder address
         # is never bound.
-        server = http.server.ThreadingHTTPServer(
+        server = SettingsHTTPServer(
             ("127.0.0.1", 0), Handler, bind_and_activate=False
         )
         server.socket = socket.socket(fileno=SD_LISTEN_FDS_START)
@@ -9807,7 +11096,7 @@ def make_server():
         server.server_port = 0
         return server
     # Dev fallback for LAN rigs / e2e runs outside the module.
-    return http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    return SettingsHTTPServer(("127.0.0.1", PORT), Handler)
 
 
 def main():

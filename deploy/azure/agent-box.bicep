@@ -26,8 +26,8 @@
 //      the API - not from `az vm extension show`, not from deployment history.
 //   3. A credential is mandatory. Azure rejects a Linux `osProfile` carrying
 //      neither an SSH key nor an admin password, even with SSH closed at the
-//      NSG. Hence the authenticationType / adminPasswordOrKey pair, the same
-//      shape every azure-quickstart-templates VM sample uses.
+//      NSG. The debug account gets a separate generated password by default;
+//      authenticationType / adminPasswordOrKey still allow an explicit key.
 
 @description('Linux user that owns the agent sessions, and the login name for the browser terminal.')
 @minLength(1)
@@ -62,6 +62,10 @@ param portalUser string = ''
 @description('The portal\'s own issuer URL, compared exactly against the token\'s `iss` claim, and where the box fetches the portal\'s published signing keys (<issuer>/.well-known/jwks.json). Whatever the portal uses -- this is NOT a Defang hostname. Empty (the default) disables portal handover entirely.')
 @maxLength(512)
 param portalIssuer string = ''
+
+@description('Destination of the portal link on the unauthenticated 401 page, including a per-box path if needed. Empty uses the portal issuer origin. Public HTTP(S) URL only; no credentials or private account identifiers. Requires a runtime supporting web.portalRedirectUrl when using a prebuilt image.')
+@maxLength(2048)
+param portalRedirectUrl string = ''
 
 // The picker annotates each value with vCPU/RAM/price because the portal's
 // generated form renders allowed values verbatim - there is no separate label
@@ -150,28 +154,31 @@ var effectiveSslipDomains = !empty(sslipDomain) ? [sslipDomain] : sslipDomains
 // caution for its own sake: on Lightsail, SSH is the only way to read
 // /var/log/agent-box-bootstrap.log after a first boot that went wrong, so the
 // port has to be open by default for the box to be debuggable at all. Azure
-// has managed boot diagnostics, so the serial console reaches the same box
-// authenticated through Azure RBAC instead of through a credential on an open
-// port - strictly better, and it works with 22 shut. Leaving 22 open by
+// has Run Command and VMAccess recovery through Azure RBAC with 22 shut.
+// Serial-console login also needs a known local credential; reset the
+// generated recovery password through VMAccess first. Leaving 22 open by
 // default would also mean a portal user who picks authenticationType=password
 // for convenience gets SSH password auth exposed to allowCidr, which defaults
 // to the whole internet.
-@description('Open port 22 to allowCidr. Off by default: the portal\'s serial console already gives debug access, authenticated through Azure RBAC rather than through a credential on an open port. Turn it on for an ordinary SSH session - the box is ordinary Ubuntu, and nothing here wipes /home or /root.')
+@description('Open port 22 to allowCidr. Off by default: Azure Run Command and VMAccess provide recovery through Azure RBAC with SSH closed. To enable SSH, supply your own recovery credential and restrict allowCidr first.')
 param debugSsh bool = false
+
+@description('Open inbound TCP 25 for optional email. Configure host email intake and STARTTLS separately; outbound SMTP restrictions remain in force.')
+param emailIngress bool = false
 
 @description('Linux user for SSH/serial-console debug access. NOT the agent user - the agent runs as userName.')
 param adminUsername string = 'azureuser'
 
-@description('Whether adminPasswordOrKey below is an SSH public key or a password. Azure will not create a Linux VM with neither, even when SSH is closed at the NSG.')
+@description('Recovery account authentication. Leave password selected and adminPasswordOrKey empty to generate a separate recovery password. For your own SSH key, choose sshPublicKey and supply your public key. SSH stays closed unless debugSsh is enabled.')
 @allowed([
   'sshPublicKey'
   'password'
 ])
-param authenticationType string = 'sshPublicKey'
+param authenticationType string = 'password'
 
-@description('SSH public key (ssh-ed25519 AAAA...) or admin password for adminUsername, per authenticationType. This is the debug credential, not the browser terminal password.')
+@description('Optional recovery credential. Leave empty for normal deployment; Azure generates a separate recovery password, so no SSH key or second password is needed. To use your own recovery credential, enter a password or SSH public key matching authenticationType. It is separate from webPassword and is not returned in outputs. Reset it through Azure if recovery access is needed.')
 @secure()
-param adminPasswordOrKey string
+param adminPasswordOrKey string = ''
 
 @description('Prefix for every resource name in the group.')
 @minLength(1)
@@ -182,6 +189,18 @@ param namePrefix string = 'agent-box'
 param location string = resourceGroup().location
 
 // ---------------------------------------------------------------------------
+
+// Generate inside a nested deployment, where ARM evaluates the default itself.
+// The portal only sees an empty optional field, never a newGuid expression it
+// could submit literally as a predictable password. The module's output is
+// secure and is consumed only by osProfile.adminPassword.
+// An SSH public key passed without authenticationType (the old default) is
+// still installed as a key: a key is far over the 72-character password limit.
+var usePasswordAuth = authenticationType == 'password' && !startsWith(adminPasswordOrKey, 'ssh-')
+var generateRecoveryPassword = usePasswordAuth && empty(adminPasswordOrKey)
+module recoveryPassword 'recovery-password.bicep' = {
+  name: '${namePrefix}-recovery-password'
+}
 
 var vmSize = split(vmSizeChoice, ' ')[0]
 
@@ -203,7 +222,7 @@ var imageSkuBySize = {
 // consequence of picking password auth is visible in the source instead of
 // being inferred from an absent property: choosing it DOES enable SSH password
 // authentication, to whatever allowCidr allows, whenever debugSsh is on.
-var linuxConfiguration = authenticationType == 'password' ? {
+var linuxConfiguration = usePasswordAuth ? {
   disablePasswordAuthentication: false
 } : {
   disablePasswordAuthentication: true
@@ -248,6 +267,20 @@ var httpsRule = {
     destinationPortRange: '443'
   }
 }
+
+var emailIngressRules = emailIngress ? [{
+  name: 'email-ingress'
+  properties: {
+    priority: 1002
+    protocol: 'Tcp'
+    access: 'Allow'
+    direction: 'Inbound'
+    sourceAddressPrefix: '*'
+    sourcePortRange: '*'
+    destinationAddressPrefix: '*'
+    destinationPortRange: '25'
+  }
+}] : []
 
 // Raw SMTP outbound is the way a hijacked box gets used to send spam, and
 // nothing this box legitimately runs needs it: mail through a real provider
@@ -410,6 +443,7 @@ install -d -m 0755 /etc/agent-box
 # decorator, so the check has to happen at runtime instead. A bad value fails
 # the boot rather than landing in config.yaml unvetted.
 portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
+portal_redirect_url="$(printf %s '@@PORTALREDIRECTURLB64@@' | base64 -d)"
 portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
 if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
   if ! [[ "$portal_issuer" =~ ^https://[A-Za-z0-9._~:/?#@\!\&\(\)*+,\;=%-]+$ ]]; then
@@ -420,6 +454,19 @@ if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
     echo "portalUser is not a plain account id" >&2
     exit 1
   fi
+fi
+if ! PORTAL_REDIRECT_URL="$portal_redirect_url" python3 - <<'PYURL'
+import os
+import re
+import sys
+
+value = os.environ["PORTAL_REDIRECT_URL"]
+origin = r"https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?"
+if value and not re.fullmatch(origin + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?", value):
+    sys.exit("portalRedirectUrl is not a plain HTTP(S) URL")
+PYURL
+then
+  exit 1
 fi
 public_ip="$(printf %s '@@PUBLICIPB64@@' | base64 -d)"
 if ! [[ "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
@@ -464,6 +511,7 @@ web:
   # handover route and no unauthenticated endpoint. No key is configured --
   # the box fetches the portal's published key set from this issuer.
   portalIssuer: '@PORTALISSUER@'
+  portalRedirectUrl: '@PORTALREDIRECTURL@'
 users:
   @@USER@@:
     root: true
@@ -479,10 +527,19 @@ AGENTBOX_CONFIG
 # them too costs nothing and keeps all substitutions uniform. box_aliases is
 # already JSON made from validated DNS suffixes and the validated public IP.
 esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
+esc_redirect=$(printf '%s' "$portal_redirect_url" | sed -e 's/[&\]/\\&/g')
 esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
 esc_domain=$(printf '%s' "$public_ip" | sed -e 's/[&\]/\\&/g')
 sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIASES@|$box_aliases|; s|@DOMAIN@|$esc_domain|" \
   /etc/agent-box/config.yaml
+# Old prebuilt runtimes do not know this optional field. Keep their issuer
+# fallback usable when no redirect was requested.
+if [ -z "$portal_redirect_url" ]; then
+  sed -i "/^  portalRedirectUrl:/d" /etc/agent-box/config.yaml
+else
+  # Last, and only in its own scalar: marker-like URL text stays literal.
+  sed -i "/^  portalRedirectUrl:/s|@PORTALREDIRECTURL@|$esc_redirect|" /etc/agent-box/config.yaml
+fi
 
 # Extra standing instructions for the agent, if the deployment gave any.
 install -d -m 0755 /etc/agent-box-guides
@@ -528,7 +585,7 @@ var portalOn = !empty(portalUser) && !empty(portalIssuer)
 var portalUserYaml = portalOn ? portalUser : ''
 var portalIssuerYaml = portalOn ? portalIssuer : ''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
@@ -540,6 +597,7 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   '@@SSLIPDOMAINSB64@@', base64(string(effectiveSslipDomains))),
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
+  '@@PORTALREDIRECTURLB64@@', base64(portalRedirectUrl)),
   '@@PORTALUSERIDB64@@', base64(portalUserYaml)),
   // ARM string(true) renders `True`, while the shell branch deliberately
   // compares its marker to lowercase `true`.
@@ -566,7 +624,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
   name: '${namePrefix}-nsg'
   location: location
   properties: {
-    securityRules: concat([httpsRule, smtpEgressRule], sshRule)
+    securityRules: concat([httpsRule, smtpEgressRule], sshRule, emailIngressRules)
   }
 }
 
@@ -650,7 +708,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
     osProfile: {
       computerName: namePrefix
       adminUsername: adminUsername
-      adminPassword: authenticationType == 'password' ? adminPasswordOrKey : null
+      adminPassword: usePasswordAuth ? (generateRecoveryPassword ? recoveryPassword.outputs.password : adminPasswordOrKey) : null
       linuxConfiguration: linuxConfiguration
     }
     networkProfile: {
@@ -709,7 +767,7 @@ output remoteControlSession string = '${userName}-main@${host}'
 @description('Static public IPv4 address.')
 output publicAddress string = publicIp.properties.ipAddress
 
-@description('Debug access. Closed at the NSG unless debugSsh is true; the portal\'s serial console works either way.')
+@description('Debug access. Closed at the NSG unless debugSsh is true. Supply a known recovery credential for SSH, or use Azure Run Command/VMAccess with SSH closed.')
 output sshCommand string = 'ssh ${adminUsername}@${publicIp.properties.ipAddress}'
 
 @description('Where first-boot output lands if the deployment fails. The extension handler keeps its own copy of the same stream under /var/lib/waagent/custom-script/download/0/.')

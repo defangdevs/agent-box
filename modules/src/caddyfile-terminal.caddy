@@ -8,6 +8,39 @@
 # attribute makes browsers scope it to this box's exact hostname. Never add
 # Domain: boxes share suffixes such as ip.sslip.io and ip.domainstation.com.
 redir /@USER@ /@USER@/
+# Temporary, upload-only capability links (issue #898). The page itself is
+# public and inert: its credential lives after the URL fragment marker, which
+# never reaches Caddy. JavaScript sends that capability in Authorization on
+# each TUS request. forward_auth validates it BEFORE reverse_proxy sees a
+# request body, and request_body bounds one compromised link to one 8 MiB
+# chunk per request. The daemon independently verifies the same capability
+# and enforces the total slot size.
+redir /@USER@/receive /@USER@/receive/
+@receive_api_@USER@ path_regexp receive_api_@USER@ ^/@USER@/receive/[A-Za-z0-9_-]{16,64}/files(/upload)?/?$
+handle @receive_api_@USER@ {
+  route {
+    forward_auth unix/@SETTINGS_SOCKET@ {
+      uri /@USER@/receive/_verify
+    }
+    request_body {
+      max_size 9MB
+    }
+    reverse_proxy unix/@SETTINGS_SOCKET@
+  }
+}
+@receive_page_@USER@ {
+  method GET HEAD
+  path_regexp receive_page_@USER@ ^/@USER@/receive/[A-Za-z0-9_-]{16,64}/?$
+}
+handle @receive_page_@USER@ {
+  request_body {
+    max_size 1KB
+  }
+  reverse_proxy unix/@SETTINGS_SOCKET@
+}
+handle /@USER@/receive/* {
+  respond 404
+}
 # @USER@'s settings page (issue #36). Same auth surface as the
 # terminal (cookie-or-basic-auth, same user name), just a different
 # upstream — the settings daemon over its user+caddy-only unix socket
@@ -192,12 +225,12 @@ handle @home_@USER@ {
 # exactly this set so no session can be shadowed by one of them.
 @sess_bare_@USER@ {
   path_regexp bare_@USER@ ^/@USER@/([^/]+)$
-  not path /@USER@/settings /@USER@/downloads /@USER@/webhook /@USER@/token /@USER@/ws /@USER@/auth
+  not path /@USER@/settings /@USER@/downloads /@USER@/receive /@USER@/webhook /@USER@/token /@USER@/ws /@USER@/auth
 }
 redir @sess_bare_@USER@ /@USER@/{re.bare_@USER@.1}/
 @sess_@USER@ {
   path_regexp sess_@USER@ ^/@USER@/([^/]+)/(.*)$
-  not path /@USER@/settings* /@USER@/downloads/* /@USER@/webhook* /@USER@/auth/*
+  not path /@USER@/settings* /@USER@/downloads/* /@USER@/receive/* /@USER@/webhook* /@USER@/auth/*
 }
 rewrite @sess_@USER@ /@USER@/{re.sess_@USER@.2}?arg={re.sess_@USER@.1}&{query}
 handle /@USER@/* {

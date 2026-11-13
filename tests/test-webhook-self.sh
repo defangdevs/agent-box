@@ -11,7 +11,7 @@
 # loading the cache as an EnvironmentFile.
 set -u
 
-SCRIPT=${1:?usage: test-webhook-self.sh PATH/TO/webhook-self.sh}
+SCRIPT=${1:?usage: test-webhook-self.sh PATH/TO/webhook-self.sh [PATH/TO/agent-box-env-exec]}
 [ -f "$SCRIPT" ] || { echo "no such script: $SCRIPT" >&2; exit 2; }
 
 BASH_BIN=$(command -v bash)
@@ -125,6 +125,59 @@ if [ "$out" = "third-bot" ] && [ "$(calls)" != "$before" ]; then
   ok "a direct ask always makes a real attempt, throttle or not"
 else
   fail "a direct ask always makes a real attempt, throttle or not — got '$out'"
+fi
+
+# --- env-exec finds the helpers whatever the env store does to PATH ---------
+# Optional second argument: the assembled agent-box-env-exec (envstore.py +
+# env-exec.py). The helpers are looked up BEFORE the env store loads, so a
+# PATH there cannot hide them ("@self" then mutes nobody, and the box reacts
+# to its own comments); a helper the store's PATH ADDS is still found after.
+ENV_EXEC=${2:-}
+if [ -n "$ENV_EXEC" ]; then
+  # Only python3 and sh, by symlink: the directory python3 lives in may be a
+  # profile that ships the REAL helpers, which would hide what is tested.
+  basebin="$work/basebin"; mkdir -p "$basebin"
+  ln -s "$(command -v python3)" "$basebin/python3"
+  ln -s "$(command -v sh)" "$basebin/sh"
+  py="$basebin/python3"; base="$basebin"
+  helpers="$work/helpers"; mkdir -p "$helpers"
+  cat > "$helpers/agent-box-webhook-self" <<EOF
+#!$BASH_BIN
+echo env-exec-bot
+EOF
+  cat > "$helpers/agent-box-webhook-backfill" <<EOF
+#!$BASH_BIN
+: > "\$AGENT_BOX_TEST_SWEPT"
+EOF
+  chmod 755 "$helpers"/*
+  # envexec HOME STORE-PATH INHERITED-PATH: prints LOCAL_WEBHOOK_SELF; the
+  # sweep marker lands in HOME.
+  envexec() {
+    home=$1; shift; mkdir -p "$home/.config/agent-box"
+    printf 'PATH=%s\n' "$1" > "$home/.config/agent-box/env"
+    HOME="$home" PATH="$2" AGENT_BOX_PROFILE= AGENT_BOX_TEST_SWEPT="$home/swept" \
+      "$py" "$ENV_EXEC" sh -c 'printf "%s\n" "${LOCAL_WEBHOOK_SELF:-}"'
+  }
+  swept() {  # the sweep is forked into the background
+    for _ in $(seq 50); do [ -e "$1/swept" ] && return 0; sleep 0.1; done
+    return 1
+  }
+  h=$(mktemp -d "$work/ee.XXXXXX")
+  got=$(envexec "$h" "$base" "$helpers:$base")
+  if [ "$got" = env-exec-bot ] && swept "$h"; then
+    ok "a store PATH without the helpers does not hide them"
+  else
+    fail "a store PATH without the helpers does not hide them (got $got)"
+  fi
+  h=$(mktemp -d "$work/ee.XXXXXX")
+  got=$(envexec "$h" "$helpers:$base" "$base")
+  if [ "$got" = env-exec-bot ] && swept "$h"; then
+    ok "helpers the store PATH adds are still found"
+  else
+    fail "helpers the store PATH adds are still found (got $got)"
+  fi
+else
+  echo "skip: env-exec helper lookup (no env-exec given)"
 fi
 
 if [ "$fails" -eq 0 ]; then

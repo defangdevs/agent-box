@@ -14,6 +14,7 @@ Metadata:
         Parameters:
           - PortalUser
           - PortalIssuer
+          - PortalRedirectUrl
       - Label:
           default: Compute and cost
         Parameters:
@@ -45,6 +46,8 @@ Metadata:
         default: Portal account id this box belongs to (issue #593)
       PortalIssuer:
         default: Portal issuer URL that signs handover tokens
+      PortalRedirectUrl:
+        default: Portal page for this box (optional)
       Agent:
         default: Agent CLI
       UserName:
@@ -83,6 +86,11 @@ Description: >
   Source: https://github.com/defangdevs/agent-box
 
 Parameters:
+  EmailIngress:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Open inbound TCP 25 for optional email. Configure email intake and STARTTLS separately on the host.
   Agent:
     Type: String
     Default: claude
@@ -244,6 +252,18 @@ Parameters:
       (<issuer>/.well-known/jwks.json). This is whatever the portal uses - it
       is NOT a Defang hostname. Blank (the default) disables portal handover
       entirely.
+  PortalRedirectUrl:
+    Type: String
+    Default: ""
+    MaxLength: 2048
+    # No quotes, backslashes or braces: safe in Nix and YAML literals.
+    AllowedPattern: '^$|^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?([/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?$'
+    Description: >-
+      Public destination of the 401 page's portal link, including a per-box
+      path, query and fragment. Blank uses the portal issuer origin.
+      Percent-encode spaces and quotes; do not include credentials or
+      private account identifiers. Requires a module or runtime supporting
+      web.portalRedirectUrl when set.
   WebPasswordHash:
     Type: String
     NoEcho: true
@@ -411,6 +431,7 @@ Parameters:
       AgentNixpkgsUrl exactly; leave empty when AgentNixpkgsUrl is empty.
 
 Conditions:
+  OpenEmail: !Equals [!Ref EmailIngress, 'true']
   UseLegacySslipDomain: !Not [!Equals [!Ref SslipDomain, '']]
   UseIpv4: !Equals [!Ref PublicIpv4, 'true']
   UseSpotCond: !Equals [!Ref UseSpot, 'true']
@@ -428,13 +449,13 @@ Mappings:
   # BEGIN AMI MAP (refreshed by scripts/refresh_amis.py — do not edit by hand)
   RegionMap:
     us-east-1:
-      AMI: ami-07b45b89cf22bcb71
+      AMI: ami-090594359cc179e3d
     us-west-2:
-      AMI: ami-03c0569d65ab7143b
+      AMI: ami-0a10325581b487ce0
     eu-central-1:
-      AMI: ami-08976856af8f0ef2a
+      AMI: ami-0c501fd5c64d807a8
     eu-west-1:
-      AMI: ami-0f2d7d1ec7f8d88d7
+      AMI: ami-0e329020993193ddb
   # END AMI MAP
 
 Resources:
@@ -550,6 +571,14 @@ Resources:
         - Key: agent-box:agent
           Value: !Ref Agent
       SecurityGroupIngress:
+        - !If
+          - OpenEmail
+          - {IpProtocol: tcp, FromPort: 25, ToPort: 25, CidrIp: '0.0.0.0/0', Description: Optional inbound email v4}
+          - !Ref AWS::NoValue
+        - !If
+          - OpenEmail
+          - {IpProtocol: tcp, FromPort: 25, ToPort: 25, CidrIpv6: '::/0', Description: Optional inbound email v6}
+          - !Ref AWS::NoValue
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
@@ -872,6 +901,9 @@ Resources:
                     # fetches the portal's published key set from this
                     # issuer's well-known path.
                     portalIssuer = "${PortalIssuer}";
+                  } // lib.optionalAttrs ("${PortalRedirectUrl}" != "") {
+                    # Omit when unset so older pinned modules still work.
+                    portalRedirectUrl = "${PortalRedirectUrl}";
                   };
                   # Lets the agent update the box on request:
                   #   sudo /run/current-system/sw/bin/systemctl \

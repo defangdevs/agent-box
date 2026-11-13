@@ -397,7 +397,20 @@
     # cache on every (re)start of that live claude process, and a restart
     # mid-block races the hand-written versions below. Same idiom the
     # delivery-spawn assertion further down uses to remove a different race.
+    # Stopping the unit does not stop its tmux server (#893): a lingering
+    # session pane can respawn the env-exec wrapper, whose plugin sync then
+    # rewrites installed_plugins.json under the fixtures below. Kill the
+    # server and wait until no tmux process of the agent is left, so nothing
+    # but this test writes the cache. The stand-in peer is its own unit.
+    def quiesce_sessions():
+        machine.execute(
+            "sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box"
+            " kill-server"
+        )
+        machine.wait_until_succeeds("! pgrep -u agent -x 'tmux: server'", timeout=30)
+
     machine.succeed("systemctl stop agent-box@agent.service")
+    quiesce_sessions()
     hookenv = (
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
@@ -526,6 +539,10 @@
         " -H 'content-type: application/json' -H 'x-github-event: workflow_run'"
         " -H 'x-github-delivery: test-1' --data-binary @/tmp/body.json"
     )
+    # 0.33.0 drops a re-sent delivery id, so a later post that must be
+    # processed again needs an id of its own.
+    ids = iter(range(100))
+    fresh = lambda: post.replace("test-1", "test-1-%d" % next(ids))  # noqa: E731
     # Wrong signature and no signature are both refused, before any parsing.
     client.succeed(
         f"{post} -H 'x-hub-signature-256: sha256=00' "
@@ -617,7 +634,7 @@
     # sessions on one PR. The suppression is logged, because a silently skipped
     # spawn is indistinguishable from a watch that stopped working (#170).
     client.succeed(
-        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"{fresh()} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
     )
     machine.wait_until_succeeds(
@@ -692,8 +709,9 @@
     # 30740226645). With it stopped, the wrapper's write is the only actor;
     # restarting it afterwards proves the spawn + consumption half.
     machine.succeed("systemctl stop agent-box@agent.service")
+    quiesce_sessions()
     client.succeed(
-        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"{fresh()} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
     )
     machine.wait_until_succeeds(
@@ -865,7 +883,7 @@
         timeout=30,
     )
     client.succeed(
-        f"{post} -H 'x-hub-signature-256: sha256={sig}' "
+        f"{fresh()} -H 'x-hub-signature-256: sha256={sig}' "
         f"https://box.test/agent/webhook/github | grep -x 200"
     )
     # The named suppression is the primary evidence: had the brake missed, the
@@ -940,7 +958,7 @@
     machine.succeed(
         "sudo -u agent env HOME=/home/agent"
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
-        " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/elsewhere"
+        " AGENT_BOX_START_WAIT_TICKS=0 LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/elsewhere"
         " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
         f" {sw}/sh -c 'echo hi | {spawn_cmd}'"
     )
@@ -1511,7 +1529,7 @@
     def prompt_for(line, key="defangdevs/assigned-probe"):
         machine.succeed(
             "sudo -u agent env HOME=/home/agent"
-            f" LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY={key}"
+            f" AGENT_BOX_START_WAIT_TICKS=0 LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY={key}"
             " LOCAL_WEBHOOK_SPAWN_TOPIC='github:defangdevs/*'"
             f" {sw}/sh -c '{sw}/printf \"%s\\n\" \"{line}\" | {spawn_cmd}'"
         )
@@ -2244,7 +2262,7 @@
 
     # The production wrapper delegates admission to the shared session CLI.
     # Pure count/restart races and actual dispatcher retry are native checks;
-    # this proves the installed programs share a limit with interactive work.
+    # this proves only hook work consumes the installed programs' budget.
     machine.succeed("echo 1 > /tmp/session-limit; chmod 644 /tmp/session-limit")
     drop_env = (
         "sudo -u agent env HOME=/home/agent"
@@ -2252,6 +2270,10 @@
         " LOCAL_WEBHOOK_STATE_DIR=/home/agent/.local/state/local-webhook"
         " LOCAL_WEBHOOK_SPAWN_SOURCE=github LOCAL_WEBHOOK_SPAWN_KEY=defangdevs/cap"
         f" {sw}/sh -c 'echo hi | {spawn_cmd}' 2>&1"
+    )
+    machine.succeed(
+        "sudo -u agent env HOME=/home/agent "
+        "agent-box-session add hook-cap-full --origin webhook"
     )
     rc, refusal_log = machine.execute(drop_env)
     assert rc == 75, (rc, refusal_log)

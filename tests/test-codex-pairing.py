@@ -338,6 +338,7 @@ class Pairing(unittest.TestCase):
         self.assertGreater(pairing["expires_at"], time.time())
         self.assertEqual(pairing["server_name"], "box.example")
         self.assertIsNone(pairing["error"])
+        self.assertIsNone(pairing["error_code"])
         self.assertEqual(pairing["devices"][0], {
             "client_id": "cli_1", "display_name": "Raph's iPhone",
             "device_type": "phone", "platform": "ios",
@@ -358,6 +359,7 @@ class Pairing(unittest.TestCase):
         self.assertEqual(len(rc), 1)
         (session,) = rc.values()
         self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
         self.assertIsNone(session["profile"])
 
     def test_a_tui_codex_session_does_not_count_as_one_to_pair(self):
@@ -365,6 +367,14 @@ class Pairing(unittest.TestCase):
         self.post("/codex/pairing/start")
         flags = sorted(s["remoteControl"] for s in self.sessions().values())
         self.assertEqual(flags, [False, True])
+
+    def test_the_canonical_daemon_marker_is_sufficient(self):
+        self.write_sessions({
+            "codex": {"agent": "codex", "remoteControl": False,
+                      "remoteControlDaemon": True},
+        })
+        self.post("/codex/pairing/start")
+        self.assertEqual(list(self.sessions()), ["codex"])
 
     def test_claimed_is_sticky(self):
         self.post("/codex/pairing/start")
@@ -424,10 +434,13 @@ class Pairing(unittest.TestCase):
         self.assertEqual(self.post("/codex/pairing/start")[0], 303)
         self.assertEqual(self.post("/codex/pairing/start")[0], 429)
 
-    def test_a_full_box_answers_503(self):
-        self.module.capacity_limit = lambda: 0
+    def test_pairing_bypasses_a_full_hook_budget(self):
+        self.module.capacity_limit = lambda: 1
+        self.write_sessions({"hook-full": {"agent": "claude", "origin": "webhook"}})
         status, _ = self.post("/codex/pairing/start")
-        self.assertEqual(status, 503)
+        self.assertEqual(status, 303)
+        self.assertEqual(self.sessions()["codex"]["origin"], "pairing")
+        self.assertEqual(self.sessions()["hook-full"]["origin"], "webhook")
 
     def test_codex_not_yet_installed_is_signed_out_and_start_is_409(self):
         """The card exists wherever codex is installable, so the GET is not
@@ -463,6 +476,50 @@ class Pairing(unittest.TestCase):
         self.assertEqual(pairing["state"], "waiting")
         self.assertEqual(pairing["devices"], [])
         self.assertEqual(pairing["devices_error"], "boom [redacted]")
+
+    def test_mfa_code_survives_redaction_and_clears_on_recovery(self):
+        self.control.fail["remoteControl/pairing/start"] = (
+            "enrollment failed at `https://chatgpt.com/x`: HTTP 403 Forbidden, "
+            'request-id: private-id, body: {"detail":'
+            '"Multi-factor authentication required"}')
+        self.assertEqual(self.post("/codex/pairing/start")[0], 303)
+        pairing = self.get()
+        self.assertEqual(pairing["state"], "failed")
+        self.assertEqual(pairing["error_code"], "mfa_required")
+        self.assertEqual(pairing["error"], "Multi-factor authentication required")
+        self.assertIsNone(pairing["code"])
+        del self.control.fail["remoteControl/pairing/start"]
+        self.assertEqual(self.post("/codex/pairing/start")[0], 303)
+        pairing = self.get()
+        self.assertEqual(pairing["state"], "waiting")
+        self.assertIsNone(pairing["error_code"])
+
+    def test_mfa_mentions_and_unrelated_403s_have_no_mfa_code(self):
+        for reason in (
+                "HTTP 403: Workspace access denied",
+                "HTTP 503: MFA service unavailable",
+                "Multi-factor authentication required"):
+            with self.subTest(reason=reason):
+                self.control.fail["remoteControl/pairing/start"] = reason
+                self.assertEqual(self.post("/codex/pairing/start")[0], 303)
+                self.assertIsNone(self.get()["error_code"])
+
+    def test_status_failure_preserves_the_mfa_code(self):
+        self.control.fail["remoteControl/status/read"] = (
+            "HTTP 403: Multi-factor authentication required")
+        pairing = self.get()
+        self.assertEqual(pairing["state"], "failed")
+        self.assertEqual(pairing["error_code"], "mfa_required")
+
+    def test_nonstring_rpc_messages_remain_reportable_failures(self):
+        for reason in (403, True, None, {"unexpected": "shape"}):
+            with self.subTest(reason=reason):
+                self.control.fail["remoteControl/pairing/start"] = reason
+                self.assertEqual(self.post("/codex/pairing/start")[0], 303)
+                pairing = self.get()
+                self.assertEqual(pairing["state"], "failed")
+                self.assertIsInstance(pairing["error"], str)
+                self.assertIsNone(pairing["error_code"])
 
     def test_redaction_drops_urls_ids_and_anything_code_shaped(self):
         redact = self.module.codex_redact
@@ -574,11 +631,12 @@ class Pairing(unittest.TestCase):
         self.assertFalse(session["remoteControl"])
 
     def test_the_env_setting_makes_a_codex_sign_in_start_remote_control(self):
-        self.module.set_key("AGENT_BOX_CODEX_SESSION_DEFAULT", "remote-control")
-        self.assertEqual(self.module.codex_session_default(), "remote-control")
+        self.module.set_key("AGENT_BOX_CODEX_SESSION_DEFAULT", "daemon")
+        self.assertEqual(self.module.codex_session_default(), "daemon")
         self.in_home(self.module.connect_signed_in, self.flow)
         (session,) = self.sessions().values()
         self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
         self.assertIsNone(session["profile"])
 
     def test_any_other_value_is_the_tui(self):

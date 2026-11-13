@@ -14,6 +14,11 @@ h2:hover .heading-anchor, h2:focus-within .heading-anchor,
 .heading-anchor:focus { opacity: 1; }
 .heading-anchor:hover { color: #58a6ff; }
 section { margin: 28px 0; }
+.resource-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
+                 gap: 12px; margin: 12px 0 0; padding: 12px 16px;
+                 border: 1px solid #30363d; border-radius: 8px; }
+.resource-grid dt { color: #8b949e; font-size: 13px; }
+.resource-grid dd { margin: 4px 0 0; font-variant-numeric: tabular-nums; }
 .sec-head { display: flex; align-items: center; justify-content: space-between;
             gap: 12px; }
 .repo { position: fixed; top: 16px; right: 16px; display: inline-flex;
@@ -154,10 +159,14 @@ ul.tbl.subs li { padding-left: 40px; }
 .conn-code { font-size: 15px; letter-spacing: 1px; color: #e6edf3; }
 .conn-error { color: #f85149; }
 .conn-field { gap: 6px; }
+.conn-country { flex: 0 0 7em; }
+.conn-national { flex: 1 1 180px; }
 .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
        border-radius: 6px; border: 1px solid #30363d; background: #21262d;
        color: #e6edf3; cursor: pointer; white-space: nowrap; }
 .btn:hover { background: #30363d; }
+/* A form whose answer is still on its way (settings.js markBusy). */
+form[aria-busy="true"] [type="submit"] { opacity: 0.6; cursor: progress; }
 .btn.small { padding: 3px 10px; font-size: 12px; }
 /* Not button.icon: the transcript download (issue #248) is a GET, so it is
    an <a> and has to sit in the same row of icons as the delete button. */
@@ -335,6 +344,14 @@ body.ws { display: flex; flex-direction: column; height: 100vh;
 .tabs a.gear:hover, .tabs a.gear:focus-visible,
 .tabs a.viewtog:hover,
 .tabs a.viewtog:focus-visible { color: #e6edf3; }
+/* Outside the iframe so the tip is not clipped by a grid tile. It must
+   never intercept a drag or take focus from the terminal. */
+#terminal-copy-hint { position: fixed; z-index: 20; pointer-events: none;
+                      box-sizing: border-box;
+                      max-width: min(320px, calc(100vw - 16px));
+                      padding: 8px 12px; border: 1px solid #484f58;
+                      border-radius: 6px; background: #161b22; color: #e6edf3;
+                      font-size: 13px; box-shadow: 0 4px 12px #0006; }
 .ws .editor, .ws .msg { margin: 8px; flex: none; }
 .panes { position: relative; flex: 1; min-height: 0; }
 /* A cell is a pane plus the caption naming it. Stacked and toggled the

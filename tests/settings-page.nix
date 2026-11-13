@@ -1018,6 +1018,7 @@ json.dump({"keys": [{"kty": "OKP", "crv": "Ed25519", "use": "sig",
     client.succeed("grep -qi 'WWW-Authenticate: Basic' /tmp/refused")
     client.succeed("grep -qi '^Content-Type: text/html; charset=utf-8' /tmp/refused")
     client.succeed("grep -q 'Sign in required' /tmp/refused-body")
+    client.succeed("grep -q \"href='https://box.test'\" /tmp/refused-body")
     client.succeed("grep -q 'Agent Box' /tmp/refused-body")
     client.succeed("grep -q 'background:#0d1117' /tmp/refused-body")
 

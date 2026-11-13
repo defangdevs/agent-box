@@ -30,6 +30,7 @@
       web.passwordHashFile = "/var/lib/agent-box-web/password-hash-agent";
       sessions = {
         main = { };
+        remote = { remoteControlServer = true; };
         review = { agent = "codex"; workingDirectory = "/home/agent/agent-box"; };
       };
     };

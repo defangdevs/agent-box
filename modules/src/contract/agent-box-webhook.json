@@ -3,7 +3,8 @@
   "condition": "webhook",
   "env": [
     { "name": "LOCAL_WEBHOOK_SPAWN_CMD", "kind": "hook-spawn", "program": "agent-box-webhook-spawn" },
-    { "name": "AGENT_BOX_TMUX_BIN", "kind": "bin", "program": "tmux" }
+    { "name": "AGENT_BOX_TMUX_BIN", "kind": "bin", "program": "tmux" },
+    { "name": "LOCAL_WEBHOOK_ACK_CMD", "kind": "bin", "program": "agent-box-webhook-ack" }
   ],
   "execStartPre": [
     { "kind": "bin", "program": "agent-box-webhook-policy-apply" }

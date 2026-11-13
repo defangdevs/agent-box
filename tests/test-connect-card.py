@@ -167,7 +167,7 @@ class WhatsAppConnectTest(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         return "http://127.0.0.1:%d/settings" % server.server_address[1]
 
-    def post_start(self, base, phone):
+    def post_start(self, base, phone, country=""):
         class NoRedirect(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *args, **kwargs):
                 return None
@@ -175,7 +175,8 @@ class WhatsAppConnectTest(unittest.TestCase):
         request = urllib.request.Request(
             base + "/connect/start",
             data=urllib.parse.urlencode({
-                "flow": "whatsapp", "phone": phone, "profile": "",
+                "flow": "whatsapp", "phone": phone,
+                "phone_country": country, "profile": "",
             }).encode(),
             method="POST",
         )
@@ -192,16 +193,42 @@ class WhatsAppConnectTest(unittest.TestCase):
         self.assertIsNone(self.daemon.connect_user_code("no code yet", "whatsapp"))
 
     def test_pairing_card_shows_phone_form_then_code(self):
-        idle = self.daemon.render_connect_card(base_state(id="whatsapp", state="idle"))
-        self.assertIn('name="phone"', idle)
-        self.assertIn('type="tel"', idle)
-        self.assertIn('inputmode="tel"', idle)
-        self.assertIn('autocomplete="off"', idle)
-        self.assertNotIn('autocomplete="tel"', idle)
-        self.assertIn("starting with + and country code", idle)
-        self.assertIn("Pair device", idle)
+        with tempfile.TemporaryDirectory() as temp:
+            self.daemon.ENV_FILE = os.path.join(temp, "env")
+            idle = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertIn('name="phone"', idle)
+            self.assertIn('name="phone_country"', idle)
+            self.assertIn('aria-label="WhatsApp country calling code" required', idle)
+            self.assertIn('aria-label="WhatsApp national phone number" required', idle)
+            self.assertIn('type="tel"', idle)
+            self.assertIn('inputmode="tel"', idle)
+            self.assertIn('autocomplete="tel-country-code"', idle)
+            self.assertIn('autocomplete="tel-national"', idle)
+            self.assertNotIn('autocomplete="off"', idle)
+            self.assertIn("country calling code", idle)
+            self.assertIn("Enter a country code and phone number", idle)
+            self.assertIn("Pair device", idle)
+
+            with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+                handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+            configured = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertNotIn(
+                'aria-label="WhatsApp country calling code" required', configured)
+            self.assertNotIn(
+                'aria-label="WhatsApp national phone number" required', configured)
+            with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+                handle.write("LOCAL_WHATSAPP_PHONE=123\n")
+            short = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertIn(
+                'aria-label="WhatsApp country calling code" required', short)
+            self.assertIn(
+                'aria-label="WhatsApp national phone number" required', short)
         waiting = self.daemon.render_connect_card(
             base_state(id="whatsapp", state="waiting", code="7JVT986A"))
+        self.assertIn("7JVT-986A", waiting)
         self.assertIn('data-copy="7JVT986A"', waiting)
         self.assertIn("Linked devices", waiting)
         self.assertNotIn('name="phone"', waiting)
@@ -211,11 +238,11 @@ class WhatsAppConnectTest(unittest.TestCase):
             handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
         status, body = self.post_start(self.serve(), "(415) 555-0123")
         self.assertEqual(400, status)
-        self.assertIn("starting with + and country code", body)
+        self.assertIn("country calling code", body)
         with open(self.daemon.ENV_FILE, encoding="utf-8") as handle:
             self.assertEqual("LOCAL_WHATSAPP_PHONE=14155550100\n", handle.read())
 
-    def test_international_phone_number_is_saved_as_digits(self):
+    def test_legacy_full_international_phone_number_is_saved_as_digits(self):
         self.daemon.whatsapp_profile = lambda profile: ""
         self.daemon.connect_start = lambda flow: {
             "state": "waiting", "error": None,
@@ -224,6 +251,29 @@ class WhatsAppConnectTest(unittest.TestCase):
         self.assertEqual(303, status)
         saved = self.daemon.as_dict(self.daemon.load(self.daemon.ENV_FILE))
         self.assertEqual("14155550123", saved["LOCAL_WHATSAPP_PHONE"])
+
+    def test_split_country_and_national_number_are_saved_as_digits(self):
+        self.daemon.whatsapp_profile = lambda profile: ""
+        self.daemon.connect_start = lambda flow: {
+            "state": "waiting", "error": None,
+        }
+        status, _ = self.post_start(self.serve(), "(415) 555-0123", "+1")
+        self.assertEqual(303, status)
+        saved = self.daemon.as_dict(self.daemon.load(self.daemon.ENV_FILE))
+        self.assertEqual("14155550123", saved["LOCAL_WHATSAPP_PHONE"])
+
+    def test_incomplete_split_phone_does_not_replace_saved_number(self):
+        with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+            handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+        for phone, country in (("", "+1"), ("4155550123", "1"),
+                               ("+14155550123", "+1"),
+                               ("415+5550123", "+1")):
+            with self.subTest(phone=phone, country=country):
+                status, body = self.post_start(self.serve(), phone, country)
+                self.assertEqual(400, status)
+                self.assertIn("country calling code", body)
+        with open(self.daemon.ENV_FILE, encoding="utf-8") as handle:
+            self.assertEqual("LOCAL_WHATSAPP_PHONE=14155550100\n", handle.read())
 
     def test_blank_phone_keeps_the_saved_secret_fallback(self):
         with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:

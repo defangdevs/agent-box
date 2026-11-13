@@ -100,6 +100,8 @@ usage: agent-box-webhook subscribe TOPIC [--note TEXT] [--ttl HOURS]
        agent-box-webhook unsubscribe TOPIC [--deliver-to session|subagent] [--name NAME]
        agent-box-webhook ls
        agent-box-webhook status
+       agent-box-webhook emit SOURCE [JSON] [--event NAME] [--delivery-id ID]
+       agent-box-webhook read-content ID
        agent-box-webhook backfill [OWNER/REPO]... [--dry-run] [--hours N]
        agent-box-webhook url
        agent-box-webhook setup [SOURCE]
@@ -126,6 +128,16 @@ Two delivery shapes:
                          session primed with the event text; bursts coalesce
                          into one. SHARED across sessions and pinned (--ttl
                          0) by default; `ls` shows these under "dispatch".
+                         Keep --note to a short purpose (over 1000 characters
+                         is refused, never cut); put the worker's instructions, safety
+                         rules and model in a profile (`agent-box-profile
+                         set NAME HARNESS=... SYSTEM_PROMPT=...`) and pass
+                         --profile NAME (SYSTEM_PROMPT is Claude-only; a
+                         Codex worker's instructions go in the working
+                         directory's AGENTS.md). Without --profile and
+                         AGENT_BOX_HOOK_PROFILE the box's default harness
+                         starts with no profile model or prompt: just the
+                         note, the event and the box's spawn preamble.
                          local-webhook >= 0.23.0 has no built-in policy: a
                          subagent watch MUST carry --when/--drop rules or it
                          is refused outright — there is no failures-only CI
@@ -146,9 +158,10 @@ Two delivery shapes:
                          claim over any watch, GitHub or not.
                          A spawned session is subscribed to the event's own
                          repo for it, so its own CI spawns no sibling.
-                         THERE IS A CEILING: all sessions running or queued
+                         THERE IS A CEILING: hook sessions running or queued
                          share a RAM-sized limit (about one/GiB by default),
-                         which sessionLimit can override. Hook sessions are
+                         which sessionLimit can override. Manual sessions bypass
+                         it and are never hibernated. Hook sessions are
                          removed by the agent they start, so enough of them
                          still running stall every watch on the box. A batch
                          that arrives then is QUEUED, not dropped: the spawn
@@ -206,8 +219,11 @@ submissions in two minutes, issue #706). POLICY is one of:
   actionable      something is asking you to do something — terminal CI
                   FAILURE, a review verdict, a comment, an assignment, the
                   object closing or reopening, or a PR entering conflict
-  terminal-ci     runs that have FINISHED, whatever the outcome; excludes
-                  queued, in_progress and check-created
+  ci-summary      one event per FINISHED workflow, whatever the outcome
+                  (green too), plus any failing job; no per-job success
+                  events. The one for "did my merge pass?"
+  terminal-ci     every job, run and check that has FINISHED, whatever the
+                  outcome; excludes queued, in_progress and check-created
 
 --include JSON does the same job with your own predicate, and is ANDed with
 the claim rather than refused alongside it. --all-events is the explicit
@@ -220,9 +236,15 @@ it and a reviewer would start a second session on your PR.
 
 Use the BARE number for a PR. GitHub reports a PR comment as an
 issue_comment carrying issue.number, not pull_request.number, so pr:42
-claims the PR and leaves the comments and reviews ON it unclaimed — the
-one event a reviewer is most likely to generate. pr:/issue: are for when
-you deliberately want only one.
+claims the PR and its reviews but leaves those discussion comments
+unclaimed. pr:/issue: are for when you deliberately want only one path.
+
+Successful session claims print coverage hints. A branch claim needs the
+PR's number to cover its discussion comments; a numbered claim needs a
+branch or commit claim for CI. Linked issues and PRs with DIFFERENT numbers
+each need their own claim: a claim does not follow those associations.
+Branch claims miss commit-status events; add the full current commit SHA
+for coverage across all CI event shapes for that commit.
 
 Prefer this to hand-writing --include. A claim only covers the payload
 paths it names, and CI reports terminal failure under six event shapes —
@@ -358,6 +380,15 @@ source_template() {
       # deliberately undeliverable upstream. Teams are what issues live in.
       printf '%s' '{"format":"generic","signatureHeader":"linear-signature","keyPath":"data.teamId","senderPath":"actor.name"}'
       ;;
+    email)
+      printf '%s' '{"format":"generic","keyPath":"recipient","senderPath":"envelopeSender","retainPayload":true}'
+      ;;
+    slack)
+      # local-slack emits through `webhook.py emit`, which signs with this
+      # source's own secret. It routes on `route` (<team>/<channel>), so a topic
+      # is slack:T0123/C0456; without keyPath every event reaches nobody.
+      printf '%s' '{"format":"generic","keyPath":"route"}'
+      ;;
     *) printf '%s' '{}' ;;
   esac
 }
@@ -485,12 +516,12 @@ hook_capacity_warning() {
     return 0
   fi
   [ "$1" -ge "$2" ] || return 0
-  printf '%s' "$1 of at most $2 sessions are running or queued, so every \
+  printf '%s' "$1 of at most $2 hook sessions are running or queued, so every \
 standing watch is stalled: a matching event batch starts nothing now. The \
 spawn wrapper DECLINES it (exit 75) and the receiver holds it, re-offering it \
 as slots free and dropping it only once the wait outlasts \
 LOCAL_WEBHOOK_SPAWN_DEFER_MAX_S — so clearing the cap is still the fix. Free \
-a slot (agent-box-session ls, then agent-box-session stop NAME, or \
+a hook slot (agent-box-session ls, then agent-box-session stop NAME, or \
 agent-box-session rm NAME to delist it for good), or raise \
 sessionLimit in the box configuration."
 }
@@ -551,9 +582,16 @@ default_subagent_when() {
 # are deliberately few: a policy nobody can predict the meaning of is worse
 # than writing the predicate out.
 #
-#   terminal-ci   a run that has FINISHED, whatever the outcome — the six
-#                 shapes CI reports through. Excludes queued, in_progress and
-#                 check-created, which is the bulk of the noise.
+#   ci-summary    one event per workflow that has FINISHED, whatever the
+#                 outcome, so green is NOT silent — plus every failing job,
+#                 so a red job does not wait for its workflow. Per-job and
+#                 per-check SUCCESS is left out: a repo with twenty jobs sends
+#                 twenty "passed" events per commit, none of which asks for
+#                 anything (53 of 98 events in one session's transcript).
+#   terminal-ci   every run, job and check that has FINISHED, whatever the
+#                 outcome — the six shapes CI reports through. Excludes
+#                 queued, in_progress and check-created. Use it only when the
+#                 per-job outcome is itself the point.
 #   actionable    something is asking you to do something: terminal CI
 #                 FAILURE (a green run asks for nothing), a review verdict, a
 #                 comment, an assignment, the object closing or reopening,
@@ -567,6 +605,19 @@ ci_terminal_json='["success","failure","cancelled","timed_out","action_required"
 events_predicate() {
   # events_predicate POLICY — the event-relevance predicate, as JSON.
   case "$1" in
+    (ci-summary)
+      # A workflow_run is the one shape that means "everything in this
+      # workflow is done", so it carries the green result. Job-level shapes
+      # contribute failures only. Commit statuses and deployments have no
+      # workflow to summarise them, so their finished states stay as they are.
+      "$JQ" -nc --argjson t "$ci_terminal_json" --argjson ci "$ci_failure_json" '
+        {any: [
+          {path:"workflow_run.conclusion", "in":$t},
+          {path:"workflow_job.conclusion", "in":$ci},
+          {path:"check_run.conclusion", "in":$ci}, {path:"check_suite.conclusion", "in":$ci},
+          {path:"deployment_status.state", "in":["success","error","failure","inactive"]},
+          {path:"state", "in":["success","error","failure"]}
+        ]}' ;;
     (terminal-ci)
       "$JQ" -nc --argjson t "$ci_terminal_json" '
         {any: [
@@ -597,7 +648,7 @@ events_predicate() {
         ]}' ;;
     (*)
       echo "agent-box-webhook: --events '$1' is not a policy — use" \
-           "terminal-ci or actionable, write --include yourself, or say" \
+           "ci-summary, terminal-ci or actionable, write --include yourself, or say" \
            "--all-events to keep the whole lifecycle" >&2
       return 1 ;;
   esac
@@ -737,8 +788,8 @@ reject_default_branch() {
        "lifecycle event on it for the whole TTL (issue #706). Claim what is" \
        "actually yours: --claim <PR number>, --claim branch:<topic branch>," \
        "or --claim sha:<40-character commit> for one run's CI. To WATCH the" \
-       "default branch without owning it, subscribe with --events terminal-ci" \
-       "and no claim." >&2
+       "default branch without owning it, subscribe with --events ci-summary" \
+       "(or terminal-ci) and no claim." >&2
   return 1
 }
 
@@ -759,7 +810,7 @@ reject_default_branch() {
 #   --claim branch:fix/42      everything CI reports against that branch
 #   --claim sha:<40 hex>       everything CI reports against that ONE commit
 #
-# Repeatable, and the clauses OR together — `--claim pr:42 --claim
+# Repeatable, and the clauses OR together - `--claim 42 --claim
 # branch:fix/42-thing` is the normal shape for picking up a PR.
 claim_clauses() {
   # claim_clauses SPEC — the JSON clauses for one spec, as a JSON array.
@@ -816,8 +867,8 @@ claim_clauses() {
     # always know whether the events it will see call it an issue or a PR —
     # GitHub itself uses both for the same object (a PR comment arrives as
     # issue_comment with issue.number). This is why the documented example
-    # uses a bare number for a PR: `pr:42` alone leaves every comment and
-    # review ON that PR unclaimed, which is the #417 collision exactly.
+    # uses a bare number for a PR: `pr:42` alone leaves its discussion
+    # comments unclaimed, which is the #417 collision exactly.
     (number) "$JQ" -nc --argjson n "$_cl_val" \
                '[{path:"pull_request.number", "in":[$n]},
                  {path:"issue.number", "in":[$n]}]' ;;
@@ -862,6 +913,88 @@ claim_clauses() {
   esac
 }
 
+# A caller's own --ignore-sender or --exclude REPLACES the rule that drops
+# this box's own echoes: the spawn-seeded ["@self"] mute, or the default
+# self-echo exclude of a new GitHub session subscription. That is often what
+# the caller wants, so this is a hint, not a refusal: it says whether "@self"
+# is still muted, and the caller re-runs or keeps it. Shared GitHub accounts
+# are why the ack adapter cannot decide this by itself: another box's comment
+# under the same login can be real work.
+self_echo_hint() {
+  [ "${ignore_given:-0}" = 1 ] || [ "${exclude_given:-0}" = 1 ] || return 0
+  self="${LOCAL_WEBHOOK_SELF:-}"
+  if [ -z "$self" ]; then
+    echo "agent-box-webhook: this box's GitHub login is unknown" \
+         "(LOCAL_WEBHOOK_SELF is unset), so \"@self\" mutes nobody and" \
+         "this box's own comments and pushes arrive as events" >&2
+    return 0
+  fi
+  self_lc="$(printf '%s' "$self" | tr '[:upper:]' '[:lower:]')"
+  muted=0
+  if [ "$ignore_given" = 1 ]; then
+    # No pathname expansion: `bot*` is a literal sender to webhook.py, and
+    # must not turn into a matching file name here.
+    old_ifs=$IFS; IFS=,; case $- in (*f*) old_f=1 ;; (*) old_f=0; set -f ;; esac
+    for ign in $ignore_list; do
+      ign="$(printf '%s' "$ign" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+      case "$ign" in ("@self"|"$self_lc") muted=1 ;; esac
+    done
+    IFS=$old_ifs; [ "$old_f" = 1 ] || set +f
+    if [ "$muted" = 1 ]; then
+      echo "agent-box-webhook: --ignore-sender includes @self ($self): this" \
+           "box's own events on $topic are muted, its CI results too" >&2
+    else
+      echo "agent-box-webhook: --ignore-sender replaces the sender mute, and" \
+           "@self ($self) is not in it. Add --ignore-sender @self to mute" \
+           "this box's own events, or keep it as-is to receive them" >&2
+    fi
+  fi
+  # Only a session subscription gets the default self-echo exclude; a
+  # standing watch has none to replace. The predicate is not judged here: an
+  # exclude can drop self-sent events without naming the login (for example
+  # every "created" action), and naming the login does not make a sender
+  # clause. So say what was removed, and promise nothing about delivery.
+  if [ "$exclude_given" = 1 ] && [ "$muted" = 0 ] && [ "$deliver_to" = session ]; then
+    echo "agent-box-webhook: --exclude replaces the default exclude, which" \
+         "dropped this box's own comments, pushes and reviews ($self)." \
+         "That default no longer drops them; your own rules decide. To keep" \
+         "them out, add --ignore-sender @self (it mutes this box's CI results" \
+         "too) or a sender clause in --exclude" >&2
+  fi
+}
+
+claim_coverage_hints() {
+  # Inspect the generated scope, so paired narrow claims count just like a
+  # bare number. Hints neither resolve associations nor change ownership.
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    (github:*) ;;
+    (*:*) return 0 ;;
+    (*/*) ;;
+    (*) return 0 ;;
+  esac
+  printf '%s' "$2" | "$JQ" -r '
+    .any as $scope
+    | [$scope[] | select(.path == "pull_request.number") | .in[]] | unique as $prs
+    | [$scope[] | select(.path == "issue.number") | .in[]] | unique as $issues
+    | ($prs + $issues | length > 0) as $numbered
+    | ($scope | any(.path == "workflow_run.head_branch")) as $branch
+    | ($scope | any(.path == "workflow_run.head_sha")) as $commit
+    | (($prs - $issues)[] as $n
+       | "agent-box-webhook: claim hint: --claim pr:\($n) misses PR discussion comments sent as issue.number; use --claim \($n) to cover those too."),
+      (if $branch and ($numbered | not) then
+         "agent-box-webhook: claim hint: a branch claim does not cover PR discussion comments or linked issue comments; add --claim <PR number> and --claim <issue number> for the items you own."
+       elif $numbered and (($branch or $commit) | not) then
+         "agent-box-webhook: claim hint: numbered claims do not cover branch CI; if this is PR work, add --claim branch:<topic branch> or --claim sha:<full commit> for one commit."
+       else empty end),
+      (if $branch and ($commit | not) then
+         "agent-box-webhook: claim hint: branch claims miss commit-status events; add --claim sha:<full current commit> to cover all CI event shapes for that commit."
+       else empty end),
+      (if $numbered then
+         "agent-box-webhook: claim hint: linked issues or PRs with different numbers need their own --claim; associations are not followed automatically."
+       else empty end)
+  ' >&2
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
   subscribe)
@@ -884,6 +1017,9 @@ case "$cmd" in
       emitted_include=0
       user_include=""; user_include_flag=""
       note=""; have_note=0
+      # Captured AND forwarded, so the end of this command can say whether the
+      # caller's own mute or exclude still drops this box's echoes ("@self").
+      ignore_given=0; ignore_list=""; exclude_given=0
       # Filter --claim out of the argument list as we scan it: webhook.py has
       # never heard of that flag, so it is translated to --include below and
       # must not survive into the exec. Rotate idiom — take from the front,
@@ -912,6 +1048,7 @@ case "$cmd" in
             (events) events_policy="$a"; have_events=1; want=""; continue ;;
             (uinclude) user_include="$a"; want=""; continue ;;
             (note) note="$a"; have_note=1; want=""; continue ;;
+            (ignore) ignore_list="$ignore_list,$a" ;;
           esac
           want=""
           set -- "$@" "$a"; continue
@@ -920,8 +1057,18 @@ case "$cmd" in
           --deliver-to) want=deliver-to ;;
           --name) want=name ;;
           --deliver-to=*) deliver_to="${a#--deliver-to=}" ;;
-          --drop|--drop=*) have_drop=1 ;;
-          --exclude|--exclude=*) have_exclude=1 ;;
+          # --drop is the old name of --exclude. Its value is consumed here
+          # (so it is never read as the topic) and forwarded unchanged.
+          --drop|--exclude)
+            case "$a" in (--drop) have_drop=1 ;; (*) have_exclude=1 ;; esac
+            exclude_given=1; want=exclude ;;
+          --drop=*|--exclude=*)
+            case "$a" in (--drop=*) have_drop=1 ;; (*) have_exclude=1 ;; esac
+            exclude_given=1 ;;
+          --ignore-sender|--ignore-senders)
+            ignore_given=1; want=ignore ;;
+          --ignore-sender=*|--ignore-senders=*)
+            ignore_given=1; ignore_list="$ignore_list,${a#*=}" ;;
           # --include and its old name --when are captured, not forwarded:
           # with a claim they are ANDed into one rule below, and without one
           # they are re-emitted unchanged under the spelling the caller used.
@@ -1123,7 +1270,9 @@ case "$cmd" in
                "opened issue #706. Add one of:" \
                "--events actionable (comments, reviews, assignments," \
                "closes, terminal CI failure);" \
-               "--events terminal-ci (finished runs only, whatever the" \
+               "--events ci-summary (one event per finished workflow, green" \
+               "included, plus failing jobs);" \
+               "--events terminal-ci (every finished job, whatever the" \
                "outcome);" \
                "--include JSON (your own predicate, ANDed with the claim);" \
                "--all-events (say you really do want every lifecycle" \
@@ -1219,18 +1368,21 @@ case "$cmd" in
       fi
     fi
     "$PY" "$SCRIPT" "$cmd" "$@" || exit $?
+    if [ "$deliver_to" = session ] && [ -n "${claims:-}" ]; then
+      claim_coverage_hints "$topic" "$claim_any"
+    fi
     # Said after the subscription exists, so it never describes one that was
     # refused. The boundary is real and invisible: a numbered claim ends at
     # the merge, and the obvious next move — claiming the branch the work
     # merged onto — is the one this CLI now refuses (issue #706).
     if [ -n "${merge_note:-}" ] && [ "$deliver_to" = session ]; then
-      echo "agent-box-webhook: that claim covers the PR or issue itself, its" \
-           "comments and its reviews, while it is open. POST-MERGE CI IS NOT" \
-           "COVERED — the work moves onto the default branch, and a default" \
+      echo "agent-box-webhook: if this claim is for a PR, POST-MERGE CI IS NOT COVERED." \
+           "The work moves onto the default branch, and a default" \
            "branch cannot be claimed. When it merges, re-subscribe with" \
            "--claim sha:<merge commit> (gh pr view N --json mergeCommit --jq" \
            ".mergeCommit.oid), never --claim branch:<default>." >&2
     fi
+    self_echo_hint
     if [ "$deliver_to" = session ] && [ -n "${topic:-}" ]; then
       remember_codex_wake
     fi
@@ -1504,16 +1656,36 @@ case "$cmd" in
     # a re-run), and secretFile is authoritative. Merge, never clobber: another
     # source may already be configured, and defaultSource must keep pointing at
     # whatever was set up first.
+    # Boot-time email initialization must not take over the bare GitHub
+    # endpoint before an operator has run setup github. emit names email
+    # explicitly, so it does not need to become the default HTTP source.
     [ -f "$SOURCES" ] || printf '{"sources":{}}\n' > "$SOURCES"
     tmp="$(mktemp "$SOURCES.XXXXXX")"
     if "$JQ" --arg s "$src" --argjson tmpl "$(source_template "$src")" \
          '.sources = ((.sources // {}) + {($s): ($tmpl + ((((.sources // {})[$s]) // {})) | .secretFile = ($s + ".secret"))})
-          | .defaultSource = (.defaultSource // $s)' "$SOURCES" > "$tmp"; then
+          | .defaultSource = (.defaultSource // (if $s == "email" then "github" else $s end))' "$SOURCES" > "$tmp"; then
       chmod 600 "$tmp"; mv "$tmp" "$SOURCES"
     else
       rm -f "$tmp"; exit 1
     fi
     sig_header="$(source_sig_header "$src")"
+    if [ "$src" = slack ]; then
+      # Slack never calls this endpoint: local-slack holds the Socket Mode
+      # connection and posts signed events to the local socket itself.
+      cat <<EOF
+$note
+
+Nothing to register in Slack. local-slack connects out to Slack and delivers
+into this box's webhook socket itself, so do NOT paste a URL into Slack's
+Event Subscriptions.
+
+Put SLACK_APP_TOKEN and SLACK_BOT_TOKEN in the settings page's secrets panel;
+the daemon starts by itself once both are set. Its log is
+~/.local/state/local-slack/daemon.log. Topics are slack:<TEAM_ID>/<CHANNEL_ID>:
+  agent-box-webhook subscribe slack:T.../C... --note "why you care"
+EOF
+      exit 0
+    fi
     cat <<EOF
 $note
 
@@ -1645,5 +1817,8 @@ EOF
     fi
     ;;
   ""|-h|--help|help) usage ;;
+  emit|read-content)
+    exec "$PY" "$SCRIPT" "$cmd" "$@"
+    ;;
   *) usage >&2; exit 2 ;;
 esac

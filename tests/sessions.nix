@@ -2,9 +2,10 @@
 # users. One hardened unit per USER supervises tmux sessions declared in the
 # user-owned ~/.config/agent-box/sessions.json.
 #
-# This half owns everything that happens BELOW the browser — the supervisor,
-# the session CLI and the agent harnesses. The browser surface on top of the
-# same box is tests/sessions-web.nix, and the box both drive is
+# These two parts own everything that happens BELOW the browser - the
+# supervisor, the session CLI and the agent harnesses. They evaluate from this
+# file as independent VM checks so their runtime is parallel, while the browser
+# surface remains in tests/sessions-web.nix. Every check drives the box in
 # tests/sessions-common.nix (issue #312: this was one 1870-line test that ran
 # for 325s and held all of CI open behind it). Exercises:
 #   - first-boot seeding of the Nix-declared config into sessions.json
@@ -39,12 +40,13 @@
 #
 # Like the other tests, the shared node lib.mkForce-swaps the module
 # Caddyfile for a minimal `tls internal` one (no ACME in the sandbox).
-{ agent-box }:
+{ agent-box, part ? "harness" }:
+assert builtins.elem part [ "harness" "lifecycle" ];
 let
   common = import ./sessions-common.nix { inherit agent-box; };
 in
 {
-  name = "agent-box-sessions";
+  name = "agent-box-sessions-${part}";
   node.pkgsReadOnly = false;
 
   nodes.machine = common.machineNode;
@@ -78,6 +80,7 @@ in
 
     # --- first boot: legacy options seeded a "main" session --------------
     machine.wait_until_succeeds(tmux("has-session -t =main"), timeout=120)
+  '' + (if part == "harness" then ''
     # Issue #78: this disk is fresh on every run, so ~/.config does not
     # exist yet when tmpfiles processes the rules — the exact condition
     # under which the parent-dir rule (#356) matters. Before that fix,
@@ -334,6 +337,69 @@ in
         )
         machine.succeed(as_agent("agent-box-session rm themed"))
 
+    with subtest("claude remote control server is explicit and foreground"):
+        # The existing remoteControl=true record remains the interactive TUI.
+        # Server mode is a separate spelling so an update cannot replace old
+        # panes with a different program (issue #383).
+        machine.fail(as_agent(
+            "agent-box-session add bad-server --harness claude "
+            "--remote-control server --prompt 'no single target'"
+        ))
+        machine.succeed(as_agent(
+            "agent-box-session add claude-server --harness claude "
+            "--daemon -- --spawn same-dir --capacity 1"
+        ))
+        machine.wait_until_succeeds(
+            tmux("has-session -t =claude-server"), timeout=60
+        )
+        machine.succeed(
+            "jq -e '.sessions[\"claude-server\"]"
+            " | .remoteControl == true and .remoteControlDaemon == true"
+            " and .remoteControlServer == true' "
+            + sfile
+        )
+        server_cmd = machine.succeed(
+            tmux('list-panes -t "=claude-server" -F "#{pane_start_command}"')
+        ).replace("\\", "")
+        assert "claude remote-control" in server_cmd, server_cmd
+        assert "--name agent-claude-server@box.test" in server_cmd, server_cmd
+        assert "--permission-mode bypassPermissions" in server_cmd, server_cmd
+        assert "--spawn same-dir --capacity 1" in server_cmd, server_cmd
+        for tui_only in ("--dangerously-skip-permissions", "--session-id",
+                         "--resume", "--settings", "--channels"):
+            assert tui_only not in server_cmd, server_cmd
+        # Selecting this mode is the explicit consent that answers Claude's
+        # one-time server confirmation. Project trust remains scoped to cwd.
+        machine.succeed(
+            "jq -e '.hasUsedRemoteControl == true"
+            " and .remoteDialogSeen == true' /home/agent/.claude.json"
+        )
+        machine.fail(
+            "jq -e '.nativeSessionId' " + state_file("claude-server")
+        )
+        # A newer writer may be read after rollback/replay without the legacy
+        # compatibility bits. The canonical marker alone must still select the
+        # daemon, derive its name, and avoid recording a TUI-native session.
+        machine.succeed(as_agent("agent-box-session stop claude-server"))
+        machine.succeed(as_agent(
+            "jq '.sessions[\"claude-server\"].remoteControl = false"
+            " | .sessions[\"claude-server\"].remoteControlServer = false' "
+            f"{sfile} > {sfile}.t && mv {sfile}.t {sfile}"
+        ))
+        machine.succeed(as_agent("agent-box-session restart claude-server"))
+        machine.wait_until_succeeds(
+            tmux("has-session -t =claude-server"), timeout=60
+        )
+        canonical_cmd = machine.succeed(
+            tmux('list-panes -t "=claude-server" -F "#{pane_start_command}"')
+        ).replace("\\", "")
+        assert "claude remote-control" in canonical_cmd, canonical_cmd
+        assert "--name agent-claude-server@box.test" in canonical_cmd, canonical_cmd
+        machine.fail(
+            "jq -e '.nativeSessionId' " + state_file("claude-server")
+        )
+        machine.succeed(as_agent("agent-box-session rm claude-server"))
+
     # --- --cwd is canonicalized before it becomes a trust key (issue #597) -
     with subtest("agent-box-session add --cwd is resolved to an absolute path"):
         # A relative or "~"-prefixed --cwd used to land in sessions.json —
@@ -495,17 +561,41 @@ in
         machine.succeed(as_agent("agent-box-session rm linked-codex"))
 
     # --- runtime add: no sudo, no rebuild ---------------------------------
-    # --remote-control true: a bare codex add now defaults to the TUI
-    # (issue #623), and this subtest is specifically exercising the daemon.
+    # A bare codex add defaults to the TUI (issue #623), and this subtest is
+    # specifically exercising the daemon.
     machine.succeed(
         "su -s /bin/sh agent -c "
-        "'agent-box-session add helper --harness codex --remote-control true'"
+        "'agent-box-session add helper --harness codex --daemon'"
     )
     machine.wait_until_succeeds(tmux("has-session -t =helper"), timeout=60)
     machine.succeed(
-        "jq -e '.sessions.helper.agent == \"codex\"' "
+        "jq -e '.sessions.helper.agent == \"codex\""
+        " and .sessions.helper.remoteControl == true"
+        " and .sessions.helper.remoteControlDaemon == true' "
         "/home/agent/.config/agent-box/sessions.json"
     )
+
+    # Exercise every daemon-only supervisor branch through the canonical
+    # marker, without relying on the legacy Codex remoteControl=true encoding.
+    # tmux existence only means the pane was created. Do not interrupt daemon
+    # startup, or let its asynchronous HUP cleanup stop the replacement daemon.
+    machine.wait_until_succeeds(
+        as_agent("codex app-server daemon version"), timeout=60
+    )
+    helper_pane_pid = machine.succeed(
+        tmux('display-message -p -t "=helper:" "#{pane_pid}"')
+    ).strip()
+    machine.succeed(as_agent("agent-box-session stop helper"))
+    machine.wait_until_fails(f"pgrep -g {helper_pane_pid}", timeout=60)
+    machine.wait_until_fails(
+        as_agent("codex app-server daemon version"), timeout=60
+    )
+    machine.succeed(as_agent(
+        "jq '.sessions.helper.remoteControl = false' "
+        f"{sfile} > {sfile}.t && mv {sfile}.t {sfile}"
+    ))
+    machine.succeed(as_agent("agent-box-session restart helper"))
+    machine.wait_until_succeeds(tmux("has-session -t =helper"), timeout=60)
 
     # Starting a codex session is what seeds the standalone layout (issue
     # #572), and it points at the binary the session was launched with.
@@ -541,9 +631,20 @@ in
     # pgrep runs as ROOT (not via as_agent): `-u agent` then filters out the
     # invoking shell, whose own command line contains the pattern — as the
     # agent it self-matched and "succeeded" with the wrapper long dead.
-    helper_cmdline = machine.wait_until_succeeds(
-        "pgrep -u agent -af agent-box-codex-remote-control", timeout=60
-    )
+    try:
+        helper_cmdline = machine.wait_until_succeeds(
+            "pgrep -u agent -af agent-box-codex-remote-control", timeout=60
+        )
+    except Exception:
+        # A live tmux pane can be the post-mortem shell. Preserve the actual
+        # startup error before the VM is torn down instead of only a timeout.
+        print(machine.execute(tmux('capture-pane -p -S -100 -t "=helper:"'))[1])
+        print(machine.execute(f"jq '.sessions.helper' {sfile}")[1])
+        print(machine.execute(
+            "tail -100 /home/agent/.codex/app-server-daemon/app-server.stderr.log"
+        )[1])
+        print(machine.execute("ps -u agent -o pid,ppid,args")[1])
+        raise
     assert "-c approval_policy=never" in helper_cmdline, helper_cmdline
     assert "-c sandbox_mode=danger-full-access" in helper_cmdline, helper_cmdline
     assert "--dangerously-bypass-approvals-and-sandbox" not in helper_cmdline, helper_cmdline
@@ -699,6 +800,18 @@ in
         " 111)' >&2\n"
         "    exit 1\n"
         "  fi\n"
+        "  if test -f /tmp/stub/mfa; then\n"
+        "    printf '%s\\n' 'Error: remoteControl/pairing/start failed: remote"
+        " control server enrollment failed: HTTP 403 Forbidden, request-id:"
+        " test, body: {\"detail\":\"Multi-factor authentication required\"}' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "  if test -f /tmp/stub/other403; then\n"
+        "    printf '%s\\n' 'Error: remoteControl/pairing/start failed: remote"
+        " control server enrollment failed: HTTP 403 Forbidden, request-id:"
+        " test, body: {\"detail\":\"Workspace access denied\"}' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
         '  echo "Pairing code: TEST-PAIR" ;;\n'
         "esac\n"
         "EOF"
@@ -718,6 +831,20 @@ in
             machine.succeed("cat /tmp/stub/out"),
             machine.succeed("cat /tmp/stub/log"),
         )
+
+    # Settings-driven startup leaves pairing to the page. Both the preferred
+    # daemon value and its compatibility spelling must suppress the wrapper's
+    # eager second code; Enter still takes that path in the keyboard test below.
+    for default in ("daemon", "remote-control"):
+        machine.succeed("rm -rf /tmp/stub && install -d -m 0777 /tmp/stub")
+        machine.succeed("touch /tmp/stub/loggedin")
+        quiet_out = machine.succeed(as_agent(
+            f'AGENT_BOX_CODEX_SESSION_DEFAULT={default} {wrapper} "" "" "" '
+            "/tmp/stub-codex > /tmp/stub/out 2>&1 || true; cat /tmp/stub/out"
+        ))
+        quiet_calls = machine.succeed("cat /tmp/stub/log")
+        assert "pair from your Station's" in quiet_out, quiet_out
+        assert "remote-control pair" not in quiet_calls, quiet_calls
 
     # Invalidated token: the pane explains itself in the server's own words,
     # drops the dead credentials, runs the device flow and pairs — all without a
@@ -750,6 +877,27 @@ in
     assert "Press Enter to try again" in offline_out, offline_out
     assert "logout" not in offline_calls, offline_calls
     assert offline_calls.count("remote-control pair") == 3, offline_calls
+
+    # MFA is an account-side enrollment requirement, not a rejected token.
+    # Retrying or deleting valid credentials cannot enable it, so the pane
+    # stops after one call and tells the user which account action comes first.
+    mfa_out, mfa_calls = run_pane("loggedin", "mfa")
+    assert "requires multi-factor authentication" in mfa_out, mfa_out
+    assert "https://chatgpt.com/settings/security" in mfa_out, mfa_out
+    assert "workspace admin" in mfa_out, mfa_out
+    assert "type: login" in mfa_out, mfa_out
+    assert "Press Enter to try again" not in mfa_out, mfa_out
+    assert "logout" not in mfa_calls, mfa_calls
+    assert "login --device-auth" not in mfa_calls, mfa_calls
+    assert mfa_calls.count("remote-control pair") == 1, mfa_calls
+
+    # The classifier requires both the 403 and the exact MFA reason. Another
+    # enrollment 403 stays on the existing retry path and preserves credentials.
+    other403_out, other403_calls = run_pane("loggedin", "other403")
+    assert "Press Enter to try again" in other403_out, other403_out
+    assert "requires multi-factor authentication" not in other403_out, other403_out
+    assert "logout" not in other403_calls, other403_calls
+    assert other403_calls.count("remote-control pair") == 3, other403_calls
 
     # A remote Codex conversation can inherit this pane's $TMUX_PANE and send
     # it a line meant for a real Codex prompt (issue #691) — /rename, or
@@ -829,7 +977,13 @@ in
     old_helper_pid = machine.succeed(
         tmux('display -p -t "=helper:" "#{pane_pid}"')
     ).strip()
-    machine.succeed(tmux("kill-session -t =helper"))
+    # The direct wrapper checks above stop the same user-wide Codex daemon
+    # that helper supervises. Its pane can therefore disappear between the
+    # PID read and this deliberate kill; wait for reconciliation to provide a
+    # live pane instead of failing in that sub-second window.
+    machine.wait_until_succeeds(
+        tmux("kill-session -t =helper"), timeout=60
+    )
     helper_restart = machine.wait_until_succeeds(
         tmux('list-panes -t "=helper" -F "#{pane_pid} #{pane_start_command}"')
         + f" | grep -v '^{old_helper_pid} '",
@@ -1105,6 +1259,7 @@ in
         "/home/agent/.config/agent-box/sessions.json"
     )
 
+  '' else ''
     # --- kickoff prompt: fires once, then resumes -------------------------
     with subtest("kickoff prompt is delivered once and consumed"):
         machine.succeed(
@@ -1271,6 +1426,45 @@ in
         assert "-c sandbox_mode=workspace-write" in careful_cmd, careful_cmd
         assert "--dangerously-bypass-approvals-and-sandbox" not in careful_cmd, careful_cmd
         machine.succeed(as_agent("agent-box-session rm careful"))
+
+    with subtest("codex: prompt-less restart follows its SessionStart record"):
+        # Exercise the installed system hook and supervisor without network
+        # inference. Two sessions in one cwd must keep distinct native ids.
+        hook = machine.succeed(
+            "python3 -c 'import tomllib; "
+            "print(tomllib.load(open(\"/etc/codex/config.toml\", \"rb\"))"
+            "[\"hooks\"][\"SessionStart\"][0][\"hooks\"][0][\"command\"])'"
+        ).strip()
+        for name, native in [
+            ("resume-codex-a", "11111111-1111-4111-8111-111111111111"),
+            ("resume-codex-b", "22222222-2222-4222-8222-222222222222"),
+        ]:
+            machine.succeed(as_agent(f"agent-box-session add {name} --harness codex"))
+            machine.wait_until_succeeds(tmux(f"has-session -t ={name}"), timeout=60)
+            quiesce_harness(name)
+            launch = machine.succeed(
+                f"jq -r .launchSessionId /home/agent/.local/state/agent-box/session/{name}.json"
+            ).strip()
+            payload = json.dumps({"session_id": native, "source": "startup",
+                                  "hook_event_name": "SessionStart"})
+            # Stand in for the supervised native process after quiescing it.
+            hook_call = (f"printf %s {shlex.quote(payload)} | "
+                         f"AGENT_BOX_SESSION_ID={launch} {hook}; :")
+            machine.succeed(as_agent(
+                "bash -c " + shlex.quote(
+                    'export AGENT_BOX_CODEX_PID=$$; exec -a codex bash -c '
+                    + shlex.quote(hook_call))
+            ))
+            machine.succeed(
+                "install -D -o agent /dev/null /home/agent/.codex/sessions/2026/10/28/"
+                f"rollout-2026-10-28T00-00-00-{native}.jsonl"
+            )
+            machine.succeed(as_agent(f"agent-box-session restart {name}"))
+            machine.wait_until_succeeds(
+                tmux(f'list-panes -t "={name}" -F "#{{pane_start_command}}"')
+                + f" | grep -- ' resume .* -- {native}' >/dev/null", timeout=60
+            )
+            machine.succeed(as_agent(f"agent-box-session rm {name}"))
 
     # --- segment rotation: respawn follows the recorded live id -----------
     with subtest("segment rotation: respawn resumes the recorded live id"):
@@ -2083,6 +2277,7 @@ in
         )
 
 
+  '') + (if part == "harness" then ''
     # --- two writers of sessions.json (issue #254, tests from #285) --------
     # Every writer of the registry rewrites the WHOLE document through
     # tmp+rename. That makes a reader safe and says nothing about the interval
@@ -2271,5 +2466,5 @@ in
         assert "does not parse" in journal, journal
         machine.succeed(as_agent(f"rm -f {sfile}.corrupt-*"))
 
-  '';
+  '' else "");
 }

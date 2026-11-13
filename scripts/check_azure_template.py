@@ -87,6 +87,7 @@ HOSTILE_AGENTSMD = "x\nAGENTBOX_AGENTSMD\ntouch /tmp/pwned\n@@WEBPASSWORD@@\n"
 # has no character constraint for a string parameter, and these two are
 # validated and decoded by the bootstrap itself rather than the template).
 PORTAL_ISSUER_SAMPLE = "https://station.example.com"
+PORTAL_REDIRECT_SAMPLE = "https://station.example.com/app/stations/42?a=1&b=2#connect"
 PORTAL_USER_SAMPLE = "usr_2Nk9x"
 PUBLIC_IP_SAMPLE = "203.0.113.7"
 DOMAIN_SAMPLE = PUBLIC_IP_SAMPLE
@@ -105,6 +106,7 @@ SAMPLE = {
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
     "@@PORTALISSUERB64@@": base64.b64encode(
         PORTAL_ISSUER_SAMPLE.encode()).decode(),
+    "@@PORTALREDIRECTURLB64@@": base64.b64encode(PORTAL_REDIRECT_SAMPLE.encode()).decode(),
     "@@PORTALUSERIDB64@@": base64.b64encode(
         PORTAL_USER_SAMPLE.encode()).decode(),
     "@@PUBLICIPB64@@": base64.b64encode(PUBLIC_IP_SAMPLE.encode()).decode(),
@@ -128,6 +130,7 @@ DEFAULT_OF = {
     # Both default to '' -- handover off, which is the default box.
     "@@PORTALISSUERB64@@": "portalIssuer",
     "@@PORTALUSERIDB64@@": "portalUser",
+    "@@PORTALREDIRECTURLB64@@": "portalRedirectUrl",
 }
 
 
@@ -207,6 +210,12 @@ def render_bootstrap(template: dict, values: dict | None = None) -> str:
     return script
 
 
+def resources(template: dict):
+    """ARM 1.x arrays and 2.0 symbolic resource maps."""
+    entries = template.get("resources", [])
+    return entries.values() if isinstance(entries, dict) else entries
+
+
 def bootstrap_chain(template: dict) -> str:
     """The compiled expression that substitutes and encodes the bootstrap.
 
@@ -218,7 +227,7 @@ def bootstrap_chain(template: dict) -> str:
     chain = template.get("variables", {}).get("bootstrap")
     if chain:
         return chain
-    for resource in template.get("resources", []):
+    for resource in resources(template):
         if resource.get("type") != "Microsoft.Compute/virtualMachines/extensions":
             continue
         script = (resource.get("properties", {}).get("protectedSettings", {})
@@ -284,7 +293,8 @@ def check_static_domain(template: dict) -> int:
                      .get("defaultValue"))
     domains_default = (template.get("parameters", {}).get("sslipDomains", {})
                        .get("defaultValue"))
-    public_ip_ref = "reference(resourceId('Microsoft.Network/publicIPAddresses'"
+    public_ip_ref = ("reference('publicIp')" if template.get("languageVersion") == "2.0"
+                     else "reference(resourceId('Microsoft.Network/publicIPAddresses'")
     failures = []
     if "--settle-delay" in script:
         failures.append("bootstrap still requests an avoidable settle delay")
@@ -441,7 +451,7 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
 
 
 PORTAL_BLOCK = re.compile(
-    r"(install -d -m 0755 /etc/agent-box\n.*?/etc/agent-box/config\.yaml)"
+    r"(install -d -m 0755 /etc/agent-box\n.*?)"
     r"\n\n# Extra standing instructions", re.S)
 
 
@@ -464,9 +474,11 @@ def extract_portal_block(script: str) -> str:
 def run_portal_block(
     block: str, workdir: Path, issuer_b64: str, user_b64: str,
     sslip_b64: str, public_ip: str = PUBLIC_IP_SAMPLE,
+    redirect_url: str = PORTAL_REDIRECT_SAMPLE,
 ) -> subprocess.CompletedProcess:
     text = block.replace("@@PORTALISSUERB64@@", issuer_b64)
     text = text.replace("@@PORTALUSERIDB64@@", user_b64)
+    text = text.replace("@@PORTALREDIRECTURLB64@@", b64(redirect_url))
     text = text.replace("@@SSLIPDOMAINSB64@@", sslip_b64)
     text = text.replace("@@PUBLICIPB64@@", b64(public_ip))
     text = text.replace("/etc/agent-box", str(workdir))
@@ -594,6 +606,12 @@ def check_written_config(template: dict) -> int:
                       file=sys.stderr)
                 rc = 1
                 continue
+            if web.get("portalRedirectUrl") != PORTAL_REDIRECT_SAMPLE:
+                print("FAIL: %s: portalRedirectUrl landed as %r, wanted %r"
+                      % (label, web.get("portalRedirectUrl"),
+                         PORTAL_REDIRECT_SAMPLE), file=sys.stderr)
+                rc = 1
+                continue
             got = (web.get("portalIssuer"), u.get("portalUser"))
             # Off is empty VALUES, not absent keys, which is what the module
             # already reads as off.
@@ -605,6 +623,29 @@ def check_written_config(template: dict) -> int:
                 continue
             print("OK: config.yaml (%s) parses and declares what it should"
                   % label)
+    for target in ("", PORTAL_REDIRECT_SAMPLE,
+                   "https://station.example.com/@DOMAIN@/@MANAGED_BY@?x=@PORTALUSERID@",
+                   "http://localhost:3000/app/stations/42", "https://[::1]:8443/app/42",
+                   "javascript:alert(1)", "https://x.test/'bad",
+                   "https://x.test/\nAGENTBOX_CONFIG\ntouch /tmp/pwned"):
+        valid = target == "" or (target.startswith(("https://", "http://"))
+                                  and "'" not in target and "\n" not in target)
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            done = run_portal_block(block, workdir, b64(PORTAL_ISSUER_SAMPLE),
+                                    b64(PORTAL_USER_SAMPLE), b64("[]"),
+                                    redirect_url=target)
+            data = parsed_config(workdir)
+            if valid:
+                if (done.returncode or data["web"].get("portalRedirectUrl", "") != target
+                        or (not target and "portalRedirectUrl" in data["web"])):
+                    print("FAIL: redirect URL did not survive bootstrap:", repr(target),
+                          done.stderr, file=sys.stderr)
+                    rc = 1
+            elif done.returncode == 0 or data is not None:
+                print("FAIL: unsafe redirect URL reached config.yaml:", repr(target),
+                      file=sys.stderr)
+                rc = 1
     return rc
 
 
@@ -641,7 +682,7 @@ def check_secrets(template: dict) -> int:
         return 1
 
     exposed = []
-    for res in template.get("resources", []):
+    for res in resources(template):
         if res.get("type") != "Microsoft.Compute/virtualMachines/extensions":
             continue
         props = res.get("properties", {})
@@ -669,6 +710,88 @@ def check_secrets(template: dict) -> int:
     return 0
 
 
+def check_recovery_defaults(template: dict) -> int:
+    """A browser password must be the only required deployment credential."""
+    params = template["parameters"]
+    recovery = params["adminPasswordOrKey"]
+    failures = []
+    if params["authenticationType"].get("defaultValue") != "password":
+        failures.append("default authentication still requires an SSH key")
+    if recovery.get("type") != "securestring":
+        failures.append("recovery credential is not a securestring")
+    if recovery.get("defaultValue") != "":
+        failures.append("portal recovery field must be empty and optional")
+    deployment = template["resources"]["recoveryPassword"]["properties"]
+    if deployment.get("parameters"):
+        failures.append("internal generated password must not be supplied by the portal")
+    generator = deployment["template"]
+    seed = generator["parameters"]["generatedPassword"]
+    if (seed.get("type") != "securestring"
+            or seed.get("defaultValue") != "[format('Ab1!{0}', newGuid())]"):
+        failures.append("internal recovery password is not securely generated")
+    output = generator["outputs"]["password"]
+    if (output.get("type") != "securestring"
+            or output.get("value") != "[parameters('generatedPassword')]"):
+        failures.append("internal recovery output is not protected")
+    if "defaultValue" in params["webPassword"]:
+        failures.append("browser password must still be supplied by the visitor")
+    if params["debugSsh"].get("defaultValue") is not False:
+        failures.append("SSH must remain closed by default")
+    public_outputs = json.dumps(template.get("outputs", {}))
+    if ("adminPasswordOrKey" in public_outputs
+            or "listOutputsWithSecureValues" in public_outputs):
+        failures.append("recovery credential is exposed in deployment outputs")
+    if "adminPasswordOrKey" in bootstrap_chain(template):
+        failures.append("recovery credential is being sent to the bootstrap")
+    vm = next(r for r in resources(template)
+              if r["type"] == "Microsoft.Compute/virtualMachines")
+    profile = vm["properties"]["osProfile"]
+    if profile.get("adminPassword") != (
+            "[if(variables('usePasswordAuth'), "
+            "if(variables('generateRecoveryPassword'), "
+            "listOutputsWithSecureValues('recoveryPassword', '2025-04-01').password, "
+            "parameters('adminPasswordOrKey')), null())]"):
+        failures.append("password authentication does not use the recovery credential")
+    if template["variables"].get("generateRecoveryPassword") != (
+            "[and(variables('usePasswordAuth'), "
+            "empty(parameters('adminPasswordOrKey')))]"):
+        failures.append("explicit recovery credentials must override generation")
+    if template["variables"].get("usePasswordAuth") != (
+            "[and(equals(parameters('authenticationType'), 'password'), "
+            "not(startsWith(parameters('adminPasswordOrKey'), 'ssh-')))]"):
+        failures.append("an ssh- value must be installed as a key, not a password")
+    linux = template["variables"]["linuxConfiguration"]
+    if "parameters('adminPasswordOrKey')" not in linux:
+        failures.append("explicit SSH key authentication no longer uses the supplied key")
+    if failures:
+        print("FAIL: Azure recovery defaults:\n       "
+              + "\n       ".join(failures), file=sys.stderr)
+        return 1
+    print("OK: only the browser password is required; recovery password is "
+          "generated, protected, and SSH stays closed.")
+    return 0
+
+
+def check_inbound_priorities() -> int:
+    # These conditional rules must coexist when both optional ports are on.
+    source = BICEP.read_text()
+    priorities = {}
+    for name in ("httpsRule", "sshRule", "emailIngressRules"):
+        block = re.search(r"(?ms)^var " + name + r"\b(.*?)(?=^var |\Z)", source)
+        value = re.search(r"\bpriority:\s*(\d+)", block[1]) if block else None
+        if not value:
+            print("FAIL: missing literal inbound priority for " + name, file=sys.stderr)
+            return 1
+        priority = int(value[1])
+        if priority in priorities:
+            print(f"FAIL: inbound priority {priority} is shared by {priorities[priority]} and {name}",
+                  file=sys.stderr)
+            return 1
+        priorities[priority] = name
+    print("OK: optional SSH and email ingress use distinct inbound priorities.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -690,7 +813,9 @@ def main() -> int:
         check_bootstrap(template, SAMPLE, "hostile sample values"),
         check_bootstrap(template, defaults_render(template), "template defaults"),
         check_secrets(template),
+        check_recovery_defaults(template),
         check_written_config(template),
+        check_inbound_priorities(),
     )
     if not args.no_build:
         rc = max(rc, check_no_drift())

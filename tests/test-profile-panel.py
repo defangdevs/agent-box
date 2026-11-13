@@ -297,6 +297,33 @@ class LoginProfile(ProfileFixture):
         self.assertEqual(
             module.default_profile(module.read_profiles()), "codex")
 
+    def test_remote_control_claude_server_keeps_the_worker_profile_as_default(self):
+        module = self.daemon()
+        module.ensure_harness_session(
+            "claude", True, remote_control_server=True)
+        session = self.read_sessions()["claude"]
+        self.assertIsNone(session["profile"])
+        self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
+        self.assertTrue(session["remoteControlServer"])
+        self.assertEqual(module.profile_launch("claude")["harness"], "claude")
+        self.assertEqual(
+            module.default_profile(module.read_profiles()), "claude")
+
+    def test_claude_server_default_is_runtime_opt_in(self):
+        module = self.daemon()
+        self.assertEqual(module.claude_session_default(), "tui")
+        module.set_key("AGENT_BOX_CLAUDE_SESSION_DEFAULT", "remote-control")
+        self.assertEqual(module.claude_session_default(), "daemon")
+        module.set_key("AGENT_BOX_CLAUDE_SESSION_DEFAULT", "daemon")
+        self.assertEqual(module.claude_session_default(), "daemon")
+        module.connect_signed_in({"id": "claude"})
+        session = self.read_sessions()["claude"]
+        self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
+        self.assertTrue(session["remoteControlServer"])
+        self.assertIsNone(session["profile"])
+
     def test_later_harness_login_never_replaces_the_default(self):
         module = self.daemon()
         module.ensure_harness_session("claude", True)
@@ -478,11 +505,15 @@ class ProfilePanel(ProfileFixture):
         so a daemon that survived an update can still be running on the
         environment it started with. Offering a picker that cannot work
         sends the operator hunting for a profile that is sitting right
-        there in the list."""
+        there in the list. The standalone servers remain usable because
+        neither depends on profile resolution."""
         self.write_profile("triage", "HARNESS=claude\n")
         module = self.daemon(AGENT_BOX_PROFILE_BIN="")
         options = module.render_profile_options(module.read_profiles())
         self.assertNotIn("triage", options)
+        self.assertIn('value=":claude-daemon"', options)
+        self.assertIn('value=":codex-daemon"', options)
+        self.assertIn('value=":shell"', options)
 
     # --- reasoning-level picker (issue #493's layout checklist) -----
 
@@ -848,6 +879,44 @@ class ProfileRoutes(ProfileFixture):
         self.assertIn("HARNESS=claude", text)
         self.assertIn("API_TOKEN=hunter2", text)
 
+    def test_multiple_starting_settings_are_paired_and_saved_atomically(self):
+        _, base = self.serve()
+        status, _ = self.post(base, "/profiles/set", name="multiple",
+                              HARNESS="claude", env_key_0="FIRST",
+                              env_value_0="", env_key_2="SECOND",
+                              env_value_2="second-value")
+        self.assertEqual(status, 303)
+        text = self.profile_text("multiple")
+        self.assertIn("FIRST=", text)
+        self.assertIn("SECOND=second-value", text)
+        page = urllib.request.urlopen(base + "/").read().decode()
+        self.assertNotIn("second-value", page)
+        status, _ = self.post(base, "/profiles/set", name="invalid",
+                              HARNESS="claude", env_key_0="GOOD",
+                              env_value_0="value", env_key_1="MODEL",
+                              env_value_1="bad")
+        self.assertEqual(status, 400)
+        self.assertIsNone(self.profile_text("invalid"))
+
+    def test_starting_value_without_name_is_refused(self):
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="missing",
+                                 HARNESS="claude", env_key_0="GOOD",
+                                 env_value_0="one", env_value_1="orphan")
+        self.assertEqual(status, 400)
+        self.assertIn("Enter a name", body)
+        self.assertIsNone(self.profile_text("missing"))
+
+    def test_duplicate_starting_settings_are_refused(self):
+        _, base = self.serve()
+        status, body = self.post(base, "/profiles/set", name="duplicate",
+                                 HARNESS="claude", env_key_0="TOKEN",
+                                 env_value_0="one", env_key_1="TOKEN",
+                                 env_value_1="two")
+        self.assertEqual(status, 400)
+        self.assertIn("different name", body)
+        self.assertIsNone(self.profile_text("duplicate"))
+
     def test_a_blank_starting_setting_is_simply_skipped(self):
         """The ordinary case: most profiles start with no environment
         setting of their own, and a bare Save with the field left empty
@@ -925,6 +994,48 @@ class ProfileRoutes(ProfileFixture):
             self.assertEqual(session["extraArgs"], [])
         module.ensure_harness_session("claude", True)
         self.assertEqual(self.read_sessions(), sessions)
+
+    def test_claude_remote_control_server_is_an_explicit_pseudo_profile(self):
+        module, base = self.serve()
+        options = module.render_profile_options(module.read_profiles())
+        self.assertIn('value=":claude-daemon"', options)
+        status, _ = self.post(
+            base, "/sessions/add", back="settings",
+            profile=":claude-daemon", cwd="~", prompt="")
+        self.assertEqual(status, 303)
+        session = self.read_sessions()["claude"]
+        self.assertEqual(session["agent"], "claude")
+        self.assertIsNone(session["profile"])
+        self.assertTrue(session["remoteControl"])
+        self.assertTrue(session["remoteControlDaemon"])
+        self.assertTrue(session["remoteControlServer"])
+
+    def test_claude_remote_control_server_rejects_one_conversation_inputs(self):
+        _, base = self.serve()
+        for fields, message in [
+                ({"prompt": "do one task"}, "cannot target one kickoff prompt"),
+                ({"prompt": "", "whatsapp": "on"}, "WhatsApp cannot target")]:
+            status, body = self.post(
+                base, "/sessions/add", back="settings",
+                profile=":claude-daemon", cwd="~", **fields)
+            self.assertEqual(status, 400)
+            self.assertIn(message, body)
+        self.assertEqual(self.read_sessions(), {})
+
+    def test_existing_claude_remote_control_server_rejects_whatsapp(self):
+        self.write_sessions({
+            "claude": {
+                "agent": "claude",
+                "remoteControl": True,
+                "remoteControlServer": True,
+            },
+        })
+        _, base = self.serve()
+        status, body = self.post(
+            base, "/sessions/whatsapp", name="claude", state="on")
+        self.assertEqual(status, 400)
+        self.assertIn("WhatsApp cannot target", body)
+        self.assertFalse(self.read_sessions()["claude"].get("whatsapp", False))
 
     def test_adding_a_session_records_the_profile_name_not_just_its_args(self):
         """The load-bearing one. The spawn wrapper re-reads the NAME at

@@ -156,8 +156,10 @@ skew allowance — so a minute after you stop using it).
 
 **An outage is survivable, but not indefinitely.** If the endpoint is
 unreachable the box keeps using the keys it already cached, so a brief blip
-does not lock anyone out. The cost is that a **withdrawn** key stays usable
-for up to the cache hour. If you need a key dead sooner than that, the
+does not lock anyone out, but never for more than two hours after the last
+successful fetch: past that the box rejects handovers until the endpoint
+answers (Basic authentication still works). The cost is that a **withdrawn**
+key stays usable for up to those two hours. If you need a key dead sooner than that, the
 revocation to reach for is per-account (§6), not the key set.
 
 ## 3. Delivery: POST, never a URL
@@ -259,6 +261,14 @@ web:
   a box and no public key is committed to a template.
   `web.portalJwksUrl` overrides that path for a portal that publishes
   somewhere else.
+- `web.portalRedirectUrl` sets the link shown on the unauthenticated 401
+  page, for example `https://station.example.com/app/stations/42`. The full
+  path, query and fragment are kept. When unset or empty, the link uses the
+  origin of `portalIssuer`. Invalid explicit URLs omit the link without
+  falling back. Use an absolute HTTP(S) URL and percent-encode spaces,
+  quotes and brackets in its path or query. The link is public; keep
+  credentials and private account identifiers out of it. It does not
+  change token verification, key discovery or ownership checks.
 - **`portalProject` is optional**, and narrows `portalUser` to one project
   within that account:
 
@@ -276,13 +286,15 @@ parameters, alongside the web password:
 
 | flavor | parameters |
 |---|---|
-| AWS CloudFormation (`deploy/aws/template.yaml`) | `PortalUser`, `PortalIssuer` |
-| AWS Lightsail (`deploy/aws/lightsail-template.yaml`) | `PortalUser`, `PortalIssuer` |
-| Azure Bicep (`deploy/azure/agent-box.bicep`) | `portalUser`, `portalIssuer` |
+| AWS CloudFormation (`deploy/aws/template.yaml`) | `PortalUser`, `PortalIssuer`, `PortalRedirectUrl` |
+| AWS Lightsail (`deploy/aws/lightsail-template.yaml`) | `PortalUser`, `PortalIssuer`, `PortalRedirectUrl` |
+| Azure Bicep (`deploy/azure/agent-box.bicep`) | `portalUser`, `portalIssuer`, `portalRedirectUrl` |
 
-Both are optional and both are needed: leave either blank and the box serves
-no handover route at all, which is what a hand-launched box gets. **There is
-no key parameter on any flavor** — that is the point of §2.1.
+`portalRedirectUrl` (AWS: `PortalRedirectUrl`) is optional and only sets the
+public return link. The issuer and user are both needed for handover: leave
+either blank and the box serves no handover route at all, which is what a
+hand-launched box gets. **There is no key parameter on any flavor** - see
+section 2.1.
 
 `portalUser` is the per-box value, and it has to arrive this way rather than
 over the wire: the handover endpoint is unauthenticated by construction, so a
@@ -338,6 +350,7 @@ cookie it was handed, and the browser never talks to the box.
 |---|---|---|
 | `GET` | `/connect` | `{"ok": true, "flows": [...]}` — every card this box offers |
 | `GET` | `/connect?flow=<id>` | `{"ok": true, "flow": {...}}` — one card |
+| `GET` | `/resources` | CPU, available memory/disk, session slot usage and sample time; unavailable readings are `null` |
 | `GET` | `/env` | `{"ok": true, "keys": [...]}` — env key **names** |
 | `GET` | `/status` | `{"rev", "sessions", "connect_fp"}` — a change fingerprint |
 | `POST` | `/connect/start` | `flow=<id>` → `303`, or `409` + a page it could not begin |
@@ -511,3 +524,18 @@ box provisioned for handover but not yet assigned one (`from` the empty
 string) is a legitimate use of this same operation. A box with no portal
 integration at all serves no `/auth/portal-user` route, exactly as it
 serves no `/auth/handoff` route.
+
+### Live resource readings
+
+`GET /<user>/settings/resources` returns `ok`, `sampled_at` (UTC ISO timestamp), and
+nullable `cpu`, `memory`, `disk`, `sessions` readings. CPU has `busy_percent` (0-100).
+Memory and disk have `available_bytes` and `total_bytes`; disk measures the filesystem
+containing the owner's home. `available_bytes` excludes reserved blocks, while
+`total_bytes` reports the full filesystem size. Memory uses `MemAvailable`.
+Sessions has `used` and `limit`, from the same policy that admits new workers.
+
+CPU requires two samples at least one second apart; the first read or one after more
+than 30 seconds without sampling is null. The sampler never sleeps in an HTTP request.
+An unavailable source does not erase the other readings. Responses are authenticated by
+the existing settings auth block and have `Cache-Control: no-store`. No process names,
+session metadata, filesystem paths, environment values or raw errors are returned.

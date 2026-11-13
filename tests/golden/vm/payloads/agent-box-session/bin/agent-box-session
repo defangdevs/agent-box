@@ -8,6 +8,7 @@ export AGENT_BOX_DEFAULT_AGENT=claude
 # this CLI, no util-linux) — and a lock that only some writers take is not
 # a lock. util-linux is the only package that ships flock.
 export AGENT_BOX_CAPACITY_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-session-capacity/bin/agent-box-session-capacity
+export AGENT_BOX_HIBERNATE_IDLE_S=30
 export AGENT_BOX_FLOCK_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-util-linux-2.42.2-bin/bin/flock
 # Agent profiles (issue #321): `add --profile` resolves the harness and
 # its arguments by shelling out to agent-box-profile, and this CLI runs
@@ -736,18 +737,19 @@ kill_session() {
 
 usage() {
   echo "usage: agent-box-session ls | capacity"
-  echo "Starts share one RAM-sized limit (about one/GiB by default); sessionLimit overrides it."
-  echo "Stop a session to free a slot. A refused start exits 75; retry is safe."
+  echo "Hook starts share one RAM-sized limit (about one/GiB); manual sessions bypass it."
+  echo "Stop a hook session to free a slot. A refused start exits 75; retry is safe."
   echo "       agent-box-session peers"
   echo "       agent-box-session add [NAME] [--harness HARNESS] [--profile PROFILE]"
-  echo "                             [--cwd DIR] [--remote-control true|false]"
+  echo "                             [--cwd DIR] [--remote-control true|false] [--daemon]"
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
   echo "                             [--whatsapp true|false]"
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm NAME"
   echo "       agent-box-session stop NAME"
+  echo "       agent-box-session hibernate [--exclude NAME...]"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session whatsapp candidates | ls | select NAME | clear"
+  echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
@@ -761,6 +763,8 @@ usage() {
   echo "--harness and a '-- EXTRA_ARGS' tail override what the profile resolved."
   echo "With neither --profile nor --harness, the default profile is used when"
   echo "one is set (agent-box-profile default)."
+  echo "--profile HARNESS-daemon (claude-daemon, codex-daemon) is a pseudo-profile for"
+  echo "--harness HARNESS --daemon. They are not files and never the default."
   echo "(--agent is the old name for --harness and still works. It is"
   echo "deprecated: claude and opencode both spell --agent for the PROFILE,"
   echo "which is this box's --profile, so the two meanings collided.)"
@@ -774,11 +778,10 @@ usage() {
   echo "fail to start."
   echo "--prompt kicks the session off with a task (first spawn only); a later"
   echo "respawn resumes the prior transcript instead of redoing it."
-  echo "--remote-control defaults to true, except for codex where it defaults to"
-  echo "false: claude's remote control is a flag on its ordinary TUI, but codex's"
-  echo "replaces the TUI outright with the app-server pairing daemon, so a plain"
-  echo "codex session (a profile, or --harness codex with none) now opens the"
-  echo "TUI unless this is passed explicitly."
+  echo "--remote-control controls Claude's ordinary TUI mirroring and defaults to"
+  echo "true (false for codex). --daemon runs the persistent multi-session process:"
+  echo "'claude remote-control' or codex's app-server pairing daemon. The legacy"
+  echo "'--remote-control server' spelling is accepted but deprecated."
   echo "--ephemeral marks a ONE-SHOT session: parking it (a clean agent exit, or"
   echo "'stop') delists it outright, because nobody is going to resume it. A"
   echo "CRASH still parks nothing and leaves the post-mortem shell attachable."
@@ -792,6 +795,8 @@ usage() {
   echo "check its pane or worktree; nothing here retries the work for you."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
+  echo "hibernate is demand-driven: only at the hook limit, park the oldest"
+  echo "conservatively quiescent resumable hook. User sessions are never hibernated."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
 # The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
@@ -811,7 +816,7 @@ valid_name() {
 # with the settings page — the more specific route wins and the session
 # becomes unreachable, with nothing on the page to say why. Mirrored by the
 # daemon's RESERVED_NAMES and the module's session-name assertion.
-RESERVED_NAMES="settings downloads webhook sessions token ws auth"
+RESERVED_NAMES="settings downloads receive webhook sessions token ws auth"
 reserved_name() {
   for r in $RESERVED_NAMES; do
     [ "$1" = "$r" ] && return 0
@@ -863,6 +868,210 @@ session_state_file() {
   # harness-minted id (issue #284), and going through an accessor is what
   # makes that re-key a change to three functions rather than a migration.
   printf '%s/%s.json\n' "$HOME/.local/state/agent-box/session" "$1"
+}
+
+record_hibernated_native() {
+  # Freeze the exact native transcript identity proven by the quiescence
+  # probe before its runtime disappears. This is a pointer, not transcript
+  # ownership: Claude/Codex remain the authority and the supervisor refuses
+  # it if the named transcript no longer exists.
+  _state="$(session_state_file "$1")"
+  _native="$2"
+  case "$_native" in
+    (*[!0-9a-fA-F-]*|"") return 75 ;;
+    (????????-????-????-????-????????????) ;;
+    (*) return 75 ;;
+  esac
+  mkdir -p "${_state%/*}" 2>/dev/null || return 75
+  _pending="$(mktemp "$_state.XXXXXX" 2>/dev/null)" || return 75
+  if [ -r "$_state" ]; then
+    "$JQ" --arg n "$_native" \
+      '(if type == "object" then . else {} end) | .nativeSessionId = $n' \
+      "$_state" > "$_pending" 2>/dev/null \
+      || { rm -f "$_pending"; return 75; }
+  else
+    "$JQ" -n --arg n "$_native" '{nativeSessionId: $n}' \
+      > "$_pending" 2>/dev/null || { rm -f "$_pending"; return 75; }
+  fi
+  chmod 600 "$_pending" 2>/dev/null \
+    && mv -f "$_pending" "$_state" 2>/dev/null \
+    || { rm -f "$_pending"; return 75; }
+}
+
+hibernate_one() {
+  # hibernate_one [EXCLUDED_NAME...] -- free one worker slot, but only while
+  # capacity is actually full. The capacity helper performs the expensive
+  # transcript/state probe outside the registry lock and returns an evidence
+  # token. Re-probing that exact token under the lock prevents a completed
+  # turn, subscription, lease or queued WhatsApp message from going stale
+  # between selection and the stopped transition.
+  _cap="${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}"
+  _candidate="$("$_cap" hibernate-candidate "$REGISTRY_FILE" "$@")" || return $?
+  _name="$(printf '%s' "$_candidate" | "$JQ" -r '.name // empty')"
+  _token="$(printf '%s' "$_candidate" | "$JQ" -r '.token // empty')"
+  _native="$(printf '%s' "$_candidate" | "$JQ" -r '.nativeSessionId // empty')"
+  valid_name "$_name" && [ -n "$_token" ] && [ -n "$_native" ] || return 1
+
+  # Check pressure outside the registry lock: the helper shells out to tmux,
+  # and issue #748's rule is that no writer holds the shared file lock across
+  # that potentially slow subprocess. A second check after the transition,
+  # while the old pane still counts live, closes the slot-freed race.
+  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+    :
+  else
+    return $?
+  fi
+  printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
+    || return 1
+
+  registry_lock || return "$REGISTRY_BUSY_RC"
+  if _verified="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
+      "$_cap" hibernate-verify "$REGISTRY_FILE" "$_name" "$_token")"; then
+    :
+  else
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  fi
+  # The verified candidate can be newer than the pointer recorded when the
+  # process launched (Claude segment rotation is the common case). Persist
+  # it before making the runtime cold; a failed pointer write leaves the
+  # session resident because exact resume is an invariant, not best effort.
+  record_hibernated_native "$_name" "$_native" || {
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  }
+  _at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _generation="$_at-$$-$RANDOM"
+  if registry_edit --arg n "$_name" --arg at "$_at" --arg gen "$_generation" \
+      'if .sessions | has($n)
+       then .sessions[$n] |= (.stopped = true | .hibernatedAt = $at
+                              | .hibernationGeneration = $gen)
+       else . end'; then
+    :
+  else
+    _rc=$?
+    registry_unlock
+    return "$_rc"
+  fi
+  registry_unlock
+
+  _undo_hibernation() {
+    registry_lock || return 75
+    if registry_edit --arg n "$_name" --arg gen "$_generation" \
+        'if (.sessions[$n].hibernationGeneration // "") == $gen
+         then .sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                                | del(.hibernationGeneration))
+         else . end'; then
+      :
+    else
+      _urc=$?
+      registry_unlock
+      return "$_urc"
+    fi
+    registry_unlock
+  }
+
+  # Demand-driven, never an idle reaper. The stopped candidate still has a
+  # live pane and therefore still counts here; a value below max means some
+  # OTHER slot became free while selection was running, so undo without
+  # killing anything.
+  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+    if ! printf '%s' "$_capacity" | "$JQ" -e \
+        '.used >= .max' >/dev/null 2>&1; then
+      _undo_hibernation || return $?
+      # The waiting admission should retry now: another runtime released the
+      # needed slot, so no hibernation is justified and no dispatcher delay
+      # is useful. An empty name tells callers that nothing was parked.
+      "$JQ" -cn '{name: null, slotAvailable: true}'
+      return 0
+    fi
+  else
+    _rc=$?
+    _undo_hibernation || return $?
+    return "$_rc"
+  fi
+
+  # Native input does not take the registry lock, so it can land after
+  # hibernate-verify. Re-check just before the kill (skips a pointless kill)
+  # and again after it (closes the window the first check leaves): input
+  # seen after the runtime is gone means the turn was cut off, so un-park
+  # and let the supervisor resume that exact conversation.
+  _quiet="$(printf '%s' "$_verified" | "$JQ" -r '.quiet // empty')"
+  # True while any process is in process group $1. Read from /proc rather
+  # than pgrep: a webhook spawn's PATH does not carry procps.
+  _pgroup_alive() {
+    _pg="$1"
+    for _f in /proc/[0-9]*/stat; do
+      read -r _stat < "$_f" 2>/dev/null || continue
+      # Field 2 (comm) may hold spaces; what follows the last ") " is
+      # state, ppid, pgrp.
+      _rest="${_stat##*) }"
+      _rest="${_rest#* }"
+      _rest="${_rest#* }"
+      [ "${_rest%% *}" = "$_pg" ] && return 0
+    done
+    return 1
+  }
+  _still_quiet() {
+    [ -n "$_quiet" ] || return 1
+    _q="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
+      "$_cap" hibernate-quiet "$REGISTRY_FILE" "$_name" "$_quiet" 2>&1)"
+  }
+  if ! _still_quiet; then
+    _undo_hibernation || return $?
+    return 1
+  fi
+
+  # tmux kill-session returns once the session is destroyed, not once the
+  # native process has exited, so it can still land one last transcript write
+  # after the second _still_quiet snapshot. Remember the pane pids and wait
+  # (bounded) for them and their process groups to go before re-checking.
+  _panepids="$(t list-panes -t "=$_name" -F '#{pane_pid}' 2>/dev/null || true)"
+  if ! kill_session "$_name"; then
+    # A failed kill freed no slot. Undo only our own transition; a concurrent
+    # explicit stop/restart is authoritative and changes hibernatedAt first.
+    _undo_hibernation || return $?
+    return 1
+  fi
+
+  _i=0
+  while [ "$_i" -lt 50 ]; do
+    _alive=0
+    for _pp in $_panepids; do
+      if kill -0 "$_pp" 2>/dev/null \
+          || _pgroup_alive "$_pp"; then
+        _alive=1
+      fi
+    done
+    [ "$_alive" = 1 ] || break
+    _i=$((_i + 1))
+    sleep 0.1
+  done
+  # A writer that outlives the wait can still append after the snapshot, so
+  # the quiet check proves nothing: un-park and let the supervisor resume.
+  if [ "$_alive" = 1 ]; then
+    _undo_hibernation || return $?
+    return 1
+  fi
+  if ! _still_quiet; then
+    _undo_hibernation || return $?
+    return 1
+  fi
+
+  # Activation can race between the flag write and the kill. In that case
+  # the target remains resident by definition: its activator cleared our
+  # marker and the supervisor will resume it. Do not tell the waiting spawn a
+  # slot was reclaimed when it was not.
+  registry_lock || return 75
+  _still="$($JQ -r --arg n "$_name" --arg gen "$_generation" \
+    '(.sessions[$n].stopped == true)
+     and ((.sessions[$n].hibernationGeneration // "") == $gen)' \
+    "$REGISTRY_FILE" 2>/dev/null)" || _still=false
+  registry_unlock
+  [ "$_still" = true ] || return 1
+  printf '%s\n' "$_verified"
 }
 prune_session_state() {
   # Only ever called for a name that has just been DELISTED, and only as an
@@ -947,7 +1156,7 @@ case "$cmd" in
       # crashed pane recorded (issue #516). tmux says a post-mortem bash pane
       # is alive, so liveness alone cannot tell a dead agent from a running
       # one, and this used to report the crash as `live`.
-      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true then "stopped" else "starting" end), (.value.died // "" | tostring)] | @tsv' "$REGISTRY_FILE" \
+      "$JQ" -r '.sessions | to_entries[] | [.key, (.value.agent // "?"), (if .value.stopped == true and (.value.hibernatedAt | type) == "string" then "hibernated" elif .value.stopped == true then "stopped" else "starting" end), (.value.died // "" | tostring)] | @tsv' "$REGISTRY_FILE" \
       | while IFS="$(printf '\t')" read -r n a state dead; do
         case $'\n'"$live"$'\n' in
           *$'\n'"$n"$'\n'*)
@@ -969,6 +1178,23 @@ case "$cmd" in
         printf '%-24s %-8s %s\n' "$n" '-' 'unmanaged'
       fi
     done
+    ;;
+  hibernate)
+    excludes=()
+    while [ $# -gt 0 ]; do
+      [ "$1" = --exclude ] && [ $# -ge 2 ] && valid_name "$2" \
+        || { usage >&2; exit 2; }
+      excludes+=("$2")
+      shift 2
+    done
+    registry_ensure
+    if hibernate_one "${excludes[@]}"; then
+      :
+    else
+      rc=$?
+      [ "$rc" = 1 ] && echo "no quiescent resumable session can be hibernated" >&2
+      exit "$rc"
+    fi
     ;;
   peers)
     # Who ELSE is live, where they work, and what they claim.
@@ -1040,7 +1266,7 @@ case "$cmd" in
       [ -n "$n" ] || continue
       [ "$n" != "$me" ] || continue
       peers=$((peers + 1))
-      harness="-"; cwd="-"; unmanaged="managed"; dead="-"
+      harness="-"; cwd="-"; unmanaged="managed"; dead="-"; rc="false"
       if [ -s "$REGISTRY_FILE" ]; then
         # One read per session, and a session tmux knows but the registry
         # does not is reported as `unmanaged` rather than skipped: it is
@@ -1048,10 +1274,11 @@ case "$cmd" in
         meta="$("$JQ" -r --arg n "$n" '
           if (.sessions | has($n)) then
             [(.sessions[$n].agent // "-"),
-             (.sessions[$n].workingDirectory // "-"),
+             ((.sessions[$n].workingDirectory // "-") | if . == "" then "-" else . end),
              "managed",
-             (.sessions[$n].died // "-" | tostring)] | @tsv
-          else "-\t-\tunmanaged\t-" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
+             (.sessions[$n].died // "-" | tostring),
+             (.sessions[$n].remoteControl // false | tostring)] | @tsv
+          else "-\t-\tunmanaged\t-\tfalse" end' "$REGISTRY_FILE" 2>/dev/null)" || meta=""
         # EVERY field carries a non-empty sentinel, and that is load-bearing
         # rather than tidy: tab is an IFS WHITESPACE character, so bash `read`
         # folds a run of them into one delimiter and an empty field simply
@@ -1059,13 +1286,14 @@ case "$cmd" in
         # <TAB><TAB>`, whose empty third field collapsed — `unmanaged` took
         # the fourth, so every registered session read as "not in the
         # registry" and a crash never reported DIED (CodeRabbit on PR #522).
-        IFS="$(printf '\t')" read -r harness cwd unmanaged dead <<<"$meta"
+        IFS="$(printf '\t')" read -r harness cwd unmanaged dead rc <<<"$meta"
         # A jq that failed leaves all four empty; put the sentinels back, or
         # an unreadable registry reads as a corpse with no exit status.
         [ -n "$harness" ] || harness="-"
         [ -n "$cwd" ] || cwd="-"
         [ -n "$unmanaged" ] || unmanaged="managed"
         [ -n "$dead" ] || dead="-"
+        [ -n "$rc" ] || rc="false"
         # No recorded working directory means the supervisor starts it in
         # $HOME — say that, rather than a dash a reader has to interpret. It
         # is where the session STARTED either way: an agent can cd anywhere,
@@ -1081,6 +1309,44 @@ case "$cmd" in
       kind="interactive"
       case "$n" in (hook-*) kind="dispatched (hook session)" ;; esac
       [ "$unmanaged" = "managed" ] || kind="$kind, not in the registry"
+      # A codex session with remote control is the app-server pairing daemon,
+      # not a TUI: it hosts app-created threads, and the filter file below is
+      # keyed by this tmux name while the claim belongs to ONE thread inside
+      # it. Say so, and name the thread the daemon registered, so a reader
+      # does not take the daemon for the worker or message the wrong name.
+      if [ "$harness" = codex ] && [ "$rc" = true ]; then
+        kind="$kind, Codex Remote Control daemon: its claims below are held by a thread it hosts, not by this tmux session"
+        tf="$sd/codex/$user-$n.json"
+        if [ -s "$tf" ]; then
+          th="$("$JQ" -r '.thread // empty' "$tf" 2>/dev/null)" || th=""
+          [ -z "$th" ] || kind="$kind (thread $th)"
+        else
+          # local-webhook keys its peer record by thread (codex/pin-*.json),
+          # not by tmux name, so the file above is usually absent (#1015).
+          # Attribute a peer to THIS daemon only on evidence: the process
+          # must really be that thread's codex-peer (a recycled pid is not),
+          # and the tmux pane it inherited must belong to this session.
+          th=""
+          for pf in "$sd"/codex/*.json; do
+            [ -s "$pf" ] || continue
+            pp="$("$JQ" -r '.pid // empty' "$pf" 2>/dev/null)" || pp=""
+            t1="$("$JQ" -r '.thread // empty' "$pf" 2>/dev/null)" || t1=""
+            case "$pp" in (""|*[!0-9]*) continue ;; esac
+            [ -n "$t1" ] || continue
+            [ -r "/proc/$pp/cmdline" ] || continue
+            cl="$(tr '\0' ' ' < "/proc/$pp/cmdline" 2>/dev/null)" || cl=""
+            case "$cl" in (*"codex-peer --thread $t1"*) ;; (*) continue ;; esac
+            pane=""
+            while IFS= read -r -d '' ev; do
+              case "$ev" in (TMUX_PANE=*) pane="${ev#TMUX_PANE=}"; break ;; esac
+            done < "/proc/$pp/environ" 2>/dev/null || true
+            [ -n "$pane" ] || continue
+            [ "$(t display-message -p -t "$pane" '#S' 2>/dev/null)" = "$n" ] || continue
+            th="${th:+$th, }$t1"
+          done
+          [ -z "$th" ] || kind="$kind (thread $th; hand over with codex queue --thread ID --message TEXT)"
+        fi
+      fi
       # A session whose agent CRASHED is still a live tmux session, because
       # the pane it left behind is a post-mortem shell (issue #516). Nobody
       # is working in it, so it is not a peer to yield to — and yielding to
@@ -1141,7 +1407,9 @@ case "$cmd" in
       [ $# -eq 1 ] || { usage >&2; exit 2; }
       if [ -s "$REGISTRY_FILE" ]; then
         "$JQ" -c '[.sessions | to_entries[] |
-          select(.value.agent == "claude" or .value.agent == "codex") |
+          select((.value.agent == "claude" or .value.agent == "codex")
+                 and ((.value.agent != "claude") or
+                      ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
           {name: .key, harness: .value.agent, stopped: (.value.stopped == true),
            selected: (.value.whatsapp == true)}]' "$REGISTRY_FILE"
       else
@@ -1153,7 +1421,10 @@ case "$cmd" in
       [ $# -eq 1 ] || { usage >&2; exit 2; }
       if [ -s "$REGISTRY_FILE" ]; then
         "$JQ" -c '[.sessions | to_entries[] |
-          select(.value.whatsapp == true and (.value.agent == "claude" or .value.agent == "codex")) |
+          select(.value.whatsapp == true
+                 and (.value.agent == "claude" or .value.agent == "codex")
+                 and ((.value.agent != "claude") or
+                      ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
           {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}]' "$REGISTRY_FILE"
       else
         echo '[]'
@@ -1173,6 +1444,11 @@ case "$cmd" in
         echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
         exit 2
       fi
+      if [ "$harness" = claude ] && "$JQ" -e --arg n "$selected" \
+          '(.sessions[$n].remoteControlDaemon == true or .sessions[$n].remoteControlServer == true)' "$REGISTRY_FILE" >/dev/null; then
+        echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
+        exit 2
+      fi
       registry_edit --arg n "$selected" \
         '.sessions |= with_entries(.value.whatsapp = (.key == $n))'
       "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
@@ -1180,6 +1456,58 @@ case "$cmd" in
         '{name: $name, harness: $harness, stopped: $stopped}'
       registry_unlock
       exit 0
+    fi
+    if [ "$name" = activate ]; then
+      selected="${2:-}"
+      [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
+      registry_ensure
+      while :; do
+        registry_lock
+        taken "$selected" || {
+          echo "no such session: '$selected' (send @$(id -un) /sessions)" >&2
+          exit 2
+        }
+        harness="$("$JQ" -r --arg n "$selected" '.sessions[$n].agent // ""' "$REGISTRY_FILE")"
+        if [ "$harness" != claude ] && [ "$harness" != codex ]; then
+          echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
+          exit 2
+        fi
+        if [ "$harness" = claude ] && "$JQ" -e --arg n "$selected" \
+            '(.sessions[$n].remoteControlDaemon == true or .sessions[$n].remoteControlServer == true)' "$REGISTRY_FILE" >/dev/null; then
+          echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
+          exit 2
+        fi
+        "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
+          "$REGISTRY_FILE" >/dev/null || {
+            echo "session '$selected' is not the selected WhatsApp target" >&2
+            exit 2
+          }
+        stopped="$("$JQ" -r --arg n "$selected" '.sessions[$n].stopped == true' "$REGISTRY_FILE")"
+        if [ "$stopped" = true ]; then
+          # A stopped session is a cold conversation. If its activation is
+          # the work that needs a full box's next slot, reclaim one OTHER
+          # quiescent runtime and retry this exact target.
+          if "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check \
+              "$REGISTRY_FILE" "$selected" >/dev/null; then
+            :
+          else
+            rc=$?
+            registry_unlock
+            if [ "$rc" = 75 ] && hibernate_one "$selected" >/dev/null; then
+              continue
+            fi
+            exit "$rc"
+          fi
+          registry_edit --arg n "$selected" \
+            '.sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                               | del(.hibernationGeneration))'
+        fi
+        "$JQ" -cn --arg name "$selected" --arg harness "$harness" \
+          --argjson activated "$stopped" \
+          '{name: $name, harness: $harness, activated: $activated}'
+        registry_unlock
+        exit 0
+      done
     fi
     if [ "$name" = clear ]; then
       [ $# -eq 1 ] || { usage >&2; exit 2; }
@@ -1201,7 +1529,10 @@ case "$cmd" in
       "$0" add --profile "$profile" --whatsapp true \
         --prompt "WhatsApp is connected to this session. Reply to incoming messages with the WhatsApp reply tool." >&2
       "$JQ" -ce '[.sessions | to_entries[] |
-        select(.value.whatsapp == true and (.value.agent == "claude" or .value.agent == "codex")) |
+        select(.value.whatsapp == true
+               and (.value.agent == "claude" or .value.agent == "codex")
+               and ((.value.agent != "claude") or
+                    ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
         {name: .key, harness: .value.agent, stopped: (.value.stopped == true)}] | if length == 1 then .[0] else error("expected one WhatsApp session") end' \
         "$REGISTRY_FILE"
       exit 0
@@ -1227,6 +1558,12 @@ case "$cmd" in
           echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
           exit 2
         fi
+        if [ "$action" = on ] && [ "$harness" = claude ] \
+             && "$JQ" -e --arg n "$name" \
+               '(.sessions[$n].remoteControlDaemon == true or .sessions[$n].remoteControlServer == true)' "$REGISTRY_FILE" >/dev/null; then
+          echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
+          exit 2
+        fi
         if [ "$action" = on ]; then
           registry_edit --arg n "$name" \
             '.sessions |= with_entries(.value.whatsapp = (.key == $n))'
@@ -1249,7 +1586,7 @@ case "$cmd" in
       *) name="$1"; shift; valid_new_name "$name" || { usage >&2; exit 2; } ;;
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
-    profile=""; has_harness=0; ephemeral=0; remote_control=""; whatsapp=false
+    profile=""; has_harness=0; ephemeral=0; remote_control=""; remote_control_daemon=false; daemon_option=false; whatsapp=false
     origin="user"; hook_source=""; hook_repo=""
     while [ $# -gt 0 ]; do
       case "$1" in
@@ -1267,12 +1604,17 @@ case "$cmd" in
         --profile) profile="${2:?--profile needs a value}"; shift 2 ;;
         --cwd) cwd="${2:?--cwd needs a value}"; shift 2 ;;
         --remote-control)
-          case "${2:?--remote-control needs 'true' or 'false'}" in
+          case "${2:?--remote-control needs 'true', 'false' or 'server'}" in
             (true|false) remote_control="$2" ;;
-            (*) echo "agent-box-session: --remote-control must be 'true' or 'false'" >&2
+            (server)
+              remote_control=true; remote_control_daemon=true
+              echo "agent-box-session: '--remote-control server' is deprecated, use --daemon" >&2
+              ;;
+            (*) echo "agent-box-session: --remote-control must be 'true', 'false' or 'server'" >&2
                 exit 2 ;;
           esac
           shift 2 ;;
+        --daemon) remote_control_daemon=true; daemon_option=true; shift ;;
         --whatsapp)
           case "${2:?--whatsapp needs 'true' or 'false'}" in
             (true|false) whatsapp="$2" ;;
@@ -1296,6 +1638,35 @@ case "$cmd" in
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
     done
+    # `claude-daemon` and `codex-daemon` are pseudo-profiles (issue #942), the
+    # CLI twin of the settings picker's `:claude-daemon` / `:codex-daemon`
+    # entries. They are not files: a daemon is not one worker, so there is no
+    # model or effort to carry. They mean `--harness X --daemon`.
+    # Any HARNESS-daemon name works, so a harness that grows daemon support
+    # needs no change here; the check below refuses one that has none.
+    pseudo="${profile#:}"
+    # A file profile that already has the name keeps resolving as itself (it
+    # predates the reservation); `:NAME` always means the pseudo-profile.
+    if [ "$pseudo" = "$profile" ] && [ "${pseudo%-daemon}" != "$pseudo" ] \
+         && "${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" launch "$profile" >/dev/null 2>&1; then
+      pseudo=""
+    fi
+    case "$pseudo" in
+      (*-daemon)
+        pseudo="${pseudo%-daemon}"
+        case " $AGENTS " in
+          (*" $pseudo "*)
+            if [ "$has_harness" = 1 ] && [ "$harness" != "$pseudo" ]; then
+              echo "--profile $pseudo-daemon means --harness $pseudo, not '$harness'" >&2
+              exit 2
+            fi
+            harness="$pseudo"; has_harness=1
+            remote_control_daemon=true; daemon_option=true
+            profile=""
+            ;;
+        esac
+        ;;
+    esac
     # Canonicalize --cwd the same way the settings page's add-session form
     # already does (resolve_session_cwd/resolve_browse_dir in
     # settings-daemon.py) — issue #597. Stored verbatim, a relative path, a
@@ -1354,8 +1725,11 @@ case "$cmd" in
     pargs=()
     # Neither --profile nor --harness: the DEFAULT profile, when one is set
     # (agent-box-profile default). An explicit --harness still means that bare
-    # harness, so a script that names one keeps getting exactly it.
-    if [ -z "$profile" ] && [ "$has_harness" = 0 ]; then
+    # harness, so a script that names one keeps getting exactly it. A daemon
+    # is not one profile's worker, so its explicit mode also bypasses
+    # the default profile.
+    if [ -z "$profile" ] && [ "$has_harness" = 0 ] \
+         && [ "$remote_control_daemon" != true ]; then
       profile="$("${AGENT_BOX_PROFILE_BIN:-agent-box-profile}" default 2>/dev/null)" || profile=""
     fi
     if [ -n "$profile" ]; then
@@ -1394,10 +1768,44 @@ case "$cmd" in
       remote_control=true
       [ "$harness" = codex ] && remote_control=false
     fi
+    # Compatibility: before issue #915 Codex used remoteControl itself as
+    # its daemon discriminator. Preserve that input while writing the new,
+    # harness-neutral marker for all newly created records.
+    if [ "$harness" = codex ] && [ "$remote_control" = true ]; then
+      remote_control_daemon=true
+    fi
     case " $AGENTS " in
       (*" $harness "*) ;;
       (*) echo "harness '$harness' is not available (available: $AGENTS)" >&2; exit 2 ;;
     esac
+    if [ "$remote_control_daemon" = true ]; then
+      remote_control=true
+      case "$harness" in
+        claude)
+          if [ -n "$profile" ]; then
+            echo "Claude daemon mode does not run one agent profile" >&2
+            exit 2
+          fi
+          ;;
+        codex)
+          if [ "$daemon_option" = true ] && [ -n "$profile" ]; then
+            echo "Codex daemon mode does not run one agent profile" >&2
+            exit 2
+          fi
+          ;;
+        *) echo "Daemon mode is not supported for '$harness'" >&2
+           exit 2 ;;
+      esac
+    fi
+    if [ "$remote_control_daemon" = true ] && [ "$harness" = claude ] \
+         && { [ "$has_prompt" = 1 ] || [ "$has_rprompt" = 1 ]; }; then
+      echo "Claude daemon mode cannot target one initial or resume prompt" >&2
+      exit 2
+    fi
+    if [ "$remote_control_daemon" = true ] && [ "$harness" = claude ] && [ "$whatsapp" = true ]; then
+      echo "WhatsApp cannot target a Claude daemon's app-created conversations" >&2
+      exit 2
+    fi
     if [ "$whatsapp" = true ] && [ "$harness" != claude ] && [ "$harness" != codex ]; then
       echo "WhatsApp delivery to '$harness' sessions is not supported" >&2
       exit 2
@@ -1416,9 +1824,9 @@ case "$cmd" in
       echo "session '$name' already exists — 'agent-box-session rm $name' first, or 'restart $name' to bounce it" >&2
       exit 2
     fi
-    # Shell panes are operator terminals, not agent workers, so only worker
-    # harnesses go through the shared agent-session admission cap (issue #795).
-    if [ "$harness" != shell ]; then
+    # Only event-created workers reserve capacity. Manual adds must remain
+    # available even when all hook slots are occupied.
+    if [ "$origin" = webhook ] && [ "$harness" != shell ]; then
       "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
     fi
     # The id this session's FIRST spawn is launched with (Claude
@@ -1439,10 +1847,14 @@ case "$cmd" in
       --arg p "$prompt" --arg pp "$has_prompt" \
       --arg rp "$rprompt" --arg rpp "$has_rprompt" --arg bid "$bid" \
       --arg prof "$profile" --arg eph "$ephemeral" --argjson rc "$remote_control" \
+      --argjson rcd "$remote_control_daemon" \
       --argjson whatsapp "$whatsapp" \
       --arg origin "$origin" --arg hsrc "$hook_source" --arg hrepo "$hook_repo" \
       '(if $whatsapp then .sessions |= with_entries(.value.whatsapp = false) else . end)
        | .sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
+                        remoteControlDaemon: $rcd,
+                        # Compatibility for releases before issue #915.
+                        remoteControlServer: ($rcd and $a == "claude"),
                         whatsapp: $whatsapp,
                         remoteControlName: null,
                         workingDirectory: (if $c == "" then null else $c end),
@@ -1464,6 +1876,99 @@ case "$cmd" in
                        + (if $eph == "1" then {ephemeral: true} else {} end))' \
       --args -- "${sargs[@]}"
     registry_unlock
+
+    # A dispatched spawn has a caller that can RETRY it: local-webhook keeps
+    # a batch when its spawn command exits EX_TEMPFAIL (75). Do not turn an
+    # infrastructure failure before the harness starts into a post-mortem
+    # shell that owns the event forever (issue #938). The supervisor records
+    # hasRun immediately after tmux accepted the pane; give the pane one more
+    # short window after that publication to report the exec-shaped statuses
+    # 126/127 through mark-stopped. Any other status, or the same status after
+    # this startup window, is an ordinary agent crash and keeps the inspectable
+    # post-mortem behavior.
+    #
+    # Bounded on both sides: the supervisor normally reconciles within ~2s,
+    # but a first-use harness fetch can take minutes and must not hold the
+    # webhook dispatcher's spawn process for its whole download. The tick
+    # overrides are test seams, not user-facing settings.
+    if [ "$origin" = webhook ]; then
+      _sw_wait_ticks="${AGENT_BOX_START_WAIT_TICKS:-50}"
+      _sw_grace_ticks="${AGENT_BOX_START_GRACE_TICKS:-10}"
+      case "$_sw_wait_ticks:$_sw_grace_ticks" in
+        (*[!0-9:]*|:*|*:) _sw_wait_ticks=50; _sw_grace_ticks=10 ;;
+      esac
+      _sw_tick=0; _sw_grace=-1; _sw_died=""
+      while [ "$_sw_tick" -lt "$_sw_wait_ticks" ]; do
+        _sw_state="$($JQ -r --arg n "$name" \
+          '(.sessions[$n] // {}) as $s
+           | [($s.hasRun == true), ($s.died // "")] | @tsv' \
+          "$REGISTRY_FILE" 2>/dev/null)" || _sw_state=""
+        IFS=$'\t' read -r _sw_started _sw_died <<<"$_sw_state"
+        case "$_sw_died" in (126|127) break ;; esac
+        if [ "$_sw_started" = true ]; then
+          if [ "$_sw_grace" -lt 0 ]; then
+            _sw_grace=$_sw_grace_ticks
+          elif [ "$_sw_grace" -eq 0 ]; then
+            break
+          else
+            _sw_grace=$((_sw_grace - 1))
+          fi
+        fi
+        _sw_tick=$((_sw_tick + 1))
+        sleep 0.1
+      done
+
+      case "$_sw_died" in
+        (126|127)
+          # Preserve the useful line before killing the post-mortem pane, but
+          # never echo arbitrary pane contents into the receiver journal.
+          _sw_error=""
+          while IFS= read -r _sw_line; do
+            case "$_sw_line" in
+              (agent-box-env-exec:*) _sw_error="$_sw_line" ;;
+            esac
+          done < <(t capture-pane -p -t "=$name:" -S -20 2>/dev/null || true)
+
+          # Delete only the exact launch this add minted. A concurrent remove
+          # and name reuse must not let an old startup observation kill the
+          # replacement. mark-stopped has already published died under this
+          # same lock, so the normal path takes it on the first attempt.
+          _sw_removed=false
+          _sw_lock_try=0
+          while [ "$_sw_lock_try" -lt 3 ]; do
+            if registry_lock 2>/dev/null; then
+              if "$JQ" -e --arg n "$name" --arg b "$bid" \
+                   '(.sessions[$n] // {}) as $s
+                    | ($s.boxSessionId == $b
+                       and (($s.died == 126) or ($s.died == 127)))' \
+                   "$REGISTRY_FILE" >/dev/null 2>&1; then
+                registry_edit --arg n "$name" --arg b "$bid" \
+                  'if (.sessions[$n] // {}) as $s
+                       | ($s.boxSessionId == $b
+                          and (($s.died == 126) or ($s.died == 127)))
+                   then del(.sessions[$n]) else . end'
+                _sw_removed=true
+              fi
+              registry_unlock
+              break
+            fi
+            _sw_lock_try=$((_sw_lock_try + 1))
+            sleep 0.1
+          done
+          if [ "$_sw_removed" = true ]; then
+            kill_session "$name" || exit 1
+            # A retry at the same deterministic hook name must be a FIRST
+            # spawn again, with its kickoff prompt and a fresh launch id.
+            prune_session_state "$name"
+            echo "agent-box-session: '$name' failed during startup (exit $_sw_died); removed so its caller can retry" >&2
+            [ -z "$_sw_error" ] || echo "$_sw_error" >&2
+            # Not EX_TEMPFAIL: that means capacity. The webhook spawn wrapper
+            # maps 76 to the receiver's retry status without evicting anyone.
+            exit 76
+          fi
+          ;;
+      esac
+    fi
     # The mascot (issue #185) marks the closest thing this CLI has to
     # "an agent just started". Small on purpose: this runs in webhook
     # spawns and scripts too, and nothing parses the lines below it.
@@ -1515,7 +2020,9 @@ case "$cmd" in
     eph=0
     "$JQ" -e --arg n "$name" '.sessions[$n].ephemeral == true' \
       "$REGISTRY_FILE" >/dev/null 2>&1 && eph=1
-    registry_edit --arg n "$name" '.sessions[$n].stopped = true'
+    registry_edit --arg n "$name" \
+      '.sessions[$n] |= (.stopped = true | del(.hibernatedAt)
+                         | del(.hibernationGeneration))'
     registry_unlock
     kill_session "$name" || exit 1
     if [ "$eph" = 1 ]; then
@@ -1532,7 +2039,8 @@ case "$cmd" in
       registry_lock
       mapfile -t restart_names < <("$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE")
       "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "${restart_names[@]}" >/dev/null
-      registry_edit 'del(.sessions[].stopped)'
+      registry_edit 'del(.sessions[].stopped) | del(.sessions[].hibernatedAt)
+                     | del(.sessions[].hibernationGeneration)'
       registry_unlock
       "$JQ" -r '.sessions | keys[]' "$REGISTRY_FILE" | while IFS= read -r n; do
         [ -n "$n" ] && kill_session "$n" || true
@@ -1547,7 +2055,9 @@ case "$cmd" in
       registry_lock
       if taken "$name"; then
         "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" check "$REGISTRY_FILE" "$name" >/dev/null
-        registry_edit --arg n "$name" 'del(.sessions[$n].stopped)'
+        registry_edit --arg n "$name" \
+          '.sessions[$n] |= (del(.stopped) | del(.hibernatedAt)
+                             | del(.hibernationGeneration))'
         registry_unlock
         # A stopped session has no live tmux session to kill; kill_session
         # treats that "can't find session" as success.

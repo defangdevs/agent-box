@@ -39,6 +39,8 @@ comparison.
 
 import argparse
 import contextlib
+import hashlib
+import html
 import ipaddress
 import json
 import os
@@ -51,7 +53,9 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 
 # --------------------------------------------------------------------------
@@ -84,6 +88,9 @@ DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
 # mismatch between any two of them is issue #353 all over again (a grant
 # that does not match the command asks for a password instead).
 UPDATE_UNIT = "agent-box-update.service"
+CVE_2026_98432_UNIT = "agent-box-cve-2026-98432.service"
+CVE_2026_98432_RULES = "/etc/agent-box/cve-2026-98432.nft"
+CVE_2026_98432_SYSCTL = "/etc/sysctl.d/60-agent-box-cve-2026-98432.conf"
 # The update's own output, where an agent that triggered one can
 # read it back. See the unit for why the journal is not enough.
 UPDATE_LOG = "/var/log/agent-box-update.log"
@@ -147,6 +154,11 @@ HARNESS_UPGRADE_UNIT = "agent-box-harness-upgrade@"
 # did, which is why a native box resolved the channel ONCE, at the first
 # install, and stayed there for ever (issues #559, #590, #614).
 AGENT_PIN_FILE = "/etc/agent-box/agent-nixpkgs-pin"
+# The system flake registry, and agent-box's record of the nixpkgs mapping
+# it last wrote there. JSON has no comment for a generated-file header, so
+# the record is what tells our entry from an operator's (nix_registry).
+NIX_REGISTRY = "/etc/nix/registry.json"
+NIX_REGISTRY_STAMP = "/etc/agent-box/nix-registry-nixpkgs.json"
 # The mutable channel the pin is resolved FROM when nothing overrides it.
 CHANNEL_NIXPKGS = "https://channels.nixos.org/nixos-unstable/nixexprs.tar.xz"
 # Where the capped newuidmap/newgidmap copies go. This exact path is on
@@ -617,6 +629,8 @@ SESSION_SCHEMA = _Obj({
     "agent": STR,
     "skipPermissions": BOOL,
     "remoteControl": BOOL,
+    "remoteControlDaemon": BOOL,
+    "remoteControlServer": BOOL,
     "remoteControlName": STR,
     "extraArgs": STR_LIST,
     "cwd": STR,
@@ -627,6 +641,7 @@ SESSION_SCHEMA = _Obj({
 })
 
 USER_SCHEMA = _Obj({
+    "email": BOOL,
     "home": STR,
     "agent": STR,
     # Inert since issue #628 put ttyd on a UNIX socket: there is no port to
@@ -657,6 +672,9 @@ USER_SCHEMA = _Obj({
 
 BOX_SCHEMA = _Obj({
     "sessionLimit": _Scalar("a positive integer", lambda v: type(v) is int and v > 0),
+    "sessionHibernationGraceSeconds": _Scalar(
+        "a non-negative integer",
+        lambda v: type(v) is int and v >= 0),
     "schemaVersion": SCHEMA_VERSION,
     "domain": STR,
     # Only consulted when `domain` is being auto-derived from the public IP
@@ -685,7 +703,15 @@ BOX_SCHEMA = _Obj({
     # only overrides that path.
     "web": _Obj({"enable": BOOL, "rebootButton": BOOL,
                  "alias": DOMAIN_SUFFIX, "aliases": STR_LIST,
-                 "portalIssuer": STR, "portalJwksUrl": STR}),
+                 "portalIssuer": STR, "portalJwksUrl": STR,
+                 "portalRedirectUrl": STR}),
+    "email": _Obj({
+        "enable": BOOL, "domains": STR_LIST,
+        "certificateFile": STR, "keyFile": STR,
+        "maxMessageBytes": _Scalar(
+            "an integer from 1024 to 8388608",
+            lambda v: type(v) is int and 1024 <= v <= 8388608),
+    }),
     "webhook": _Obj({
         "enable": BOOL,
         "repo": STR,
@@ -740,6 +766,10 @@ class Spec:
         validate_config(data)
         self.profile = profile
         self.session_limit = data.get("sessionLimit")
+        self.session_hibernation_grace_seconds = data.get(
+            "sessionHibernationGraceSeconds")
+        if self.session_hibernation_grace_seconds is None:
+            self.session_hibernation_grace_seconds = 30
         self.domain = data.get("domain") or ""
         # Default matches the literal that used to be baked into first_boot()
         # (issue #647): an unset domainSuffix derives exactly the sslip.io
@@ -844,6 +874,7 @@ class Spec:
         # means no handover route is served at all, so a box nobody wired to
         # a portal exposes no unauthenticated endpoint.
         self.portal_issuer = web.get("portalIssuer") or ""
+        self.portal_redirect_url = web.get("portalRedirectUrl") or ""
         self.portal_jwks_url = web.get("portalJwksUrl") or ""
         self.protect_memory = bool(data.get("protectMemory", True))
         # Rootless containers for the agent users (issue #600).
@@ -986,6 +1017,29 @@ class Spec:
             )
         self.root_user = flagged[0] if flagged else self.users[0]
 
+        email = data.get("email") or {}
+        self.email_enable = bool(email.get("enable", False))
+        self._email_domains = email.get("domains")
+        self.email_certificate = email.get("certificateFile") or ""
+        self.email_key = email.get("keyFile") or ""
+        self.email_max_bytes = email.get("maxMessageBytes") or 2097152
+        if self.email_enable:
+            if not self.webhook_enable:
+                raise ConfigError("email.enable requires web.enable and webhook.enable with a pinned webhook script")
+            if not any(u.email for u in self.users):
+                raise ConfigError("email.enable requires at least one users.<name>.email: true")
+            unresolved_default = self._email_domains is None and self.domain in ("", "auto", self.domain_suffix)
+            if not unresolved_default and (not self.email_domains or not all(
+                    len(d) <= 253 and DOMAIN_SUFFIX_RE.fullmatch(d) for d in self.email_domains)):
+                raise ConfigError("email.domains must contain exact DNS hostnames")
+            if not all(re.fullmatch(r"/[A-Za-z0-9/_.+-]+", p) for p in (self.email_certificate, self.email_key)):
+                raise ConfigError("email requires absolute certificateFile/keyFile paths without whitespace")
+
+    @property
+    def email_domains(self):
+        # first_boot may resolve domain after the spec is constructed.
+        return self._email_domains if self._email_domains is not None else [self.domain]
+
     @property
     def webhook_enable(self):
         return bool(self._webhook_enable and self.web_enable
@@ -995,6 +1049,7 @@ class Spec:
 class User:
     def __init__(self, name, data, spec):
         self.name = name
+        self.email = bool(data.get("email", False))
         self.spec = spec
         self.home = data.get("home") or f"/home/{name}"
         self.agent = data.get("agent") or spec.default_agent
@@ -1040,6 +1095,31 @@ class User:
                     f"user {name}: session {sname!r} uses agent {agent!r}, "
                     f"which is not in agents {spec.agents!r}"
                 )
+            daemon = bool((s or {}).get("remoteControlDaemon")
+                          or (s or {}).get("remoteControlServer")
+                          or (agent == "codex"
+                              and (s or {}).get("remoteControl") is True))
+            if (s or {}).get("remoteControlDaemon") and agent not in ("claude", "codex"):
+                raise ConfigError(
+                    f"user {name}: session {sname!r} may enable "
+                    "remoteControlDaemon only for Claude or Codex"
+                )
+            if (s or {}).get("remoteControlServer"):
+                if (agent != "claude"
+                        or (s or {}).get("remoteControl", True) is not True):
+                    raise ConfigError(
+                        f"user {name}: session {sname!r} may enable "
+                        "remoteControlServer only for a Claude session with "
+                        "remoteControl: true"
+                    )
+            if (agent == "claude" and daemon
+                    and ((s or {}).get("prompt") is not None
+                         or (s or {}).get("initialPrompt") is not None
+                         or (s or {}).get("resumePrompt") is not None)):
+                raise ConfigError(
+                    f"user {name}: session {sname!r} cannot set a prompt "
+                    "in Claude daemon mode"
+                )
 
     @property
     def url(self):
@@ -1080,6 +1160,7 @@ class Tree:
         self.remove = []
         self.units = []      # unit names to enable
         self.disable = []    # unit names to disable
+        self.settings_restart = set()
 
     def file(self, path, text, mode=0o644):
         self.files[str(path)] = (text, mode)
@@ -1258,10 +1339,52 @@ class Renderer:
             out += f"export {entry['name']}={rendered}\n"
         return out
 
+    def tls_environment(self):
+        """The runtime owns distrust, even when the distro bundle is stale."""
+        bundle = str(self.profile / "etc/ssl/certs/ca-no-trust-rules-bundle.crt")
+        return {
+            "SSL_CERT_FILE": bundle,
+            "SSL_CERT_DIR": str(self.profile / "etc/agent-box/empty-ca-dir"),
+            "NIX_SSL_CERT_FILE": bundle,
+            "CURL_CA_BUNDLE": bundle,
+            "REQUESTS_CA_BUNDLE": bundle,
+            "NODE_OPTIONS": "--use-openssl-ca",
+        }
+
+    def tls_policy(self, t):
+        pairs = sorted(self.tls_environment().items())
+        t.file(self.p("/etc/agent-box/tls.env"), env_file(pairs))
+        t.file(self.p("/etc/profile.d/agent-box-tls.sh"), GENERATED_HEADER
+               + "".join(f"export {k}={shlex.quote(v)}\n" for k, v in pairs))
+        exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in pairs)
+        # t.units lists only units to enable. Discover socket/timer-activated
+        # services from their rendered files too. Keep the original unit bytes
+        # intact: feature-off cleanup uses them as an ownership witness.
+        services = {"nix-daemon.service"}
+        for path, (text, mode) in list(t.files.items()):
+            file = Path(path)
+            if file.name.endswith(".service"):
+                services.add(file.name)
+            elif file.parent.name.endswith(".service.d"):
+                services.add(file.parent.name[:-2])
+            if mode & 0o111 and GENERATED_HEADER in text and text.startswith("#!"):
+                # Keep the ownership header directly after the shebang.
+                t.file(file, text.replace(GENERATED_HEADER, GENERATED_HEADER + exports, 1), mode)
+        active = set()
+        for unit in sorted(services):
+            path = self.p("/etc/systemd/system", f"{unit}.d", "05-tls.conf")
+            active.add(path)
+            t.file(path, dropin(["EnvironmentFile=/etc/agent-box/tls.env"]))
+        # These generated drop-ins belong only to the services still rendered.
+        for path in self.p("/etc/systemd/system").glob("*.service.d/05-tls.conf"):
+            if path not in active:
+                t.gone(path)
+
     def render(self):
         t = Tree()
         self.dirs(t)
         self.shared_units(t)
+        self.ipv4_tcp_mitigation(t)
         self.update_unit(t)
         self.nix_gc(t)
         self.nixpkgs_cache(t)
@@ -1293,9 +1416,79 @@ class Renderer:
             self.web_off(t)
         if not self.spec.webhook_enable:
             self.webhook_off(t)
+        self.email(t)
+        self.tls_policy(t)
         return t
 
     # -- agent defaults ------------------------------------------------------
+
+    def email(self, t):
+        unit = "agent-box-email.service"
+        path = self.p("/etc/systemd/system", unit)
+        source_units = [f"agent-box-email-source@{u.name}.service" for u in self.spec.users if u.email]
+        if not self.spec.email_enable:
+            t.gone(path)
+            if generated_by_us(path):
+                t.disable.append(unit)
+            for u in self.spec.users:
+                source = self.p("/etc/systemd/system", f"agent-box-email-source@{u.name}.service")
+                t.gone(source)
+                if generated_by_us(source):
+                    t.disable.append(source.name)
+            return
+        users = [u for u in self.spec.users if u.email]
+        if not all(len(d) <= 253 and DOMAIN_SUFFIX_RE.fullmatch(d) for d in self.spec.email_domains):
+            raise ConfigError("email.domains needs resolved DNS hostnames; use --first-boot for domain discovery")
+        cfg = {"domains": self.spec.email_domains, "users": [u.name for u in users],
+               "certificateFile": self.spec.email_certificate, "keyFile": self.spec.email_key,
+               "maxMessageBytes": self.spec.email_max_bytes}
+        t.link(self.p("/etc/agent-box/bin/agent-box-email"), self.bin / "agent-box-email")
+        t.link(self.p("/etc/agent-box/bin/agent-box-email-smtpd"), self.profile / "sbin" / "smtpd")
+        t.link(self.p("/etc/agent-box/email-webhook.py"), self.spec.webhook_script)
+        t.link(self.p("/etc/agent-box/email-tools/smtpctl"), self.bin / "smtpctl")
+        cfg_path = self.p("/etc/agent-box/email.json")
+        cfg_text = json.dumps(cfg, sort_keys=True) + "\n"
+        try:
+            old_config = cfg_path.read_text()
+        except FileNotFoundError:
+            old_config = None
+        # The profile symlink has already moved when apply runs. Record the
+        # immutable executable identities so an unchanged JSON config still
+        # refreshes the MTA and its forked delivery helpers after an upgrade.
+        runtime = json.dumps([str(p.resolve()) for p in (
+            self.bin / "agent-box-email", self.profile / "sbin/smtpd",
+            Path(self.spec.webhook_script))])
+        runtime_text = hashlib.sha256(runtime.encode()).hexdigest() + "\n"
+        runtime_path = self.p("/etc/agent-box/email-runtime")
+        try:
+            old_runtime = runtime_path.read_text()
+        except FileNotFoundError:
+            old_runtime = None
+        t.email_restart = old_config is not None and (old_config != cfg_text or old_runtime != runtime_text)
+        t.file(runtime_path, runtime_text)
+        t.file(cfg_path, cfg_text)
+        for u in users:
+            t.file(self.p("/etc/systemd/system", f"agent-box-email-source@{u.name}.service"),
+                   GENERATED_HEADER + "[Unit]\nBefore=agent-box-email.service\n\n[Service]\n"
+                   + f"Type=oneshot\nUser={u.name}\nEnvironment=HOME={u.home}\n"
+                   + f"Environment=PATH={self.bin}:/usr/bin:/bin\n"
+                   + f"Environment=AGENT_BOX_WEBHOOK_URL=https://{self.spec.domain}/{u.name}/webhook\n"
+                   + "ExecStart=/usr/local/bin/agent-box-webhook setup email\n"
+                   + "StandardOutput=null\nStandardError=journal\nRemainAfterExit=true\n")
+        t.file(path, GENERATED_HEADER + "[Unit]\nDescription=Optional inbound email to Linux-user message buses\n"
+               + "After=network.target " + " ".join(source_units) + "\nRequires=" + " ".join(source_units)
+               + "\n\n[Service]\n"
+               + f"ExecStart={self.bin}/agent-box-email server\n"
+               + "RuntimeDirectory=agent-box-email\nRestart=on-failure\nRestartSec=5\n"
+               + "StateDirectory=agent-box-email\nStateDirectoryMode=0755\n"
+               + "PrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/run /var/spool/smtpd "
+               + " ".join(u.home for u in users) + "\nNoNewPrivileges=true\n"
+               # Linux getifaddrs uses netlink while OpenSMTPD discovers listeners.
+               + "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\nMemoryMax=256M\nTasksMax=64\n"
+               + "\n[Install]\nWantedBy=multi-user.target\n")
+        # Cleanup must retain the sources required by the intake service.
+        t.units.extend(source_units)
+        t.units.append(unit)
 
     def agent_defaults(self, t):
         """The two files the agent CLIs themselves read (issue #394).
@@ -1320,21 +1513,29 @@ class Renderer:
             t.file(self.p(CLAUDE_SETTINGS),
                    json.dumps(settings, indent=2, sort_keys=True) + "\n")
         codex_conf = self.p("/etc/codex/config.toml")
-        if self.spec.codex_full_access:
+        if "codex" in self.spec.agents:
+            if not self.spec.codex_full_access and foreign_file(codex_conf):
+                self.notes.append(
+                    f"{codex_conf}: not written by agentbox - left alone; "
+                    "add the Agentbox SessionStart recorder to enable "
+                    "prompt-less Codex resume")
+                return
             t.dir(self.p("/etc/codex"), 0o755)
-            t.file(codex_conf,
-                   GENERATED_HEADER
-                   + 'approval_policy = "never"\n'
-                   'sandbox_mode = "danger-full-access"\n')
+            content = GENERATED_HEADER
+            if self.spec.codex_full_access:
+                content += ('approval_policy = "never"\n'
+                            'sandbox_mode = "danger-full-access"\n')
+            # System hooks are managed by the box; keep user hooks intact
+            # and record prompt-less TUI conversations without a model turn.
+            hook = str(self.bin / "agent-box-claude-session-start-hook") + " codex"
+            content += ('[[hooks.SessionStart]]\n'
+                        '[[hooks.SessionStart.hooks]]\n'
+                        'type = "command"\n'
+                        'command = ' + json.dumps(hook) + '\n')
+            t.file(codex_conf, content)
         else:
-            # Turning the option OFF has to take the file with it. apply
-            # never deletes what a render stops emitting, so without this
-            # a box flipped from true to false kept
-            # sandbox_mode = "danger-full-access" on disk while
-            # AGENT_BOX_CODEX_FULL_ACCESS disappeared — full access still
-            # in force, and the flag a session uses to pin the restricted
-            # values back gone with it. Exactly the contract this pair
-            # exists to keep, inverted.
+            # Dropping Codex must also remove its managed defaults. apply
+            # otherwise leaves files that a render stops emitting on disk.
             t.gone(codex_conf)
 
     # -- memory protection ---------------------------------------------------
@@ -1998,6 +2199,7 @@ class Renderer:
                "[Journal]\n"
                "SystemMaxUse=200M\n")
         self.nix_conf(t)
+        self.nix_registry(t)
 
     def nixpkgs_cache(self, t):
         """Build the shared nixpkgs cache each user's first install reads.
@@ -2211,6 +2413,40 @@ class Renderer:
             mode = 0o644
         t.file(target, existing.rstrip("\n") + "\n\n" + want, mode=mode)
 
+    def nix_registry(self, t):
+        """Point `nixpkgs#...` at this box's pinned nixpkgs.
+
+        Without this a bare `nix profile add nixpkgs#foo` resolves through
+        the GLOBAL flake registry, which on a Determinate box maps nixpkgs
+        to FlakeHub's nixpkgs-weekly - a revision agent-box neither chose
+        nor moves. On one aarch64 box that rev had whisper-cpp
+        dependency-failed on Hydra, so the install compiled from source,
+        while the box's own pin had it cached. The system registry
+        (/etc/nix/registry.json) outranks the global one, so naming the
+        jitNixpkgs pin here puts user installs on the revision the harnesses,
+        the nixpkgs cache and every update already agree on.
+
+        It only outranks the GLOBAL registry. A user's own
+        `nix registry add nixpkgs ...` (~/.config/nix/registry.json) still
+        wins, as does `--override-flake nixpkgs ...` or naming any other
+        flake ref outright - the per-case escape hatch for a package the
+        pin carries at an old version.
+
+        The file is shared, so only our own entry is ours: see
+        plan_nix_registry for the ownership rule, and nix_conf for why a
+        foreign file keeps its mode and its symlink.
+        """
+        path = self.p(NIX_REGISTRY)
+        stamp = self.p(NIX_REGISTRY_STAMP)
+        plan = plan_nix_registry(path, stamp, self.spec.jit_nixpkgs)
+        if plan.note:
+            self.notes.append(plan.note)
+        if plan.text is None:
+            return
+        t.dir(self.p("/etc/nix"), 0o755)
+        t.file(plan.target, plan.text, mode=plan.mode)
+        t.file(stamp, plan.stamp)
+
     # -- base-OS patching ----------------------------------------------------
 
     def os_updates(self, t):
@@ -2400,6 +2636,42 @@ class Renderer:
                           "agent-web-auth-secrets.service"),
                    self.auth_secrets_unit(), 0o444)
 
+    def ipv4_tcp_mitigation(self, t):
+        """Install the temporary filter on first boot AND an existing update."""
+        rules = (self.share / "cve-2026-98432.nft").read_text()
+        t.file(self.p(CVE_2026_98432_RULES), rules)
+        t.file(self.p(CVE_2026_98432_SYSCTL),
+               (self.share / "cve-2026-98432.sysctl").read_text())
+        command = f"{self.bin}/nft --file {CVE_2026_98432_RULES}"
+        mptcp = f"{self.bin}/sysctl --ignore --write net.mptcp.enabled=0"
+        t.file(self.p("/etc/systemd/system", CVE_2026_98432_UNIT),
+               GENERATED_HEADER + "\n".join([
+                   "[Unit]",
+                   "Description=Temporary IPv4 TCP IP-options mitigation for CVE-2026-98432",
+                   "DefaultDependencies=no",
+                   "After=local-fs.target nftables.service",
+                   "ReloadPropagatedFrom=nftables.service",
+                   "PartOf=nftables.service",
+                   "Before=network-pre.target shutdown.target",
+                   "Wants=network-pre.target",
+                   "Conflicts=shutdown.target",
+                   "",
+                   "[Service]",
+                   "Type=oneshot",
+                   "RemainAfterExit=yes",
+                   f"ExecStartPre={mptcp}",
+                   f"ExecStart={command}",
+                   f"ExecReload={mptcp}",
+                   f"ExecReload={command}",
+                   "",
+                   "[Install]",
+                   "WantedBy=multi-user.target nftables.service",
+                   "",
+               ]))
+        # Required independently of web.enable or the distro's update policy:
+        # SSH and user-published apps can also receive IPv4 TCP connections.
+        t.units.append(CVE_2026_98432_UNIT)
+
     def update_unit(self, t):
         """The on-demand self-update unit (issue #358).
 
@@ -2569,7 +2841,7 @@ class Renderer:
         return (
             "[Unit]\n"
             "Description=Caddy (agent-box web front door)\n"
-            "After=network-online.target\n"
+            "After=network-online.target agent-box-cve-2026-98432.service\n"
             "Wants=network-online.target\n"
             "\n"
             "[Service]\n"
@@ -2716,6 +2988,10 @@ class Renderer:
                 # marketplace's default branch instead.
                 pairs.append(("AGENT_BOX_WEBHOOK_PINNED_SCRIPT",
                               self.spec.webhook_script))
+        if self.spec.webhook_enable:
+            # The pinned webhook.py, for the local-slack daemon's emit command
+            # (issue #864) — independent of whether claude is installed.
+            pairs.append(("AGENT_BOX_WEBHOOK_SCRIPT", self.spec.webhook_script))
         if self.spec.codex_full_access:
             # Set ONLY when the file above was written: supervisor.sh reads
             # this as "the box has a system-wide codex config", and a
@@ -2785,6 +3061,9 @@ class Renderer:
                 # off a box nobody wired to a portal.
                 settings += [
                     ("AGENT_BOX_PORTAL_ISSUER", self.spec.portal_issuer),
+                    ("AGENT_BOX_PORTAL_REDIRECT_URL",
+                     json.dumps(self.spec.portal_redirect_url)
+                     if self.spec.portal_redirect_url else ""),
                     # env_file drops an empty value, so an unset override
                     # simply is not passed and the daemon derives the
                     # well-known path from the issuer itself.
@@ -2846,6 +3125,7 @@ class Renderer:
         ] + [
             f'Environment="{e["name"]}={self.contract_bin(e)}"'
             for e in agent_box_contract["env"]
+            if e.get("condition", "always") == "always" or self.spec.webhook_enable
         ] + [
             f'ExecSearchPath={path}',
             "ExecStart=",
@@ -2913,6 +3193,8 @@ class Renderer:
         if agent_box_directive_holds("ReadWritePaths"):
             for template in agent_box_directives["ReadWritePaths"]["templates"]:
                 lines.append(f"ReadWritePaths={template.replace('%i', u.name)}")
+        if self.spec.email_enable and u.email:
+            lines.append(f"ReadWritePaths=/var/lib/agent-box-email/addresses/{u.name}")
         for f in u.environment_files:
             lines.append(f"EnvironmentFile=-{f}")
         t.file(self.p("/etc/systemd/system",
@@ -3052,7 +3334,8 @@ class Renderer:
                        "ExecStart=",
                        f"ExecStart="
                        f"{self.contract_bin(settings_contract['execStart'][0])}",
-                   ]))
+                   ] + ([f"ReadWritePaths=/var/lib/agent-box-email/addresses/{u.name}"]
+                        if self.spec.email_enable and u.email else [])))
         if self.spec.webhook_enable:
             # Env vars and Exec directives come from the shared binding
             # contract (issue #451) instead of being hand-written here —
@@ -3123,7 +3406,7 @@ class Renderer:
             "root-owned and you cannot write it: that is deliberate, since "
             "whatever\n"
             "writes it decides what root installs. Read it freely - "
-            f"`git -C {SRC_DIR} log -1`\n"
+            f"`git -c safe.directory={SRC_DIR} -C {SRC_DIR} log -1`\n"
             "names the rev the box runs. The one exception is an update in "
             "flight: the\n"
             "tree moves FIRST and the profile swap follows it, so between "
@@ -3153,7 +3436,7 @@ class Renderer:
             "moving. Not the source tree's rev: the tree is fast-forwarded "
             "FIRST\n"
             "and a rollback leaves it ahead: after a failed update\n"
-            f"`git -C {SRC_DIR} log -1` names a rev this box is not\n"
+            f"`git -c safe.directory={SRC_DIR} -C {SRC_DIR} log -1` names a rev this box is not\n"
             "running.\n\n"
         )
         # Which HOST this guide is describing. The module binds the NixOS
@@ -3223,6 +3506,10 @@ class Renderer:
         for sname in sorted(u.sessions):
             s = u.sessions[sname] or {}
             agent = s.get("agent") or u.agent
+            daemon = bool(s.get("remoteControlDaemon")
+                          or s.get("remoteControlServer")
+                          or (agent == "codex"
+                              and s.get("remoteControl") is True))
             sessions[sname] = {
                 "agent": agent,
                 "skipPermissions": bool(s.get("skipPermissions", True)),
@@ -3232,7 +3519,15 @@ class Renderer:
                 # interactive TUI (issue #623), mirroring
                 # sessionOpts.remoteControl's default in agent-box.nix.in.
                 # Every other harness keeps the old default.
-                "remoteControl": bool(s.get("remoteControl", agent != "codex")),
+                "remoteControl": (True if daemon else
+                                  bool(s.get("remoteControl", agent != "codex"))),
+                "remoteControlDaemon": daemon,
+                # Explicit because existing Claude remoteControl=true records
+                # are ordinary TUIs mirrored to the apps. An update must not
+                # reinterpret them as the newer multi-session server mode.
+                "remoteControlServer": bool(
+                    s.get("remoteControlServer")
+                    or (daemon and agent == "claude")),
                 "extraArgs": list(s.get("extraArgs") or []),
                 # null → the supervisor derives "<user>-<session>@<host>"
                 # at start time.
@@ -3355,6 +3650,14 @@ class Renderer:
         systemd-tmpfiles --create to realize it.
         """
         lines = []
+        if self.spec.email_enable:
+            lines += ["d /var/lib/agent-box-email 0755 root root - -",
+                      "d /var/lib/agent-box-email/addresses 0755 root root - -",
+                      "d /var/empty 0755 root root - -",
+                      "d /var/spool/smtpd 0711 root root - -",
+                      "d /var/spool/smtpd/offline 0770 root smtpq - -",
+                      "d /var/spool/smtpd/purge 0700 smtpq root - -",
+                      "d /var/spool/smtpd/queue 0700 smtpq root - -"]
         # Nothing here for containers: the daemon's XDG_RUNTIME_DIR is the
         # shared unit's own RuntimeDirectory=, kept across a stop with
         # RuntimeDirectoryPreserve=yes. A rule here would race user
@@ -3372,6 +3675,8 @@ class Renderer:
                 f"d {TTYD_SOCKET_DIR} 0755 root root - -",
             ]
         for u in self.spec.users:
+            if self.spec.email_enable and u.email:
+                lines.append(f"d /var/lib/agent-box-email/addresses/{u.name} 2750 {u.name} smtpd - -")
             if self.spec.web_enable:
                 lines += [
                     f"d /var/lib/agent-box-sites/{u.name} 0750 {u.name} caddy - -",
@@ -3475,7 +3780,7 @@ class Renderer:
                + f"\thelper = !{gh} auth git-credential\n")
 
     def interactive_clis(self, t):
-        """agent-box-session and agent-box-profile, on every box.
+        """Interactive agent-box CLIs, on every box.
 
         The profile ships them bare (-bare); the env prelude the module
         compiles into its wrapper is generated here, because these run
@@ -3500,6 +3805,8 @@ class Renderer:
                f"export AGENT_BOX_AGENTS={q(agents)}\n"
                f"export AGENT_BOX_DEFAULT_AGENT={q(self.spec.default_agent)}\n"
                f"export AGENT_BOX_CAPACITY_BIN={q(f'{self.bin}/agent-box-session-capacity')}\n"
+               f"export AGENT_BOX_HIBERNATE_IDLE_S="
+               f"{self.spec.session_hibernation_grace_seconds}\n"
                f"export AGENT_BOX_FLOCK_BIN={q(f'{self.bin}/flock')}\n"
                # The env store's one reader/writer (issue #212): `env
                # ls/set/rm` here and the settings page must agree
@@ -3526,6 +3833,21 @@ class Renderer:
                f"export AGENT_BOX_ENVSTORE_BIN="
                f"{q(f'{self.bin}/agent-box-envstore')}\n"
                f'exec {self.bin}/agent-box-profile-bare "$@"\n', 0o755)
+        # Remote ACP endpoint (#300). Its forced command is configured per
+        # key, but the loader/profile tools and self-exec path are properties
+        # of this installed runtime and must not depend on an SSH login PATH.
+        t.file(self.p("/usr/local/bin/agent-box-acp"),
+               "#!/bin/sh\n"
+               "# Generated by `agentbox apply` - do not edit.\n"
+               f"export AGENT_BOX_ENV_EXEC="
+               f"{q(f'{self.bin}/agent-box-env-exec')}\n"
+               f"export AGENT_BOX_ENVSTORE_BIN="
+               f"{q(f'{self.bin}/agent-box-envstore')}\n"
+               f"export AGENT_BOX_PROFILE_BIN="
+               f"{q('/usr/local/bin/agent-box-profile')}\n"
+               f"export AGENT_BOX_ACP_SELF="
+               f"{q(f'{self.bin}/agent-box-acp-bare')}\n"
+               f'exec {self.bin}/agent-box-acp-bare "$@"\n', 0o755)
         # Moving an installed harness onto this box's pin (issues #559,
         # #590, #614). Its prologue is rendered from the wrapper contract
         # rather than hand-written like the two above: the pin has to be
@@ -3551,6 +3873,28 @@ class Renderer:
         return bool(self.spec.web_enable
                     and self.spec.portal_issuer
                     and u.portal_user)
+
+    def portal_hint(self):
+        """HTML for the 401 page's portal link, or "" (issue #937).
+
+        A configured return URL keeps its path, query and fragment. Unset
+        falls back to the issuer's origin. Reject syntax that could escape
+        the HTML attribute or Caddy string, including Caddy placeholders.
+        """
+        origin = (r"(https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])"
+                  r"(?::(?:6553[0-5]|655[0-2][0-9]|65[0-4][0-9]{2}|6[0-4][0-9]{3}|[1-5]?[0-9]{1,4}))?)")
+        if self.spec.portal_redirect_url:
+            target = self.spec.portal_redirect_url
+            if not re.fullmatch(origin + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?", target):
+                return ""
+        else:
+            m = re.fullmatch(origin + r"(?:[/?#].*)?", self.spec.portal_issuer)
+            if not m:
+                return ""
+            target = m.group(1)
+        return ("<p style='margin:12px 0 0;font-size:14px'><a href='%s' "
+                "style='color:#58a6ff'>Open this box from your portal "
+                "page</a></p>" % html.escape(target, quote=True))
 
     def caddy(self, t):
         """Bind the shared Caddyfile fragments.
@@ -3608,13 +3952,15 @@ class Renderer:
                 ]:
                     text = text.replace(token, value)
             left = re.findall(r"@[A-Z_]+@", text.replace(
-                "@WEBHOOK_ROUTES@", ""))
+                "@WEBHOOK_ROUTES@", "").replace("@PORTAL_HINT@", ""))
             if left:
                 raise ConfigError(
                     f"caddyfile-{name}.caddy has unbound token(s) "
                     f"{sorted(set(left))} — the fragment gained a token the "
                     "native renderer does not know about")
-            return text
+            # Insert URL data after binding tokens so marker-like path text
+            # remains literal, matching Nix's non-recursive replaceStrings.
+            return text.replace("@PORTAL_HINT@", self.portal_hint())
 
         parts = [bind("header")]
         for u in self.spec.users:
@@ -3775,7 +4121,14 @@ def write_if_changed(path, text, mode, dry_run=False):
         return True
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".agentbox-new")
-    tmp.write_text(text)
+    # Created at the TARGET mode, not chmod'ed to it after the write: a
+    # 0600 file (a registry or a nix.custom.conf carrying credentials)
+    # must not exist world-readable even for the moment in between.
+    with contextlib.suppress(FileNotFoundError):
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode & 0o777)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
     os.chmod(tmp, mode)
     os.replace(tmp, path)
     print(f"wrote {path}")
@@ -4152,6 +4505,26 @@ def validate_render(spec, tree, act, profile):
     cause. `systemctl daemon-reload` and the enable/start in activate() are
     the real gate on a unit, and both are required actions now.
     """
+    if spec.email_enable:
+        import pwd
+        for u in spec.users:
+            if not u.email:
+                continue
+            try:
+                account = pwd.getpwnam(u.name)
+            except KeyError:
+                continue  # ensure_user creates it with the configured home.
+            if Path(account.pw_dir) != Path(u.home):
+                act.failed("email home for " + u.name,
+                           f"configured home {u.home} differs from passwd home {account.pw_dir}")
+    rules = tree.files.get(CVE_2026_98432_RULES)
+    if rules:
+        with tempfile.TemporaryDirectory() as tmp:
+            candidate = Path(tmp) / "cve-2026-98432.nft"
+            candidate.write_text(rules[0])
+            act.require("validate IPv4 TCP IP-options mitigation",
+                        [str(Path(profile) / "bin/nft"), "--check", "--file",
+                         str(candidate)], quiet=True)
     for path, (text, _mode) in sorted(tree.files.items()):
         if Path(path).parent == Path(SUDOERS_DIR):
             validate_sudoers(path, text, act)
@@ -4306,6 +4679,13 @@ def commit(tree, args):
     for path, (text, mode) in sorted(tree.files.items()):
         if write_if_changed(path, text, mode, args.dry_run):
             changed += 1
+            # EnvironmentFile paths stay stable across apply. An active
+            # daemon must reread changed contents even if its unit did not.
+            match = re.fullmatch(r"agent-box-settings-([a-z_][a-z0-9_-]*)\.env",
+                                 Path(path).name)
+            if match:
+                tree.settings_restart.add(
+                    f"agent-box-settings@{match.group(1)}.service")
     for link, target in sorted(tree.links):
         if link_if_changed(link, target, args.dry_run):
             changed += 1
@@ -4382,6 +4762,9 @@ def activate(spec, tree, removed, advisory, act):
     for u in spec.users:
         ensure_user(u.name, u.home, act)
         ensure_linger(u.name, act)
+    if spec.email_enable:
+        ensure_group_user("smtpd", act, home="/var/empty")
+        ensure_group_user("smtpq", act, home="/var/empty")
     if spec.web_enable:
         # Advisory on its own: if the login really cannot be created,
         # caddy.service cannot start as it, and THAT is a required failure
@@ -4508,6 +4891,15 @@ def activate(spec, tree, removed, advisory, act):
                         ["systemctl", "enable", "--now", OOMD_UNIT]):
             remove_if_ours(OOMD_STAMP)
     act.require("systemctl daemon-reload", ["systemctl", "daemon-reload"])
+    # The multi-user Nix daemon fetches independently of an agent's process
+    # environment. Re-read the runtime trust policy without enabling it.
+    if "nix-daemon.service" in active_units("nix-daemon.service"):
+        act.require("refresh Nix daemon TLS trust",
+                    ["systemctl", "restart", "nix-daemon.service"])
+    for unit in sorted(tree.settings_restart):
+        if unit in active_units(unit):
+            if not act.require(f"refresh {unit}", ["systemctl", "restart", unit]):
+                failed_starts.add(unit)
     # Enable what the config declares; stop instances for users that
     # were removed from it, so a shrinking config is honored too.
     for unit in tree.units:
@@ -4523,10 +4915,25 @@ def activate(spec, tree, removed, advisory, act):
                    else act.require(f"start {unit}", cmd))
         if not started:
             failed_starts.add(unit)
+    if (CVE_2026_98432_UNIT in tree.units
+            and CVE_2026_98432_UNIT not in failed_starts):
+        # enable --now does nothing for an active oneshot. Reload on every
+        # apply so an existing box receives changed rules, and a rule flushed
+        # outside this service is restored. nft commits the reload atomically.
+        if not act.require("refresh IPv4 TCP IP-options mitigation",
+                           ["systemctl", "reload-or-restart",
+                            CVE_2026_98432_UNIT]):
+            failed_starts.add(CVE_2026_98432_UNIT)
+    if (spec.email_enable and getattr(tree, "email_restart", False)
+            and "agent-box-email.service" not in failed_starts):
+        # Re-render the OpenSMTPD config when domains/users/cert paths change;
+        # enable --now alone leaves an already running listener unchanged.
+        if not act.require("refresh email intake", ["systemctl", "restart", "agent-box-email.service"]):
+            failed_starts.add("agent-box-email.service")
     wanted = set(tree.units)
     for prefix in ("agent-box@", "agent-web-terminal@",
                    "agent-box-settings@", "agent-box-webhook@",
-                   DOCKER_UNIT_PREFIX):
+                   DOCKER_UNIT_PREFIX, "agent-box-email-source@"):
         for unit in systemd_units_live(prefix):
             if unit not in wanted and "@." not in unit:
                 # `disable` would be a no-op for the same reason; the
@@ -4824,9 +5231,8 @@ def rollback_to(profile, generation):
     """Walk the profile back to `generation`. True when it got there.
 
     One `nix profile rollback` at a time rather than a jump, because a
-    failed switch can leave the profile one OR two generations ahead: the
-    remove-then-install below is two operations, so `rollback` (which knows
-    only "the previous one") has to be repeated. The step is bounded and
+    failed switch can leave the profile more than one generation ahead, so
+    `rollback` (which knows only "the previous one") has to be repeated. The step is bounded and
     stops the moment a rollback stops moving, so a profile that cannot go
     further reports failure instead of spinning.
     """
@@ -4843,6 +5249,45 @@ def rollback_to(profile, generation):
         if profile_generation(profile) == current:
             return False
     return False
+
+
+def clear_staging(stage):
+    """Remove a staging profile's symlinks (never the store paths)."""
+    stage = Path(stage)
+    for link in stage.parent.glob(stage.name + "*"):
+        if link == stage or re.fullmatch(
+                re.escape(stage.name) + r"-\d+-link", link.name):
+            try:
+                link.unlink()
+            except OSError:
+                pass
+
+
+def switch_profile(profile, name, flake):
+    """Replace the runtime element without the profile ever lacking one.
+
+    Services resolve their tools through <profile>/bin while an update runs
+    (issue #957), so `nix profile remove` + `install` on the live profile
+    briefly deleted sleep and flock from under the supervisor. The remove
+    and install happen on a staging copy instead, and the live profile
+    moves once, to the finished generation, with `nix-env --set` (a new
+    generation and an atomic symlink flip). Remove-then-install is still
+    the right edit: a bare install over the existing entry fails with "An
+    existing package already provides the following file" and can leave
+    the OLD profile in place (issue #358).
+    """
+    # Unique per call: a fixed name would let a second update, or a sibling
+    # profile of that name, have its links cleared underneath it.
+    stage = f"{profile}-staging-{uuid.uuid4().hex}"
+    try:
+        run(["nix-env", "--profile", stage, "--set",
+             os.path.realpath(str(profile))])
+        run(nix_cmd("profile", "remove", "--profile", stage, name))
+        run(nix_cmd("profile", "install", "--profile", stage, flake))
+        run(["nix-env", "--profile", str(profile), "--set",
+             os.path.realpath(stage)])
+    finally:
+        clear_staging(stage)
 
 
 # What a profile swap invalidates, in restart order. Sessions are separate
@@ -5036,10 +5481,9 @@ def cmd_update(args):
     # BEFORE the profile is touched — so a box that cannot fetch or build
     # the new release must not have been told its services were going down.
     wall(f"fetching {repo}@{target[:12]} — nothing has changed yet.")
-    # Realize the new closure BEFORE touching the profile, so the window in
-    # which the profile has no runtime element (between the remove and the
-    # install) is a symlink flip rather than a multi-minute download that
-    # can fail halfway.
+    # Realize the new closure BEFORE touching the profile, so the staged
+    # install below is a symlink shuffle rather than a multi-minute download
+    # that can fail halfway.
     try:
         run(nix_cmd("build", "--no-link", flake))
     except subprocess.CalledProcessError as e:
@@ -5049,14 +5493,7 @@ def cmd_update(args):
 
     generation = profile_generation(profile)
     try:
-        # Remove-then-install, not a bare install: installing over the
-        # existing entry fails with "An existing package already provides
-        # the following file" and — this is the trap — leaves the OLD
-        # profile in place while a following `apply` reports "0 change(s)",
-        # so the box looks updated and is not (verified by hand on a live
-        # native box, issue #358).
-        run(nix_cmd("profile", "remove", "--profile", str(profile), name))
-        run(nix_cmd("profile", "install", "--profile", str(profile), flake))
+        switch_profile(profile, name, flake)
     except subprocess.CalledProcessError as e:
         rollback_to(profile, generation)
         wall(f"update to {target[:12]} FAILED at the profile switch — "
@@ -5148,6 +5585,128 @@ def recover_handover(args, profile, generation, target, rc):
           + ("rolled back" if rolled else "NOT rolled back"),
           file=sys.stderr)
     return rc
+
+
+class RegistryPlan:
+    """What nix_registry would write, and where, and why not if it won't."""
+
+    def __init__(self, text=None, target=None, mode=0o644, stamp=None,
+                 note=None):
+        self.text, self.target, self.mode = text, target, mode
+        self.stamp, self.note = stamp, note
+
+
+def registry_target(ref):
+    """The registry `to` for a jitNixpkgs ref, or None.
+
+    Only an https archive URL - which is what the channel default and every
+    pin `agentbox update` writes look like - maps to a registry entry
+    without parsing nix's whole flake-ref grammar here. Anything else
+    (github:, git+, a path) leaves nixpkgs# where it was rather than
+    guessing a type nix would then refuse.
+    """
+    bare, _, query = ref.partition("?")
+    if not (ref.startswith("https://") and re.search(
+            r"\.(tar(\.[a-z0-9]+)?|tgz|zip)$", bare)):
+        return None
+    # narHash and dir are flake attributes, not part of the download URL:
+    # left in `url`, nix would not enforce the hash and would drop the
+    # subdirectory. Every other query parameter stays on the URL.
+    want, rest = {"type": "tarball"}, []
+    for param in query.split("&") if query else []:
+        key, _, value = param.partition("=")
+        if key in ("narHash", "dir"):
+            want[key] = urllib.parse.unquote(value)
+        else:
+            rest.append(param)
+    want["url"] = bare + ("?" + "&".join(rest) if rest else "")
+    return want
+
+
+def plan_nix_registry(path, stamp_path, ref):
+    """Plan /etc/nix/registry.json so nixpkgs maps to `ref`.
+
+    Entries other than nixpkgs are always kept. A nixpkgs entry is replaced
+    only when it is absent, or when it is exactly the mapping agent-box
+    recorded writing last time (NIX_REGISTRY_STAMP) - so an operator's own
+    mapping, whatever host it names, is never overruled, and a pin agent-box
+    wrote is still moved when the pin moves. A file that cannot be read or
+    parsed is left alone. Every skip is a note: a silently skipped setting
+    looks exactly like one never implemented.
+    """
+    path = Path(path)
+    want = registry_target(ref)
+    if want is None:
+        return RegistryPlan(note=f"{path}: jitNixpkgs ({ref}) is not an "
+                                 "https archive URL - nixpkgs# keeps its "
+                                 "existing mapping")
+    ours = {"from": {"type": "indirect", "id": "nixpkgs"}, "to": want}
+    try:
+        recorded = json.loads(Path(stamp_path).read_text())
+    except (OSError, ValueError):
+        recorded = None
+    flakes, mode = [], 0o644
+    target = path.resolve() if path.is_symlink() else path
+    try:
+        existing = path.read_text()
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        existing = None
+    except (OSError, UnicodeDecodeError) as e:
+        return RegistryPlan(note=f"{path}: could not be read ({e}) - left "
+                                 "unchanged")
+    if existing is not None:
+        try:
+            data = json.loads(existing)
+            if not isinstance(data, dict) or data.get("version") != 2:
+                raise ValueError("not a version 2 registry")
+            flakes = list(data["flakes"])
+        except (ValueError, KeyError, TypeError) as e:
+            return RegistryPlan(note=f"{path}: not a registry agent-box can "
+                                     f"read ({e}) - left unchanged")
+    kept = []
+    for entry in flakes:
+        frm = entry.get("from") if isinstance(entry, dict) else None
+        if not (isinstance(frm, dict) and frm.get("type") == "indirect"
+                and frm.get("id") == "nixpkgs"):
+            kept.append(entry)
+            continue
+        # Ours if it is what we recorded writing - or already exactly what
+        # we would write, which needs no record to be safe to restate.
+        if entry.get("to") not in (recorded, want):
+            return RegistryPlan(note=f"{path}: maps nixpkgs itself - left "
+                                     "alone; agent-box did not pin it")
+    text = json.dumps({"version": 2, "flakes": [ours] + kept},
+                      indent=2) + "\n"
+    if existing == text and recorded == want:
+        return RegistryPlan()
+    return RegistryPlan(text=text, target=target, mode=mode,
+                        stamp=json.dumps(want) + "\n")
+
+
+def retarget_nix_registry(from_ref, to_ref):
+    """Move our nixpkgs registry entry from `from_ref` back to `to_ref`.
+
+    For an update that rolled back: the restored release may predate the
+    registry and so never re-render it, which would leave nixpkgs# on the
+    pin the failed release wrote. Only moves an entry that is still ours AND
+    still names `from_ref`; an operator's jitNixpkgs never moved, so its
+    entry is left where it is. Best effort, like the pin restore beside it.
+    """
+    if registry_target(from_ref) is None:
+        return
+    try:
+        recorded = json.loads(Path(NIX_REGISTRY_STAMP).read_text())
+    except (OSError, ValueError):
+        return
+    if recorded != registry_target(from_ref):
+        return
+    plan = plan_nix_registry(NIX_REGISTRY, NIX_REGISTRY_STAMP, to_ref)
+    if plan.text is None:
+        return
+    with contextlib.suppress(OSError):
+        write_if_changed(plan.target, plan.text, plan.mode)
+        write_if_changed(NIX_REGISTRY_STAMP, plan.stamp, 0o644)
 
 
 def read_agent_pin(root="/"):
@@ -5287,6 +5846,8 @@ def post_switch(args, profile):
                     Path(AGENT_PIN_FILE).unlink(missing_ok=True)
                 else:
                     Path(AGENT_PIN_FILE).write_text(previous_pin)
+            retarget_nix_registry(
+                resolved_pin, (previous_pin or "").strip() or CHANNEL_NIXPKGS)
         # Re-apply with the rolled-back code, as a fresh process for the
         # same version-skew reason phase one handed over to us.
         run([str(profile / "bin" / "agentbox"), "apply",

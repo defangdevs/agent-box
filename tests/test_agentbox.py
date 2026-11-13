@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -79,7 +80,7 @@ def profile_payload_names(webhook=True):
 # names in every case.
 FAKE_TOOLS = [
     "claude", "codex", "tmux", "ttyd", "caddy", "grep", "find", "flock",
-    "hostname", "fail2ban-server", "fail2ban-client", "nft",
+    "hostname", "fail2ban-server", "fail2ban-client", "nft", "sysctl",
 ]
 FAKE_BINS = sorted(profile_payload_names() | set(FAKE_TOOLS))
 
@@ -141,6 +142,8 @@ def build_fake_profile(root):
     (share / "contract").mkdir()
     for j in (SRC / "contract").glob("*.json"):
         shutil.copy(j, share / "contract" / j.name)
+    shutil.copy(SRC / "cve-2026-98432.nft", share / "cve-2026-98432.nft")
+    shutil.copy(SRC / "cve-2026-98432.sysctl", share / "cve-2026-98432.sysctl")
     shutil.copy(SRC / "tmux.conf", share / "tmux.conf")
     # The pinned local-webhook the profile ships (issue #425), and the pin it
     # came from. A box needs no webhook config because these are here — so a
@@ -230,6 +233,25 @@ def tree_modes(root):
 
 
 class RenderTest(unittest.TestCase):
+    def test_tls_policy_reaches_socket_and_timer_services_and_keeps_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = render(tmp, CONFIG_JSON)
+            unit_root = out / "etc/systemd/system"
+            for name in ["agent-box-settings@agent.service", "agent-box-update.service",
+                         "agent-box-webhook@agent.service", "agent-box@agent.service",
+                         "caddy.service", "nix-daemon.service"]:
+                self.assertIn("EnvironmentFile=/etc/agent-box/tls.env",
+                              (unit_root / (name + ".d") / "05-tls.conf").read_text())
+            env = (out / "etc/agent-box/tls.env").read_text()
+            self.assertIn("NODE_OPTIONS=--use-openssl-ca", env)
+            self.assertIn("SSL_CERT_DIR=@PROFILE@/etc/agent-box/empty-ca-dir", env)
+            wrapper = (out / "usr/local/bin/agent-box-session").read_text()
+            self.assertIn("export NODE_OPTIONS=--use-openssl-ca", wrapper)
+            self.assertTrue(load_agentbox().generated_by_us(out / "usr/local/bin/agent-box-session"))
+            # Byte-for-byte unit copies remain recognizable by feature-off cleanup.
+            shared = (out / "etc/systemd/system/agent-box-settings@.service").read_text()
+            self.assertEqual(shared, (SRC / "units/agent-box-settings@.service").read_text())
+
     def test_ip_certificate_and_optional_dns_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
             cfg = Path(tmp) / "config.json"
@@ -802,6 +824,204 @@ class RenderTest(unittest.TestCase):
         nixconf = (FIXTURE / "etc/nix/nix.custom.conf").read_text()
         self.assertIn("min-free = 1073741824", nixconf)
         self.assertIn("max-free = 5368709120", nixconf)
+
+    def test_nixpkgs_registry_follows_the_box_pin(self):
+        """`nixpkgs#` must name the jitNixpkgs pin, not the global
+        registry's moving target, so a user install lands on the revision
+        the harnesses use and that the binary cache has built."""
+        reg = json.loads((FIXTURE / "etc/nix/registry.json").read_text())
+        self.assertEqual(2, reg["version"])
+        entry = reg["flakes"][0]
+        self.assertEqual({"type": "indirect", "id": "nixpkgs"}, entry["from"])
+        self.assertEqual("tarball", entry["to"]["type"])
+        # The fixture renders with no pin file under its root, so the pin
+        # is the channel default - the same URL jitNixpkgs falls back to.
+        self.assertEqual(load_agentbox().CHANNEL_NIXPKGS, entry["to"]["url"])
+
+    def _render_registry(self, existing=None, stamp=None, config=None,
+                         prepare=None):
+        """Render against a root holding `existing` as the registry and
+        `stamp` as agent-box's record of its last write. Returns the parsed
+        registry it would write (None for none), the notes, the out root
+        and the tree."""
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "out"
+            (out / "etc/nix").mkdir(parents=True)
+            (out / "etc/agent-box").mkdir(parents=True)
+            reg = out / "etc/nix/registry.json"
+            if existing is not None:
+                (reg.write_bytes if isinstance(existing, bytes)
+                 else reg.write_text)(existing)
+            if stamp is not None:
+                (out / "etc/agent-box/nix-registry-nixpkgs.json").write_text(
+                    json.dumps(stamp))
+            if prepare:
+                prepare(out)
+            mod = load_agentbox()
+            data = json.loads(CONFIG_JSON.read_text())
+            data.update(config or {})
+            rend = mod.Renderer(mod.Spec(data, prof), prof, root=out)
+            tree = rend.render()
+            target = reg.resolve() if reg.is_symlink() else reg
+            written = tree.files.get(str(target))
+            return ((json.loads(written[0]) if written else None),
+                    rend.notes, written, tree, out)
+
+    @staticmethod
+    def _pin(url):
+        return {"from": {"type": "indirect", "id": "nixpkgs"},
+                "to": {"type": "tarball", "url": url}}
+
+    OLD = ("https://releases.nixos.org/nixos/unstable/old/nixexprs.tar.xz")
+
+    def test_a_registry_keeps_other_entries_and_moves_our_pin(self):
+        other = {"from": {"type": "indirect", "id": "mine"},
+                 "to": {"type": "github", "owner": "o", "repo": "r"}}
+        stale = self._pin(self.OLD)
+        reg, *_ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [other, stale]}),
+            stamp=stale["to"])
+        self.assertIn(other, reg["flakes"], "dropped somebody else's entry")
+        pins = [f for f in reg["flakes"] if f["from"].get("id") == "nixpkgs"]
+        self.assertEqual(1, len(pins), "left the stale pin beside the new one")
+        self.assertNotEqual(stale["to"], pins[0]["to"])
+
+    def test_an_explicit_jit_pin_reaches_the_registry(self):
+        """A renderer that hardcoded the channel URL would pass the fixture
+        test; this one would not."""
+        url = "https://example.org/nixpkgs/pinned.tar.gz"
+        reg, *_ = self._render_registry(config={"jitNixpkgs": url})
+        self.assertEqual({"type": "tarball", "url": url},
+                         reg["flakes"][0]["to"])
+
+    def test_a_pin_agent_box_wrote_moves_whatever_its_host(self):
+        """Ownership is the record, not the URL's host: pin A on a host that
+        is not nixos.org is still ours, and moves to pin B."""
+        a = "https://example.org/a.tar.gz"
+        b = "https://example.org/b.tar.gz"
+        reg, *_ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [self._pin(a)]}),
+            stamp={"type": "tarball", "url": a}, config={"jitNixpkgs": b})
+        self.assertEqual(b, reg["flakes"][0]["to"]["url"])
+
+    def test_an_operator_nixpkgs_mapping_is_left_alone(self):
+        """Even one on releases.nixos.org: with no record that agent-box
+        wrote it, it is an operator's choice."""
+        for to in ({"type": "github", "owner": "NixOS", "repo": "nixpkgs",
+                    "ref": "nixos-25.11"},
+                   {"type": "tarball", "url": self.OLD}):
+            with self.subTest(to=to):
+                theirs = {"version": 2, "flakes": [
+                    {"from": {"type": "indirect", "id": "nixpkgs"},
+                     "to": to}]}
+                reg, notes, *_ = self._render_registry(json.dumps(theirs))
+                self.assertIsNone(reg, "overruled an operator's mapping")
+                self.assertTrue(any("registry.json" in n for n in notes),
+                                "skipped the pin without saying so")
+
+    def test_an_operator_edit_after_our_write_is_left_alone(self):
+        mine = {"type": "tarball", "url": self.OLD}
+        theirs = {"type": "github", "owner": "NixOS", "repo": "nixpkgs"}
+        reg, notes, *_ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [
+                {"from": {"type": "indirect", "id": "nixpkgs"},
+                 "to": theirs}]}), stamp=mine)
+        self.assertIsNone(reg)
+        self.assertTrue(any("registry.json" in n for n in notes))
+
+    def test_an_unreadable_registry_is_left_alone(self):
+        for bad in ("not json", b"\xff\xfe not utf-8",
+                    json.dumps({"version": 1, "flakes": []})):
+            with self.subTest(bad=bad):
+                reg, notes, *_ = self._render_registry(bad)
+                self.assertIsNone(reg)
+                self.assertTrue(any("registry.json" in n for n in notes))
+
+    def test_a_malformed_entry_is_kept_not_fatal(self):
+        odd = {"from": None, "to": None}
+        reg, *_ = self._render_registry(
+            json.dumps({"version": 2, "flakes": [odd, "junk"]}))
+        self.assertIn(odd, reg["flakes"])
+        self.assertIn("junk", reg["flakes"])
+
+    def test_a_non_tarball_jit_ref_leaves_the_registry(self):
+        reg, notes, *_ = self._render_registry(
+            config={"jitNixpkgs": "github:NixOS/nixpkgs/nixos-unstable"})
+        self.assertIsNone(reg, "wrote a github: ref as a tarball URL")
+        self.assertTrue(any("not an https archive" in n for n in notes))
+
+    def test_flake_params_leave_the_url_for_attributes(self):
+        reg, *_ = self._render_registry(config={"jitNixpkgs": (
+            "https://example.org/n.tar.xz"
+            "?narHash=sha256-a%2Bb%2Fc%3D&x=1&dir=sub")})
+        self.assertEqual(
+            {"type": "tarball", "url": "https://example.org/n.tar.xz?x=1",
+             "narHash": "sha256-a+b/c=", "dir": "sub"},
+            reg["flakes"][0]["to"])
+
+    def test_a_registry_keeps_its_mode_and_symlink(self):
+        def prepare(out):
+            real = out / "elsewhere.json"
+            real.write_text(json.dumps({"version": 2, "flakes": []}))
+            real.chmod(0o600)
+            reg = out / "etc/nix/registry.json"
+            reg.unlink(missing_ok=True)
+            reg.symlink_to(real)
+        reg, _, written, tree, out = self._render_registry(prepare=prepare)
+        self.assertIsNotNone(reg)
+        self.assertEqual(0o600, written[1], "widened a root-only registry")
+        self.assertNotIn(str(out / "etc/nix/registry.json"), tree.files,
+                         "would replace the symlink with a plain file")
+
+    def test_a_settled_registry_is_not_rewritten(self):
+        reg, _, _, tree, out = self._render_registry()
+        stamp = json.loads(tree.files[
+            str(out / "etc/agent-box/nix-registry-nixpkgs.json")][0])
+        again, notes, *_ = self._render_registry(
+            json.dumps(reg, indent=2) + "\n", stamp=stamp)
+        self.assertIsNone(again, "rewrote a settled registry")
+        self.assertFalse([n for n in notes if "registry.json" in n])
+
+    def test_write_if_changed_never_widens_a_temp_file(self):
+        """The temp file is CREATED at the target mode, so a 0600 file is
+        never readable by others, not even between the write and a chmod."""
+        mod = load_agentbox()
+        modes = []
+        real_open = os.open
+
+        def spy(path, flags, mode=0o777, *a, **k):
+            modes.append(mode)
+            return real_open(path, flags, mode, *a, **k)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "secret.json"
+            with mock.patch.object(mod.os, "open", spy):
+                mod.write_if_changed(target, "x\n", 0o600)
+            self.assertEqual(0o600, stat.S_IMODE(target.stat().st_mode))
+        self.assertEqual([0o600], modes)
+
+    def test_rollback_puts_our_registry_pin_back(self):
+        """A rolled-back update restores the pin file and re-applies with
+        the OLD release, which may predate the registry - so the registry
+        is moved back too, but only off the pin the failed run wrote."""
+        mod = load_agentbox()
+        new_pin = "https://releases.nixos.org/nixos/unstable/new/nixexprs.tar.xz"
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = Path(tmp) / "registry.json"
+            stamp = Path(tmp) / "stamp.json"
+            reg.write_text(json.dumps(
+                {"version": 2, "flakes": [self._pin(new_pin)]}))
+            stamp.write_text(json.dumps(self._pin(new_pin)["to"]))
+            with mock.patch.object(mod, "NIX_REGISTRY", str(reg)), \
+                    mock.patch.object(mod, "NIX_REGISTRY_STAMP", str(stamp)):
+                # Not ours to move: the registry names some other ref.
+                mod.retarget_nix_registry("https://x.org/other.tar.gz",
+                                          self.OLD)
+                self.assertIn(new_pin, reg.read_text())
+                mod.retarget_nix_registry(new_pin, self.OLD)
+            back = json.loads(reg.read_text())
+            self.assertEqual(self.OLD, back["flakes"][0]["to"]["url"])
+            self.assertEqual(self.OLD, json.loads(stamp.read_text())["url"])
 
     def test_a_foreign_nix_custom_conf_keeps_its_scalars(self):
         """/etc/nix/nix.custom.conf is what Determinate tells a HUMAN to
@@ -1463,6 +1683,31 @@ class RenderTest(unittest.TestCase):
                             f"the guide promises `{cmd}`, which this box "
                             f"does not have")
 
+    def test_every_cli_a_payload_looks_up_on_path_is_installed(self):
+        """A shared payload that resolves an agent-box CLI from PATH
+        (`shutil.which(...)` or `command -v ...`) degrades silently when
+        the profile does not ship it: env-exec found no
+        agent-box-webhook-self on native boxes, so no session got
+        LOCAL_WEBHOOK_SELF, "@self" muted nobody, and a hook session
+        received and eyes-reacted to its own PR comment. Every name a
+        payload probes for must be a wrapper or a profile payload."""
+        probed = set()
+        for path in SRC.iterdir():
+            if path.suffix not in (".py", ".sh"):
+                continue
+            text = path.read_text()
+            probed |= set(re.findall(
+                r'shutil\.which\("(agent-box-[a-z0-9-]+)"\)', text))
+            probed |= set(re.findall(
+                r'command -v (agent-box-[a-z0-9-]+)', text))
+        self.assertIn("agent-box-webhook-self", probed)
+        wrappers = {p.name for p in (FIXTURE / "usr/local/bin").iterdir()}
+        payloads = profile_payload_names()
+        for cmd in sorted(probed):
+            self.assertTrue(cmd in wrappers or cmd in payloads,
+                            f"a payload looks up `{cmd}` on PATH, which "
+                            f"the native profile does not install")
+
     def test_the_session_cli_can_reach_the_env_store(self):
         """session-cli.sh reads AGENT_BOX_ENVSTORE_BIN with ${VAR:?}, so an
         unset value is not a degraded `env` verb — it is an error message
@@ -1472,9 +1717,14 @@ class RenderTest(unittest.TestCase):
         self.assertIn("AGENT_BOX_PROFILE_BIN=", wrapper)
         profile = (FIXTURE / "usr/local/bin/agent-box-profile").read_text()
         self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
+        acp = (FIXTURE / "usr/local/bin/agent-box-acp").read_text()
+        self.assertIn("AGENT_BOX_ENV_EXEC=", acp)
+        self.assertIn("AGENT_BOX_ENVSTORE_BIN=", acp)
+        self.assertIn("AGENT_BOX_PROFILE_BIN=", acp)
+        self.assertIn("AGENT_BOX_ACP_SELF=", acp)
 
     def test_wrappers_generated_without_web(self):
-        """agent-box-session and agent-box-profile must exist even with
+        """Interactive agent-box CLIs must exist even with
         web.enable: false — the shipped guide tells every agent to run
         them regardless, and the module's own agentRuntimePackages carries
         both unconditionally. Their generation used to live inside
@@ -1494,6 +1744,8 @@ class RenderTest(unittest.TestCase):
             self.assertIn("AGENT_BOX_PROFILE_BIN=", session)
             profile = (out / "usr/local/bin/agent-box-profile").read_text()
             self.assertIn("AGENT_BOX_ENVSTORE_BIN=", profile)
+            acp = (out / "usr/local/bin/agent-box-acp").read_text()
+            self.assertIn("AGENT_BOX_ACP_SELF=", acp)
 
     def test_every_user_gets_their_own_canonical_guide(self):
         """Issue #394. Two things were wrong at once here.
@@ -1557,13 +1809,15 @@ class RenderTest(unittest.TestCase):
         self.assertIn('approval_policy = "never"', toml)
         # Both keys, or the box opens the filesystem and still stops to ask.
         self.assertIn('sandbox_mode = "danger-full-access"', toml)
+        self.assertIn('[[hooks.SessionStart.hooks]]', toml)
+        self.assertIn('command = "@PROFILE@/bin/agent-box-claude-session-start-hook codex"', toml)
         for user in ("agent", "robot"):
             env = (FIXTURE / "etc/agent-box/units" / f"{user}.env").read_text()
             self.assertIn("AGENT_BOX_CLAUDE_SETTINGS="
                           "/etc/agent-box/claude-hook-settings.json", env)
             self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env)
 
-    def test_turning_codex_full_access_off_removes_the_file(self):
+    def test_turning_codex_full_access_off_keeps_only_the_hook(self):
         """The dangerous transition, applied to ONE root.
 
         A box rendered with codexFullAccess: true and later false kept
@@ -1599,8 +1853,10 @@ class RenderTest(unittest.TestCase):
             for user in ("agent", "robot"):
                 self.assertIn("AGENT_BOX_CODEX_FULL_ACCESS=1", env_text(user))
             apply(False)
-            self.assertFalse(conf.exists(),
+            self.assertNotIn("danger-full-access", conf.read_text(),
                              "stale full-access config survived the flip")
+            self.assertNotIn('approval_policy = "never"', conf.read_text())
+            self.assertIn('[[hooks.SessionStart.hooks]]', conf.read_text())
             for user in ("agent", "robot"):
                 self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env_text(user),
                                  "stale full-access flag survived the flip")
@@ -1652,6 +1908,23 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(mod.GENERATED_HEADER + "x = 1\n",
                              elsewhere.read_text())
 
+    def test_codex_hook_preserves_foreign_restricted_configuration(self):
+        mod = load_agentbox()
+        config = json.loads(CONFIG_JSON.read_text())
+        config["codexFullAccess"] = False
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            out = Path(tmp) / "root"
+            conf = out / "etc/codex/config.toml"
+            conf.parent.mkdir(parents=True)
+            content = 'model = "custom-model"\n'
+            conf.write_text(content)
+            renderer = mod.Renderer(mod.Spec(config, prof), prof, root=out)
+            tree = renderer.render()
+            self.assertNotIn(str(conf), tree.files)
+            self.assertEqual(conf.read_text(), content)
+            self.assertTrue(any("SessionStart" in note for note in renderer.notes))
+
     def test_codex_full_access_is_file_and_flag_together(self):
         """Never the flag without the file. supervisor.sh reads the flag as
         evidence the file exists, so setting one alone would make a
@@ -1666,10 +1939,12 @@ class RenderTest(unittest.TestCase):
                 spec = mod.Spec(config, prof)
                 rend = mod.Renderer(spec, prof, root=Path(tmp) / f"o{want}")
                 tree = rend.render()
-                toml = [f for f in tree.files if f.endswith("codex/config.toml")]
+                toml = [text for path, (text, _) in tree.files.items()
+                        if path.endswith("codex/config.toml")][0]
                 env = [text for path, (text, _) in tree.files.items()
                        if path.endswith("/agent.env")][0]
-                self.assertEqual(want, bool(toml))
+                self.assertEqual(want, 'sandbox_mode = "danger-full-access"' in toml)
+                self.assertIn('[[hooks.SessionStart.hooks]]', toml)
                 self.assertEqual(want, "AGENT_BOX_CODEX_FULL_ACCESS" in env)
 
     def test_a_quoted_false_does_not_turn_codex_loose(self):
@@ -1695,9 +1970,10 @@ class RenderTest(unittest.TestCase):
             config["codexFullAccess"] = None
             spec = mod.Spec(config, prof)
             tree = mod.Renderer(spec, prof, root=Path(tmp) / "null").render()
-            self.assertFalse(
-                [f for f in tree.files if f.endswith("codex/config.toml")],
-                "codexFullAccess: null rendered the full-access file")
+            toml = [text for path, (text, _) in tree.files.items()
+                    if path.endswith("codex/config.toml")][0]
+            self.assertNotIn('sandbox_mode = "danger-full-access"', toml,
+                             "codexFullAccess: null rendered full-access defaults")
             env = [text for path, (text, _) in tree.files.items()
                    if path.endswith("/agent.env")][0]
             self.assertNotIn("AGENT_BOX_CODEX_FULL_ACCESS", env)
@@ -2923,6 +3199,60 @@ class ConfigSchemaTest(unittest.TestCase):
         for value in [0, -1, True, "four", 1.5]:
             self.assertIn("sessionLimit", self.refused(lambda c: c.update(sessionLimit=value)))
 
+    def test_session_hibernation_grace_is_non_negative(self):
+        self.assertEqual(
+            self.spec(lambda c: c.pop("sessionHibernationGraceSeconds", None))
+            .session_hibernation_grace_seconds, 30)
+        self.assertEqual(
+            self.spec(lambda c: c.update(sessionHibernationGraceSeconds=None))
+            .session_hibernation_grace_seconds, 30)
+        self.assertEqual(
+            self.spec(lambda c: c.update(sessionHibernationGraceSeconds=0))
+            .session_hibernation_grace_seconds, 0)
+        self.assertEqual(
+            self.spec(lambda c: c.update(sessionHibernationGraceSeconds=90))
+            .session_hibernation_grace_seconds, 90)
+        for value in [-1, True, "thirty", 1.5]:
+            self.assertIn(
+                "sessionHibernationGraceSeconds",
+                self.refused(lambda c: c.update(
+                    sessionHibernationGraceSeconds=value)))
+
+    def test_claude_remote_control_server_has_one_unambiguous_shape(self):
+        # The valid form is accepted and rendered by the golden fixture.
+        self.spec(lambda c: c["users"]["agent"]["sessions"]["main"].update(
+            remoteControlServer=True))
+        for message, mutate in [
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["review"].update(
+                 remoteControlServer=True)),
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControl=False, remoteControlServer=True)),
+            ("only for a Claude session with remoteControl: true",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControl=None, remoteControlServer=True)),
+            ("cannot set a prompt in Claude daemon mode",
+             lambda c: c["users"]["agent"]["sessions"]["main"].update(
+                 remoteControlServer=True, prompt="one task")),
+        ]:
+            self.assertIn(message, self.refused(mutate))
+
+    def test_remote_control_daemon_is_harness_neutral(self):
+        for agent in ("claude", "codex"):
+            spec = self.spec(
+                lambda c, agent=agent: c["users"]["agent"]["sessions"]
+                ["main"].update(agent=agent, remoteControlDaemon=True))
+            user = next(user for user in spec.users if user.name == "agent")
+            session = user.sessions["main"]
+            self.assertTrue(session["remoteControlDaemon"])
+        self.assertIn(
+            "remoteControlDaemon only for Claude or Codex",
+            self.refused(lambda c: (
+                c["agents"].append("opencode"),
+                c["users"]["agent"]["sessions"]["main"].update(
+                    agent="opencode", remoteControlDaemon=True))))
+
     def test_the_reported_coercions_are_refused_with_the_field_named(self):
         """Every example from issue #525, each with the path in the message.
 
@@ -3114,6 +3444,7 @@ class ConfigSchemaTest(unittest.TestCase):
             ("Spec", "__init__"): {
                 "data": mod.BOX_SCHEMA,
                 "wh": webhook,
+                "email": mod.BOX_SCHEMA.fields["email"],
                 "web": mod.BOX_SCHEMA.fields["web"],
                 "os_updates": mod.BOX_SCHEMA.fields["osUpdates"],
                 "containers": mod.BOX_SCHEMA.fields["containers"],
@@ -3503,6 +3834,41 @@ class SelfUpdateLogicTest(unittest.TestCase):
         self.assertLess(self.calls.index(removes[0]),
                         self.calls.index(installs[0]))
 
+    def test_the_live_profile_never_loses_its_runtime_during_a_switch(self):
+        """Issue #957: the supervisor reads <profile>/bin while we update.
+
+        remove + install on the live profile left it empty between the two,
+        so sleep and flock vanished. The edits belong on a staging profile;
+        the live one may only be moved by the single closing `--set`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = build_fake_profile(tmp)
+            self._source("2" * 40)
+            with self.quiet(), self.assertRaises(self.mod.UpdateError):
+                self.mod.cmd_update(self._args(prof))
+        live = str(prof)
+        for call in self.calls:
+            if "remove" in call or "install" in call:
+                self.assertNotIn(live, call, call)
+        touching = [c for c in self.calls
+                    if c[:3] == ["nix-env", "--profile", live]]
+        self.assertEqual(len(touching), 1, touching)
+        self.assertIn("--set", touching[0])
+
+    def test_each_switch_stages_on_its_own_profile_name(self):
+        """A fixed `<profile>-staging` let concurrent updates (or a sibling
+        profile of that name) clear each other's links."""
+        stages = []
+        for _ in range(2):
+            self.calls.clear()
+            with tempfile.TemporaryDirectory() as tmp:
+                prof = build_fake_profile(tmp)
+                self.mod.switch_profile(prof, "agent-box", "flake")
+            stages.append(self.calls[0][2])
+        self.assertNotEqual(stages[0], stages[1])
+        for stage in stages:
+            self.assertIn("-staging-", stage)
+
     def test_a_failed_build_is_reported_and_leaves_the_profile_alone(self):
         """`main` catches ConfigError and UpdateError — nothing else.
 
@@ -3807,6 +4173,61 @@ class ApplyActivationTest(unittest.TestCase):
         self.assertNotIn("apply FAILED", err)
 
     # -- phase 4: activation -------------------------------------------------
+
+    def test_existing_apply_activates_and_refreshes_tcp_mitigation(self):
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        unit = self.mod.CVE_2026_98432_UNIT
+        self.assertIn(["systemctl", "enable", "--now", unit], self.calls)
+        self.assertIn(["systemctl", "reload-or-restart", unit], self.calls)
+        self.assertIn(["systemctl", "show", unit],
+                      [call[:3] for call in self.calls])
+
+    def test_changed_settings_environment_refreshes_only_active_daemons(self):
+        path = "/etc/agent-box/units/agent-box-settings-agent.env"
+        self.extra_files[path] = "AGENT_BOX_PORTAL_REDIRECT_URL=https://x.test/new\n"
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: (
+            ["agent-box-settings@agent.service"]
+            if pattern == "agent-box-settings@agent.service" else [])
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
+        self.calls.clear()
+        self.mod.write_if_changed = lambda *args: False
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
+        self.calls.clear()
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: []
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
+
+    def test_a_failed_settings_environment_refresh_fails_apply(self):
+        path = "/etc/agent-box/units/agent-box-settings-agent.env"
+        self.extra_files[path] = "AGENT_BOX_PORTAL_REDIRECT_URL=https://x.test/new\n"
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: (
+            ["agent-box-settings@agent.service"]
+            if pattern == "agent-box-settings@agent.service" else [])
+        self.fail_when = ["restart agent-box-settings@agent.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "refresh agent-box-settings@agent.service")
+
+    def test_invalid_tcp_mitigation_fails_before_activation(self):
+        self.extra_files[self.mod.CVE_2026_98432_RULES] = (
+            SRC / "cve-2026-98432.nft").read_text()
+        self.fail_when = ["nft --check --file"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "validate IPv4 TCP IP-options mitigation")
+        self.assertNotIn(["systemctl", "daemon-reload"], self.calls)
+
+    def test_tcp_mitigation_failure_fails_existing_apply(self):
+        self.fail_when = ["reload-or-restart agent-box-cve-2026-98432.service"]
+        rc, out, err = self.apply()
+        self.assertFailed(rc, out, err, "refresh IPv4 TCP IP-options mitigation")
 
     def test_a_required_unit_that_will_not_start_fails_apply(self):
         self.fail_when = ["enable --now caddy.service"]
@@ -4404,6 +4825,88 @@ class PortalHandoff(unittest.TestCase):
         self.assertRegex(env, r"AGENT_BOX_OPENSSL=/.*/openssl")
         self.assertIn("handle /agent/auth/*",
                       files["/etc/agent-box/Caddyfile"])
+
+    def test_the_401_page_links_the_portal_only_when_an_issuer_is_set(self):
+        """Issue #937: a hint for users who arrive without a login."""
+        hint = "Open this box from your portal page"
+        with_issuer = self._render({"agent": dict(self.MAPPED)},
+                                   self.PORTAL_WEB)["/etc/agent-box/Caddyfile"]
+        self.assertIn("<a href='https://station.example.com'", with_issuer)
+        self.assertIn(hint, with_issuer)
+        without = self._render({"agent": {"root": True}})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertNotIn(hint, without)
+        self.assertNotIn("@PORTAL_HINT@", without)
+        # Only the origin is linked, and a value that is not a plain origin
+        # renders no link rather than a broken string.
+        odd = self._render({"agent": {"root": True}},
+                           {"portalIssuer": "https://x.test/a?b=1"})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertIn("href='https://x.test'", odd)
+        v6 = self._render({"agent": {"root": True}},
+                          {"portalIssuer": "https://[2001:db8::1]:8443/x"})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertIn("href='https://[2001:db8::1]:8443'", v6)
+        bad = self._render({"agent": {"root": True}},
+                           {"portalIssuer": "https://x.test'\"{"})[
+            "/etc/agent-box/Caddyfile"]
+        self.assertNotIn(hint, bad)
+
+    def test_401_redirect_preserves_the_destination_without_changing_trust(self):
+        target = "https://station.example.com/app/stations/42?a=1&b=2#connect"
+        web = dict(self.PORTAL_WEB, portalRedirectUrl=target)
+        files = self._render({"agent": dict(self.MAPPED)}, web)
+        self.assertIn("href='" + target.replace("&", "&amp;") + "'",
+                      files["/etc/agent-box/Caddyfile"])
+        env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+        self.assertIn("AGENT_BOX_PORTAL_ISSUER=https://station.example.com\n", env)
+        # The daemon's own 401 page needs the same destination (CodeRabbit,
+        # PR #1007); trust still comes from the issuer alone.
+        self.assertIn("AGENT_BOX_PORTAL_REDIRECT_URL=" + json.dumps(target) + "\n", env)
+        # The informational link can also be used without handover configured.
+        without_issuer = self._render({"agent": {"root": True}},
+                                     {"portalRedirectUrl": target})
+        self.assertIn("/app/stations/42", without_issuer["/etc/agent-box/Caddyfile"])
+
+    def test_401_redirect_keeps_template_marker_text_literal(self):
+        target = "https://station.example.com/@DOMAIN@/@MANAGED_BY@?x=@PORTALUSERID@"
+        files = self._render({"agent": {"root": True}},
+                             dict(self.PORTAL_WEB, portalRedirectUrl=target))
+        self.assertIn("href='" + target + "'", files["/etc/agent-box/Caddyfile"])
+
+    def test_invalid_redirect_cannot_add_environment_assignments(self):
+        for target in ('""', " ", "\n", "\r", "\t", "\\\n",
+                       "https://x.test/\nAGENT_BOX_PORTAL_ISSUER=https://other.test"):
+            with self.subTest(target=target):
+                files = self._render({"agent": dict(self.MAPPED)},
+                                     dict(self.PORTAL_WEB, portalRedirectUrl=target))
+                env = files["/etc/agent-box/units/agent-box-settings-agent.env"]
+                lines = env.splitlines()
+                redirects = [line for line in lines
+                             if line.startswith("AGENT_BOX_PORTAL_REDIRECT_URL=")]
+                self.assertEqual(len(redirects), 1)
+                self.assertEqual(json.loads(redirects[0].split("=", 1)[1]), target)
+                self.assertEqual([line for line in lines
+                                  if line.startswith("AGENT_BOX_PORTAL_ISSUER=")],
+                                 ["AGENT_BOX_PORTAL_ISSUER=https://station.example.com"])
+                self.assertNotIn("Open this box from your portal page",
+                                 files["/etc/agent-box/Caddyfile"])
+
+    def test_401_redirect_falls_back_only_when_unset(self):
+        for target in (None, ""):
+            web = dict(self.PORTAL_WEB, portalRedirectUrl=target)
+            files = self._render({"agent": {"root": True}}, web)
+            self.assertIn("href='https://station.example.com'",
+                          files["/etc/agent-box/Caddyfile"])
+        for target in ("javascript:alert(1)", "//evil.test/", "https://x.test/'",
+                       'https://x.test/"', "https://x.test/\nnext",
+                       "https://x.test/{http.request.host}", "https://x.test/\\path",
+                       "https://x.test:65536/", "https://x.test:99999/"):
+            with self.subTest(target=target):
+                files = self._render({"agent": {"root": True}},
+                                     dict(self.PORTAL_WEB, portalRedirectUrl=target))
+                self.assertNotIn("Open this box from your portal page",
+                                 files["/etc/agent-box/Caddyfile"])
 
     def test_the_jwks_url_is_passed_only_when_overridden(self):
         """Keys are FETCHED, so there is nothing to configure per rotation.

@@ -63,6 +63,13 @@ its tradeoffs are recorded in [`docs/deployment-model.md`](docs/deployment-model
 
 Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as a single file, so it must not import sibling files. This is why the sources are re-embedded at build time rather than loaded with `readFile` — after editing the template or `modules/src/`, run `nix run .#assemble` and commit the regenerated `modules/agent-box.nix` (CI's `module-generated-up-to-date` check fails on drift).
 
+Keep all deployment templates in sync. When adding or changing a provisioning
+option, check AWS EC2 (`deploy/aws/template.yaml`), AWS Lightsail
+(`deploy/aws/lightsail-template.yaml`) and Azure (`deploy/azure/agent-box.bicep`
+plus its generated `agent-box.json`), their bootstrap configuration and the
+documentation. Apply equivalent changes to each supported platform in the same
+PR; document any intentional platform difference explicitly.
+
 ## Build, Test, and Development Commands
 
 - `nix run .#assemble` regenerates `modules/agent-box.nix` from `modules/agent-box.nix.in` + `modules/src/` (run from the repo root after editing either).
@@ -74,6 +81,8 @@ Keep the module self-contained: deployed boxes fetch `modules/agent-box.nix` as 
 - `nix build -L .#checks.<system>.source-tree` runs `tests/test-source-tree.sh` against `modules/src/source-tree.sh`, the tree the box is BUILT from and the whole of what an update moves (issue #242). Weighted at the refusals for the same reason: it runs as root, unattended, and the tree it leaves behind is what the next rebuild builds — so a rewritten history, a downgrade, and a baseline the tree has never heard of each get an assertion, as does the realign that makes the fast-forward guard measure ancestry from the rev the box is RUNNING. It also pins the two locks the trust boundary rests on: `check` answers from `git ls-remote` and so creates no tree and fetches into none, and git runs with `core.hooksPath` pointed at nothing, so a `post-checkout`/`post-merge` hook in the tree cannot run as root (that assertion has a negative control — remove the lock and it fails). `origin` is a local repository, so there is no network and it runs natively on every architecture. Runnable without Nix too: `bash tests/test-source-tree.sh modules/src/source-tree.sh`.
 - `nix build -L .#checks.<system>.checkout-options` is the eval regression for `selfUpdate`'s three path assertions (issue #242). It reads `config.assertions` rather than forcing `toplevel`, so a failure names WHICH assertion fired instead of only reporting that something did — and it asserts the accepting cases too, so an assertion that rejects everything fails it as loudly as one that rejects nothing. `selfUpdate.srcDir` is the one that matters most, because root BUILDS the box from that tree: it is confined to a normalized path under `/var/lib`, since owning the directory is not enough — a writable ancestor (`/home/agent/src`, `/tmp/src`) lets an agent swap the whole tree and choose what root builds. For `selfUpdate.checkout.path` the inputs that matter are the ones a first pass at "must be relative" lets through: `../agent-box` escapes the home, `.` and `""` collapse to `/home/<maintainer>` itself — which the agent unit's `ProtectSystem=strict` would refuse as EROFS inside a background job's journal — and `a//b`, which resolves to a perfectly ordinary child path and is refused for a different reason: every empty component is, because one is how the collapsing cases are spelled.
 - `nix build -L .#checks.<system>.webhook-defer` runs `tests/test-webhook-defer.sh`: what `modules/src/webhook-spawn.sh` answers when shared session admission refuses a start, and what the pinned `webhook.py` does with that answer (issues #170, #301). A refusal is `exit 75` (`EX_TEMPFAIL`), the one code the dispatcher reads as "declined for now" rather than "this spawner is broken" -- every other code drops the batch, and a standing watch is for events NO session owns, so nothing else is holding them. The second half runs the REAL wrapper as the REAL Dispatcher's spawn command, fills the cap, frees a slot and asserts the declined batch starts by itself, because the bug was the two programs disagreeing about what a non-zero exit meant. Runnable without Nix too: `bash tests/test-webhook-defer.sh modules/src/webhook-spawn.sh /path/to/webhook.py` (the dispatcher half is skipped, and says so, when no `webhook.py` is given).
+- `nix build -L .#checks.<system>.changed-paths` runs `tests/test-changed-paths.py`: the GitHub `paths` glob dialect as `scripts/changed_paths.py` reimplements it, the committed `.github/path-filters/*.paths` against the concrete paths whose bug histories put them in the list, and - the part nothing else can see - that no gated workflow has grown a trigger-level `paths:` again. That filter shape is what made green CI unrequireable (issue #632): a workflow that never starts reports no check run, so requiring it would block every docs-only PR forever. Runnable without Nix too: `python3 tests/test-changed-paths.py` (one case needs a git checkout and says so when it skips).
+- `nix build -L .#checks.<system>.release-manifest` runs `tests/test-release-manifest.py` against `scripts/release_manifest.py`, the record of what a promoted candidate actually IS (issue #632). Weighted at the refusals: a manifest that verifies when it should not is how an untested artifact becomes the public install default, and it looks exactly like a pass - so a changed module, a changed template, a changed `flake.lock`, another rev, an unpinned channel and a `flake_ref` naming a different commit each get an assertion. Hermetic - no network, and `nix-prefetch-url` is a stub the test writes itself - so it runs natively on every architecture: `python3 tests/test-release-manifest.py`.
 - `nix flake metadata` validates flake inputs and basic evaluation.
 - `nix build .#packages.x86_64-linux.vm` builds the bootable qcow2 image under `result/`.
 - `nix build -L .#checks.<system>.multi-user` runs the quick module/configuration assertion.
@@ -226,41 +235,34 @@ The rules, all enforced by `scripts/check_vendor.py`:
 
 ## Keeping the local-webhook pin from going stale
 
-`nix/webhook-pin.nix` vendors one file (`local-webhook/webhook.py`) from
-`defangdevs/local-channels`, but not through `scripts/check_vendor.py` - it
-has no `vendor.json` entry and no weekly `--upstream` check, so nothing here
-notices when local-channels tags a release. The pin drifts until whoever
-remembers to look bumps it by hand, following the steps in that file's own
-header comment (`nix-prefetch-url` + `nix hash convert` + `nix run
-.#assemble`).
+`.github/workflows/update-webhook-pin.yml` checks stable `vX.Y.Z` tags in
+`defangdevs/local-channels` daily and supports manual dispatch. It replaces
+the box-local `webhook-pin-bump` standing watch; deployments need no watch
+or agent profile for this repository maintenance.
 
-A running box can close that gap itself with a standing webhook watch
-instead of a person remembering: subscribe `defangdevs/local-channels` for a
-version-tag push, deliver to a subagent, and give that watch its own profile
-whose system prompt requires sanity checks before it touches anything - the
-new tag's commit is on green CI, no live session or open PR is already
-bumping it, and the commits since the current pin are read for any
-default-behavior change agent-box depends on - and only then runs the
-mechanical bump and opens a PR, never a merge:
+`scripts/update_webhook_pin.py` selects the newest stable release, verifies
+its exact commit passed upstream's default-branch CI, and calculates the
+SRI hash of `local-webhook/webhook.py` without executing upstream code. It
+refuses downgrades and tag/file version mismatches, checks the old pin's
+hash, and leaves any existing pin-changing PR alone. A newer release may
+have diverged from an old pre-squash pin; the PR explicitly flags that case
+for review and includes the comparison and upstream commit subjects.
 
-    agent-box-profile set webhook-pin-bumper HARNESS=claude \
-      SYSTEM_PROMPT="<sanity checks first, then the bump, then a PR - never a merge>"
-    agent-box-webhook subscribe defangdevs/local-channels \
-      --deliver-to subagent --name webhook-pin-bump \
-      --profile webhook-pin-bumper \
-      --when '{"all":[{"path":"event","in":["push"]},
-                       {"path":"ref","contains":["refs/tags/v"]},
-                       {"path":"deleted","notIn":[true]}]}' \
-      --note "..."
+The workflow updates `nix/webhook-pin.nix`, assembles the module, runs the
+assembler tests, and opens a PR. Review default watch/dispatch behavior and
+deployment assumptions before merging; the workflow never merges. It uses
+`GITHUB_TOKEN`, so PR CI may require "Approve workflows to run". Manual
+bumps still follow the commands in `nix/webhook-pin.nix`'s header.
 
-This is box-local state (`~/.local/state/local-webhook`,
-`~/.config/agent-box/profiles/`), set up per deployment rather than shipped
-in the module, so a fresh box - or one nobody has run this command on - gets
-no automation and the pin still has to be noticed by hand. Whether every
-deployment should get this by default, in
-`services.agent-box.webhook.watchPolicy`, is a real design question - it
-means every box opens PRs against a repo it may not have push access to -
-and is left open rather than decided here.
+Before cutover, verify Settings -> Actions -> General allows GitHub Actions
+to create and approve pull requests; workflow permissions alone do not enable
+PR creation. The repository API reports this as
+`can_approve_pull_request_reviews` under `actions/permissions/workflow`.
+
+When migrating an existing box, remove only the old named dispatch watch
+with `agent-box-webhook unsubscribe defangdevs/local-channels --deliver-to
+subagent --name webhook-pin-bump` after verifying the Actions workflow.
+Keep shared repository webhooks and unrelated subscriptions.
 
 ## Coding Style & Naming Conventions
 
@@ -337,14 +339,17 @@ Register VM tests in `vmTestsFor` and assign each to exactly one `ciVmLanes`
 entry in `flake.nix`. The `ci-scheduling` check rejects missing or duplicate
 assignments and mismatches with the workflow matrix. Each lane prepares only
 its own drivers, then runs their exact inventory with `scripts/ci-vm-tests.sh`.
-`sessions` and `webhook` each have a lane; `browser` and `host` split the
-remaining checks. Each lane runs one test at a time on its own standard
-runner, so at most four tests run per workflow run.
+`sessions` and `sessions-lifecycle` each have a lane; `browser`, `webhook`
+and `host` split the remaining checks. Each lane runs one test at a time on
+its own standard runner, so at most five tests run per workflow run. The
+short `session-limit` check shares webhook's existing critical-path slack,
+avoiding another checkout and driver-preparation runner.
 A test may boot multiple guests. Do not raise that budget without measuring
 memory and CPU pressure. No test assertions are removed to meet timing goals.
 
-The matrix has `fail-fast: false`. The final `Validate module & VM` job runs
-with `always()` and fails unless native checks AND every VM lane succeeded.
+The matrix has `fail-fast: false`. The final `CI gate` job runs
+with `always()` and fails unless native checks AND every VM lane succeeded;
+skipped `native` and `vm` jobs are accepted only when `build` is `false`.
 For #519, measure from the first validation job's start to the final gate's
 completion, not the short final job alone. Report queue time and per-job
 preparation/test times separately, and sum job durations for runner cost.
@@ -545,6 +550,11 @@ under a 25-minute job timeout, leaving six minutes for setup and teardown.
 
 ### Finishing a CodeRabbit review
 
+For every submitted review, read its inline comments as well as its summary,
+including approved reviews with nits. Address each comment and reply on its
+originating thread with the change and validation, or explain why no change
+is needed. A pickup reaction acknowledges dispatch, not completion.
+
 CodeRabbit reviews every PR in this repo, and pushing the fix does not clear the review it left. Two things stay behind, and each one keeps the PR red on its own - `gh pr merge --auto` then waits forever, because the branch ruleset gates on resolved conversations. Close both by hand, in this order, as the last step of addressing a review:
 
 1. **Resolve every thread you addressed.** Re-read the thread first: a finding can be argued down and withdrawn between the moment you read it and the moment you push, and resolving is the wrong answer to a comment you decided not to act on - reply there instead. Collect the ids and resolve them, paginating past the first 100 threads:
@@ -568,3 +578,26 @@ CodeRabbit reviews every PR in this repo, and pushing the fix does not clear the
          -f event=DISMISS -f message='addressed in <sha>'
 
    `gh pr view NNN --json reviews` has the review ids and their states. A plain `COMMENTED` review carries no merge-blocking verdict, so there is nothing here to clear - asking for a fresh pass with an `@coderabbitai review` comment gets the same result the slow way.
+
+## Releases (#632)
+
+`CI gate`, `AWS template gate` and `Azure template gate` report on every PR
+and push to master. Build path filters live in `.github/path-filters/`;
+keep these terminal job names stable when configuring required checks.
+`scripts/release_manifest.py` records one candidate's source, lockfile,
+module, channel snapshot and templates. `promote.yml` requires green gates
+for that commit and successful EC2 and Lightsail fresh boots before calling
+`publish-template.yml`. Publication has no standalone dispatch.
+
+Re-promoting a previously released commit reuses its original manifest and
+leaves its tag, release notes and manifest asset unchanged. For a public
+install rollback, dispatch promotion with the earlier released commit,
+`allow_rollback` and optionally `skip_deploy_test`. A new commit cannot skip
+fresh boot. This moves public template defaults and the `release` pointer;
+it does not downgrade already-installed boxes past their fast-forward guard.
+The shipped update default remains master until a separate policy change.
+
+`release-workflows` executes the actual workflow refusal scripts against
+fixtures, including missing/failed/foreign-app gates, both fresh-boot
+results, original-manifest immutability and release lookup errors. It is
+automatically included in `ci-native`.

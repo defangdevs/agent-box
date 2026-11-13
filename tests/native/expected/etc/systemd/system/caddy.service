@@ -1,6 +1,6 @@
 [Unit]
 Description=Caddy (agent-box web front door)
-After=network-online.target
+After=network-online.target agent-box-cve-2026-98432.service
 Wants=network-online.target
 
 [Service]

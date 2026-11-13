@@ -21,17 +21,22 @@
       imageSystem = "x86_64-linux";
       vmSystems = [ imageSystem ];
 
-      # Across runners, preserve the existing four-test concurrency budget.
+      # Each lane runs one test at a time because a test can boot several
+      # memory-sized guests. The two sessions halves get separate runners so
+      # neither holds the validation critical path behind the other (#860).
       ciVmLanes = {
-        sessions = { jobs = 1; checks = [ "sessions" "session-limit" ]; };
-        webhook = { jobs = 1; checks = [ "webhook" ]; };
+        sessions = { jobs = 1; checks = [ "sessions" ]; };
+        sessions-lifecycle = { jobs = 1; checks = [ "sessions-lifecycle" ]; };
+        # session-limit is shorter than the slack this lane had before #860,
+        # avoiding another checkout and driver-preparation runner.
+        webhook = { jobs = 1; checks = [ "webhook" "session-limit" ]; };
         browser = {
           jobs = 1;
           checks = [ "connect" "sessions-web" "settings-page" ];
         };
         host = {
           jobs = 1;
-          checks = [ "containers" "memory-protection" "ttyd-isolation" "web-surface" ];
+          checks = [ "ipv4-tcp-mitigation" "containers" "memory-protection" "ttyd-isolation" "web-surface" "email" ];
         };
       };
 
@@ -75,6 +80,9 @@
           # leans on hardest: with no docker installed the unit is a clean
           # "condition failed" rather than a restart loop, and the granted
           # `restart` alone picks a newly installed one up.
+          ipv4-tcp-mitigation = pkgs.testers.runNixOSTest
+            (import ./tests/ipv4-tcp-mitigation.nix { agent-box = self.nixosModules.agent-box; });
+
           containers = pkgs.testers.runNixOSTest
             (import ./tests/containers.nix { agent-box = self.nixosModules.agent-box; });
 
@@ -84,7 +92,19 @@
           # runtime session lives inside the hardened unit's cgroup, and the
           # supervisor's own bookkeeping survives two writers racing it.
           sessions = pkgs.testers.runNixOSTest
-            (import ./tests/sessions.nix { agent-box = self.nixosModules.agent-box; });
+            (import ./tests/sessions.nix {
+              agent-box = self.nixosModules.agent-box;
+              part = "harness";
+            });
+
+          # The stateful lifecycle half of the same guest. This was split
+          # from `sessions` when its serial script reached seven minutes and
+          # again dominated the complete CI graph (#860).
+          sessions-lifecycle = pkgs.testers.runNixOSTest
+            (import ./tests/sessions.nix {
+              agent-box = self.nixosModules.agent-box;
+              part = "lifecycle";
+            });
 
           # The browser half of the same box (issue #312 — this and `sessions`
           # were one test that ran for 325s, more than the other five checks
@@ -126,6 +146,9 @@
           # filter, and the discovery surface (CLI on PATH,
           # AGENT_BOX_WEBHOOK_URL, per-session LOCAL_WEBHOOK_SESSION, seeded
           # claude plugin settings).
+          email = pkgs.testers.runNixOSTest
+            (import ./tests/email.nix { agent-box = self.nixosModules.agent-box; });
+
           webhook = pkgs.testers.runNixOSTest
             (import ./tests/webhook.nix { agent-box = self.nixosModules.agent-box; });
         };
@@ -163,7 +186,7 @@
           # Capturing the override text here is what would have caught it.
           unitFilter = n:
             builtins.match
-              "(agent-box|agent-web|caddy|fail2ban|earlyoom).*|multi-user\\.target|sockets\\.target"
+              "(agent-box|agent-web|caddy|fail2ban|earlyoom|nix-daemon).*|multi-user\\.target|sockets\\.target"
               n != null;
           # /etc content the module owns or materially shapes. The fail2ban
           # dir entries (filter.d/, action.d/) are upstream package trees and
@@ -176,7 +199,7 @@
               # reads — the payload capture below only scans Nix-visible
               # `environment` attrs, so these plain-text files are the review
               # surface for what moved out of that attrset.
-              "agent-box-guides/.*|agent-box/session-limit|agent-box/units/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
+              "agent-box-guides/.*|agent-box/session-limit|agent-box/cve-2026-98432[.]nft|sysctl[.]d/60-agent-box-cve-2026-98432[.]conf|agent-box/units/.*|caddy/caddy_config|codex/config\\.toml|fail2ban/(fail2ban|jail)\\.local|fail2ban/filter\\.d/agent-web-auth\\.conf|sudoers"
               n != null;
           manifestOf = modules:
             let sys = nixpkgs.lib.nixosSystem { inherit system modules; }; in
@@ -428,6 +451,44 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             ];
           };
           services = multiUser.config.systemd.services;
+          tlsRoots = builtins.fromJSON (builtins.readFile ./modules/src/tls-roots.json);
+          tlsBlacklistFor = version: import ./nix/tls-blacklist.nix {
+            inherit (nixpkgs) lib;
+            inherit version;
+            roots = tlsRoots;
+          };
+          tlsCacert = pkgs.cacert.override { blacklist = tlsBlacklistFor pkgs.cacert.version; };
+          # Exercise the root-store format on the failing 26.05 AMI without
+          # replacing the flake's independent pin or its whole package set.
+          modernCacertBase = pkgs.cacert.overrideAttrs (_: {
+            version = "3.131.1";
+            src = pkgs.fetchurl {
+              name = "certdata.txt";
+              url = "https://raw.githubusercontent.com/nss-dev/nss/refs/tags/NSS_3_131_1_RTM/lib/ckfw/builtins/certdata.txt";
+              hash = "sha256-PsK00kDcEsdH6vRQBh24SvdXxIO72jAvninOtdcL5RA=";
+            };
+          });
+
+          modernPkgs = pkgs // { cacert = modernCacertBase; };
+          modernRuntime = import ./nix/runtime.nix { pkgs = modernPkgs; };
+          modernModule = nixpkgs.lib.nixosSystem {
+            inherit system;
+            modules = [
+              self.nixosModules.agent-box
+              {
+                nixpkgs.pkgs = modernPkgs;
+                # NixOS appends overlays to an externally supplied set;
+                # preserve the version override through that extension.
+                nixpkgs.overlays = [ (_final: _prev: { cacert = modernCacertBase; }) ];
+                services.agent-box = { enable = true; users.agent = { }; };
+                # The fixture asserts root absence as well as rejection, so
+                # use standard PEM rather than auxiliary distrust records.
+                security.pki.useCompatibleBundle = true;
+                system.stateVersion = "25.05";
+              }
+            ];
+          };
+
           # issue #154 Phase 3: "agent-box@" is the systemd %i template unit,
           # shipped verbatim via systemd.packages (not a systemd.services
           # Nix declaration — a template-level drop-in there was found to
@@ -475,7 +536,8 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             } ''
               python3 ${./tests/test-ci-scheduling.py} ${./scripts/ci-vm-tests.sh} \
                 ${./.github/workflows/ci.yml} \
-                ${pkgs.writeText "ci-vm-lanes.json" (builtins.toJSON ciVmLanes)}
+                ${pkgs.writeText "ci-vm-lanes.json" (builtins.toJSON ciVmLanes)} \
+                ${./.github/path-filters/ci.paths}
               touch "$out"
             '';
 
@@ -926,6 +988,175 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               printf 'downloads route present, served by the daemon, and isolated\n' > "$out"
             '';
 
+          # The large-file receiver (issue #898) is intentionally the one
+          # public browser page on a user's path: its fragment capability is
+          # never sent in that request. Only the upload API accepts the
+          # capability, and Caddy validates it before proxying a bounded
+          # request body to the per-user daemon.
+          receive-route =
+            let
+              sys = nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      agent = "claude";
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "receive.test";
+                        user = "agent";
+                      };
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+            in
+            pkgs.runCommand "agent-box-receive-route-ok"
+              { caddyfile = sys.config.services.caddy.configFile;
+                nativeBuildInputs = [ pkgs.caddy ]; } ''
+              grep -qF 'handle @receive_page_agent {' "$caddyfile"
+              grep -qF 'path_regexp receive_page_agent ^/agent/receive/[A-Za-z0-9_-]{16,64}/?$' "$caddyfile"
+              grep -qF 'handle /agent/receive/* {' "$caddyfile"
+              grep -qF 'respond 404' "$caddyfile"
+              grep -qF 'handle @receive_api_agent {' "$caddyfile"
+              grep -qF 'uri /agent/receive/_verify' "$caddyfile"
+              grep -qF 'max_size 9MB' "$caddyfile"
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/receive/* /agent/webhook*' "$caddyfile"
+
+              # This first trio belongs to the receiver because its fragment
+              # is emitted before every authenticated route in the user
+              # snippet. Authentication and the body limit must both precede
+              # the proxy that consumes the upload stream.
+              auth=$(awk '/forward_auth unix\/\/run\/agent-box-settings\/agent.sock/ { print NR; exit }' "$caddyfile")
+              limit=$(grep -n 'max_size 9MB' "$caddyfile" | cut -d: -f1)
+              proxy=$(awk '/reverse_proxy unix\/\/run\/agent-box-settings\/agent.sock/ { print NR; exit }' "$caddyfile")
+              [ "$auth" -lt "$limit" ]
+              [ "$limit" -lt "$proxy" ]
+
+              # The public-page stanza ends at the settings comment. It must
+              # never acquire ambient box auth; the bearer authorizes only
+              # the matched upload API stanza above it.
+              sed -n '/Temporary, upload-only capability links/,/settings page/p' \
+                "$caddyfile" > receive-stanza
+              if grep 'basic_auth' receive-stanza >/dev/null; then
+                echo "receiver page must not require or mint box auth" >&2
+                exit 1
+              fi
+
+              WEB_PASSWORD_ALGORITHM_AGENT=bcrypt \
+              WEB_PASSWORD_HASH_AGENT='$2a$14$ptCNRCTOMkoUnEXBv0kPWuOJHhYtnpBWQZbLFXW/Ehg5AGKQMoS/W' \
+              WEB_COOKIE_SECRET_AGENT=0123456789abcdef \
+                caddy validate --config "$caddyfile" --adapter caddyfile
+              printf 'public receiver and authenticated bounded upload API present\n' > "$out"
+            '';
+
+          # Exercise both rendered backends with real HTTP/TLS requests. A
+          # byte-only fixture cannot catch Caddy bypassing header handlers on
+          # automatic redirects, error routes or upstream responses (#962).
+          caddy-server-header =
+            let
+              makeSystem = web: nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.agent-box
+                  ({ modulesPath, ... }: { imports = [ (modulesPath + "/virtualisation/qemu-vm.nix") ]; })
+                  {
+                    services.agent-box = {
+                      enable = true;
+                      users.agent.web.passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                      web = {
+                        enable = true;
+                        domain = "box.test";
+                        aliases = [ "alias.test" ];
+                        user = "agent";
+                      } // web;
+                    };
+                    system.stateVersion = "25.05";
+                  }
+                ];
+              };
+              target = "https://station.example.com/app/stations/42?a=1&b=2#connect";
+              cases = [
+                { web = {}; expected = ""; }
+                { web.portalIssuer = "https://issuer.example.com/path"; expected = "https://issuer.example.com"; }
+                { web = { portalIssuer = "https://issuer.example.com"; portalRedirectUrl = target; }; expected = target; }
+                { web = { portalIssuer = "https://issuer.example.com"; portalRedirectUrl = "https://x.test/{http.request.host}"; }; expected = ""; }
+              ];
+              arguments = nixpkgs.lib.concatMapStringsSep " " (c:
+                nixpkgs.lib.escapeShellArg "${(makeSystem c.web).config.services.caddy.configFile}=${c.expected}"
+              ) cases;
+            in
+            pkgs.runCommand "agent-box-caddy-server-header" {
+              nativeBuildInputs = [ pkgs.python3 pkgs.caddy ];
+              repo = builtins.path {
+                path = ./.;
+                name = "agent-box-src";
+                filter = path: type:
+                  let base = builtins.baseNameOf path; in
+                  base != "result" && base != ".git";
+              };
+            } ''
+              cp -rT --no-preserve=mode,ownership "$repo" repo
+              cd repo
+              python3 tests/test-caddy-server-header.py ${arguments} > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          portal-redirect-env =
+            let
+              render = c:
+                let
+                  sys = nixpkgs.lib.nixosSystem {
+                    inherit system;
+                    modules = [
+                      self.nixosModules.agent-box
+                      {
+                        services.agent-box = {
+                          enable = true;
+                          web = {
+                            enable = true;
+                            domain = "box.test";
+                            portalIssuer = "https://station.example.com";
+                            portalRedirectUrl = c.target;
+                          };
+                          users.agent.web = {
+                            passwordHashFile = "/var/lib/agent-box-web/password-hash";
+                            portalUser = "usr_test";
+                          };
+                        };
+                        system.stateVersion = "25.05";
+                      }
+                    ];
+                  };
+                  env = sys.config.environment.etc."agent-box/units/agent-box-settings-agent.env";
+                in c // {
+                  env = env.text;
+                  restart = builtins.elem (toString env.source)
+                    (map toString sys.config.systemd.services."agent-box-settings@agent".restartTriggers);
+                };
+              cases = map render [
+                { target = ""; expected = "https://station.example.com"; }
+                { target = "https://station.example.com/app/42?a=1&b=2#connect"; expected = "https://station.example.com/app/42?a=1&b=2#connect"; }
+                { target = "https://x.test/\nAGENT_BOX_PORTAL_ISSUER=https://other.test"; expected = ""; }
+                { target = "\"\""; expected = ""; }
+                { target = " "; expected = ""; }
+              ];
+            in pkgs.runCommand "agent-box-portal-redirect-env" {
+              nativeBuildInputs = [ pkgs.python3 ];
+              cases = pkgs.writeText "portal-redirect-env.json" (builtins.toJSON cases);
+            } ''
+              python3 ${self}/tests/test-portal-redirect-env.py "$cases" > "$out"
+            '';
+
           # Every Basic-auth bypass cookie must be host-only (issue #813).
           # Boxes commonly sit below shared sslip.io or domainstation.com
           # suffixes, so a Domain attribute would send one box's credential
@@ -1029,7 +1260,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               grep -qF 'redir @sess_bare_agent /agent/{re.bare_agent.1}/' "$caddyfile"
               # The names a session may not take are excluded from both, so
               # the pages that own them keep answering.
-              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/webhook*' "$caddyfile"
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/receive/* /agent/webhook*' "$caddyfile"
               # Ordering: the rewrite must be emitted before the catch-all it
               # feeds, and the landing page before it too.
               rw=$(grep -n 'rewrite @sess_agent' "$caddyfile" | cut -d: -f1)
@@ -1163,8 +1394,8 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               # 4. The rewrites let it through. These run BEFORE any handle,
               # so without the exclusions the route above is unreachable and
               # every check up to here would still pass.
-              grep -qF 'not path /agent/settings /agent/downloads /agent/webhook /agent/token /agent/ws /agent/auth' "$caddyfile"
-              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/webhook* /agent/auth/*' "$caddyfile"
+              grep -qF 'not path /agent/settings /agent/downloads /agent/receive /agent/webhook /agent/token /agent/ws /agent/auth' "$caddyfile"
+              grep -qF 'not path /agent/settings* /agent/downloads/* /agent/receive/* /agent/webhook* /agent/auth/*' "$caddyfile"
 
               # 5. Every authenticated route also admits a live portal
               # session, and asks the daemon rather than matching a static
@@ -1431,6 +1662,44 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 fail=1
               fi
 
+              # The receive CLI shares its state protocol with the settings
+              # daemon through a nested include. Pin the resolved Python, not
+              # the marker-bearing source, on native boxes too.
+              python3 ${./bin/assemble-module.py} \
+                --resolve tree/modules/src/receive-cli.py > want_receive.py
+              if ! diff -u want_receive.py \
+                   <(tail -n +2 "$profile/bin/agent-box-receive") >/dev/null; then
+                echo "DRIFT: bin/agent-box-receive is not resolve(src/receive-cli.py)"
+                diff -u want_receive.py \
+                  <(tail -n +2 "$profile/bin/agent-box-receive") | head -20 || true
+                fail=1
+              else
+                echo "ok: bin/agent-box-receive == resolve(src/receive-cli.py)"
+              fi
+              python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+                "$profile/bin/agent-box-receive" \
+                || { echo "SYNTAX: bin/agent-box-receive"; fail=1; }
+              if grep -q '@@include' "$profile/bin/agent-box-receive"; then
+                echo "MARKER: bin/agent-box-receive still has an @@include@@ marker"
+                fail=1
+              fi
+
+              # agent-box-acp-bare is another finished Python payload. Keep
+              # both backends on the exact source that the focused transport
+              # tests exercise, without treating it as a shell payload.
+              if ! diff -u "$srcDir/acp-cli.py" \
+                   <(tail -n +2 "$profile/bin/agent-box-acp-bare") >/dev/null; then
+                echo "DRIFT: bin/agent-box-acp-bare is not src/acp-cli.py"
+                diff -u "$srcDir/acp-cli.py" \
+                  <(tail -n +2 "$profile/bin/agent-box-acp-bare") | head -20 || true
+                fail=1
+              else
+                echo "ok: bin/agent-box-acp-bare == src/acp-cli.py"
+              fi
+              python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' \
+                "$profile/bin/agent-box-acp-bare" \
+                || { echo "SYNTAX: bin/agent-box-acp-bare"; fail=1; }
+
               # The settings daemon is the one asset in modules/src that is
               # NOT a finished file: it carries @@include@@ markers for
               # settings.css, settings.js and docs/potato.svg. Shipping it
@@ -1529,7 +1798,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-agentbox-render-ok"
               {
                 nativeBuildInputs = [
-                  (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+                  (pkgs.python3.withPackages (ps: [ ps.pyyaml ps.dkimpy ps.pyspf ]))
                   pkgs.caddy
                   # visudo, for the sudoers half of what `agentbox apply`
                   # now validates before it commits a render (issue #526).
@@ -1566,6 +1835,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 exit 1
               fi
               tail -5 render.log
+              python3 tests/test_email.py
 
               # The rendered Caddyfile must be a config caddy accepts. Env
               # placeholders are resolved from a throwaway env file with a
@@ -1766,6 +2036,41 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               printf 'fail2ban jail parses, is armed, and matches\n' > "$out"
             '';
 
+          tls-trust =
+            assert builtins.all (name: builtins.elem name multiUser.config.security.pki.caCertificateBlacklist)
+              (tlsBlacklistFor pkgs.cacert.version);
+            assert multiUser.config.systemd.globalEnvironment.NODE_OPTIONS == "--use-openssl-ca";
+            assert multiUser.config.systemd.services.nix-daemon.environment.SSL_CERT_FILE == "/etc/ssl/certs/ca-certificates.crt";
+            pkgs.runCommand "agent-box-tls-trust" {
+            nativeBuildInputs = [ pkgs.python3 pkgs.openssl ];
+          } ''
+            export SSL_CERT_FILE="${tlsCacert}/etc/ssl/certs/ca-no-trust-rules-bundle.crt"
+            export NIX_SSL_CERT_FILE="$SSL_CERT_FILE"
+            mkdir empty-certs
+            export SSL_CERT_DIR="$PWD/empty-certs"
+            python3 ${./tests}/check-tls-trust.py
+            touch $out
+          '';
+
+          tls-trust-modern =
+            assert tlsBlacklistFor "3.126" == tlsRoots;
+            assert tlsBlacklistFor "3.131.1" == [ "Comodo AAA Services root" ];
+            assert tlsBlacklistFor "3.132" == [ "Comodo AAA Services root" ];
+            assert modernModule.config.security.pki.caCertificateBlacklist == [ "Comodo AAA Services root" ];
+            pkgs.runCommand "agent-box-tls-trust-modern" {
+              nativeBuildInputs = [ pkgs.python3 pkgs.openssl ];
+            } ''
+              mkdir empty-certs
+              export SSL_CERT_DIR="$PWD/empty-certs"
+              for bundle in \
+                "${modernModule.config.environment.etc."ssl/certs/ca-certificates.crt".source}" \
+                "${modernRuntime}/etc/ssl/certs/ca-no-trust-rules-bundle.crt"; do
+                export SSL_CERT_FILE="$bundle" NIX_SSL_CERT_FILE="$bundle"
+                python3 ${./tests}/check-tls-trust.py
+              done
+              touch "$out"
+            '';
+
           module-generated-up-to-date =
             pkgs.runCommand "agent-box-module-generated-up-to-date"
               {
@@ -1783,6 +2088,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 # outside modules/src that the template splices, because both
                 # backends have to read the pin from ONE place (issue #425).
                 pin = ./nix/webhook-pin.nix;
+                tlsPolicy = ./nix/tls-blacklist.nix;
               } ''
               install -d repo/bin repo/modules repo/docs repo/nix
               cp "$assembler" repo/bin/assemble-module.py
@@ -1791,6 +2097,7 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp -r "$srcDir" repo/modules/src
               cp "$mark" repo/docs/potato.svg
               cp "$pin" repo/nix/webhook-pin.nix
+              cp "$tlsPolicy" repo/nix/tls-blacklist.nix
               python3 repo/bin/assemble-module.py --check --repo repo
               touch "$out"
             '';
@@ -1833,6 +2140,22 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          landing-passwords =
+            pkgs.runCommand "agent-box-landing-passwords"
+              {
+                nativeBuildInputs = [ pkgs.nodejs ];
+                test = ./tests/test-landing-passwords.cjs;
+                page = ./docs/index.html;
+                launch = ./docs/launch-passwords.js;
+              } ''
+              mkdir -p repo/docs repo/tests
+              cp "$test" repo/tests/test-landing-passwords.cjs
+              cp "$page" repo/docs/index.html
+              cp "$launch" repo/docs/launch-passwords.js
+              node repo/tests/test-landing-passwords.cjs
+              touch "$out"
+            '';
+
           assemble-module-escaping =
             pkgs.runCommand "agent-box-assemble-module-escaping"
               {
@@ -1859,6 +2182,91 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cat log
               cp log "$out"
             '';
+
+          # The path filters and the always-reporting CI gate (issue #632).
+          # The gate is a REQUIRED status check, so both of its failure
+          # directions are silent: a filter that matches too little skips
+          # the checks and reports green over the change that needed them,
+          # and one that matches too much runs the whole VM suite on a
+          # docs commit. The `Wiring` cases are the ones no other check
+          # can see - that a gated workflow has not grown a trigger-level
+          # `paths:` again, which is exactly what made green CI
+          # unrequireable before.
+          changed-paths =
+            pkgs.runCommand "agent-box-changed-paths"
+              {
+                nativeBuildInputs = [ pkgs.python3 pkgs.git ];
+                matcher = ./scripts/changed_paths.py;
+                tests = ./tests/test-changed-paths.py;
+                filters = ./.github/path-filters;
+                workflows = ./.github/workflows;
+              } ''
+              install -d repo/scripts repo/tests repo/.github
+              cp "$matcher" repo/scripts/changed_paths.py
+              cp "$tests" repo/tests/test-changed-paths.py
+              cp -r "$filters" repo/.github/path-filters
+              cp -r "$workflows" repo/.github/workflows
+              # Not piped into tee: the log has to reach the build output
+              # whether the tests pass or fail, and the exit status has to
+              # be python's own.
+              python3 repo/tests/test-changed-paths.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # The release manifest promotion records (issue #632): the
+          # identities the deployment test ran against and the identities
+          # the published templates carry. Weighted at the refusals, since
+          # a manifest that verifies when it should not is how an untested
+          # artifact becomes the public install default - and it looks
+          # exactly like a pass. Hermetic: no network, and
+          # `nix-prefetch-url` is a stub the test writes itself.
+          release-manifest =
+            pkgs.runCommand "agent-box-release-manifest"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                # Not `builder`, which is a derivation's own
+                # reserved attribute.
+                manifester = ./scripts/release_manifest.py;
+                tests = ./tests/test-release-manifest.py;
+              } ''
+              install -d repo/scripts repo/tests
+              cp "$manifester" repo/scripts/release_manifest.py
+              cp "$tests" repo/tests/test-release-manifest.py
+              python3 repo/tests/test-release-manifest.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          webhook-pin-update = pkgs.runCommand "agent-box-webhook-pin-update" {
+            nativeBuildInputs = [ pkgs.bash (pkgs.python3.withPackages (ps: [ ps.pyyaml ])) ];
+          } ''
+            mkdir -p repo/scripts repo/tests repo/.github/workflows
+            cp ${./scripts/update_webhook_pin.py} repo/scripts/update_webhook_pin.py
+            cp ${./tests/test-update-webhook-pin.py} repo/tests/test-update-webhook-pin.py
+            cp ${./.github/workflows/update-webhook-pin.yml} repo/.github/workflows/update-webhook-pin.yml
+            python3 repo/tests/test-update-webhook-pin.py
+            touch "$out"
+          '';
+
+          release-workflows = pkgs.runCommand "agent-box-release-workflows" {
+            nativeBuildInputs = [
+              pkgs.bash pkgs.git pkgs.jq
+              (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
+            ];
+          } ''
+            mkdir -p repo/tests repo/.github
+            cp ${./tests/test-release-workflows.py} repo/tests/test-release-workflows.py
+            cp -r ${./.github/workflows} repo/.github/workflows
+            python3 repo/tests/test-release-workflows.py
+            touch "$out"
+          '';
 
           # Unit test for agent-box-upload (issue #368). The three things it
           # gets right were shipped WRONG first, as a curl recipe in the guide
@@ -1897,10 +2305,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             pkgs.runCommand "agent-box-jit-agents"
               {
                 nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
-                lib = ./modules/src/lib/agents.sh;
+                src = ./modules/src;
                 tests = ./tests/test-jit-agents.sh;
               } ''
-              bash "$tests" "$lib" > log 2>&1 || {
+              bash "$tests" "$src/lib/agents.sh" > log 2>&1 || {
                 cat log
                 exit 1
               }
@@ -1965,6 +2373,22 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           # environment variable and Linux caps that at 128 KiB
           # (MAX_ARG_STRLEN): the driver stopped building with "Argument
           # list too long" before any VM booted.
+          webhook-ack = pkgs.runCommand "agent-box-webhook-ack-tests" {
+            nativeBuildInputs = [ pkgs.python3 ];
+            src = ./modules/src;
+            tests = ./tests/test-webhook-ack.py;
+          } ''
+            mkdir -p repo/modules repo/tests
+            cp -r "$src" repo/modules/src
+            cp "$tests" repo/tests/test-webhook-ack.py
+            python3 repo/tests/test-webhook-ack.py > log 2>&1 || {
+              cat log
+              exit 1
+            }
+            cat log
+            cp log "$out"
+          '';
+
           webhook-spawn-claim =
             pkgs.runCommand "agent-box-webhook-spawn-claim"
               {
@@ -2129,11 +2553,16 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
           webhook-self =
             pkgs.runCommand "agent-box-webhook-self-test"
               {
-                nativeBuildInputs = [ pkgs.bash pkgs.coreutils ];
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.python3 ];
                 script = ./modules/src/webhook-self.sh;
                 tests = ./tests/test-webhook-self.sh;
+                # env-exec is what RUNS the resolver at session start; the
+                # installed form is envstore.py followed by env-exec.py.
+                envstore = ./modules/src/lib/envstore.py;
+                envExec = ./modules/src/env-exec.py;
               } ''
-              bash "$tests" "$script" > log 2>&1 || {
+              { cat "$envstore"; printf '\n\n'; cat "$envExec"; } > env-exec.py
+              bash "$tests" "$script" "$PWD/env-exec.py" > log 2>&1 || {
                 cat log
                 exit 1
               }
@@ -2184,6 +2613,11 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cat log
               cp log "$out"
             '';
+
+          email-options = import ./tests/email-options.nix {
+            inherit nixpkgs system pkgs;
+            agent-box = self.nixosModules.agent-box;
+          };
 
           # Eval regression for selfUpdate.checkout's assertions and fork
           # opt-in (issue #242, PR #478 review). The path assertion guards
@@ -2441,6 +2875,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The Codex remote-control wrapper ends an app-server that only an
+          # older CLI's legacy pid file records (issue #904).
+          codex-legacy-app-server =
+            pkgs.runCommand "agent-box-codex-legacy-app-server"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnused pkgs.procps ];
+                src = ./modules/src;
+                tests = ./tests/test-codex-legacy-app-server.sh;
+              } ''
+              bash "$tests" "$src/codex-remote-control.sh" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # The settings daemon's session API for portals (issue #787): the
           # JSON list, web stop, and the JSON answers of restart/delete.
           # Same subject (the GOLDEN PAYLOAD) as the pairing check above.
@@ -2496,7 +2947,10 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 supervisor = ./modules/src/supervisor.sh;
                 tests = ./tests/test-whatsapp-cli.py;
                 supervisorTests = ./tests/test-whatsapp-supervisor.sh;
+                slackSupervisorTests = ./tests/test-slack-supervisor.sh;
+                sessionTmpTests = ./tests/test-session-tmp.sh;
                 codexResumeTests = ./tests/test-codex-registered-thread.sh;
+                sessionStartHook = ./modules/src/claude-session-start-hook.sh;
               } ''
               install -d repo/modules/src repo/tests
               cp "$cli" repo/modules/src/whatsapp-cli.py
@@ -2509,7 +2963,15 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 cat log
                 exit 1
               }
-              bash "$codexResumeTests" "$supervisor" >> log 2>&1 || {
+              bash "$slackSupervisorTests" "$supervisor" >> log 2>&1 || {
+                cat log
+                exit 1
+              }
+              bash "$sessionTmpTests" "$supervisor" >> log 2>&1 || {
+                cat log
+                exit 1
+              }
+              bash "$codexResumeTests" "$supervisor" "$sessionStartHook" >> log 2>&1 || {
                 cat log
                 exit 1
               }
@@ -2553,6 +3015,28 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
               cp "$tests" repo/tests/test-settings-json.py
               python3 repo/tests/test-settings-json.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Partial page renders (X-Agent-Box-Sections) and the live feed's
+          # resources/connect topics. Same subject as settings-json above:
+          # the golden payload, the daemon as it actually ships.
+          settings-sections =
+            pkgs.runCommand "agent-box-settings-sections"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-settings-sections.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-settings-sections.py
+              python3 repo/tests/test-settings-sections.py > log 2>&1 || {
                 cat log
                 exit 1
               }
@@ -2613,6 +3097,53 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # Stale-key bound and refresh serialization for the portal JWKS
+          # cache (issue #634), against the assembled daemon.
+          portal-jwks =
+            pkgs.runCommand "agent-box-portal-jwks"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-portal-jwks.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-portal-jwks.py
+              python3 repo/tests/test-portal-jwks.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # Browser-independent protocol coverage for the resumable receiver
+          # (issue #898), against the same assembled daemon that ships. This
+          # includes a deliberately severed PATCH request and continuation
+          # from the persisted byte offset.
+          receive-upload =
+            pkgs.runCommand "agent-box-receive-upload"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                daemon = ./tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings;
+                tests = ./tests/test-receive.py;
+              } ''
+              install -d repo/tests/golden/web/payloads/agent-box-settings/bin \
+                repo/bin repo/modules
+              cp "$daemon" \
+                repo/tests/golden/web/payloads/agent-box-settings/bin/agent-box-settings
+              cp "$tests" repo/tests/test-receive.py
+              cp ${./bin/assemble-module.py} repo/bin/assemble-module.py
+              cp -r ${./modules/src} repo/modules/src
+              python3 repo/tests/test-receive.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           # The settings daemon's session routes against a registry that
           # does not parse (issue #279). Same shape and same subject as the
           # two above: the GOLDEN PAYLOAD, the daemon as it actually ships.
@@ -2627,6 +3158,19 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
             cp -r ${./modules/src} repo/modules/src
             cp ${./tests/test-session-capacity.py} repo/tests/test-session-capacity.py
             python3 repo/tests/test-session-capacity.py
+            touch $out
+          '';
+
+          # Remote Buzz ACP transport/profile boundary (#300). Pure native
+          # tests cover context rewriting, forced-command refusal, literal
+          # Codex argv, bidirectional stdio and stubborn descendant cleanup.
+          buzz-acp = pkgs.runCommand "agent-box-buzz-acp-test" {
+            nativeBuildInputs = [ pkgs.python3 ];
+          } ''
+            mkdir -p repo/modules/src repo/tests
+            cp ${./modules/src/acp-cli.py} repo/modules/src/acp-cli.py
+            cp ${./tests/test-buzz-acp.py} repo/tests/test-buzz-acp.py
+            python3 repo/tests/test-buzz-acp.py -v
             touch $out
           '';
 
