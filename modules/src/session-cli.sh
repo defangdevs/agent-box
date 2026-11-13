@@ -725,12 +725,32 @@ case "$cmd" in
           elif ((.topics // []) | length) == 0 then
             "    claims nothing — subscribed to no topic"
           else
-            .topics[]
-            | "    " + (if .include then "CLAIMS " else "listens to (no predicate, so not a claim) " end)
-              + (.topic // "?")
-              + (if (.note // "") == "" then ""
-                 else " — note: \"" + ((.note | gsub("[\r\n\t]"; " "))[:200]) + "\"" end)
-          end' "$ff" 2>/dev/null)" || claims=""
+            # An entry expires ttlHours after subscribedAt (a per-entry
+            # ttlHours beats the file one; 0 = pinned) and stays in the file
+            # until a later write prunes it. An expired entry claims nothing,
+            # so say that instead of CLAIMS, and how long ago it lapsed: it
+            # reads differently from "never subscribed" (#1031).
+            # Match local-webhook read_filter for a SESSION filter: an absent
+            # or invalid file ttlHours is 1, and 0 or anything above 8 is
+            # clamped to 8 (capped_ttl), pinned entries included. An entry
+            # without its own ttlHours takes the clamped file value.
+            def cap: if . == 0 or . > 8 then 8 else . end;
+            ((.ttlHours | if type == "number" and . >= 0 then . else 1 end) | cap) as $ft
+            | .topics[]
+            | (if (.ttlHours | type) == "number" and .ttlHours >= 0 then (.ttlHours | cap) else $ft end) as $ttl
+            | (try ((.subscribedAt | sub("\\.[0-9]+Z$"; "Z") | fromdate)) catch null) as $at
+            | if $ttl > 0 and $at != null and ($now - $at) > ($ttl * 3600) then
+                "    claims nothing — its subscription to " + (.topic // "?")
+                + " expired " + ((($now - $at - $ttl * 3600) / 3600 | floor) | tostring)
+                + "h ago (a subscription lasts " + ($ttl | tostring)
+                + "h unless renewed), so an event on its work spawns a session beside it"
+              else
+                "    " + (if .include then "CLAIMS " else "listens to (no predicate, so not a claim) " end)
+                + (.topic // "?")
+                + (if (.note // "") == "" then ""
+                   else " — note: \"" + ((.note | gsub("[\r\n\t]"; " "))[:200]) + "\"" end)
+              end
+          end' --argjson now "$(date +%s)" "$ff" 2>/dev/null)" || claims=""
         [ -n "$claims" ] || claims="    claims nothing — its filter file is unreadable"
       else
         claims="    claims nothing — no subscription file, so an event on its work spawns a session beside it"
