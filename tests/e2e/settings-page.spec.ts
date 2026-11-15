@@ -189,7 +189,7 @@ test('armored public key pane toggles and copies the rendered key', async ({ bro
   const page = await authedPage(browser);
   await page.goto(SETTINGS_PATH);
 
-  const toggle = page.getByRole('button', { name: 'Show public key' });
+  const toggle = page.getByRole('button', { name: /(Show|Hide) public key/ });
   const pane = page.locator('#gpg-key-pane');
   const key = page.locator('#gpg-public-key');
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');

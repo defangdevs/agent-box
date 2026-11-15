@@ -184,8 +184,9 @@ plainly rather than handing it back.
   value straight into the persistent env store without printing it, run:
 
       secret="$(gpg --homedir ~/.config/agent-box/gnupg --batch --quiet \
-        --decrypt secret.gpg)" || { echo "decryption failed" >&2; exit 1; }
-      printf '%s\n' "$secret" | agent-box-session env set KEY --stdin
+        --decrypt secret.gpg && printf x)" ||
+        { echo "decryption failed" >&2; exit 1; }
+      printf '%s\n' "${secret%x}" | agent-box-session env set KEY --stdin
 
   The decrypt runs first so a failure never overwrites KEY. This keeps plaintext out of the transcript, command line and shell output.
   It does not isolate sibling sessions: every session of this Linux user can

@@ -1,5 +1,9 @@
 set -eu
 
+# Run on the tools shipped next to this payload even when the unit's own
+# Environment=PATH omits them: a failed ExecStartPre stops the supervisor.
+PATH="${0%/*}:$PATH"
+
 # Provision one OpenPGP recipient for this Linux user. The primary key only
 # certifies the cv25519 encryption subkey: agent-box needs a recipient for
 # secret handoff, not another signing identity. The secret key is deliberately

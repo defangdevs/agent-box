@@ -1,5 +1,10 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
+    export PATH=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-gawk-5.4.1/bin:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-coreutils-9.11/bin:$PATH
 set -eu
+
+# Run on the tools shipped next to this payload even when the unit's own
+# Environment=PATH omits them: a failed ExecStartPre stops the supervisor.
+PATH="${0%/*}:$PATH"
 
 # Provision one OpenPGP recipient for this Linux user. The primary key only
 # certifies the cv25519 encryption subkey: agent-box needs a recipient for

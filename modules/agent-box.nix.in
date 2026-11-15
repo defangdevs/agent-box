@@ -1147,6 +1147,7 @@ GH_BIN = "${pkgs.gh}/bin/gh"
   # its After=agent-box@ ordering lets it start. Native ships the same payload
   # from nix/runtime.nix.
   gpgInit = pkgs.writeShellScriptBin "agent-box-gpg-init" ''
+    export PATH=${lib.makeBinPath [ pkgs.gawk pkgs.coreutils ]}:$PATH
 @@include:src/gpg-init.sh@@
   '';
 

@@ -1580,8 +1580,9 @@ let
       value straight into the persistent env store without printing it, run:
 
           secret="$(gpg --homedir ~/.config/agent-box/gnupg --batch --quiet \
-            --decrypt secret.gpg)" || { echo "decryption failed" >&2; exit 1; }
-          printf '%s\n' "$secret" | agent-box-session env set KEY --stdin
+            --decrypt secret.gpg && printf x)" ||
+            { echo "decryption failed" >&2; exit 1; }
+          printf '%s\n' "''${secret%x}" | agent-box-session env set KEY --stdin
 
       The decrypt runs first so a failure never overwrites KEY. This keeps plaintext out of the transcript, command line and shell output.
       It does not isolate sibling sessions: every session of this Linux user can
@@ -15124,7 +15125,12 @@ fi
   # its After=agent-box@ ordering lets it start. Native ships the same payload
   # from nix/runtime.nix.
   gpgInit = pkgs.writeShellScriptBin "agent-box-gpg-init" ''
+    export PATH=${lib.makeBinPath [ pkgs.gawk pkgs.coreutils ]}:$PATH
 set -eu
+
+# Run on the tools shipped next to this payload even when the unit's own
+# Environment=PATH omits them: a failed ExecStartPre stops the supervisor.
+PATH="''${0%/*}:$PATH"
 
 # Provision one OpenPGP recipient for this Linux user. The primary key only
 # certifies the cv25519 encryption subkey: agent-box needs a recipient for
