@@ -282,6 +282,8 @@ class WhatsAppRouteTest(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.cli.os.environ.pop("AGENT_BOX_ROUTER_BACKEND", None)
+        self.cli.READY = self.cli.STATE / "ready"
+        self.cli.os.environ["AGENT_BOX_WHATSAPP_PAIRING"] = ""
         self.cli.os.environ.pop("AGENT_BOX_ROUTER_MODEL", None)
         self.live([{"name": "wa-vat", "harness": "claude", "stopped": True, "selected": False},
                    {"name": "manual", "harness": "claude", "stopped": False, "selected": False}])
@@ -525,9 +527,14 @@ class WhatsAppRouteTest(unittest.TestCase):
             with self.subTest(collide=collide):
                 self.setUp()
                 self.interrupted_start(collide)
-                self.assertEqual(self.state()["decisions"]["M2"]["session"], started)
+                pending = self.state()["decisions"]["M2"]
+                self.assertEqual(pending["session"], started)
+                self.assertRegex(pending["nonce"], r"^[0-9a-f]{32}$")
+                add = [c["argv"] for c in self.calls("agent-box-session") if c["argv"][0] == "add"][-1]
+                self.assertIn("[router start %s]" % pending["nonce"], add[add.index("--prompt") + 1])
                 self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False, "id": "v1"},
-                           {"name": started, "harness": "claude", "stopped": False, "selected": False, "id": "g9"}])
+                           {"name": started, "harness": "claude", "stopped": False, "selected": False, "id": "g9",
+                            "start": pending["nonce"]}])
                 again = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "x", "reason": "llm"})
                 out = self.cli.route_request(self.REQUEST, again)
                 self.assertEqual((out["session"], out["reason"]), (started, "replay"))
@@ -539,6 +546,36 @@ class WhatsAppRouteTest(unittest.TestCase):
                 self.assertEqual(state["current"], started)
                 self.assertEqual([m["id"] for m in state["sessions"][started]["messages"]], ["M2"])
                 self.assertEqual(state["sessions"][started]["id"], "g9")
+
+    def test_interrupted_start_never_adopts_a_hand_made_session(self):
+        # Interrupted after the start (decision saved, no id), then the
+        # session is replaced by hand before the retry.
+        self.interrupted_start(False)
+        self.live([{"name": "wa-greece", "harness": "claude", "stopped": False, "selected": False,
+                    "id": "manual", "start": None}])
+        again = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"})
+        out = self.cli.route_request(self.REQUEST, again)
+        self.assertEqual(out["reason"], "llm")              # decided again
+        self.assertEqual(out["session"], "wa-greece-2")     # the hand-made one is left alone
+        self.assertNotIn("wa-greece", self.state()["sessions"])
+
+    def test_interrupted_before_add_never_adopts_a_hand_made_session(self):
+        # Decision saved, then the call died BEFORE `add`; a session of that
+        # name appears from elsewhere.
+        real_start = self.cli.start_session
+
+        def dies_before_add(name, prompt, before_attempt=None):
+            before_attempt(name)
+            raise KeyboardInterrupt("bridge killed")
+        with mock.patch.object(self.cli, "start_session", side_effect=dies_before_add):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli.route_request(self.REQUEST, FakeRouter(
+                    {"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"}))
+        self.assertTrue(real_start)
+        self.live([{"name": "wa-greece", "harness": "codex", "stopped": False, "selected": False, "id": "x"}])
+        out = self.cli.route_request(self.REQUEST, FakeRouter(
+            {"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"}))
+        self.assertEqual((out["session"], out["reason"]), ("wa-greece-2", "llm"))
 
     def test_replay_never_goes_to_a_replacement_session(self):
         # CONTINUE recorded for wa-vat (id v1), then wa-vat is re-created (id v2).
@@ -652,6 +689,38 @@ class WhatsAppRouteTest(unittest.TestCase):
         # A route that opens the CURRENT lock file proceeds.
         with open(self.cli.ROUTE_STATE.with_name("lock"), "a") as fresh:
             self.cli.take_route_lock(fresh)
+
+    def test_a_route_from_an_earlier_pairing_refuses_even_if_it_opens_the_new_lock(self):
+        self.cli.STATE.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(self.cli, "paired", return_value=True):
+            self.cli.activate()
+        old_token = self.cli.pairing_token()
+        self.assertRegex(old_token, r"^[0-9a-f]{32}$")
+        # The old bridge's route call pauses before it even opens the lock.
+        with mock.patch.object(self.cli, "bridge_connected", return_value=False), \
+                mock.patch.object(self.cli, "UNLINK_SETTLE", 0):
+            self.cli.unlink()
+        with mock.patch.object(self.cli, "paired", return_value=True):
+            self.cli.activate()                     # pair again: a new token
+        self.assertNotEqual(self.cli.pairing_token(), old_token)
+        self.cli.os.environ["AGENT_BOX_WHATSAPP_PAIRING"] = old_token
+        with mock.patch.object(self.cli.sys, "stdin", io.StringIO(json.dumps(self.REQUEST))):
+            with self.assertRaisesRegex(RuntimeError, "earlier WhatsApp pairing"):
+                self.cli.route()
+        self.assertFalse(self.cli.ROUTE_STATE.exists())
+        # The new bridge's calls carry the new token and proceed to routing.
+        self.cli.os.environ["AGENT_BOX_WHATSAPP_PAIRING"] = self.cli.pairing_token()
+        with open(self.cli.ROUTE_STATE.with_name("lock"), "a") as lock:
+            self.cli.take_route_lock(lock)
+
+    def test_activate_keeps_an_existing_token(self):
+        self.cli.STATE.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(self.cli, "paired", return_value=True):
+            self.cli.activate()
+            first = self.cli.pairing_token()
+            self.cli.activate()
+        self.assertEqual(self.cli.pairing_token(), first)
+        self.assertEqual(self.cli.READY.stat().st_mode & 0o777, 0o600)
 
     def test_unlink_gives_up_if_a_route_never_finishes(self):
         import fcntl

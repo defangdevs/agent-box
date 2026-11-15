@@ -9970,7 +9970,9 @@ case "$cmd" in
                  and ((.value.agent != "claude") or
                       ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
           {name: .key, harness: .value.agent, stopped: (.value.stopped == true),
-           selected: (.value.whatsapp == true), id: (.value.boxSessionId // null)}]' "$REGISTRY_FILE"
+           selected: (.value.whatsapp == true), id: (.value.boxSessionId // null),
+           start: (try (.value.initialPrompt | capture("\\[router start (?<n>[0-9a-f]{32})\\]").n)
+                   catch null)}]' "$REGISTRY_FILE"
       else
         echo '[]'
       fi
@@ -10699,6 +10701,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -10866,7 +10869,21 @@ def activate():
     if not paired():
         raise RuntimeError("WhatsApp is not linked; pair the device first")
     private_dir(STATE)
-    READY.touch(mode=0o600)
+    # The marker carries a pairing token. serve() hands it to the bridge, the
+    # bridge's route calls inherit it, and a route from an EARLIER pairing
+    # (route calls can outlive their bridge) refuses to write (take_route_lock).
+    if not READY.is_file() or not pairing_token():
+        pending = READY.with_name(READY.name + ".pending")
+        pending.write_text(secrets.token_hex(16))
+        pending.chmod(0o600)
+        pending.replace(READY)
+
+
+def pairing_token():
+    try:
+        return READY.read_text().strip()
+    except OSError:
+        return ""
 
 
 def bridge_connected():
@@ -10944,6 +10961,7 @@ def serve():
     install()
     env = dict(os.environ)
     env.pop("LOCAL_WHATSAPP_ROUTE_CMD", None)
+    env["AGENT_BOX_WHATSAPP_PAIRING"] = pairing_token()
     if os.environ.get("AGENT_BOX_WHATSAPP_ROUTER", "").strip().lower() not in ("off", "0", "false", "no"):
         wrapper = RUNTIME / "route"
         self_path = Path(sys.argv[0]).resolve()
@@ -11252,9 +11270,11 @@ def route_request(request, router=None):
             # Only into the SAME session, never one re-created under the name.
             ours = sid == done["id"]
         else:
-            # A start attempt saved its name just before it ran, when no
-            # session had that name; the session there now is that start.
-            ours = done.get("action") != "CONTINUE" and bool(sid)
+            # An interrupted start: adopt the session only if its kickoff
+            # prompt carries this route's nonce. A session someone created by
+            # hand under that name cannot, so it is decided again (fail closed).
+            nonce = done.get("nonce") if done.get("action") != "CONTINUE" else None
+            ours = bool(nonce) and live[name].get("start") == nonce
         if ours:
             done["id"] = sid
             if done.get("action") == "CONTINUE":
@@ -11301,12 +11321,17 @@ def route_request(request, router=None):
                 lines.append("- %s: %s" % (link, "; ".join(dict.fromkeys(topics[-3:])) or "no topic labels"))
         lines.append("(This session was started by the message router for this topic. Later owner messages "
                      "on the same topic arrive here as OWNER messages via inbox.)")
+        # A durable mark of THIS start: the registry keeps the kickoff prompt,
+        # and `whatsapp candidates` reads the nonce back as "start".
+        nonce = secrets.token_hex(16)
+        lines.append("[router start %s]" % nonce)
 
         def attempt(candidate):
             # Saved before EACH start attempt, so an interrupted start under
             # a suffixed name is found again by a replay.
             decisions[message["id"]] = {"session": candidate, "action": decision["action"],
-                                        "links": decision.get("links") or [], "id": None, "topic": topic}
+                                        "links": decision.get("links") or [], "id": None, "topic": topic,
+                                        "nonce": nonce}
             write_private(ROUTE_STATE, state)
         name = start_session(name, "\n".join(lines), attempt)
         started = (run_json([SESSION_BIN, "whatsapp", "candidates"]) or [])
@@ -11342,6 +11367,10 @@ def take_route_lock(lock):
         raise RuntimeError("WhatsApp was unlinked while this route waited; not routing")
     if not READY.is_file():
         raise RuntimeError("WhatsApp is unlinked; not routing")
+    # Bound to the pairing the bridge was started for: a call from before an
+    # Unlink and a new pairing carries the old token, whenever it got here.
+    if os.environ.get("AGENT_BOX_WHATSAPP_PAIRING") != pairing_token():
+        raise RuntimeError("this route belongs to an earlier WhatsApp pairing; not routing")
 
 
 def pair():

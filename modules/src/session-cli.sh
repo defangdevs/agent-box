@@ -780,7 +780,9 @@ case "$cmd" in
                  and ((.value.agent != "claude") or
                       ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
           {name: .key, harness: .value.agent, stopped: (.value.stopped == true),
-           selected: (.value.whatsapp == true), id: (.value.boxSessionId // null)}]' "$REGISTRY_FILE"
+           selected: (.value.whatsapp == true), id: (.value.boxSessionId // null),
+           start: (try (.value.initialPrompt | capture("\\[router start (?<n>[0-9a-f]{32})\\]").n)
+                   catch null)}]' "$REGISTRY_FILE"
       else
         echo '[]'
       fi
