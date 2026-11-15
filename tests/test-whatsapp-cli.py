@@ -195,7 +195,8 @@ STUB = r"""#!/usr/bin/env python3
 import json, os, sys
 log = os.environ["STUB_LOG"]
 with open(log, "a") as f:
-    f.write(json.dumps({"bin": os.path.basename(sys.argv[0]), "argv": sys.argv[1:],
+    stdin = sys.stdin.read() if "-" in sys.argv[1:] else ""
+    f.write(json.dumps({"bin": os.path.basename(sys.argv[0]), "argv": sys.argv[1:], "stdin": stdin,
                         "session": os.environ.get("LOCAL_WEBHOOK_SESSION"),
                         "thread": os.environ.get("LOCAL_WEBHOOK_CODEX_THREAD")}) + "\n")
 key = " ".join([os.path.basename(sys.argv[0])] + sys.argv[1:3])
@@ -309,8 +310,8 @@ class WhatsAppRouteTest(unittest.TestCase):
         self.assertEqual(sub["argv"][:4], ["subscribe", "inbox:wa-vat", "--ttl", "8"])
         self.assertEqual(sub["session"], "agent-wa-vat")
         emit = next(c for c in hooks if c["argv"][0] == "emit")
-        self.assertEqual(emit["argv"][1], "inbox")
-        payload = json.loads(emit["argv"][2])
+        self.assertEqual(emit["argv"][1:5], ["inbox", "-", "--event", "message"])
+        payload = json.loads(emit["stdin"])
         self.assertEqual((payload["session"], payload["text"], payload["id"], payload["channel"]),
                          ("wa-vat", "and in Greece?", "M2", "whatsapp"))
         self.assertIn("node bridge.mjs reply M2 <reply text>", payload["reply"])
@@ -412,6 +413,22 @@ class WhatsAppRouteTest(unittest.TestCase):
             {"action": "CONTINUE", "session": "wa-vat", "links": [], "topic": "", "reason": "fallback",
              "error": "claude exited 1"}))
         self.assertFalse(self.cli.ROUTE_BACKEND_CACHE.exists())
+
+    def test_names_that_could_read_as_options_never_reach_a_command(self):
+        self.live([{"name": "-rf", "harness": "claude", "stopped": False, "selected": False}])
+        self.cli.write_private(self.cli.ROUTE_STATE, {"current": "-rf", "sessions": {"-rf": {"messages": []}}})
+        router = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "--help", "reason": "llm"})
+        out = self.cli.route_request(self.REQUEST, router)
+        self.assertEqual(router.calls[0]["sessions"], [])
+        self.assertEqual(out["session"], "wa-help")
+        with self.assertRaisesRegex(RuntimeError, "invalid session name"):
+            self.cli.deliver("--x", "claude", self.REQUEST, "a", "r")
+
+    def test_state_writes_stay_in_the_router_directory(self):
+        with self.assertRaisesRegex(RuntimeError, "refusing to write outside"):
+            self.cli.write_private(self.cli.ROUTE_STATE.parent / ".." / "elsewhere.json", {})
+        with self.assertRaisesRegex(RuntimeError, "refusing to write outside"):
+            self.cli.write_private(self.root / "x.json", {})
 
     def test_bad_request_is_refused(self):
         for bad in ({}, {"message": {"id": "../x"}}, {"message": "hi"}):

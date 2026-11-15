@@ -272,7 +272,15 @@ INBOX_TTL_HOURS = "8"       # local-webhook's longest session TTL; renewed on ev
 SESSION_BIN = os.environ.get("AGENT_BOX_SESSION_BIN", "agent-box-session")
 WEBHOOK_BIN = os.environ.get("AGENT_BOX_WEBHOOK_BIN", "agent-box-webhook")
 PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "agent-box-profile")
-NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,150}")
+# A session name never starts with "-", so it can never read as an option
+# on the command lines below, whatever a model or the state file says.
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,149}")
+
+
+def checked_name(name):
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise RuntimeError("invalid session name %r" % (name,))
+    return name
 
 
 def run_json(argv, env=None, timeout=60):
@@ -323,6 +331,13 @@ def router_backend(router):
 
 
 def write_private(path, value):
+    # Only the router's own state files: nothing read from a request, the
+    # state file or a model answer may choose where this writes.
+    root = os.path.realpath(str(ROUTE_STATE.parent))
+    target = os.path.realpath(str(path))
+    if os.path.dirname(target) != root:
+        raise RuntimeError("refusing to write outside %s" % root)
+    path = Path(target)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     pending = path.with_name(path.name + ".%d.tmp" % os.getpid())
     pending.write_text(json.dumps(value))
@@ -360,7 +375,7 @@ def new_session_name(topic, taken):
 
 
 def start_session(name, prompt):
-    argv = [SESSION_BIN, "add", name, "--origin", "webhook", "--prompt", prompt]
+    argv = [SESSION_BIN, "add", checked_name(name), "--origin", "webhook", "--prompt", prompt]
     configured = profile()
     if configured:
         argv[3:3] = ["--profile", configured]
@@ -397,6 +412,7 @@ def codex_thread(name):
 
 def deliver(name, harness, request, ack, reply):
     """Wake NAME, renew its inbox subscription, emit the message on the bus."""
+    name = checked_name(name)
     run_json([SESSION_BIN, "whatsapp", "wake", name], timeout=180)
     ensure_inbox_source()
     env = dict(os.environ, LOCAL_WEBHOOK_SESSION="%s-%s" % (os.environ.get("USER") or "", name))
@@ -413,8 +429,9 @@ def deliver(name, harness, request, ack, reply):
     payload = {"session": name, "text": message.get("text") or "", "channel": request.get("channel") or "",
                "id": message["id"], "attachments": message.get("attachments") or "",
                "reply": "acknowledge when you start with `%s`, answer with `%s`" % (ack, reply)}
-    subprocess.run([WEBHOOK_BIN, "emit", "inbox", json.dumps(payload), "--event", "message"],
-                   capture_output=True, timeout=60, check=True)
+    # On stdin, not as an argument: the payload carries the owner's text.
+    subprocess.run([WEBHOOK_BIN, "emit", "inbox", "-", "--event", "message"],
+                   input=json.dumps(payload), text=True, capture_output=True, timeout=60, check=True)
 
 
 def route_request(request, router=None):
@@ -427,8 +444,8 @@ def route_request(request, router=None):
             if isinstance(item, dict) and NAME_RE.fullmatch(str(item.get("name", "")))}
     state = load_route_state()
     known = state["sessions"]
-    for name in [n for n in known if n not in live]:
-        del known[name]                 # removed sessions are forgotten
+    for name in [n for n in known if n not in live or not NAME_RE.fullmatch(n)]:
+        del known[name]                 # removed (or malformed) sessions are forgotten
     # Answers the channel already sent become the assistant side of history.
     for item in request.get("recent") or []:
         if not isinstance(item, dict):
