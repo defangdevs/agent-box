@@ -69,7 +69,7 @@ _jit_lock="$_jit_dir/install.lock"
 _jit_pin_file() { printf '%s' "$_jit_dir/$1.pin"; }
 
 agent_bin() {
-  # agent_bin NAME — resolve an agent (or "shell") to its binary via
+  # agent_bin NAME [stable] — resolve an agent (or "shell") to its binary via
   # the unit's AGENT_BOX_AGENT_BINS ("name=/path ..." pairs; store and
   # shell paths never contain whitespace, so word-splitting is safe).
   #
@@ -108,10 +108,31 @@ agent_bin() {
   # Only ever a harness name we know; never an arbitrary string off the
   # registry turned into a path.
   agent_attr "$1" >/dev/null 2>&1 || return 1
-  if [ -x "$HOME/.nix-profile/bin/$1" ]; then
+  # Return the immutable store path, not the profile symlink. A harness
+  # upgrade is a `nix profile remove` then `add`, so for one generation
+  # ~/.nix-profile/bin/NAME does not exist; a launch holding that path
+  # between this check and exec would die with exit 127 (issue #938). The
+  # store path stays valid, because the old generation roots it. The flip
+  # can also land between the -x test and the resolve, so retry that pair
+  # once; a harness that is simply not installed still fails at once.
+  #
+  # A long-lived consumer (the WhatsApp bridge reads the path once and keeps
+  # it for its lifetime) passes "stable" instead: it wants the profile path,
+  # which follows upgrades, because a store path it holds can be garbage
+  # collected after the next one.
+  if [ "${2:-}" = stable ]; then
+    [ -x "$HOME/.nix-profile/bin/$1" ] || return 1
     printf '%s\n' "$HOME/.nix-profile/bin/$1"
     return 0
   fi
+  for _ab_try in 1 2; do
+    [ -x "$HOME/.nix-profile/bin/$1" ] || return 1
+    _ab_real="$(readlink -f "$HOME/.nix-profile/bin/$1" 2>/dev/null)" || _ab_real=""
+    if [ -n "$_ab_real" ] && [ -x "$_ab_real" ]; then
+      printf '%s\n' "$_ab_real"
+      return 0
+    fi
+  done
   return 1
 }
 
@@ -467,6 +488,66 @@ agent_upgrade() {
 # for. resolve_codex_home is what start_session passes instead, so the
 # layout lands where that session's app-server daemon will actually look
 # for it.
+# stop_codex_pid PID — end a codex process: TERM, wait up to 5 s, then KILL.
+#
+# Shared by the remote-control wrapper (an app-server only the legacy pid
+# file records, issue #904) and the session-start mirror (a managed daemon
+# running a stale codex build, issue #949). The caller proves the process
+# is the right one first: this helper never checks identity, so never hand
+# it a pid that has not been matched against something stronger than the
+# pid alone.
+stop_codex_pid() {
+  kill -TERM "$1" 2>/dev/null || return 0
+  for _scp in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  kill -KILL "$1" 2>/dev/null || true
+}
+
+# Stop this user's managed codex daemons that run a different build than $1
+# and whose CODEX_HOME is $2 (issue #949).
+#
+# A running daemon keeps the binary it started from and hands that store
+# path to its command runner. After an upgrade, or a build that lacked the
+# helpers, it still names a build that is gone or incomplete: "failed to
+# spawn code-mode host /nix/store/<old>/bin/codex-code-mode-host", and
+# restarting the session does not touch it. The next client starts a fresh
+# daemon.
+#
+# Identify it by its real argv, not a flattened string (a TUI whose prompt
+# text mentions the flag must survive): argv[1] is `app-server` and some
+# argument is exactly `--managed-daemon`. A binary that the swap removed
+# reads as "... (deleted)" in /proc/PID/exe, and is stale by definition.
+# Another profile's daemon (a different CODEX_HOME) is left alone, since
+# only this session's mirror was updated.
+_mcs_stop_stale_daemons() {
+  _sd_real=$1 _sd_home=$2
+  for _sd_p in /proc/[0-9]*; do
+    [ -O "$_sd_p" ] || continue
+    _sd_exe="$(readlink "$_sd_p/exe" 2>/dev/null)" || continue
+    _sd_del=
+    case "$_sd_exe" in (*" (deleted)") _sd_del=1 _sd_exe=${_sd_exe% (deleted)} ;; esac
+    case "${_sd_exe##*/}" in (codex) ;; (*) continue ;; esac
+    # A deleted exe is stale even at the mirrored path: the file there now
+    # is a replacement, not the build this daemon runs.
+    [ -n "$_sd_del" ] || [ "$_sd_exe" != "$_sd_real" ] || continue
+    _sd_n=0 _sd_sub= _sd_flag=
+    while IFS= read -r -d '' _sd_a; do
+      [ "$_sd_n" -ne 1 ] || _sd_sub=$_sd_a
+      [ "$_sd_a" != --managed-daemon ] || _sd_flag=1
+      _sd_n=$((_sd_n + 1))
+    done 2>/dev/null < "$_sd_p/cmdline"
+    [ "$_sd_sub" = app-server ] && [ -n "$_sd_flag" ] || continue
+    _sd_dh=
+    while IFS= read -r -d '' _sd_e; do
+      case "$_sd_e" in (CODEX_HOME=*) _sd_dh=${_sd_e#CODEX_HOME=} ;; esac
+    done 2>/dev/null < "$_sd_p/environ"
+    [ "${_sd_dh:-$HOME/.codex}" = "$_sd_home" ] || continue
+    stop_codex_pid "${_sd_p#/proc/}"
+  done
+}
+
 mirror_codex_standalone() {
   if [ -n "${1:-}" ]; then
     cbin=$1
@@ -484,6 +565,19 @@ mirror_codex_standalone() {
   # uses that file in place and copies nothing.
   _mcs_swap "$cxhome/packages/standalone" agent-box-current "$cbin" codex
   _mcs_swap "$cxhome/packages/app-server-daemon" agent-box-current "$cbin" bin/codex
+  # codex finds its helpers (codex-code-mode-host, logs_client) NEXT TO the
+  # path it was started from, without resolving the symlink above. Mirror
+  # them beside each link, or the daemon's codex dies with
+  # "codex-code-mode-host is missing" (issue #946).
+  _mcs_real="$(readlink -f "$cbin" 2>/dev/null)" || _mcs_real=
+  if [ -n "$_mcs_real" ]; then
+    for _mcs_sib in "$(dirname "$_mcs_real")"/*; do
+      [ -f "$_mcs_sib" ] && [ "$_mcs_sib" != "$_mcs_real" ] || continue
+      ln -sfn "$_mcs_sib" "$cxhome/packages/standalone/agent-box-current/$(basename "$_mcs_sib")"
+      ln -sfn "$_mcs_sib" "$cxhome/packages/app-server-daemon/agent-box-current/bin/$(basename "$_mcs_sib")"
+    done
+    _mcs_stop_stale_daemons "$_mcs_real" "$cxhome"
+  fi
 }
 
 # Point $1/$2/$4 at $3 and swap $1/current to $2.

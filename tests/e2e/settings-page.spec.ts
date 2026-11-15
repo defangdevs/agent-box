@@ -115,6 +115,10 @@ test('basic auth renders the page and sets the auth cookie; cookie alone then su
   );
   expect(cookie, 'first authenticated response should set the __Host- auth cookie').toBeTruthy();
   expect(cookie!.sameSite).toBe('Lax');
+  // __Host- cookies must have no Domain attribute. Chromium exposes this
+  // host-only cookie with the exact request hostname, so it must never
+  // collapse to a shared sslip.io or domainstation.com suffix.
+  expect(cookie!.domain).toBe(new URL(process.env.E2E_BASE_URL!).hostname);
 
   // A fresh context with ONLY the cookie (no basic-auth credentials) must get
   // through — this is the leg the VM test cannot cover.
@@ -402,6 +406,39 @@ test('morph: a row the server renders open is allowed to open', async ({ browser
   await page.unrouteAll({ behavior: 'ignoreErrors' });
 });
 
+test('morph: a server-opened connection row closes when its state settles', async ({ browser }) => {
+  const page = await authedPage(browser);
+  let forceOpen = true;
+  await page.route('**/settings/**', async (route, request) => {
+    if (request.url().includes('/events')) return route.continue();
+    try {
+      const res = await route.fetch();
+      const body = await res.text();
+      if (!forceOpen || !body.includes('data-fold="conn-')) {
+        return route.fulfill({ response: res, body });
+      }
+      return route.fulfill({
+        response: res,
+        body: body.replace(/(<details data-fold="conn-[^"]*")/, '$1 open'),
+      });
+    } catch {
+      // A poll still in flight when the test ends; nothing to assert on it.
+    }
+  });
+
+  await page.goto(SETTINGS_PATH);
+  const row = page.locator('details[data-fold^="conn-"]').first();
+  await row.waitFor();
+  expect(await row.evaluate((el: HTMLDetailsElement) => el.open)).toBe(true);
+
+  forceOpen = false;
+  const key = uniqueKey();
+  await saveKey(page, key, 'server-close-check');
+  expect(await row.evaluate((el: HTMLDetailsElement) => el.open)).toBe(false);
+  await deleteKey(page, key);
+  await page.unrouteAll({ behavior: 'ignoreErrors' });
+});
+
 test('dismissing the delete confirm keeps the key; accepting removes it', async ({ browser }) => {
   const key = uniqueKey();
   const page = await authedPage(browser);
@@ -444,4 +481,45 @@ test('restart is confirm-guarded and kills the agent tmux session', async ({ bro
   if (TMUX_BIN) {
     await expect.poll(tmuxSessionAlive, { timeout: 10_000 }).toBe(false);
   }
+});
+
+// Creation keeps several unsaved settings together until the profile is saved.
+test('create a profile with multiple environment settings', async ({ browser }) => {
+  const page = await authedPage(browser);
+  const name = `e2e_${Date.now().toString(36)}`;
+  const first = uniqueKey();
+  const second = uniqueKey();
+  await page.goto(SETTINGS_PATH);
+  await page.getByRole('button', { name: 'Add profile' }).click();
+  const editor = page.locator('#profile-editor');
+  await editor.getByLabel('Profile name').fill(name);
+  await editor.getByLabel('Assistant', { exact: true }).selectOption('claude');
+  await editor.getByLabel('Environment setting name').first().fill(first);
+  await editor.getByLabel('Value for that setting').first().fill('first-secret');
+  await editor.getByRole('button', { name: 'Add setting' }).click();
+  await editor.getByLabel('Environment setting name').last().fill('DISCARD_ME');
+  await editor.getByRole('button', { name: 'Remove' }).last().click();
+  await editor.getByRole('button', { name: 'Add setting' }).click();
+  await editor.getByLabel('Environment setting name').last().fill(first);
+  await editor.getByLabel('Value for that setting').last().fill('second-secret');
+  await editor.getByRole('button', { name: 'Save' }).click();
+  await expect(page.locator('.msg')).toContainText('different name');
+  await expect(editor).toBeVisible();
+  await expect(editor.getByLabel('Value for that setting').last()).toHaveValue('second-secret');
+  await editor.getByLabel('Environment setting name').last().fill('');
+  await editor.getByRole('button', { name: 'Save' }).click();
+  await expect(page.locator('.msg')).toContainText('Enter a name');
+  await expect(editor.getByLabel('Value for that setting').last()).toHaveValue('second-secret');
+  await editor.getByLabel('Environment setting name').last().fill(second);
+  await editor.getByRole('button', { name: 'Save' }).click();
+  const profile = page.locator('.prof-row', { hasText: name });
+  await expect(profile).toContainText('2 custom settings');
+  await profile.locator('summary').click();
+  await expect(profile).toContainText(first);
+  await expect(profile).toContainText(second);
+  await expect(page.locator('body')).not.toContainText('second-secret');
+  page.once('dialog', d => d.accept());
+  await profile.getByRole('button', { name: 'Delete', exact: true }).click();
+  await expect(profile).toHaveCount(0);
+  await page.close();
 });

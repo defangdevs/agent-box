@@ -26,8 +26,8 @@
 //      the API - not from `az vm extension show`, not from deployment history.
 //   3. A credential is mandatory. Azure rejects a Linux `osProfile` carrying
 //      neither an SSH key nor an admin password, even with SSH closed at the
-//      NSG. Hence the authenticationType / adminPasswordOrKey pair, the same
-//      shape every azure-quickstart-templates VM sample uses.
+//      NSG. The debug account gets a separate generated password by default;
+//      authenticationType / adminPasswordOrKey still allow an explicit key.
 
 @description('Linux user that owns the agent sessions, and the login name for the browser terminal.')
 @minLength(1)
@@ -62,6 +62,10 @@ param portalUser string = ''
 @description('The portal\'s own issuer URL, compared exactly against the token\'s `iss` claim, and where the box fetches the portal\'s published signing keys (<issuer>/.well-known/jwks.json). Whatever the portal uses -- this is NOT a Defang hostname. Empty (the default) disables portal handover entirely.')
 @maxLength(512)
 param portalIssuer string = ''
+
+@description('Destination of the portal link on the unauthenticated 401 page, including a per-box path if needed. Empty uses the portal issuer origin. Public HTTP(S) URL only; no credentials or private account identifiers. Requires a runtime supporting web.portalRedirectUrl when using a prebuilt image.')
+@maxLength(2048)
+param portalRedirectUrl string = ''
 
 // The picker annotates each value with vCPU/RAM/price because the portal's
 // generated form renders allowed values verbatim - there is no separate label
@@ -132,39 +136,49 @@ param imageIncludesRuntime bool = false
 @description('Source range allowed to reach the terminal (and SSH). A CIDR, or an Azure service tag such as Internet.')
 param allowCidr string = '0.0.0.0/0'
 
-// Optional sslip.io-compatible alias. The public IPv4 remains the primary
-// URL; an alias is redirected to it and its cert is obtained on first use.
-// Bicep has no pattern constraint for strings, so the bootstrap decodes and
-// validates this suffix before putting it in the Caddyfile.
-@description('Optional DNS alias suffix. Set sslip.io (or a compatible resolver suffix) to expose a second URL; its certificate is requested only on first use. Empty leaves the public IPv4 as the sole URL.')
+// DNS aliases never replace the public IPv4 as the primary URL. Each alias
+// redirects to it and receives a certificate only after its first use.
+// Bicep cannot constrain array members, so the bootstrap validates every
+// suffix before writing the derived names into config.yaml.
+@description('DNS alias suffixes for the static public IPv4. Each alias certificate is requested only on first use. The direct-IP URL remains primary.')
+param sslipDomains array = [
+  'sslip.io'
+]
+
+@description('Deprecated single DNS alias suffix. When non-empty it replaces sslipDomains, preserving deployments that still pass the old parameter.')
 param sslipDomain string = ''
+
+var effectiveSslipDomains = !empty(sslipDomain) ? [sslipDomain] : sslipDomains
 
 // Default false, where the AWS templates default their DebugSsh to true. Not
 // caution for its own sake: on Lightsail, SSH is the only way to read
 // /var/log/agent-box-bootstrap.log after a first boot that went wrong, so the
 // port has to be open by default for the box to be debuggable at all. Azure
-// has managed boot diagnostics, so the serial console reaches the same box
-// authenticated through Azure RBAC instead of through a credential on an open
-// port - strictly better, and it works with 22 shut. Leaving 22 open by
+// has Run Command and VMAccess recovery through Azure RBAC with 22 shut.
+// Serial-console login also needs a known local credential; reset the
+// generated recovery password through VMAccess first. Leaving 22 open by
 // default would also mean a portal user who picks authenticationType=password
 // for convenience gets SSH password auth exposed to allowCidr, which defaults
 // to the whole internet.
-@description('Open port 22 to allowCidr. Off by default: the portal\'s serial console already gives debug access, authenticated through Azure RBAC rather than through a credential on an open port. Turn it on for an ordinary SSH session - the box is ordinary Ubuntu, and nothing here wipes /home or /root.')
+@description('Open port 22 to allowCidr. Off by default: Azure Run Command and VMAccess provide recovery through Azure RBAC with SSH closed. To enable SSH, supply your own recovery credential and restrict allowCidr first.')
 param debugSsh bool = false
+
+@description('Open inbound TCP 25 for optional email. Configure host email intake and STARTTLS separately; outbound SMTP restrictions remain in force.')
+param emailIngress bool = false
 
 @description('Linux user for SSH/serial-console debug access. NOT the agent user - the agent runs as userName.')
 param adminUsername string = 'azureuser'
 
-@description('Whether adminPasswordOrKey below is an SSH public key or a password. Azure will not create a Linux VM with neither, even when SSH is closed at the NSG.')
+@description('Recovery account authentication. Leave password selected and adminPasswordOrKey empty to generate a separate recovery password. For your own SSH key, choose sshPublicKey and supply your public key. SSH stays closed unless debugSsh is enabled.')
 @allowed([
   'sshPublicKey'
   'password'
 ])
-param authenticationType string = 'sshPublicKey'
+param authenticationType string = 'password'
 
-@description('SSH public key (ssh-ed25519 AAAA...) or admin password for adminUsername, per authenticationType. This is the debug credential, not the browser terminal password.')
+@description('Optional recovery credential. Leave empty for normal deployment; Azure generates a separate recovery password, so no SSH key or second password is needed. To use your own recovery credential, enter a password or SSH public key matching authenticationType. It is separate from webPassword and is not returned in outputs. Reset it through Azure if recovery access is needed.')
 @secure()
-param adminPasswordOrKey string
+param adminPasswordOrKey string = ''
 
 @description('Prefix for every resource name in the group.')
 @minLength(1)
@@ -175,6 +189,18 @@ param namePrefix string = 'agent-box'
 param location string = resourceGroup().location
 
 // ---------------------------------------------------------------------------
+
+// Generate inside a nested deployment, where ARM evaluates the default itself.
+// The portal only sees an empty optional field, never a newGuid expression it
+// could submit literally as a predictable password. The module's output is
+// secure and is consumed only by osProfile.adminPassword.
+// An SSH public key passed without authenticationType (the old default) is
+// still installed as a key: a key is far over the 72-character password limit.
+var usePasswordAuth = authenticationType == 'password' && !startsWith(adminPasswordOrKey, 'ssh-')
+var generateRecoveryPassword = usePasswordAuth && empty(adminPasswordOrKey)
+module recoveryPassword 'recovery-password.bicep' = {
+  name: '${namePrefix}-recovery-password'
+}
 
 var vmSize = split(vmSizeChoice, ' ')[0]
 
@@ -196,7 +222,7 @@ var imageSkuBySize = {
 // consequence of picking password auth is visible in the source instead of
 // being inferred from an absent property: choosing it DOES enable SSH password
 // authentication, to whatever allowCidr allows, whenever debugSsh is on.
-var linuxConfiguration = authenticationType == 'password' ? {
+var linuxConfiguration = usePasswordAuth ? {
   disablePasswordAuthentication: false
 } : {
   disablePasswordAuthentication: true
@@ -241,6 +267,20 @@ var httpsRule = {
     destinationPortRange: '443'
   }
 }
+
+var emailIngressRules = emailIngress ? [{
+  name: 'email-ingress'
+  properties: {
+    priority: 1002
+    protocol: 'Tcp'
+    access: 'Allow'
+    direction: 'Inbound'
+    sourceAddressPrefix: '*'
+    sourcePortRange: '*'
+    destinationAddressPrefix: '*'
+    destinationPortRange: '25'
+  }
+}] : []
 
 // Raw SMTP outbound is the way a hijacked box gets used to send spam, and
 // nothing this box legitimately runs needs it: mail through a real provider
@@ -391,7 +431,7 @@ fi
 install -d -m 0755 /etc/agent-box
 
 # Bicep has no character constraint for a string parameter -- only length --
-# so a raw portalIssuer/portalUser/sslipDomain could close the single-quoted
+# so a raw portalIssuer/portalUser/sslipDomains value could close the single-quoted
 # YAML scalar below, or worse, a newline plus the literal text
 # "AGENTBOX_CONFIG" closes the heredoc itself and everything after runs
 # as a shell command instead of landing in config.yaml (same class of bug
@@ -403,6 +443,7 @@ install -d -m 0755 /etc/agent-box
 # decorator, so the check has to happen at runtime instead. A bad value fails
 # the boot rather than landing in config.yaml unvetted.
 portal_issuer="$(printf %s '@@PORTALISSUERB64@@' | base64 -d)"
+portal_redirect_url="$(printf %s '@@PORTALREDIRECTURLB64@@' | base64 -d)"
 portal_user="$(printf %s '@@PORTALUSERIDB64@@' | base64 -d)"
 if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
   if ! [[ "$portal_issuer" =~ ^https://[A-Za-z0-9._~:/?#@\!\&\(\)*+,\;=%-]+$ ]]; then
@@ -414,12 +455,17 @@ if [ -n "$portal_issuer" ] || [ -n "$portal_user" ]; then
     exit 1
   fi
 fi
-# Same DNS-suffix shape the AWS template's DomainSuffix parameter enforces
-# with its AllowedPattern (deploy/aws/template.yaml) and BOX_SCHEMA enforces
-# for a native config.yaml (bin/agentbox) -- kept in sync across all three.
-sslip_domain="$(printf %s '@@SSLIPDOMAINB64@@' | base64 -d)"
-if [ -n "$sslip_domain" ] && ! [[ "$sslip_domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
-  echo "sslipDomain is not a DNS suffix" >&2
+if ! PORTAL_REDIRECT_URL="$portal_redirect_url" python3 - <<'PYURL'
+import os
+import re
+import sys
+
+value = os.environ["PORTAL_REDIRECT_URL"]
+origin = r"https?://(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]+)?"
+if value and not re.fullmatch(origin + r"(?:[/?#][-A-Za-z0-9._~:/?#@!$&()*+,;=%]*)?", value):
+    sys.exit("portalRedirectUrl is not a plain HTTP(S) URL")
+PYURL
+then
   exit 1
 fi
 public_ip="$(printf %s '@@PUBLICIPB64@@' | base64 -d)"
@@ -427,9 +473,31 @@ if ! [[ "$public_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
   echo "Azure public IP is not a plain IPv4 address" >&2
   exit 1
 fi
-box_alias=""
-if [ -n "$sslip_domain" ]; then
-  box_alias="${public_ip//./-}.${sslip_domain}"
+# Decode the array as JSON, validate the same DNS-suffix grammar the runtime
+# uses, reject duplicates, and emit a compact JSON array. JSON is valid YAML,
+# so it can be inserted as one safely bounded scalar below.
+if ! box_aliases="$(SSLIP_DOMAINS_JSON="$(printf %s '@@SSLIPDOMAINSB64@@' | base64 -d)" PUBLIC_IP="$public_ip" python3 - <<'PY'
+import json
+import os
+import re
+import sys
+
+suffixes = json.loads(os.environ["SSLIP_DOMAINS_JSON"])
+pattern = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$")
+if not isinstance(suffixes, list) or not all(isinstance(value, str) for value in suffixes):
+    sys.exit("sslipDomains must be an array of DNS suffix strings")
+if len(suffixes) != len(set(suffixes)):
+    sys.exit("sslipDomains must not contain duplicates")
+if not all(pattern.fullmatch(value) for value in suffixes):
+    sys.exit("sslipDomains entries must be DNS suffixes")
+dashed = os.environ["PUBLIC_IP"].replace(".", "-")
+aliases = [f"{dashed}.{suffix}" for suffix in suffixes]
+if any(len(alias) > 253 for alias in aliases):
+    sys.exit("sslipDomains entries make a hostname longer than 253 characters")
+print(json.dumps(aliases, separators=(",", ":")))
+PY
+)"; then
+  exit 1
 fi
 
 cat > /etc/agent-box/config.yaml <<'AGENTBOX_CONFIG'
@@ -437,12 +505,13 @@ domain: '@DOMAIN@'
 agents: [claude, codex]
 web:
   enable: true
-  alias: '@ALIAS@'
+  aliases: @ALIASES@
   # Portal handover (issue #593). Empty is off, which is the module's own
   # default: a box deployed without the two portal parameters serves no
   # handover route and no unauthenticated endpoint. No key is configured --
   # the box fetches the portal's published key set from this issuer.
   portalIssuer: '@PORTALISSUER@'
+  portalRedirectUrl: '@PORTALREDIRECTURL@'
 users:
   @@USER@@:
     root: true
@@ -455,13 +524,22 @@ AGENTBOX_CONFIG
 # written, or an issuer URL containing one would splice the placeholder
 # into config.yaml instead of the URL (same bug as the CFN twin, before its
 # own fix). box_alias and public_ip already exclude both, but escaping
-# them too costs nothing and keeps all substitutions uniform.
+# them too costs nothing and keeps all substitutions uniform. box_aliases is
+# already JSON made from validated DNS suffixes and the validated public IP.
 esc_issuer=$(printf '%s' "$portal_issuer" | sed -e 's/[&\]/\\&/g')
+esc_redirect=$(printf '%s' "$portal_redirect_url" | sed -e 's/[&\]/\\&/g')
 esc_user=$(printf '%s' "$portal_user" | sed -e 's/[&\]/\\&/g')
-esc_alias=$(printf '%s' "$box_alias" | sed -e 's/[&\]/\\&/g')
 esc_domain=$(printf '%s' "$public_ip" | sed -e 's/[&\]/\\&/g')
-sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIAS@|$esc_alias|; s|@DOMAIN@|$esc_domain|" \
+sed -i "s|@PORTALISSUER@|$esc_issuer|; s|@PORTALUSERID@|$esc_user|; s|@ALIASES@|$box_aliases|; s|@DOMAIN@|$esc_domain|" \
   /etc/agent-box/config.yaml
+# Old prebuilt runtimes do not know this optional field. Keep their issuer
+# fallback usable when no redirect was requested.
+if [ -z "$portal_redirect_url" ]; then
+  sed -i "/^  portalRedirectUrl:/d" /etc/agent-box/config.yaml
+else
+  # Last, and only in its own scalar: marker-like URL text stays literal.
+  sed -i "/^  portalRedirectUrl:/s|@PORTALREDIRECTURL@|$esc_redirect|" /etc/agent-box/config.yaml
+fi
 
 # Extra standing instructions for the agent, if the deployment gave any.
 install -d -m 0755 /etc/agent-box-guides
@@ -507,7 +585,7 @@ var portalOn = !empty(portalUser) && !empty(portalIssuer)
 var portalUserYaml = portalOn ? portalUser : ''
 var portalIssuerYaml = portalOn ? portalIssuer : ''
 
-var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
+var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(
   bootstrapTemplate,
   '@@NIXINSTALLER@@', nixInstallerUrl),
   '@@FLAKEREF@@', agentBoxFlakeRef),
@@ -516,9 +594,10 @@ var bootstrap = replace(replace(replace(replace(replace(replace(replace(replace(
   // and check_secrets() in scripts/check_azure_template.py, which fails if
   // this ever goes back to a raw substitution.
   '@@AGENTSMDB64@@', base64(agentsMd)),
-  '@@SSLIPDOMAINB64@@', base64(sslipDomain)),
+  '@@SSLIPDOMAINSB64@@', base64(string(effectiveSslipDomains))),
   '@@WEBPASSWORD@@', base64(webPassword)),
   '@@PORTALISSUERB64@@', base64(portalIssuerYaml)),
+  '@@PORTALREDIRECTURLB64@@', base64(portalRedirectUrl)),
   '@@PORTALUSERIDB64@@', base64(portalUserYaml)),
   // ARM string(true) renders `True`, while the shell branch deliberately
   // compares its marker to lowercase `true`.
@@ -545,7 +624,7 @@ resource nsg 'Microsoft.Network/networkSecurityGroups@2024-05-01' = {
   name: '${namePrefix}-nsg'
   location: location
   properties: {
-    securityRules: concat([httpsRule, smtpEgressRule], sshRule)
+    securityRules: concat([httpsRule, smtpEgressRule], sshRule, emailIngressRules)
   }
 }
 
@@ -629,7 +708,7 @@ resource vm 'Microsoft.Compute/virtualMachines@2024-07-01' = {
     osProfile: {
       computerName: namePrefix
       adminUsername: adminUsername
-      adminPassword: authenticationType == 'password' ? adminPasswordOrKey : null
+      adminPassword: usePasswordAuth ? (generateRecoveryPassword ? recoveryPassword.outputs.password : adminPasswordOrKey) : null
       linuxConfiguration: linuxConfiguration
     }
     networkProfile: {
@@ -668,16 +747,19 @@ resource bootstrapExtension 'Microsoft.Compute/virtualMachines/extensions@2024-0
 
 // ---------------------------------------------------------------------------
 
-// The public IPv4 is primary. A configured sslipDomain creates a dashed-IP
-// DNS alias; the dotted spelling is never included in its certificate.
+// The public IPv4 is primary. Each configured suffix creates a dashed-IP DNS
+// alias; the dotted spelling is never included in an alias certificate.
 var host = publicIp.properties.ipAddress
-var sslipHost = '${replace(host, '.', '-')}.${sslipDomain}'
+var aliasUrlValues = map(effectiveSslipDomains, suffix => 'https://${replace(host, '.', '-')}.${suffix}/${userName}/')
 
 @description('Browser terminal. Sign in with the userName and the webPassword chosen at deployment time. The first load waits on Caddy\'s ACME certificate. (The URL deliberately carries no user@ prefix: Chrome answers the auth challenge with URL userinfo plus an EMPTY password, and credentials typed into the prompt cannot override the URL-embedded identity.)')
 output webUrl string = 'https://${host}/${userName}/'
 
-@description('Optional sslip.io-compatible alias URL. Empty when sslipDomain is unset. Caddy obtains its certificate on first use.')
-output sslipUrl string = empty(sslipDomain) ? '' : 'https://${sslipHost}/${userName}/'
+@description('DNS alias URLs. Caddy obtains each certificate on first use.')
+output aliasUrls array = aliasUrlValues
+
+@description('First DNS alias URL, retained for clients of the former single-value output. Empty when sslipDomains is empty.')
+output sslipUrl string = length(aliasUrlValues) == 0 ? '' : aliasUrlValues[0]
 
 @description('Claude Remote Control session name. Only meaningful if the session started from the settings page\'s install+sign-in cards is a claude one: after finishing `claude login` once in the browser terminal, the Claude desktop and mobile apps can drive it.')
 output remoteControlSession string = '${userName}-main@${host}'
@@ -685,7 +767,7 @@ output remoteControlSession string = '${userName}-main@${host}'
 @description('Static public IPv4 address.')
 output publicAddress string = publicIp.properties.ipAddress
 
-@description('Debug access. Closed at the NSG unless debugSsh is true; the portal\'s serial console works either way.')
+@description('Debug access. Closed at the NSG unless debugSsh is true. Supply a known recovery credential for SSH, or use Azure Run Command/VMAccess with SSH closed.')
 output sshCommand string = 'ssh ${adminUsername}@${publicIp.properties.ipAddress}'
 
 @description('Where first-boot output lands if the deployment fails. The extension handler keeps its own copy of the same stream under /var/lib/waagent/custom-script/download/0/.')

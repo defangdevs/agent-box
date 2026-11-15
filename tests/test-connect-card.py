@@ -30,12 +30,17 @@ article, and the golden-snapshot check fails if it stops matching.
 """
 import importlib.machinery
 import importlib.util
+import http.server
 import json
 import os
 import pathlib
 import re
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -144,6 +149,43 @@ class ConnectCardCheckingTest(unittest.TestCase):
 class WhatsAppConnectTest(unittest.TestCase):
     def setUp(self):
         self.daemon = load_daemon()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.daemon.ENV_FILE = os.path.join(self.temp.name, "env")
+
+    def serve(self):
+        original_connect_flow = self.daemon.connect_flow
+        self.daemon.connect_flow = lambda flow_id: (
+            {"id": "whatsapp", "bin": None}
+            if flow_id == "whatsapp" else original_connect_flow(flow_id)
+        )
+        self.daemon.Handler.log_message = lambda self, fmt, *args: None
+        server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), self.daemon.Handler)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return "http://127.0.0.1:%d/settings" % server.server_address[1]
+
+    def post_start(self, base, phone, country=""):
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        request = urllib.request.Request(
+            base + "/connect/start",
+            data=urllib.parse.urlencode({
+                "flow": "whatsapp", "phone": phone,
+                "phone_country": country, "profile": "",
+            }).encode(),
+            method="POST",
+        )
+        try:
+            with urllib.request.build_opener(NoRedirect).open(request) as response:
+                return response.status, response.read().decode()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, exc.read().decode()
 
     def test_pairing_code_is_extracted_from_bridge_output(self):
         text = "WhatsApp pairing code: 7JVT986A\nEnter it on your phone."
@@ -151,14 +193,99 @@ class WhatsAppConnectTest(unittest.TestCase):
         self.assertIsNone(self.daemon.connect_user_code("no code yet", "whatsapp"))
 
     def test_pairing_card_shows_phone_form_then_code(self):
-        idle = self.daemon.render_connect_card(base_state(id="whatsapp", state="idle"))
-        self.assertIn('name="phone"', idle)
-        self.assertIn("Pair device", idle)
+        with tempfile.TemporaryDirectory() as temp:
+            self.daemon.ENV_FILE = os.path.join(temp, "env")
+            idle = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertIn('name="phone"', idle)
+            self.assertIn('name="phone_country"', idle)
+            self.assertIn('aria-label="WhatsApp country calling code" required', idle)
+            self.assertIn('aria-label="WhatsApp national phone number" required', idle)
+            self.assertIn('type="tel"', idle)
+            self.assertIn('inputmode="tel"', idle)
+            self.assertIn('autocomplete="tel-country-code"', idle)
+            self.assertIn('autocomplete="tel-national"', idle)
+            self.assertNotIn('autocomplete="off"', idle)
+            self.assertIn("country calling code", idle)
+            self.assertIn("Enter a country code and phone number", idle)
+            self.assertIn("Pair device", idle)
+
+            with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+                handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+            configured = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertNotIn(
+                'aria-label="WhatsApp country calling code" required', configured)
+            self.assertNotIn(
+                'aria-label="WhatsApp national phone number" required', configured)
+            with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+                handle.write("LOCAL_WHATSAPP_PHONE=123\n")
+            short = self.daemon.render_connect_card(
+                base_state(id="whatsapp", state="idle"))
+            self.assertIn(
+                'aria-label="WhatsApp country calling code" required', short)
+            self.assertIn(
+                'aria-label="WhatsApp national phone number" required', short)
         waiting = self.daemon.render_connect_card(
             base_state(id="whatsapp", state="waiting", code="7JVT986A"))
+        self.assertIn("7JVT-986A", waiting)
         self.assertIn('data-copy="7JVT986A"', waiting)
         self.assertIn("Linked devices", waiting)
         self.assertNotIn('name="phone"', waiting)
+
+    def test_national_phone_number_is_rejected_without_replacing_saved_number(self):
+        with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+            handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+        status, body = self.post_start(self.serve(), "(415) 555-0123")
+        self.assertEqual(400, status)
+        self.assertIn("country calling code", body)
+        with open(self.daemon.ENV_FILE, encoding="utf-8") as handle:
+            self.assertEqual("LOCAL_WHATSAPP_PHONE=14155550100\n", handle.read())
+
+    def test_legacy_full_international_phone_number_is_saved_as_digits(self):
+        self.daemon.whatsapp_profile = lambda profile: ""
+        self.daemon.connect_start = lambda flow: {
+            "state": "waiting", "error": None,
+        }
+        status, _ = self.post_start(self.serve(), "+1 (415) 555-0123")
+        self.assertEqual(303, status)
+        saved = self.daemon.as_dict(self.daemon.load(self.daemon.ENV_FILE))
+        self.assertEqual("14155550123", saved["LOCAL_WHATSAPP_PHONE"])
+
+    def test_split_country_and_national_number_are_saved_as_digits(self):
+        self.daemon.whatsapp_profile = lambda profile: ""
+        self.daemon.connect_start = lambda flow: {
+            "state": "waiting", "error": None,
+        }
+        status, _ = self.post_start(self.serve(), "(415) 555-0123", "+1")
+        self.assertEqual(303, status)
+        saved = self.daemon.as_dict(self.daemon.load(self.daemon.ENV_FILE))
+        self.assertEqual("14155550123", saved["LOCAL_WHATSAPP_PHONE"])
+
+    def test_incomplete_split_phone_does_not_replace_saved_number(self):
+        with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+            handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+        for phone, country in (("", "+1"), ("4155550123", "1"),
+                               ("+14155550123", "+1"),
+                               ("415+5550123", "+1")):
+            with self.subTest(phone=phone, country=country):
+                status, body = self.post_start(self.serve(), phone, country)
+                self.assertEqual(400, status)
+                self.assertIn("country calling code", body)
+        with open(self.daemon.ENV_FILE, encoding="utf-8") as handle:
+            self.assertEqual("LOCAL_WHATSAPP_PHONE=14155550100\n", handle.read())
+
+    def test_blank_phone_keeps_the_saved_secret_fallback(self):
+        with open(self.daemon.ENV_FILE, "w", encoding="utf-8") as handle:
+            handle.write("LOCAL_WHATSAPP_PHONE=14155550100\n")
+        self.daemon.whatsapp_profile = lambda profile: ""
+        self.daemon.connect_start = lambda flow: {
+            "state": "waiting", "error": None,
+        }
+        status, _ = self.post_start(self.serve(), "")
+        self.assertEqual(303, status)
+        saved = self.daemon.as_dict(self.daemon.load(self.daemon.ENV_FILE))
+        self.assertEqual("14155550100", saved["LOCAL_WHATSAPP_PHONE"])
 
     def test_connected_status_requires_live_bridge(self):
         class Proc:
@@ -534,14 +661,40 @@ class ReloginRestartTest(unittest.TestCase):
         self.daemon.connect_signed_in(gh)
         self.assertEqual(self.killed, [])
 
-    def test_notice_shows_on_the_signed_in_card(self):
+    def test_notice_is_page_feedback_not_card_content(self):
         self.add("main")
         notice = self.restart()
         self.assertEqual(self.daemon.relogin_notice("claude"), notice)
-        page = self.daemon.render_connect_card(
-            base_state(state="connected", notice=notice))
-        self.assertIn("Restarted 1 session so it uses the new sign-in: main.", page)
-        self.assertIn(" open", page)
+        state = base_state(state="connected", notice=notice)
+        page = self.daemon.render_connect_card(state)
+        self.assertNotIn(notice, page)
+        self.assertNotIn(" open", page)
+
+        self.daemon.read_keys = lambda: set()
+        self.daemon.tmux_sessions = lambda: (True, set())
+        self.daemon.connect_state = lambda *_args, **_kwargs: state
+        section, feedback = self.daemon.render_connect([self.flow])
+        self.assertNotIn(notice, section)
+        self.assertEqual(feedback, [("claude", notice)])
+        self.assertEqual(self.daemon.take_connect_feedback(feedback), notice)
+        self.assertIsNone(self.daemon.relogin_notice("claude"))
+
+    def test_connection_poll_morphs_page_feedback_with_the_card(self):
+        self.assertIn(
+            'applyRefreshDoc(parseHTML(t), ["connect-list"])',
+            self.daemon.SCRIPT,
+        )
+        self.assertEqual(
+            self.daemon.SCRIPT.count(
+                'applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"])'),
+            2,
+        )
+        self.assertIn('doc.querySelector("#msg-slot .msg")', self.daemon.SCRIPT)
+
+    def test_only_manually_opened_folds_veto_server_close(self):
+        self.assertIn("var manuallyOpenFolds = new WeakSet();", self.daemon.SCRIPT)
+        self.assertIn("manuallyOpenFolds.has(node)", self.daemon.SCRIPT)
+        self.assertIn("manuallyOpenFolds.add(fold)", self.daemon.SCRIPT)
 
 if __name__ == "__main__":
     unittest.main()

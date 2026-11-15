@@ -15,12 +15,12 @@ import time
 from urllib.request import urlopen
 
 
-REV = "52059e30642be1b0ee04c8f4401d21c7d932fc67"
+REV = "cd70050eaca87cd45bf936cd87b0dbd18ab41fd2"
 FILES = {
-    "bridge.mjs": "1526b8e2b4784edb95a6a5f3a9337d5e19e0821c83ae522353965023d1e90d9a",
-    "state.mjs": "4f5125000fbb44b43c9dc7909ee293c61b5c3a6ae44f83620bd506470344e81b",
-    "package.json": "2ee16b0da02a289bf68d71811c39f51e27a2f16e9a810690b69c3091fab28df1",
-    "package-lock.json": "d030965125393662c5effbea6e25c98512e9fd29e470343010096ec413096110",
+    "bridge.mjs": "c76883483a33b5b1e6cf31b8fbb2dede119cd22888b0d239f74f4c39a097d302",
+    "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
+    "package.json": "8dda2da5443512104027d3905e14cf24def81ab240a12d6aea6799fb15dea200",
+    "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"

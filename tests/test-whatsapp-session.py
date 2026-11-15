@@ -38,7 +38,14 @@ class WhatsAppSessionTest(unittest.TestCase):
                                 "esac\n")
         self.profile.chmod(0o700)
         self.capacity = self.home / "capacity"
-        self.capacity.write_text("#!/bin/sh\nexit 0\n")
+        self.capacity_log = self.home / "capacity.log"
+        self.capacity.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$CAPACITY_LOG\"\n"
+            "if [ \"${CAPACITY_FAIL:-0}\" = 1 ]; then\n"
+            "  echo 'Session limit reached' >&2\n"
+            "  exit 75\n"
+            "fi\n")
         self.capacity.chmod(0o700)
         self.env = dict(os.environ, HOME=str(self.home),
                         AGENT_BOX_AGENTS="claude codex shell",
@@ -46,6 +53,7 @@ class WhatsAppSessionTest(unittest.TestCase):
                         AGENT_BOX_SESSIONS_FILE=str(self.registry),
                         AGENT_BOX_PROFILE_BIN=str(self.profile),
                         AGENT_BOX_CAPACITY_BIN=str(self.capacity),
+                        CAPACITY_LOG=str(self.capacity_log),
                         REGISTRY_FLOCK=shutil.which("flock") or "")
 
     def run_cli(self, *args):
@@ -83,6 +91,36 @@ class WhatsAppSessionTest(unittest.TestCase):
         self.assertIn("not supported", result.stderr)
         self.assertFalse(json.loads(self.registry.read_text())
                          ["sessions"]["shell1"].get("whatsapp", False))
+
+    def test_activate_revives_the_selected_stopped_session(self):
+        self.assertEqual(0, self.run_cli("select", "codex1").returncode)
+        activated = self.run_cli("activate", "codex1")
+        self.assertEqual(0, activated.returncode, activated.stderr)
+        self.assertEqual({"name": "codex1", "harness": "codex",
+                          "activated": True}, json.loads(activated.stdout))
+        session = json.loads(self.registry.read_text())["sessions"]["codex1"]
+        self.assertNotIn("stopped", session)
+        self.assertIn("check", self.capacity_log.read_text())
+
+    def test_activate_is_idempotent_for_a_running_target(self):
+        self.assertEqual(0, self.run_cli("select", "claude1").returncode)
+        activated = self.run_cli("activate", "claude1")
+        self.assertEqual(0, activated.returncode, activated.stderr)
+        self.assertFalse(json.loads(activated.stdout)["activated"])
+        self.assertFalse(self.capacity_log.exists())
+
+    def test_activate_refuses_an_unselected_or_unadmitted_target(self):
+        unselected = self.run_cli("activate", "codex1")
+        self.assertEqual(2, unselected.returncode)
+        self.assertIn("not the selected WhatsApp target", unselected.stderr)
+
+        self.assertEqual(0, self.run_cli("select", "codex1").returncode)
+        self.env["CAPACITY_FAIL"] = "1"
+        refused = self.run_cli("activate", "codex1")
+        self.assertEqual(75, refused.returncode)
+        self.assertIn("Session limit reached", refused.stderr)
+        self.assertTrue(json.loads(self.registry.read_text())
+                        ["sessions"]["codex1"]["stopped"])
 
 
 if __name__ == "__main__":

@@ -11,6 +11,9 @@
 # href (issue 56): Chrome answers the basic-auth challenge with URL
 # userinfo + an EMPTY password, and credentials typed into the
 # prompt cannot override the URL-embedded identity.
+# The __Host- auth cookie uses Path=/, Secure, and NO Domain attribute so
+# browsers scope it to this exact box hostname. Never add Domain: sibling
+# boxes commonly share a DNS suffix.
 handle {
   # A live portal session (issue #541) reaches this exactly as a
   # basic-auth login does. forward_auth is stock caddy -- part of

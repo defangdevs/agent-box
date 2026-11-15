@@ -33,7 +33,9 @@ DAEMON = (REPO / "tests" / "golden" / "web" / "payloads"
           / "agent-box-settings" / "bin" / "agent-box-settings")
 
 ROW_KEYS = {"name", "agent", "profile", "state", "exit_status", "origin",
-            "remote_control", "remote_control_name", "working_directory",
+            "remote_control", "remote_control_daemon", "remote_control_server",
+            "remote_control_name",
+            "working_directory",
             "ephemeral", "created_at", "hook"}
 SECRET = "TASK-TEXT-NEVER-EXPOSED"
 
@@ -58,6 +60,7 @@ def daemon_with(**env):
 
 def entry(**fields):
     base = {"agent": "claude", "skipPermissions": True, "remoteControl": True,
+            "remoteControlServer": False,
             "remoteControlName": None, "workingDirectory": None,
             "extraArgs": ["--model", SECRET], "profile": None,
             "initialPrompt": SECRET, "resumePrompt": SECRET,
@@ -163,11 +166,11 @@ class SessionsApi(unittest.TestCase):
     def test_states_and_capacity(self):
         self.limit = 2
         self.write({
-            "a-run": entry(),
-            "b-died": entry(died=7),
-            "c-stop": entry(stopped=True),
-            "d-wait": entry(),
-            "e-over": entry(),
+            "a-run": entry(origin="webhook"),
+            "b-died": entry(died=7, origin="webhook"),
+            "c-stop": entry(stopped=True, origin="webhook"),
+            "d-wait": entry(origin="webhook"),
+            "e-over": entry(origin="webhook"),
         })
         self.live = {"a-run", "b-died"}
         data, _ = self.listing()
@@ -186,6 +189,10 @@ class SessionsApi(unittest.TestCase):
         row = self.by_name()["old"]
         self.assertIsNone(row["origin"])
         self.assertIsNone(row["created_at"])
+
+    def test_claude_server_mode_is_explicit_metadata(self):
+        self.write({"remote": entry(remoteControlServer=True)})
+        self.assertTrue(self.by_name()["remote"]["remote_control_server"])
         self.write({"odd": entry(origin="somewhere-else")})
         self.assertIsNone(self.by_name()["odd"]["origin"])
 
@@ -211,18 +218,30 @@ class SessionsApi(unittest.TestCase):
 
     def test_shell_pane_is_unmetered_and_not_queued(self):
         self.limit = 1
-        self.write({"worker": entry(), "terminal": entry(agent="shell")})
+        self.write({"worker": entry(origin="webhook"), "terminal": entry(agent="shell")})
         self.live = {"worker"}
         data, _ = self.listing()
         states = {s["name"]: s["state"] for s in data["sessions"]}
         self.assertEqual(states, {"worker": "running", "terminal": "starting"})
         self.assertEqual(data["capacity"], {"used": 1, "limit": 1})
 
+    def test_manual_pending_sessions_start_above_full_hook_limit(self):
+        self.limit = 1
+        self.write({"hook-busy": entry(origin="webhook"),
+                    "manual": entry(origin="user"), "legacy": entry(),
+                    "hook-wait": entry(origin="webhook")})
+        self.live = {"hook-busy"}
+        data, _ = self.listing()
+        self.assertEqual({row["name"]: row["state"] for row in data["sessions"]},
+                         {"hook-busy": "running", "manual": "starting",
+                          "legacy": "starting", "hook-wait": "queued"})
+        self.assertEqual(data["capacity"], {"used": 2, "limit": 1})
+
     # --- POST /sessions/stop --------------------------------------------
 
     def test_stop_parks_frees_the_slot_and_keeps_the_entry(self):
         self.limit = 1
-        self.write({"claude": entry()})
+        self.write({"claude": entry(origin="webhook")})
         self.live = {"claude"}
         self.assertEqual(self.listing()[0]["capacity"]["used"], 1)
         status, _, _ = self.request("/sessions/stop", "POST", name="claude")
@@ -267,7 +286,8 @@ class SessionsApi(unittest.TestCase):
 
     def test_restart_revives_or_503s_when_full(self):
         self.limit = 1
-        self.write({"a": entry(), "b": entry(stopped=True)})
+        self.write({"a": entry(origin="webhook"),
+                    "b": entry(stopped=True, origin="webhook")})
         self.live = {"a"}
         status, body, _ = self.request("/sessions/restart", "POST",
                                        json_accept=True, name="b")

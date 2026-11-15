@@ -133,6 +133,10 @@ in
     # route the settings page uses — a sibling form, since a <form> inside
     # the tab <a> would be invalid markup. The two-click arming that keeps
     # a stray click from killing a session is client-side (tests/e2e).
+    # The wrapper id is the DOM morph key. It keeps a removed tab's focused
+    # close button from being reused for another session with its client-only
+    # "Close?" text still attached (issue 579).
+    assert '<span class="tab-wrap" id="tab-wrap-main">' in root_page, root_page
     assert '<form class="tab-close" method="post" action="/sessions/delete">' in root_page, root_page
     assert 'class="tab-x" data-close="main" aria-label="Close main"' in root_page, root_page
 

@@ -323,6 +323,19 @@ case "$cmd" in
   set)
     name="${1:-}"; shift || true
     valid_name "$name" || { echo "invalid profile name '$name' (letters, digits, '_' and '-', at most $NAME_MAX characters)" >&2; exit 2; }
+    # Reserved for the daemon pseudo-profiles `agent-box-session add --profile`
+    # resolves itself (issue #942); a file by that name would be shadowed.
+    case "$name" in
+      (*-daemon)
+        for _h in $HARNESSES; do
+          # Only a NEW profile is refused: an existing file of that name keeps
+          # working and stays editable until its owner renames it.
+          if [ "$name" = "$_h-daemon" ] && [ ! -f "$(file_for "$name")" ]; then
+            echo "'$name' is reserved for the $name pseudo-profile (agent-box-session add --profile $name); pick another name" >&2
+            exit 2
+          fi
+        done ;;
+    esac
     [ $# -gt 0 ] || { usage >&2; exit 2; }
     # Validate every assignment BEFORE writing any of them: a `set` that
     # stored the first two of three pairs and then failed would leave a

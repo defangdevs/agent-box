@@ -412,6 +412,13 @@ in
         # leaving the session profile-less (issue #623) - a second claude
         # session added from the picker afterwards then has one to pick.
         assert claude_session["profile"] == "claude", claude_session
+        # A successful sign-in also fills an EMPTY default (issue #818), so
+        # profile-driven entry points such as WhatsApp can start a worker
+        # without a separate visit to the Profiles panel.
+        default_profile = machine.succeed(
+            as_agent("agent-box-profile default")
+        ).strip()
+        assert default_profile == "claude", default_profile
 
     with subtest("the card shows the code the CLI printed, not its prose"):
         assert post("/agent/settings/connect/start", "flow=github") == "303"
@@ -575,7 +582,19 @@ in
         notice = state("claude")["notice"] or ""
         assert "Restarted 1 session" in notice and "claude" in notice, got
         assert "keyed (uses ANTHROPIC_API_KEY)" in notice, notice
-        assert "Restarted 1 session" in get("/agent/settings/")
+        # The browser keeps the start redirect's query while connectPoll runs;
+        # the completion feedback must replace that stale acknowledgement.
+        settings_html = get("/agent/settings/?ok=connect_started")
+        banner = "Restarted 1 session so it uses the new sign-in: claude."
+        visible_banner = f'<span class="msg-text">{banner}'
+        assert settings_html.count(visible_banner) == 1, settings_html
+        connections_at = settings_html.index('id="connections"')
+        assert settings_html.index(banner) < connections_at, settings_html
+        assert banner not in settings_html[connections_at:], settings_html
+        # It is flash feedback, not durable panel state: after one page
+        # render has surfaced it, a later live morph must not resurrect a
+        # banner the operator already dismissed.
+        assert banner not in get("/agent/settings/")
         machine.succeed(as_agent("agent-box-session rm keyed"))
         machine.succeed(as_agent("agent-box-profile rm keyed"))
 

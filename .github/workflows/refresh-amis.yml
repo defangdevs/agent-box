@@ -45,7 +45,23 @@ jobs:
           gh pr create --base "$GITHUB_REF_NAME" --head "$branch" \
             --title "Refresh NixOS AMI map (26.05)" \
             --body "Automated weekly AMI map refresh."
-          gh pr merge "$branch" --squash --delete-branch
+          # master now requires CI gate, AWS/Azure template gates, CodeRabbit
+          # and SonarCloud. A PR opened with GITHUB_TOKEN triggers no
+          # pull_request workflows, so those gates never report and an
+          # immediate merge is refused ("base branch policy prohibits the
+          # merge", run 42653103734). Dispatch the gating workflows on the
+          # branch: their check runs attach to the PR's head commit.
+          for wf in ci.yml aws-ci.yml azure-ci.yml; do
+            gh workflow run "$wf" --ref "$branch"
+          done
+          gh pr merge "$branch" --squash --delete-branch --auto
+          for _ in $(seq 1 120); do
+            state=$(gh pr view "$branch" --json state --jq .state)
+            [ "$state" = MERGED ] && break
+            [ "$state" = CLOSED ] && { echo "PR closed unmerged"; exit 1; }
+            sleep 30
+          done
+          [ "$state" = MERGED ] || { echo "PR not merged after 60 min"; exit 1; }
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
       # master's "Require conversation resolution" ruleset (21491459, added

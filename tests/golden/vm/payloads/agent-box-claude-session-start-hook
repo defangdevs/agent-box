@@ -1,6 +1,9 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
 set -u
-# SessionStart hook for supervisor-spawned claude sessions (issue #223).
+# SessionStart hook for supervisor-spawned Claude and Codex sessions
+# (issues #223, #825). Codex's system config also uses this recorder: its
+# native id cannot be chosen up front, and a prompt-less session has no
+# launch marker in its conversation. Both hook payloads carry session_id.
 # A clear, a compact or a resume rotates claude's live session id
 # mid-process: the running process keeps its Remote Control registration but
 # opens a NEW transcript under a new uuid, while the supervisor still holds
@@ -24,10 +27,42 @@ valid_uuid() {
   esac
   return 1
 }
+codex_process_matches() {
+  # Tool shells inherit the launch id. Only the nearest Codex owner may
+  # update it; a nested `codex exec` has its own pid and must not replace
+  # the terminal's conversation. exec-server is a transport child, not a
+  # conversation owner. The launch wrapper sets the pid just before exec.
+  local expected="${AGENT_BOX_CODEX_PID:-}" parent=$PPID next key value rest n binary
+  local -a args
+  case "$expected" in (""|*[!0-9]*) return 1 ;; esac
+  for ((n = 0; n < 64; n++)); do
+    [ "$parent" -gt 1 ] || return 1
+    mapfile -d '' -t args 2>/dev/null < "/proc/$parent/cmdline" || return 1
+    binary="${args[0]:-}"
+    case "${binary##*/}" in
+      codex|.codex-wrapped)
+        if [ "${args[1]:-}" != exec-server ]; then
+          [ "$parent" = "$expected" ]
+          return
+        fi
+        ;;
+    esac
+    next=""
+    while read -r key value rest; do
+      if [ "$key" = PPid: ]; then next=$value; break; fi
+    done 2>/dev/null < "/proc/$parent/status"
+    case "$next" in (""|*[!0-9]*) return 1 ;; esac
+    parent=$next
+  done
+  return 1
+}
 # Drain stdin BEFORE any gate can exit (the #220/#222 lesson): claude is
 # still writing the payload, and an early exit would slam the pipe shut
 # under it. Unreachable-in-practice gates are exactly the ones that bite.
 payload="$(cat 2>/dev/null)" || payload=""
+if [ "${1:-}" = codex ]; then
+  codex_process_matches || exit 0
+fi
 box="${AGENT_BOX_SESSION_ID:-}"
 valid_uuid "$box" || exit 0
 sid="$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)" || exit 0

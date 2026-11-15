@@ -15,6 +15,10 @@ Claude Code or Codex.
   Most of this document describes it; the Lightsail section covers what
   differs.
 
+The reason Lightsail defaults to native Ubuntu while EC2 retains a NixOS
+appliance path is recorded in the shared
+[deployment-model decision](../../docs/deployment-model.md).
+
 ## What the template does
 
 - Provisions its own VPC (10.42.0.0/16) with an Amazon-provided IPv6 CIDR,
@@ -247,9 +251,14 @@ that immediately fails cert validation.
 `sslip.io` is itself open source ([cunnie/sslip.io](https://github.com/cunnie/sslip.io))
 and self-hostable, so a deployment that does not want the third-party
 dependency at all can run its own copy under its own domain. The
-`SslipDomain` parameter (default `sslip.io`) is the suffix the hostname
-is derived under, on both templates - point it at a self-hosted instance
-to whitelabel the URL entirely (issue #647).
+`SslipDomains` parameter (default `sslip.io`) accepts a comma-separated list
+on both templates. The first suffix remains the primary hostname; later
+suffixes are on-demand certificate aliases that redirect to it. Keeping that
+primary shape preserves in-place CloudFormation updates and the IPv6-only EC2
+path, where a public IP certificate is unavailable. Add a self-hosted
+instance's suffix to accept both names (issue #647). The deprecated
+`SslipDomain` parameter remains a single-value override for existing launch
+integrations.
 
 ### CloudFormation quick-create requires an S3 template URL
 
@@ -578,14 +587,44 @@ commit if anything changed.
 CloudFormation's `templateURL` accepts only S3 URLs, so the templates live
 at `s3://defang-agent-box/lightsail-template.yaml` (the default Launch
 buttons) and `s3://defang-agent-box/template.yaml` (the EC2 alternative).
-`.github/workflows/publish-template.yml` uploads both on every push to
-`master` via GitHub OIDC (no static AWS keys).
+`.github/workflows/publish-template.yml` uploads both, plus the
+`release-manifest.json` that says what they pin, via GitHub OIDC (no static
+AWS keys).
+
+**It no longer runs on a push to `master`** (issue #632). Publishing was
+independent of CI and of the fresh-boot deploy test, and it re-resolved the
+nixos-unstable channel at publish time - so the box a Launch button creates
+had never been booted by anything, and its one mutable dependency was
+resolved after the last thing that could have tested it. Publishing is now
+the last phase of `.github/workflows/promote.yml`, which requires the three
+aggregate CI gates green for one exact commit, builds that candidate's
+release manifest ONCE, boots EC2 with those pins and Lightsail with the
+recorded flake reference, and only then calls this workflow with the same manifest. So a failed deployment test
+leaves the public defaults unchanged, and the templates always pin what was
+actually tested. See "Releases" in the repo's `AGENTS.md`, including how to
+roll back.
+
+To publish or roll back, dispatch `Promote a release candidate`. Publication
+has no standalone manual entry point. Re-promoting a release downloads and
+verifies its original manifest; it does not resolve the channel again or
+replace the recorded release asset.
+
+The required Lightsail fresh-boot job creates one temporary Ubuntu instance
+with a static IP, waits for native activation, checks HTTPS authentication
+and the live browser terminal, then deletes the stack even on failure. It
+runs during promotion and on explicit test dispatches, rather than on every
+push. The test role needs the Lightsail create/read/delete permissions for
+the instance and static IP (including attaching and detaching the static
+IP), plus CloudFormation list/describe/create/delete
+permissions. A missing IAM grant fails promotion. For diagnostics without
+running EC2, dispatch `Deploy test` with `lightsail_only` selected.
 
 ### Prerequisites (forking this repo)
 
 The workflow is self-bootstrapping - it upserts the bucket, its
 public-access configuration, and an `s3:GetObject` policy scoped to the two
-template objects (the only objects in the bucket) every run. The module itself
+template objects plus `release-manifest.json` (the only objects in the
+bucket) every run. The module itself
 is fetched by the box direct from `raw.githubusercontent.com` at first boot;
 that host is dual-stack, so an IPv6-only box needs no NAT64. It reads all
 deploy config from **repo-level Actions variables** (Settings > Secrets and
@@ -613,18 +652,24 @@ The GitHub environment listed in `AGENT_BOX_ENVIRONMENT` must exist - create it
 via `gh api --method PUT repos/<owner>/<repo>/environments/<name>` or the
 repo settings UI. No secrets attached; it's just the deployment gate.
 
-Verify with a `workflow_dispatch` run of `Publish CFN template to S3`, then:
+Verify by dispatching `Promote a release candidate` (the publish workflow
+no longer has its own `workflow_dispatch` trigger), then:
 
 ```bash
 curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/lightsail-template.yaml"
 curl -I "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/template.yaml"
+# what the last COMPLETED publication pinned (not necessarily both current
+# templates: a failed upload can leave one template updated before this is written)
+curl -s "https://${AGENT_BOX_BUCKET}.s3.amazonaws.com/release-manifest.json"
 ```
 
 ## Pull request validation
 
-`.github/workflows/aws-ci.yml` runs on pull requests that touch the AWS
-templates, launch page, browser-terminal smoke helper, or related workflows. It
-does not create AWS resources; it runs
+`.github/workflows/aws-ci.yml` starts on every pull request. Its `AWS template
+gate` check is always reported, so it is the one to require; the `validate`
+job itself only runs when a change touches the AWS templates, launch page,
+browser-terminal smoke helper, or related workflows (issue #632). It does not
+create AWS resources; when it runs, it runs
 `cfn-lint deploy/aws/template.yaml deploy/aws/lightsail-template.yaml` and compiles
 `scripts/ws_smoke.py` so template/auth-helper changes get fast PR feedback.
 

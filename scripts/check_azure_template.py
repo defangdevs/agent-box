@@ -87,6 +87,7 @@ HOSTILE_AGENTSMD = "x\nAGENTBOX_AGENTSMD\ntouch /tmp/pwned\n@@WEBPASSWORD@@\n"
 # has no character constraint for a string parameter, and these two are
 # validated and decoded by the bootstrap itself rather than the template).
 PORTAL_ISSUER_SAMPLE = "https://station.example.com"
+PORTAL_REDIRECT_SAMPLE = "https://station.example.com/app/stations/42?a=1&b=2#connect"
 PORTAL_USER_SAMPLE = "usr_2Nk9x"
 PUBLIC_IP_SAMPLE = "203.0.113.7"
 DOMAIN_SAMPLE = PUBLIC_IP_SAMPLE
@@ -99,11 +100,13 @@ SAMPLE = {
     "@@FLAKEREF@@": "github:defangdevs/agent-box/0123456789abcdef",
     "@@IMAGERUNTIME@@": "false",
     "@@USER@@": "agent",
-    "@@SSLIPDOMAINB64@@": base64.b64encode(b"sslip.example.com").decode(),
+    "@@SSLIPDOMAINSB64@@": base64.b64encode(
+        b'["sslip.io","defangstation.com"]').decode(),
     "@@AGENTSMDB64@@": base64.b64encode(HOSTILE_AGENTSMD.encode()).decode(),
     "@@WEBPASSWORD@@": base64.b64encode(HOSTILE_PASSWORD.encode()).decode(),
     "@@PORTALISSUERB64@@": base64.b64encode(
         PORTAL_ISSUER_SAMPLE.encode()).decode(),
+    "@@PORTALREDIRECTURLB64@@": base64.b64encode(PORTAL_REDIRECT_SAMPLE.encode()).decode(),
     "@@PORTALUSERIDB64@@": base64.b64encode(
         PORTAL_USER_SAMPLE.encode()).decode(),
     "@@PUBLICIPB64@@": base64.b64encode(PUBLIC_IP_SAMPLE.encode()).decode(),
@@ -116,17 +119,18 @@ SAMPLE = {
 # webPassword has no default: it is the one field the form always demands.
 # A `...B64@@` marker's default is base64-encoded by defaults_render below,
 # matching what the template's own base64(...) call does at deploy time --
-# sslipDomain's empty default means the primary IP URL has no DNS alias.
+# sslipDomains is JSON before it is base64-encoded by the template.
 DEFAULT_OF = {
     "@@NIXINSTALLER@@": "nixInstallerUrl",
     "@@FLAKEREF@@": "agentBoxFlakeRef",
     "@@IMAGERUNTIME@@": "imageIncludesRuntime",
     "@@USER@@": "userName",
-    "@@SSLIPDOMAINB64@@": "sslipDomain",
+    "@@SSLIPDOMAINSB64@@": "sslipDomains",
     "@@AGENTSMDB64@@": "agentsMd",
     # Both default to '' -- handover off, which is the default box.
     "@@PORTALISSUERB64@@": "portalIssuer",
     "@@PORTALUSERIDB64@@": "portalUser",
+    "@@PORTALREDIRECTURLB64@@": "portalRedirectUrl",
 }
 
 
@@ -206,6 +210,12 @@ def render_bootstrap(template: dict, values: dict | None = None) -> str:
     return script
 
 
+def resources(template: dict):
+    """ARM 1.x arrays and 2.0 symbolic resource maps."""
+    entries = template.get("resources", [])
+    return entries.values() if isinstance(entries, dict) else entries
+
+
 def bootstrap_chain(template: dict) -> str:
     """The compiled expression that substitutes and encodes the bootstrap.
 
@@ -217,7 +227,7 @@ def bootstrap_chain(template: dict) -> str:
     chain = template.get("variables", {}).get("bootstrap")
     if chain:
         return chain
-    for resource in template.get("resources", []):
+    for resource in resources(template):
         if resource.get("type") != "Microsoft.Compute/virtualMachines/extensions":
             continue
         script = (resource.get("properties", {}).get("protectedSettings", {})
@@ -278,10 +288,13 @@ def check_static_domain(template: dict) -> int:
     script = template.get("variables", {}).get("bootstrapTemplate", "")
     chain = bootstrap_chain(template)
     web_url = template.get("outputs", {}).get("webUrl", {}).get("value", "")
-    sslip_url = template.get("outputs", {}).get("sslipUrl", {}).get("value", "")
+    alias_urls = template.get("outputs", {}).get("aliasUrls", {}).get("value", "")
     sslip_default = (template.get("parameters", {}).get("sslipDomain", {})
                      .get("defaultValue"))
-    public_ip_ref = "reference(resourceId('Microsoft.Network/publicIPAddresses'"
+    domains_default = (template.get("parameters", {}).get("sslipDomains", {})
+                       .get("defaultValue"))
+    public_ip_ref = ("reference('publicIp')" if template.get("languageVersion") == "2.0"
+                     else "reference(resourceId('Microsoft.Network/publicIPAddresses'")
     failures = []
     if "--settle-delay" in script:
         failures.append("bootstrap still requests an avoidable settle delay")
@@ -295,10 +308,12 @@ def check_static_domain(template: dict) -> int:
         failures.append("webUrl is not derived from Azure's allocated Public IP")
     if "parameters('sslipDomain')" in web_url:
         failures.append("webUrl still depends on the optional DNS alias")
-    if "if(empty(parameters('sslipDomain'))" not in sslip_url:
-        failures.append("sslipUrl is not empty when no alias is configured")
+    if "variables('effectiveSslipDomains')" not in alias_urls:
+        failures.append("aliasUrls is not derived from the effective suffix list")
     if sslip_default != "":
-        failures.append("sslipDomain must default to no DNS alias")
+        failures.append("legacy sslipDomain must default to empty")
+    if domains_default != ["sslip.io"]:
+        failures.append("sslipDomains must default to [sslip.io]")
     if failures:
         print("FAIL: static Azure domain wiring:\n       "
               + "\n       ".join(failures), file=sys.stderr)
@@ -321,7 +336,9 @@ def defaults_render(template: dict) -> dict:
         if "defaultValue" in params[name]:
             default = params[name]["defaultValue"]
             if marker.endswith("B64@@"):
-                values[marker] = base64.b64encode(default.encode()).decode()
+                raw = (json.dumps(default, separators=(",", ":"))
+                       if isinstance(default, list) else default)
+                values[marker] = base64.b64encode(raw.encode()).decode()
             elif isinstance(default, bool):
                 # ARM's string(bool) replacement emits lowercase shell booleans.
                 values[marker] = str(default).lower()
@@ -434,7 +451,7 @@ def check_bootstrap(template: dict, values: dict, label: str) -> int:
 
 
 PORTAL_BLOCK = re.compile(
-    r"(install -d -m 0755 /etc/agent-box\n.*?/etc/agent-box/config\.yaml)"
+    r"(install -d -m 0755 /etc/agent-box\n.*?)"
     r"\n\n# Extra standing instructions", re.S)
 
 
@@ -457,10 +474,12 @@ def extract_portal_block(script: str) -> str:
 def run_portal_block(
     block: str, workdir: Path, issuer_b64: str, user_b64: str,
     sslip_b64: str, public_ip: str = PUBLIC_IP_SAMPLE,
+    redirect_url: str = PORTAL_REDIRECT_SAMPLE,
 ) -> subprocess.CompletedProcess:
     text = block.replace("@@PORTALISSUERB64@@", issuer_b64)
     text = text.replace("@@PORTALUSERIDB64@@", user_b64)
-    text = text.replace("@@SSLIPDOMAINB64@@", sslip_b64)
+    text = text.replace("@@PORTALREDIRECTURLB64@@", b64(redirect_url))
+    text = text.replace("@@SSLIPDOMAINSB64@@", sslip_b64)
     text = text.replace("@@PUBLICIPB64@@", b64(public_ip))
     text = text.replace("/etc/agent-box", str(workdir))
     return subprocess.run(
@@ -471,7 +490,7 @@ def b64(value: str) -> str:
     return base64.b64encode(value.encode()).decode()
 
 
-SSLIP_DOMAIN_SAMPLE = "sslip.example.com"
+SSLIP_DOMAINS_SAMPLE = ["sslip.io", "defangstation.com"]
 
 
 def check_written_config(template: dict) -> int:
@@ -499,25 +518,25 @@ def check_written_config(template: dict) -> int:
     rc = 0
     cases = {
         "handover on": (
-            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAINS_SAMPLE,
             PUBLIC_IP_SAMPLE, True),
         "handover off": (
-            "", "", "", PUBLIC_IP_SAMPLE, True),
+            "", "", [], PUBLIC_IP_SAMPLE, True),
         # '&' is IN portalIssuer's allowed character class (a query string
         # may have one) but is sed replacement-text magic -- unescaped, this
         # is exactly the input that used to splice the placeholder into
         # config.yaml instead of the URL.
         "handover on, ampersand": (
             "https://station.example.com/cb?a=1&b=2", PORTAL_USER_SAMPLE,
-            SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, True),
+            SSLIP_DOMAINS_SAMPLE, PUBLIC_IP_SAMPLE, True),
         "invalid issuer (not https)": (
             "http://station.example.com", PORTAL_USER_SAMPLE,
-            SSLIP_DOMAIN_SAMPLE, PUBLIC_IP_SAMPLE, False),
+            SSLIP_DOMAINS_SAMPLE, PUBLIC_IP_SAMPLE, False),
         "invalid user (space)": (
-            PORTAL_ISSUER_SAMPLE, "usr with space", SSLIP_DOMAIN_SAMPLE,
+            PORTAL_ISSUER_SAMPLE, "usr with space", SSLIP_DOMAINS_SAMPLE,
             PUBLIC_IP_SAMPLE, False),
         "invalid sslip domain (space)": (
-            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, "not a domain",
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, ["not a domain"],
             PUBLIC_IP_SAMPLE, False),
         # The value a raw (non-base64) substitution used to let close the
         # quoted heredoc: a newline plus the literal delimiter, followed by a
@@ -527,17 +546,18 @@ def check_written_config(template: dict) -> int:
         # reach the shell at all, not merely that this one payload fails.
         "sslip domain injection (newline closes heredoc)": (
             PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE,
-            "evil.example.com\nAGENTBOX_CONFIG\ntouch /tmp/pwned\ncat <<EOF",
+            ["evil.example.com\nAGENTBOX_CONFIG\ntouch /tmp/pwned\ncat <<EOF"],
             PUBLIC_IP_SAMPLE, False),
         "invalid public IP (shell syntax)": (
-            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAIN_SAMPLE,
+            PORTAL_ISSUER_SAMPLE, PORTAL_USER_SAMPLE, SSLIP_DOMAINS_SAMPLE,
             "203.0.113.7; touch /tmp/pwned", False),
     }
     for label, (issuer, user, sslip, public_ip, should_succeed) in cases.items():
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
             done = run_portal_block(
-                block, workdir, b64(issuer), b64(user), b64(sslip), public_ip)
+                block, workdir, b64(issuer), b64(user),
+                b64(json.dumps(sslip, separators=(",", ":"))), public_ip)
             if should_succeed and done.returncode != 0:
                 print("FAIL: %s: the portal block refused a valid value:\n%s"
                       % (label, done.stderr), file=sys.stderr)
@@ -572,11 +592,11 @@ def check_written_config(template: dict) -> int:
                       % (label, data), file=sys.stderr)
                 rc = 1
                 continue
-            alias = (public_ip.replace(".", "-") + "." + sslip
-                     if sslip else "")
-            if web.get("alias") != alias:
-                print("FAIL: %s: web.alias landed as %r, wanted %r"
-                      % (label, web.get("alias"), alias),
+            aliases = [public_ip.replace(".", "-") + "." + suffix
+                       for suffix in sslip]
+            if web.get("aliases") != aliases:
+                print("FAIL: %s: web.aliases landed as %r, wanted %r"
+                      % (label, web.get("aliases"), aliases),
                       file=sys.stderr)
                 rc = 1
                 continue
@@ -584,6 +604,12 @@ def check_written_config(template: dict) -> int:
                 print("FAIL: %s: domain landed as %r, wanted %r"
                       % (label, data.get("domain"), DOMAIN_SAMPLE),
                       file=sys.stderr)
+                rc = 1
+                continue
+            if web.get("portalRedirectUrl") != PORTAL_REDIRECT_SAMPLE:
+                print("FAIL: %s: portalRedirectUrl landed as %r, wanted %r"
+                      % (label, web.get("portalRedirectUrl"),
+                         PORTAL_REDIRECT_SAMPLE), file=sys.stderr)
                 rc = 1
                 continue
             got = (web.get("portalIssuer"), u.get("portalUser"))
@@ -597,6 +623,29 @@ def check_written_config(template: dict) -> int:
                 continue
             print("OK: config.yaml (%s) parses and declares what it should"
                   % label)
+    for target in ("", PORTAL_REDIRECT_SAMPLE,
+                   "https://station.example.com/@DOMAIN@/@MANAGED_BY@?x=@PORTALUSERID@",
+                   "http://localhost:3000/app/stations/42", "https://[::1]:8443/app/42",
+                   "javascript:alert(1)", "https://x.test/'bad",
+                   "https://x.test/\nAGENTBOX_CONFIG\ntouch /tmp/pwned"):
+        valid = target == "" or (target.startswith(("https://", "http://"))
+                                  and "'" not in target and "\n" not in target)
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            done = run_portal_block(block, workdir, b64(PORTAL_ISSUER_SAMPLE),
+                                    b64(PORTAL_USER_SAMPLE), b64("[]"),
+                                    redirect_url=target)
+            data = parsed_config(workdir)
+            if valid:
+                if (done.returncode or data["web"].get("portalRedirectUrl", "") != target
+                        or (not target and "portalRedirectUrl" in data["web"])):
+                    print("FAIL: redirect URL did not survive bootstrap:", repr(target),
+                          done.stderr, file=sys.stderr)
+                    rc = 1
+            elif done.returncode == 0 or data is not None:
+                print("FAIL: unsafe redirect URL reached config.yaml:", repr(target),
+                      file=sys.stderr)
+                rc = 1
     return rc
 
 
@@ -633,7 +682,7 @@ def check_secrets(template: dict) -> int:
         return 1
 
     exposed = []
-    for res in template.get("resources", []):
+    for res in resources(template):
         if res.get("type") != "Microsoft.Compute/virtualMachines/extensions":
             continue
         props = res.get("properties", {})
@@ -661,6 +710,88 @@ def check_secrets(template: dict) -> int:
     return 0
 
 
+def check_recovery_defaults(template: dict) -> int:
+    """A browser password must be the only required deployment credential."""
+    params = template["parameters"]
+    recovery = params["adminPasswordOrKey"]
+    failures = []
+    if params["authenticationType"].get("defaultValue") != "password":
+        failures.append("default authentication still requires an SSH key")
+    if recovery.get("type") != "securestring":
+        failures.append("recovery credential is not a securestring")
+    if recovery.get("defaultValue") != "":
+        failures.append("portal recovery field must be empty and optional")
+    deployment = template["resources"]["recoveryPassword"]["properties"]
+    if deployment.get("parameters"):
+        failures.append("internal generated password must not be supplied by the portal")
+    generator = deployment["template"]
+    seed = generator["parameters"]["generatedPassword"]
+    if (seed.get("type") != "securestring"
+            or seed.get("defaultValue") != "[format('Ab1!{0}', newGuid())]"):
+        failures.append("internal recovery password is not securely generated")
+    output = generator["outputs"]["password"]
+    if (output.get("type") != "securestring"
+            or output.get("value") != "[parameters('generatedPassword')]"):
+        failures.append("internal recovery output is not protected")
+    if "defaultValue" in params["webPassword"]:
+        failures.append("browser password must still be supplied by the visitor")
+    if params["debugSsh"].get("defaultValue") is not False:
+        failures.append("SSH must remain closed by default")
+    public_outputs = json.dumps(template.get("outputs", {}))
+    if ("adminPasswordOrKey" in public_outputs
+            or "listOutputsWithSecureValues" in public_outputs):
+        failures.append("recovery credential is exposed in deployment outputs")
+    if "adminPasswordOrKey" in bootstrap_chain(template):
+        failures.append("recovery credential is being sent to the bootstrap")
+    vm = next(r for r in resources(template)
+              if r["type"] == "Microsoft.Compute/virtualMachines")
+    profile = vm["properties"]["osProfile"]
+    if profile.get("adminPassword") != (
+            "[if(variables('usePasswordAuth'), "
+            "if(variables('generateRecoveryPassword'), "
+            "listOutputsWithSecureValues('recoveryPassword', '2025-04-01').password, "
+            "parameters('adminPasswordOrKey')), null())]"):
+        failures.append("password authentication does not use the recovery credential")
+    if template["variables"].get("generateRecoveryPassword") != (
+            "[and(variables('usePasswordAuth'), "
+            "empty(parameters('adminPasswordOrKey')))]"):
+        failures.append("explicit recovery credentials must override generation")
+    if template["variables"].get("usePasswordAuth") != (
+            "[and(equals(parameters('authenticationType'), 'password'), "
+            "not(startsWith(parameters('adminPasswordOrKey'), 'ssh-')))]"):
+        failures.append("an ssh- value must be installed as a key, not a password")
+    linux = template["variables"]["linuxConfiguration"]
+    if "parameters('adminPasswordOrKey')" not in linux:
+        failures.append("explicit SSH key authentication no longer uses the supplied key")
+    if failures:
+        print("FAIL: Azure recovery defaults:\n       "
+              + "\n       ".join(failures), file=sys.stderr)
+        return 1
+    print("OK: only the browser password is required; recovery password is "
+          "generated, protected, and SSH stays closed.")
+    return 0
+
+
+def check_inbound_priorities() -> int:
+    # These conditional rules must coexist when both optional ports are on.
+    source = BICEP.read_text()
+    priorities = {}
+    for name in ("httpsRule", "sshRule", "emailIngressRules"):
+        block = re.search(r"(?ms)^var " + name + r"\b(.*?)(?=^var |\Z)", source)
+        value = re.search(r"\bpriority:\s*(\d+)", block[1]) if block else None
+        if not value:
+            print("FAIL: missing literal inbound priority for " + name, file=sys.stderr)
+            return 1
+        priority = int(value[1])
+        if priority in priorities:
+            print(f"FAIL: inbound priority {priority} is shared by {priorities[priority]} and {name}",
+                  file=sys.stderr)
+            return 1
+        priorities[priority] = name
+    print("OK: optional SSH and email ingress use distinct inbound priorities.")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
@@ -682,7 +813,9 @@ def main() -> int:
         check_bootstrap(template, SAMPLE, "hostile sample values"),
         check_bootstrap(template, defaults_render(template), "template defaults"),
         check_secrets(template),
+        check_recovery_defaults(template),
         check_written_config(template),
+        check_inbound_priorities(),
     )
     if not args.no_build:
         rc = max(rc, check_no_drift())

@@ -36,9 +36,22 @@ secret_key_exists() {
       >/dev/null 2>&1
 }
 
+# The dedicated keyring only ever holds keys this script made, so a managed
+# recipient is recognised by its user-ID prefix and not by the current host
+# label, which may have changed since the key was created. Prefer the current
+# label when several exist, else the first.
 find_existing_key() {
-  gpg_cmd --batch --with-colons --list-secret-keys "$uid" 2>/dev/null |
-    awk -F: '$1 == "fpr" { print $10; exit }'
+  gpg_cmd --batch --with-colons --list-secret-keys 2>/dev/null |
+    awk -F: -v want="$uid" -v prefix="Agent Box recipient for ${owner}@" '
+      $1 == "sec" { primary = 1; fp = ""; next }
+      $1 == "fpr" && primary && fp == "" { fp = $10; next }
+      $1 == "uid" && fp != "" {
+        if ($10 == want) { exact = fp }
+        else if (index($10, prefix) == 1 && first == "") { first = fp }
+        fp = ""; primary = 0
+      }
+      END { print (exact != "" ? exact : first) }
+    '
 }
 
 has_encryption_subkey() {

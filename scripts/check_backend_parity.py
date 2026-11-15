@@ -105,6 +105,8 @@ INTERNAL = {
                          "supervisor it spawns",
     "AGENT_BOX_REGISTRY_LOCK_FD": "registry.sh passes its open lock fd down",
     "AGENT_BOX_CODEX_UTS": "codex-remote-control.sh re-execs itself",
+    "AGENT_BOX_CODEX_PID": "the shared supervisor's exec wrapper passes "
+                           "the runtime owner pid to its SessionStart hook",
 }
 
 # Divergences that are CORRECT. Each needs a reason a reader can check -
@@ -201,6 +203,26 @@ BY_DESIGN = {
         "actual store-built payload; native "
         "has no equivalent capture to give "
         "this checker"),
+    "AGENT_BOX_SECRET_SOCKET": (
+        "module",
+        "issue #922: env-exec.py sets this (env-exec.py is already shared, "
+        "built as a real Nix derivation on both backends - nix/runtime.nix's "
+        "envExecWrapper natively, modules/agent-box.nix.in's own copy for "
+        "the module), same shape as AGENT_BOX_WEBHOOK_POLICY_FILE above. "
+        "tests/native/expected can only ever show the native side one-"
+        "sided here too: test_agentbox.py's fake profile stubs EVERY "
+        "profile binary as an empty `#!/bin/sh\\n:\\n`, so env-exec.py's "
+        "real body - the only place this name appears - is never in that "
+        "fixture to find. The golden snapshot sees the module's copy only "
+        "because it captures the actual store-built payload; native has no "
+        "equivalent capture to give this checker. Confirmed by hand (not "
+        "by this check, which cannot see it): `nix build .#runtime` then "
+        "`agentbox apply --profile <that store path> --root DIR` with "
+        "`secrets: {enable: true}` in config.yaml renders "
+        "AGENT_BOX_SECRET_SOCKET into /etc/agent-box/units/<user>.env, the "
+        "unit drop-in, tmpfiles and the target .wants files identically to "
+        "the module side (verified against a NixOS eval of the same "
+        "config)."),
     "AGENT_BOX_HOOK_SESSION_ARGS": (
         "module",
         "same shape as AGENT_BOX_WEBHOOK_POLICY_"
@@ -372,6 +394,14 @@ UNIT_VARS_BY_DESIGN = {
         "used to leave a bare `nix` for the pane's shell, which on a native "
         "box resolves against a PATH that carries none). The daemon already "
         "treats the variable as optional and resolves it itself when unset"),
+    "agent-box-harness-upgrade@.service AGENT_BOX_NIX_BIN": (
+        "module",
+        "same divergence as agent-box@.service above, for the per-user "
+        "harness upgrade (issue #742). The module's drop-in replaces the "
+        "unit's PATH with one that has no nix, and NixOS has none of the "
+        "fallback locations agent_nix_bin probes, so it names the store "
+        "path. A native box keeps nix on the unit's PATH or in the "
+        "standard multi-user profile, which agent_nix_bin finds at USE"),
     "agent-web-terminal@.service AGENT_BOX_SESSION_BIN": (
         "native",
         "the attach wrapper needs the session CLI to start a stopped "

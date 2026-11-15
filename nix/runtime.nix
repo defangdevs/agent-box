@@ -49,6 +49,16 @@
 , webhookPin ? import ./webhook-pin.nix
 }:
 let
+  # Native hosts do not evaluate NixOS's security.pki module. Ship the same
+  # distrust policy in the runtime, independent of the distro CA package.
+  tlsCacert = pkgs.cacert.override {
+    blacklist = import ./tls-blacklist.nix {
+      inherit lib;
+      version = pkgs.cacert.version;
+      roots = builtins.fromJSON (builtins.readFile ../modules/src/tls-roots.json);
+    };
+  };
+  emptyCaDir = pkgs.runCommand "agent-box-empty-ca-dir" { } "mkdir -p $out/etc/agent-box/empty-ca-dir";
   src = ../modules/src;
   readSrc = file: builtins.readFile (src + "/${file}");
   # bin/agentbox lives outside modules/src (it is a tool, not a payload).
@@ -122,6 +132,28 @@ let
       chmod +x $out/bin/agent-box-settings
     '';
 
+  # The interactive half of issue #898. Like settingsDaemon it contains an
+  # @@include marker for the shared receive state protocol, so resolve it at
+  # build time rather than shipping the marker verbatim on native boxes.
+  receiveCli = pkgs.runCommand "agent-box-receive"
+    {
+      nativeBuildInputs = [ pkgs.python3 pkgs.python3Packages.flake8 ];
+    } ''
+      ${resolveTree}
+      python3 ${../bin/assemble-module.py} \
+        --resolve tree/modules/src/receive-cli.py > receive.py
+      if grep -q '@@include' receive.py; then
+        echo "an @@include@@ marker survived resolve() in receive-cli.py" >&2
+        exit 1
+      fi
+      flake8 --show-source \
+        --ignore E501,E302,E305,E402,F811 receive.py
+      install -d $out/bin
+      { printf '#!%s\n' ${pkgs.python3}/bin/python3; cat receive.py; } \
+        > $out/bin/agent-box-receive
+      chmod +x $out/bin/agent-box-receive
+    '';
+
   # The tree the assembler resolves markers in: the paths in an @@include@@
   # are relative to the including file, and settings-daemon.py's reach out
   # to docs/, so the repo layout has to be rebuilt around modules/src.
@@ -171,6 +203,24 @@ let
   # the module's envExecWrapper does. `payload` above would wrap it in a
   # bash shebang and hand bash a python file to parse.
   envStoreLib = readSrc "lib/envstore.py";
+
+  # Secret custody (issue #922). Spliced the same way: secret-cli.py,
+  # secret-broker.py and secrets-mcp.py all call into
+  # lib/secret-protocol.py (encryption, the wire protocol) without
+  # importing it, and secret-broker.py additionally needs lib/secret-jobs.py
+  # (the exec_with_secrets job engine) spliced between the two. Shipped
+  # unconditionally, like every other payload here - this file has no `cfg`
+  # to gate on, and a box with `services.agent-box.secrets.enable` unset
+  # simply has no socket for any of these to connect to
+  # (AGENT_BOX_SECRET_SOCKET unset; see env-exec.py and secret-cli.py's own
+  # "not enabled on this box" refusal). secret-worker.py is deliberately
+  # NOT spliced with this library - see its own header - so it needs
+  # neither `cryptography` nor the heavier interpreter below.
+  secretProtocolLib = readSrc "lib/secret-protocol.py";
+  secretJobsLib = readSrc "lib/secret-jobs.py";
+  # The plaintext-candidate scanner (issue #922): advisory only, never a
+  # migration - see its own header. Only secret-cli.py needs it.
+  secretCandidatesLib = readSrc "lib/secret-candidates.py";
   envExecWrapper = pkgs.writers.writePython3Bin "agent-box-env-exec" {
     flakeIgnore = [ "E402" "E501" ];
   } (envStoreLib + "\n\n" + readSrc "env-exec.py");
@@ -185,9 +235,16 @@ let
     flakeIgnore = [ "E402" "E501" ];
   } (envStoreLib + "\n\n" + readSrc "envstore-cli.py");
 
+  # Installed bare; `agentbox apply` writes the /usr/local/bin wrapper that
+  # pins the profile/env tools and this executable's own Codex shim path.
+  acpLauncherBare = pkgs.writers.writePython3Bin "agent-box-acp-bare" {
+    flakeIgnore = [ "E501" "E128" "W503" ];
+  } (readSrc "acp-cli.py");
+
   capacityCli = pkgs.writers.writePython3Bin "agent-box-session-capacity" {
-    flakeIgnore = [ "E501" "E402" ];
+    flakeIgnore = [ "E501" "E402" "E128" "W503" ];
   } (readSrc "lib/session-capacity.py" + "\n\n"
+     + readSrc "lib/session-hibernation.py" + "\n\n"
      + readSrc "session-capacity-cli.py");
 
   agentPackage = agent:
@@ -291,14 +348,22 @@ let
   # env-setting wrapper, which is the native counterpart of the module's
   # generated wrapper prelude.
   cliPayloads = [
+    (pkgs.writers.writePython3Bin "agent-box-email" {
+      libraries = with pkgs.python3Packages; [ dkimpy pyspf ];
+      flakeIgnore = [ "E501" "E302" "E305" "W503" ];
+    } (readSrc "email-cli.py"))
     (pkgs.writers.writePython3Bin "agent-box-whatsapp" {
       flakeIgnore = [ "E501" "E302" "E305" ];
     } (readSrc "whatsapp-cli.py"))
+    (pkgs.writers.writePython3Bin "agent-box-slack" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "slack-cli.py"))
     (payload "agent-box-session-bare" "session-cli.sh")
     # Agent profiles (issue #321): the worker `--profile` selects. Bare, so
     # `agentbox apply` can pin the env store and the harness list into the
     # wrapper — this CLI runs from PATHs that carry almost nothing.
     (payload "agent-box-profile-bare" "profile-cli.sh")
+    acpLauncherBare
     # Moving an installed harness onto this box's pin (issues #559, #590,
     # #614). Bare for the same reason the two above are: the pin belongs in
     # the wrapper `agentbox apply` generates, and this CLI is run from a
@@ -306,8 +371,62 @@ let
     (payload "agent-box-harness-bare" "harness-cli.sh")
     # Needs no env wrapper: it resolves its token from gh at runtime.
     (payload "agent-box-upload" "upload-cli.sh")
+    # Speech to text for voice notes (issue #970). Fetches its prebuilt
+    # engine on first use; nothing here is compiled.
+    (pkgs.writers.writePython3Bin "agent-box-transcribe" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "transcribe-cli.py"))
+    receiveCli
+    # Secret custody (issue #922): the unprivileged CLI. Needs no env
+    # wrapper - it reads AGENT_BOX_SECRET_SOCKET straight from the
+    # environment env-exec.py already loaded, same as agent-box-upload's
+    # token above.
+    (pkgs.writers.writePython3Bin "agent-box-secret" {
+      libraries = [ pkgs.python3Packages.cryptography ];
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (envStoreLib + "\n\n" + secretProtocolLib + "\n\n" + secretCandidatesLib
+       + "\n\n" + readSrc "secret-cli.py"))
+    # The root broker and its fixed worker (issue #922). Not yet started by
+    # any unit on this backend - that is the next slice - but shipped here
+    # so the binaries exist on PATH ahead of it, and so an operator can run
+    # the broker by hand to try the feature before the unit lands.
+    (pkgs.writers.writePython3Bin "agent-box-secret-broker" {
+      libraries = [ pkgs.python3Packages.cryptography ];
+      flakeIgnore = [ "E402" "F811" "E501" "E302" "E305" "W503" "W504" ];
+    } (secretProtocolLib + "\n\n" + secretJobsLib + "\n\n" + readSrc "secret-broker.py"))
+    (pkgs.writers.writePython3Bin "agent-box-secret-worker" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "secret-worker.py"))
+    # The box-local MCP adapter (issue #922). Needs the `mcp` SDK on top of
+    # `cryptography` - its own closure, not the broker's, so a box that
+    # never registers it with a harness does not pay for the SDK in the
+    # broker's otherwise-minimal interpreter.
+    (pkgs.writers.writePython3Bin "agent-box-secrets-mcp" {
+      libraries = [ pkgs.python3Packages.cryptography pkgs.python3Packages.mcp ];
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (secretProtocolLib + "\n\n" + readSrc "secrets-mcp.py"))
+    # Advisory-only plaintext-credential scanner (issue #922), run on every
+    # `agentbox apply` over every configured user - see its own header for
+    # why this is not a migration and not gated on secrets.enable.
+    (pkgs.writers.writePython3Bin "agent-box-secret-candidates-report" {
+      libraries = [ pkgs.python3Packages.cryptography ];
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (envStoreLib + "\n\n" + secretProtocolLib + "\n\n" + secretCandidatesLib
+       + "\n\n" + readSrc "secret-candidates-report.py"))
   ] ++ lib.optionals webhookEnabled [
     (payload "agent-box-webhook-bare" "webhook-cli.sh")
+    # The GitHub login this box acts as. env-exec runs it at every session
+    # start and exports LOCAL_WEBHOOK_SELF; without it on PATH, a session's
+    # webhook peer resolves "@self" to nobody, so the spawn-seeded mute and
+    # the default self-echo exclude are inert and the session receives (and
+    # the ack adapter reacts to) its own comments. Needs no env wrapper: it
+    # reads the token from the environment env-exec has already loaded.
+    (payload "agent-box-webhook-self" "webhook-self.sh")
+    (pkgs.writers.writePython3Bin "agent-box-webhook-ack" {
+      flakeIgnore = [ "E402" "F811" "E501" "W503" "W504" ];
+    } (envStoreLib + "\n\n" + ''
+GH_BIN = "${pkgs.gh}/bin/gh"
+    '' + readSrc "webhook-ack.py"))
     # Ingress liveness and delivery recovery (issue #605). Needs no env
     # wrapper for the same reason agent-box-upload does not: it resolves its
     # token from gh at runtime, and the one box value it reads
@@ -339,7 +458,7 @@ let
   # a ban action whose binary comes from the distro is a lock that
   # depends on the image having shipped one.
   serviceTools = with pkgs; [ tmux ttyd caddy bubblewrap which fail2ban
-                              nftables earlyoom
+                              nftables earlyoom opensmtpd
                               # shadow for newuidmap/newgidmap and libcap
                               # for setcap: `agentbox apply` copies the
                               # first pair into /etc/agent-box/uidmap and
@@ -380,6 +499,7 @@ let
     # module splices into agent-box-defang-cli-expr.nix, so both backends
     # resolve to one output path and share one binary cache hit.
     install -m444 ${src}/defang-cli.nix $out/share/agent-box/
+    install -m444 ${src}/cve-2026-98432.nft ${src}/cve-2026-98432.sysctl $out/share/agent-box/
     install -m444 ${src}/tmux.conf $out/share/agent-box/
     # The password helper is generated per user by `agentbox apply` (it
     # crosses sudo, so its paths must not come from env); the template it
@@ -392,7 +512,7 @@ pkgs.buildEnv {
   paths = unitPayloads ++ cliPayloads ++ baseTools ++ serviceTools
           ++ [ agentboxCli pythonForHelper ]
           ++ map agentPackage eagerAgents
-          ++ [ assets ];
+          ++ [ assets tlsCacert emptyCaDir ];
   # A profile is a user-visible PATH: keep man pages, drop nothing silently.
   extraOutputsToInstall = [ "man" ];
   meta = {

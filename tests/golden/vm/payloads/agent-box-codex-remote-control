@@ -42,7 +42,52 @@ fi
 wake_thread=$1; shift
 wake_prompt=$1; shift
 codex=$1; shift
-stop() { "$codex" app-server daemon stop >/dev/null 2>&1 || true; }
+# stop_codex_pid PID — end a codex process: TERM, wait up to 5 s, then KILL.
+#
+# Shared by the remote-control wrapper (an app-server only the legacy pid
+# file records, issue #904) and the session-start mirror (a managed daemon
+# running a stale codex build, issue #949). The caller proves the process
+# is the right one first: this helper never checks identity, so never hand
+# it a pid that has not been matched against something stronger than the
+# pid alone.
+stop_codex_pid() {
+  kill -TERM "$1" 2>/dev/null || return 0
+  for _scp in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.5
+  done
+  kill -KILL "$1" 2>/dev/null || true
+}
+# An older CLI, run from packages/standalone, records its app-server in the
+# legacy app-server.pid. Once packages/app-server-daemon/current exists (the
+# mirror seeds it, issue #788) a current CLI reads daemon.pid instead, so its
+# `daemon stop` cannot see the old app-server, and `daemon start` then dies
+# with "app server is running but is not managed by codex app-server daemon"
+# (issue #904). End that orphan ourselves. The recorded start time and the
+# argv must both still match, so a reused pid is never killed.
+stop_legacy_app_server() {
+  _lpf="${CODEX_HOME:-$HOME/.codex}/app-server-daemon/app-server.pid"
+  [ -r "$_lpf" ] || return 0
+  _lrec=$(cat "$_lpf" 2>/dev/null) || return 0
+  case "$_lrec" in *'"pid":'*'"processStartTime":"'*) ;; *) return 0 ;; esac
+  _lpid=${_lrec#*'"pid":'}; _lpid=${_lpid%%[!0-9]*}
+  _lstart=${_lrec#*'"processStartTime":"'}; _lstart=${_lstart%%'"'*}
+  [ -n "$_lpid" ] || return 0
+  # Word splitting collapses ps's padding ("Oct  6") to compare like for like.
+  # shellcheck disable=SC2086,SC2116
+  _lnow=$(ps -o lstart= -p "$_lpid" 2>/dev/null) && _lnow=$(echo $_lnow) || return 0
+  # shellcheck disable=SC2086,SC2116
+  [ "$_lnow" = "$(echo $_lstart)" ] || return 0
+  case "$(ps -o args= -p "$_lpid" 2>/dev/null)" in
+    *codex*" app-server"*) ;;
+    *) return 0 ;;
+  esac
+  stop_codex_pid "$_lpid"
+}
+stop() {
+  "$codex" app-server daemon stop >/dev/null 2>&1 || true
+  stop_legacy_app_server
+}
 # A daemon left over from an earlier start would make ours a no-op and
 # leave us supervising nothing, so clear it first, then own a fresh one.
 stop
@@ -57,11 +102,13 @@ signed_in() { "$codex" login status >/dev/null 2>&1; }
 # When the settings page drives pairing (its /codex/pairing API, issue #780),
 # a code minted HERE would be a second live code beside the page's, and it
 # would print to a pane the user never needed to open. The page's
-# `AGENT_BOX_CODEX_SESSION_DEFAULT=remote-control` is the signal. In that
-# mode the pane signs in and reports status on its own; it mints a code only
-# when someone presses Enter.
+# `AGENT_BOX_CODEX_SESSION_DEFAULT=daemon` is the signal. In that mode the
+# pane signs in and reports status on its own; it mints a code only when
+# someone presses Enter. Keep the old `remote-control` value for compatibility.
 quiet=false
-[ "${AGENT_BOX_CODEX_SESSION_DEFAULT:-}" = remote-control ] && quiet=true
+case "${AGENT_BOX_CODEX_SESSION_DEFAULT:-}" in
+  daemon|remote-control) quiet=true ;;
+esac
 # Run the sign-in HERE rather than printing the command for someone to paste
 # into another session. This box is headless, so device auth is the only
 # flow that works: plain `codex login` serves a localhost URL no outside
@@ -106,6 +153,28 @@ auth_rejected() {
   esac
   return 1
 }
+# Remote Control enrollment can require an account-side MFA change even when
+# the stored credentials are otherwise valid. Re-authentication alone cannot
+# satisfy that policy, so keep it separate from auth_rejected(): the latter
+# deliberately logs out and starts device auth again. Match both the status and
+# the server's exact reason so an unrelated 403 keeps the ordinary retry path.
+mfa_required() {
+  printf '%s' "$1" | python3 -c '
+import sys
+
+# Shared by the terminal wrapper and the settings API. Keep provider-text
+# matching here; API consumers use the stable code, never transport prose.
+def codex_pairing_error_code(error):
+    """Classify the explicit account-policy rejection, not unrelated 403s."""
+    error = str(error or "")
+    if (error and "HTTP 403" in error
+            and "Multi-factor authentication required" in error):
+        return "mfa_required"
+    return None
+
+sys.exit(0 if codex_pairing_error_code(sys.stdin.read()) == "mfa_required" else 1)
+'
+}
 # The only part of the JSON-RPC blob worth showing a human is the server's
 # own message; the URL, cf-ray and status code belong in a bug report.
 auth_reason() {
@@ -129,7 +198,8 @@ auth_reason() {
 # before sign-in needs the nudge once credentials exist.
 #
 # Exit status: 0 paired, 2 the credentials were rejected (caller
-# re-authenticates), 1 anything else (already reported, retryable).
+# re-authenticates), 3 the account requires MFA (caller explains the account
+# change), 1 anything else (already reported, retryable).
 pair() {
   attempt=0
   while [ "$attempt" -lt 3 ]; do
@@ -146,8 +216,9 @@ pair() {
 EOF
       return 0
     fi
-    # Retrying a token the backend has rejected just prints the same 401
-    # three times over six seconds; hand it to the caller at once.
+    # Neither a rejected token nor an unmet account policy can change during
+    # this retry loop, so hand both to the caller after the first attempt.
+    if mfa_required "$pairout"; then return 3; fi
     if auth_rejected "$pairout"; then return 2; fi
     sleep 2
   done
@@ -193,6 +264,13 @@ onboard() {
       printf '\n  ✗ ChatGPT still rejects the credentials: %s\n' "$(auth_reason "$pairout")" >&2
       printf '%s\n' "    Sign-in was already retried once. Type: login  to try again," >&2
       printf '%s\n' "    or check that the account you signed in with has Codex access." >&2
+    elif [ "$pairrc" -eq 3 ]; then
+      printf '\n%s\n' "  ChatGPT requires multi-factor authentication before Remote Control"
+      printf '%s\n' "    can enroll this box. Open https://chatgpt.com/settings/security and"
+      printf '%s\n' "    enable or complete MFA. If it is already enabled, ask your ChatGPT"
+      printf '%s\n' "    workspace admin to confirm Remote Control access. Then type: login  here"
+      printf '%s\n' "    to refresh the credentials and retry pairing. Pressing Enter alone cannot"
+      printf '%s\n' "    fix this requirement."
     fi
   else
     cat <<EOF

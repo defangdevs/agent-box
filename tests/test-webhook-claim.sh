@@ -38,6 +38,7 @@ cat > "$work/bin/python3" <<EOF
 #!$BASH_BIN
 shift            # the webhook.py path
 printf '%s\n' "\$@"
+exit "\${CLAIM_TEST_EXIT:-0}"
 EOF
 chmod +x "$work/bin/python3"
 PATH="$work/bin:$PATH"; export PATH
@@ -114,8 +115,8 @@ else no "the push ref claim is fully qualified" \
 
 # --- the shape the guide tells you to use --------------------------------
 # A PR is claimed with the BARE number, not pr:N. GitHub reports a comment
-# on a PR as issue_comment with issue.number, so pr:N alone leaves reviews
-# and comments on your own PR unclaimed — which is the #417 collision.
+# on a PR as issue_comment with issue.number, so pr:N alone leaves discussion
+# comments on your own PR unclaimed - which is the #417 collision.
 # Assert the documented example covers both spellings.
 for p in pull_request.number issue.number; do
   covers "the documented PR claim covers $p" "$p" \
@@ -150,6 +151,90 @@ else ok "commit status is left unclaimed, not guessed at"; fi
 n=$(include_of defangdevs/agent-box --all-events --claim=pr:42 | jq '.any | length')
 [ "$n" = 1 ] && ok "--claim=SPEC is accepted too" \
   || no "--claim=SPEC is accepted too" "got $n"
+
+# --- coverage hints advise without widening the claim -------------------
+out=$(run defangdevs/agent-box --claim branch:fix/42 --events actionable)
+if grep -q 'claim hint: a branch claim' "$work/err" \
+   && grep -q -- '--claim <PR number> and --claim <issue number>' "$work/err" \
+   && grep -q 'branch claims miss commit-status events' "$work/err" \
+   && printf '%s\n' "$out" | awk '/^--include$/ { getline; print; exit }' \
+      | jq -e '[.all[0].any[].path] | all(endswith(".number") | not)' >/dev/null; then
+  ok "a branch-only hint suggests numbered claims without inferring 42"
+else
+  no "a branch-only hint suggests numbered claims without inferring 42" "$(cat "$work/err")"
+fi
+
+for topic in github:defangdevs/agent-box GitHub:defangdevs/agent-box GITHUB:defangdevs/agent-box; do
+  run "$topic" --claim pr:42 --events actionable >/dev/null
+  if grep -q -- '--claim pr:42 misses PR discussion comments' "$work/err"; then
+    ok "$topic receives GitHub coverage hints"
+  else
+    no "$topic receives GitHub coverage hints" "$(cat "$work/err")"
+  fi
+done
+
+run defangdevs/agent-box --claim=42 --events actionable >/dev/null
+if grep -q 'claim hint: numbered claims do not cover branch CI' "$work/err" \
+   && grep -q 'different numbers need their own --claim' "$work/err" \
+   && ! grep -q 'misses PR discussion comments' "$work/err"; then
+  ok "a bare number gets CI and linked-item hints, without a narrow-PR warning"
+else
+  no "a bare number gets CI and linked-item hints, without a narrow-PR warning" "$(cat "$work/err")"
+fi
+
+run defangdevs/agent-box --claim pr:42 --claim issue:41 --events actionable >/dev/null
+if grep -q -- '--claim pr:42 misses PR discussion comments' "$work/err" \
+   && grep -q -- 'use --claim 42 to cover those too' "$work/err"; then
+  ok "a different issue number does not cover PR 42 discussion comments"
+else
+  no "a different issue number does not cover PR 42 discussion comments" "$(cat "$work/err")"
+fi
+
+for extra in 42 issue:42; do
+  run defangdevs/agent-box --claim pr:42 --claim "$extra" \
+      --claim branch:fix/42 --events actionable >/dev/null
+  if grep -q 'misses PR discussion comments\|numbered claims do not cover branch CI\|a branch claim' "$work/err"; then
+    no "paired $extra and branch claims suppress number and branch-scope hints" "$(cat "$work/err")"
+  else
+    ok "paired $extra and branch claims suppress number and branch-scope hints"
+  fi
+  if grep -q 'branch claims miss commit-status events' "$work/err"; then
+    ok "paired $extra and branch claims still need a commit for status events"
+  else
+    no "paired $extra and branch claims still need a commit for status events" "$(cat "$work/err")"
+  fi
+done
+
+hint_sha=0123456789abcdef0123456789abcdef01234567
+run defangdevs/agent-box --claim issue:41 --claim "sha:$hint_sha" \
+    --claim branch:fix/42 --events actionable >/dev/null
+if grep -q 'numbered claims do not cover branch CI\|branch claims miss commit-status events' "$work/err"; then
+  no "a commit claim already supplies CI scope" "$(cat "$work/err")"
+else
+  ok "a commit claim already supplies CI scope"
+fi
+
+for mode in observer commit watch non-github; do
+  case "$mode" in
+    (observer) run defangdevs/agent-box --events actionable >/dev/null ;;
+    (commit) run defangdevs/agent-box --claim "sha:$hint_sha" --events terminal-ci >/dev/null ;;
+    (watch) run defangdevs/agent-box --claim pr:42 --deliver-to subagent --all-events >/dev/null ;;
+    (non-github) run gitlab:group/project --claim pr:42 --events actionable >/dev/null ;;
+  esac
+  if grep -q 'claim hint:' "$work/err"; then
+    no "$mode gets no GitHub session coverage hints" "$(cat "$work/err")"
+  else
+    ok "$mode gets no GitHub session coverage hints"
+  fi
+done
+
+CLAIM_TEST_EXIT=7 run defangdevs/agent-box --claim 42 --events actionable >/dev/null
+st=$?
+if [ "$st" -eq 7 ] && ! grep -q 'claim hint:' "$work/err"; then
+  ok "a failed subscription preserves its status and gets no coverage hints"
+else
+  no "a failed subscription preserves its status and gets no coverage hints" "status $st: $(cat "$work/err")"
+fi
 
 # --- the flag never reaches webhook.py ----------------------------------
 if run defangdevs/agent-box --all-events --claim pr:42 --note hi | grep -qx -- --claim
@@ -386,6 +471,27 @@ if include_of defangdevs/agent-box --events terminal-ci \
    | jq -e 'has("any")' >/dev/null 2>&1
 then ok "--events alone is a filtered observation subscription"
 else no "--events alone is a filtered observation subscription"; fi
+# ci-summary: green is delivered once per WORKFLOW, never once per job. A
+# workflow_run success is in; a job-level success is out; a failing job is in.
+cs=$(include_of defangdevs/agent-box --events ci-summary)
+cs_has() { # cs_has PATH VALUE — does the policy match PATH == VALUE?
+  printf '%s' "$cs" | jq -e --arg p "$1" --arg v "$2" \
+    'any(.any[]; .path == $p and (.in | index($v)))' >/dev/null 2>&1
+}
+all_conclusions=1
+for c in success failure cancelled timed_out action_required neutral skipped stale startup_failure; do
+  cs_has workflow_run.conclusion "$c" || all_conclusions=0
+done
+if [ "$all_conclusions" = 1 ]; then
+  ok "ci-summary delivers every finished workflow, green included"
+else no "ci-summary delivers every finished workflow, green included" "$cs"; fi
+if cs_has check_run.conclusion success || cs_has workflow_job.conclusion success \
+   || cs_has check_suite.conclusion success; then
+  no "ci-summary drops per-job success" "$cs"
+else ok "ci-summary drops per-job success"; fi
+if cs_has check_run.conclusion failure && cs_has workflow_job.conclusion failure; then
+  ok "ci-summary still delivers a failing job"
+else no "ci-summary still delivers a failing job" "$cs"; fi
 run defangdevs/agent-box --all-events >/dev/null
 [ $? -ne 0 ] \
   && ok "--all-events without a claim is refused rather than ignored" \
@@ -458,7 +564,7 @@ run defangdevs/agent-box --all-events --claim branch:main >/dev/null
 # The guidance has to be actionable, or an agent just picks another wrong
 # claim: name the three shapes that ARE bounded, and the no-claim way to
 # watch the branch it was told it cannot own.
-for want in "--claim sha:" "--events terminal-ci" "branch:<topic branch>"; do
+for want in "--claim sha:" "--events ci-summary" "branch:<topic branch>"; do
   grep -qF -- "$want" "$work/err" \
     || no "the refusal offers [$want]" "$(cat "$work/err")"
 done
@@ -736,6 +842,102 @@ MATCH
   fi
 else
   echo "skip webhook.py match (no pin given)"
+fi
+
+# --- an over-long note is refused, never silently cut (issue #877) ----------
+# A watch's worker instructions put in --note were once lost to a silent cut,
+# safety rules first. The pinned webhook.py must refuse, store nothing, and the
+# guide must keep pointing at a profile for the instructions.
+if [ -n "$WEBHOOK_PY" ]; then
+  real_py=$(PATH="${PATH#"$work/bin:"}" command -v python3)
+  long=$(head -c 1001 /dev/zero | tr '\0' x)
+  for mode in subagent session; do
+    if [ "$mode" = subagent ]; then n=$long; else n=${long:0:301}; fi
+    nstate="$work/note-$mode"; mkdir -p "$nstate"
+    args=(subscribe defangdevs/agent-box --note "$n" --deliver-to "$mode")
+    [ "$mode" = subagent ] && args+=(--when '{"path":"action","in":["opened"]}')
+    if LOCAL_WEBHOOK_STATE_DIR="$nstate" LOCAL_WEBHOOK_SESSION=t \
+         "$real_py" "$WEBHOOK_PY" "${args[@]}" >"$work/nout" 2>&1; then
+      no "an over-long $mode note is refused" "exit 0: $(tail -2 "$work/nout" | tr '\n' ' ')"
+    elif grep -q "never cut" "$work/nout" \
+         && ! grep -rqs "xxxxxxxxxx" "$nstate"; then
+      ok "an over-long $mode note is refused and nothing is stored"
+    else
+      no "an over-long $mode note is refused and nothing is stored" \
+         "$(tail -2 "$work/nout" | tr '\n' ' ')"
+    fi
+  done
+fi
+
+# --- a caller's own mute or exclude says whether "@self" is still muted ---
+# The user chose a hint over a refusal (PR #1006 follow-up): the box's login
+# is shared by several boxes, so receiving its "own" comments can be right.
+hint_case() {  # NAME PATTERN(grep -E, or !PATTERN for absent) ARGS...
+  name=$1; pat=$2; shift 2
+  run "$@" >/dev/null
+  case "$pat" in
+    (!*) if grep -Eq "${pat#!}" "$work/err"; then no "$name" "$(cat "$work/err")"
+         else ok "$name"; fi ;;
+    (*)  if grep -Eq "$pat" "$work/err"; then ok "$name"
+         else no "$name" "$(cat "$work/err")"; fi ;;
+  esac
+}
+export LOCAL_WEBHOOK_SELF=DefangDevs
+hint_case "--ignore-sender @self says this box is muted" \
+  'includes @self \(DefangDevs\)' defangdevs/agent-box --ignore-sender @self
+hint_case "--ignore-sender with the login itself, any case, counts as @self" \
+  'includes @self' defangdevs/agent-box --ignore-sender 'bot, defangdevs'
+hint_case "--ignore-sender without @self says it is not muted" \
+  '@self \(DefangDevs\) is not in it' defangdevs/agent-box --ignore-sender=dependabot
+hint_case "--exclude says the default self-echo rule is gone, without promising delivery" \
+  'That default no longer drops them' \
+  defangdevs/agent-box --exclude '{"path":"event","in":["star"]}'
+hint_case "--exclude naming the login is not taken as a sender mute" \
+  'That default no longer drops them' defangdevs/agent-box \
+  --exclude '{"path":"title","in":["defangdevs-bottle"]}'
+hint_case "--drop, the old name of --exclude, gets the same hint" \
+  'That default no longer drops them' defangdevs/agent-box --drop '{}'
+hint_case "--exclude= form gets the same hint" \
+  'That default no longer drops them' defangdevs/agent-box --exclude='{}'
+hint_case "--drop= form gets the same hint" \
+  'That default no longer drops them' defangdevs/agent-box --drop='{}'
+hint_case "--exclude before the topic does not swallow the topic" \
+  'That default no longer drops them' --exclude '{}' defangdevs/agent-box
+hint_case "--ignore-senders (plural) with @self counts as muted" \
+  'includes @self' defangdevs/agent-box --ignore-senders @self
+hint_case "a separated --exclude value before the topic is not taken as the topic" \
+  'own events on defangdevs/agent-box are muted' \
+  --exclude '{}' --ignore-sender @self defangdevs/agent-box
+# webhook.py stores `bot*` literally, so a file named like the login must not
+# turn the glob into a match (no pathname expansion while splitting).
+( cd "$work" && : > defangdevs && LOCAL_WEBHOOK_SELF=defangdevs \
+    bash "$SCRIPT" subscribe defangdevs/agent-box --ignore-sender 'defang*' \
+    >/dev/null 2>"$work/err" )
+if grep -q 'is not in it' "$work/err"; then
+  ok "--ignore-sender 'defang*' is not expanded against file names"
+else
+  no "--ignore-sender 'defang*' is not expanded against file names" "$(cat "$work/err")"
+fi
+rm -f "$work/defangdevs"
+hint_case "--exclude plus --ignore-sender @self gives no exclude warning" \
+  '!default no longer drops' defangdevs/agent-box --exclude '{}' --ignore-sender @self
+hint_case "a standing watch's --exclude replaces no self-echo default" \
+  '!default no longer drops' defangdevs/agent-box --deliver-to subagent \
+  --when '{"path":"action","in":["opened"]}' --exclude '{}'
+hint_case "no mute or exclude flag, no hint" \
+  '!@self|no longer drops' defangdevs/agent-box
+# Before the capture, a flag's value ahead of the topic became the topic.
+hint_case "--ignore-sender's value before the topic is not read as the topic" \
+  'events on defangdevs/agent-box are muted' --ignore-sender @self defangdevs/agent-box
+unset LOCAL_WEBHOOK_SELF
+hint_case "an unknown login says @self mutes nobody" \
+  '"@self" mutes nobody' defangdevs/agent-box --ignore-sender @self
+
+# The wrapper's own help must say where the instructions belong.
+if bash "$SCRIPT" --help 2>&1 | grep -q "put the worker's instructions"; then
+  ok "subscribe --help points worker instructions at a profile"
+else
+  no "subscribe --help points worker instructions at a profile"
 fi
 
 echo

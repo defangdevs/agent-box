@@ -22,8 +22,8 @@ chmod +x "$TEST_ROOT/bin/agent-box-session"
 
 cat > "$TEST_ROOT/bin/agent-box-whatsapp" <<'EOF'
 #!/bin/sh
-printf '%s\t%s\t%s\n' "$*" "${LOCAL_WHATSAPP_SESSION_BIN:-}" \
-  "${LOCAL_WHATSAPP_CODEX_BIN:-}" >> "$CALLS"
+printf '%s\t%s\t%s\t%s\n' "$*" "${LOCAL_WHATSAPP_SESSION_BIN:-}" \
+  "${LOCAL_WHATSAPP_CODEX_BIN:-}" "${LOCAL_WHATSAPP_DEBUG:-}" >> "$CALLS"
 trap 'exit 0' TERM INT
 while :; do sleep 1; done
 EOF
@@ -34,6 +34,16 @@ cat > "$TEST_ROOT/bin/codex" <<'EOF'
 exit 0
 EOF
 chmod +x "$TEST_ROOT/bin/codex"
+
+# The env store is how a user turns diagnostic receipts on; the supervisor
+# must hand that one setting to the bridge it starts.
+cat > "$TEST_ROOT/bin/envstore" <<'EOF'
+#!/bin/sh
+printf '{"LOCAL_WHATSAPP_DEBUG":"1"}\n'
+EOF
+chmod +x "$TEST_ROOT/bin/envstore"
+AGENT_BOX_ENVSTORE_BIN="$TEST_ROOT/bin/envstore"
+JQ="$(command -v jq)"
 
 export PATH="$TEST_ROOT/bin:$PATH"
 AGENT_BOX_WHATSAPP_BIN="$TEST_ROOT/bin/missing"
@@ -61,6 +71,7 @@ done
 grep '^serve' "$CALLS" >/dev/null
 grep "$TEST_ROOT/bin/agent-box-session" "$CALLS" >/dev/null
 grep "$TEST_ROOT/bin/codex" "$CALLS" >/dev/null
+[ "$(cut -f4 "$CALLS")" = 1 ]
 [ "$(wc -l < "$CALLS")" -eq 1 ]
 
 # A live helper is retained; removing the marker stops it.

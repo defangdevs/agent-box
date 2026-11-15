@@ -17,7 +17,7 @@ trap cleanup EXIT
 
 run_init() {
   HOME="$test_home" USER=alice AGENT_BOX_GPG_BIN="$(command -v gpg)" \
-    bash "$script" box.example
+    bash "$script" "${1:-box.example}"
 }
 
 run_init > "$test_root/first.log"
@@ -76,6 +76,16 @@ test "$(gpg --homedir "$test_home/.config/agent-box/gnupg" --batch \
 # primary key. This is the interrupted-publication path in gpg-init.sh.
 printf 'not-a-fingerprint\n' > "$test_home/.config/agent-box/gpg-fingerprint"
 run_init > "$test_root/recovered.log"
+test "$(sed -n '1p' "$test_home/.config/agent-box/gpg-fingerprint")" = \
+  "$fingerprint"
+test "$(gpg --homedir "$test_home/.config/agent-box/gnupg" --batch \
+  --with-colons --list-secret-keys |
+  awk -F: '$1 == "sec" { count++ } END { print count + 0 }')" = 1
+
+# A changed host label with the marker removed must still find the retained
+# key through its managed user-ID prefix, not create a second recipient.
+rm -f "$test_home/.config/agent-box/gpg-fingerprint"
+run_init renamed-box > "$test_root/relabelled.log"
 test "$(sed -n '1p' "$test_home/.config/agent-box/gpg-fingerprint")" = \
   "$fingerprint"
 test "$(gpg --homedir "$test_home/.config/agent-box/gnupg" --batch \

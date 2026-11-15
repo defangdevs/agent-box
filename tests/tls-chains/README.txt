@@ -1,0 +1,1 @@
+Public test certificates from https://emudhra.we-have-a-problem.com/chains.zip, retrieved 2026-10-21. No private keys. These cover six compromised issuing CAs via direct and AAA cross-signed chains. Verification fixes the evaluation time to the disclosure date so expiry cannot masquerade as distrust.

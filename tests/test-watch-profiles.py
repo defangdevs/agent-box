@@ -177,6 +177,51 @@ class Watches(unittest.TestCase):
             key='agent', dispatch='1'))
         self.assertEqual(self.entries(), [first])
 
+    def test_email_settings_share_cli_and_preserve_the_acceptance_boundary(self):
+        address = 'agent+github@box.test'
+        route = {'purpose': '<script>untrusted label</script>', 'profile': 'triage',
+                 'batchSeconds': 120, 'enabled': True}
+        listing = {'user': 'agent', 'domains': ['box.test'], 'addresses': {address: route}}
+        with patch.object(self.d.os.path, 'isfile', return_value=True), \
+                patch.object(self.d, 'email_cli', return_value=subprocess.CompletedProcess(
+                    [], 0, stdout=json.dumps(listing))) as cli:
+            markup = self.d.render_email_addresses()
+            self.assertIn('agent+github@box.test', markup)
+            self.assertIn('&lt;script&gt;', markup)
+            self.assertNotIn('<script>untrusted', markup)
+            self.assertIn('value="120"', markup)
+            self.assertIn('Disable reception', markup)
+            cli.assert_called_once_with(['list'])
+
+        def post_email(action, fields, origin=None):
+            connection = http.client.HTTPConnection(*self.server.server_address, timeout=15)
+            headers = {'Content-Type': 'application/x-www-form-urlencoded'}
+            if origin:
+                headers['Origin'] = origin
+            try:
+                connection.request('POST', self.d.BASE + '/email/' + action,
+                                   urllib.parse.urlencode(fields), headers)
+                response = connection.getresponse()
+                response.read()
+                return response.status, response.getheader('Location')
+            finally:
+                connection.close()
+
+        fields = {'address': address, 'purpose': 'GitHub notifications', 'profile': 'triage', 'batch_seconds': '120'}
+        with patch.object(self.d, 'email_cli', return_value=subprocess.CompletedProcess([], 0)) as cli:
+            status, location = post_email('set', fields)
+            self.assertEqual(status, 303)
+            self.assertIn('email_saved', location)
+            cli.assert_called_once_with(['set', address, '--purpose', 'GitHub notifications',
+                                         '--profile', 'triage', '--batch-seconds', '120'])
+            cli.reset_mock()
+            self.assertEqual(post_email('disable', {'address': address})[0], 303)
+            cli.assert_called_once_with(['disable', address])
+            cli.reset_mock()
+            self.assertEqual(post_email('set', fields, 'https://evil.example')[0], 403)
+            cli.assert_not_called()
+        self.assertFalse(self.d.webhook_save({'topic': ['email:' + address], 'watch_name': ['email-address']}))
+
     def test_unnamed_profile_edit_preserves_policy_and_other_spawn_config(self):
         self.subscribe('', 'triage', self.d.WATCH_EVENTS['issues'][1])
         p = self.cli('subscribe', 'owner/repo', '--deliver-to', 'subagent',
