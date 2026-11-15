@@ -2687,6 +2687,7 @@ step allowed to fail.
 """
 # The library above already imported os and json; only what it does not is
 # imported here.
+import pwd
 import shutil
 import subprocess
 import sys
@@ -2729,6 +2730,17 @@ def main(argv):
     # turn this session's own secret stripping off from inside the very
     # file it is supposed to protect.
     secret_socket = os.environ.get("AGENT_BOX_SECRET_SOCKET")
+    if not secret_socket:
+        # Enabling custody on a box whose agent unit is already running
+        # writes the socket into the unit's env file, but a running
+        # supervisor (and its tmux server) keeps the environment it started
+        # with, and restarting the unit would end every session. The file
+        # is root-owned, so read it afresh at each spawn instead: new
+        # sessions are protected at once, running ones are untouched.
+        unit_env = os.environ.get("AGENT_BOX_UNIT_ENV_FILE") or os.path.join(
+            "/etc/agent-box/units", f"{pwd.getpwuid(os.getuid()).pw_name}.env"
+        )
+        secret_socket = dict(load(unit_env)).get("AGENT_BOX_SECRET_SOCKET")
 
     # The per-user secrets file the settings page and `agent-box-session env`
     # manage.
@@ -3707,6 +3719,14 @@ def _validate_exec_request(req):
 ROOT_KEY_BYTES = 32
 
 
+def _fsync_dir(directory):
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def load_root_key(path):
     """The box-wide root key, creating it on first use. Callers hold this in
     memory only; it is never written anywhere but this one 0600 file."""
@@ -3718,6 +3738,10 @@ def load_root_key(path):
     if key is not None:
         if len(key) != ROOT_KEY_BYTES:
             raise SecretError("root key corrupt")
+        # A concurrent creator may have linked this key and not yet synced
+        # the directory; sync it here so records are never written under a
+        # key whose directory entry could still be lost.
+        _fsync_dir(os.path.dirname(path) or ".")
         return key
     # Create it atomically. A loser of the race below simply re-reads the
     # winner's file instead of overwriting it.
@@ -3742,11 +3766,7 @@ def load_root_key(path):
     # without this, a power loss could drop .rootkey while records already
     # encrypted under it survive, and the next start would mint a different
     # key that cannot decrypt them.
-    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    _fsync_dir(directory)
     return load_root_key(path)
 
 
@@ -4242,14 +4262,17 @@ class JobManager:
         def pump(stream, attr):
             raw = bytearray()
             truncated = False
+            discarded = False
 
             def publish(eof):
                 nonlocal truncated
                 clean = redact(bytes(raw), redact_values)
-                if not eof and hold:
+                if hold and (not eof or discarded):
                     # The last hold bytes may be the start of a secret whose
-                    # end has not been read yet; publishing them would leak
-                    # an unresolved prefix through status.
+                    # end has not been read yet - or, once the raw cap has
+                    # discarded bytes, whose end was cut off for good, so EOF
+                    # does not resolve it. Publishing them would leak an
+                    # unresolved prefix through status.
                     clean = clean[:max(len(clean) - hold, 0)]
                 if len(clean) > self.max_output_bytes:
                     clean = clean[:self.max_output_bytes]
@@ -4269,12 +4292,14 @@ class JobManager:
                     room = raw_cap - len(raw)
                     if room <= 0:
                         truncated = True
+                        discarded = True
                         with job.lock:
                             setattr(job, attr + "_truncated", True)
                         continue
                     if len(chunk) > room:
                         raw.extend(chunk[:room])
                         truncated = True
+                        discarded = True
                     else:
                         raw.extend(chunk)
                     publish(False)
@@ -4411,15 +4436,27 @@ MAX_ENV_FILE_BYTES = 1024 * 1024
 def _names_in(path):
     """Advisory only, and run as root at activation: a FIFO with no writer
     would block open() forever and a symlink to an endless stream would
-    never stop reading, so anything but a small regular file is skipped
-    before load() ever opens it."""
+    never stop reading. So the path is opened ONCE with O_NOFOLLOW |
+    O_NONBLOCK, the descriptor is checked with fstat, and at most the size
+    limit plus one byte is read from that same descriptor - nothing can be
+    swapped in between the check and the read."""
     try:
-        info = os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return []
-    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ENV_FILE_BYTES:
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ENV_FILE_BYTES:
+            return []
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(MAX_ENV_FILE_BYTES + 1)
+    except OSError:
         return []
-    return [key for key, _ in load(path)]
+    finally:
+        os.close(fd)
+    if len(data) > MAX_ENV_FILE_BYTES:
+        return []
+    return [key for key, _ in parse(data.decode("utf-8", errors="replace"))]
 
 
 def list_profiles(home):

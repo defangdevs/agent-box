@@ -352,6 +352,7 @@ step allowed to fail.
 """
 # The library above already imported os and json; only what it does not is
 # imported here.
+import pwd
 import shutil
 import subprocess
 import sys
@@ -394,6 +395,17 @@ def main(argv):
     # turn this session's own secret stripping off from inside the very
     # file it is supposed to protect.
     secret_socket = os.environ.get("AGENT_BOX_SECRET_SOCKET")
+    if not secret_socket:
+        # Enabling custody on a box whose agent unit is already running
+        # writes the socket into the unit's env file, but a running
+        # supervisor (and its tmux server) keeps the environment it started
+        # with, and restarting the unit would end every session. The file
+        # is root-owned, so read it afresh at each spawn instead: new
+        # sessions are protected at once, running ones are untouched.
+        unit_env = os.environ.get("AGENT_BOX_UNIT_ENV_FILE") or os.path.join(
+            "/etc/agent-box/units", f"{pwd.getpwuid(os.getuid()).pw_name}.env"
+        )
+        secret_socket = dict(load(unit_env)).get("AGENT_BOX_SECRET_SOCKET")
 
     # The per-user secrets file the settings page and `agent-box-session env`
     # manage.

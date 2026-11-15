@@ -48,7 +48,7 @@ PYBIN = os.environ.get("AGENT_BOX_TEST_PYBIN", sys.executable)
 # ModuleNotFoundError and AGENT_BOX_TEST_PYBIN never gets a say.
 if PYBIN != sys.executable and not os.environ.get("AGENT_BOX_TEST_REEXEC"):
     os.environ["AGENT_BOX_TEST_REEXEC"] = "1"
-    os.execv(PYBIN, [PYBIN, *sys.argv])
+    os.execvp(PYBIN, [PYBIN, *sys.argv])
 
 ns = {"__name__": "secret_lib"}
 # LIB (protocol + jobs) is also what composes BROKER below, so it stays
@@ -507,6 +507,27 @@ class Custody(unittest.TestCase):
         started = time.time()
         self.assertEqual(ns["scan"](home), [])
         self.assertLess(time.time() - started, 5)
+
+    def test_truncated_capture_never_releases_a_partial_secret(self):
+        self.broker.ask({"op": "set", "name": "TOKEN", "value": CANARY})
+        # Enough copies that the raw cap cuts one in half, offset by a
+        # 3-byte pad so the cut cannot land on a copy boundary.
+        script = ('import os,sys; v=os.environ["TOKEN"]; '
+                  'sys.stdout.write("yyy"+v*(70000//len(v)+5))')
+        resp = self.broker.ask({"op": "exec", "argv": [PYBIN, "-c", script],
+                                "secretNames": ["TOKEN"], "cwd": self.tmp})
+        final = self.broker.wait_job(resp["jobId"])
+        self.assertTrue(final["stdoutTruncated"])
+        self.assertNotIn(CANARY[:8], final["stdout"])
+
+    def test_scan_skips_a_symlinked_env_file(self):
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        target = Path(home) / "elsewhere"
+        target.write_text("API_TOKEN=x\n")
+        os.symlink(target, config / "env")
+        self.assertEqual(ns["scan"](home), [])
 
     def test_oversize_status_reply_keeps_its_output_and_marks_truncation(self):
         self.broker.ask({"op": "set", "name": "TOKEN", "value": "t"})

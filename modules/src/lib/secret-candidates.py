@@ -51,15 +51,27 @@ MAX_ENV_FILE_BYTES = 1024 * 1024
 def _names_in(path):
     """Advisory only, and run as root at activation: a FIFO with no writer
     would block open() forever and a symlink to an endless stream would
-    never stop reading, so anything but a small regular file is skipped
-    before load() ever opens it."""
+    never stop reading. So the path is opened ONCE with O_NOFOLLOW |
+    O_NONBLOCK, the descriptor is checked with fstat, and at most the size
+    limit plus one byte is read from that same descriptor - nothing can be
+    swapped in between the check and the read."""
     try:
-        info = os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return []
-    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ENV_FILE_BYTES:
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ENV_FILE_BYTES:
+            return []
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            data = handle.read(MAX_ENV_FILE_BYTES + 1)
+    except OSError:
         return []
-    return [key for key, _ in load(path)]
+    finally:
+        os.close(fd)
+    if len(data) > MAX_ENV_FILE_BYTES:
+        return []
+    return [key for key, _ in parse(data.decode("utf-8", errors="replace"))]
 
 
 def list_profiles(home):
