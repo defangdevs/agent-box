@@ -519,10 +519,54 @@ class WhatsAppRouteTest(unittest.TestCase):
         self.cli.STATE.mkdir(parents=True, exist_ok=True)
         self.cli.READY = self.cli.STATE / "ready"
         with mock.patch.object(self.cli, "bridge_connected", return_value=False), \
-                mock.patch.object(self.cli.time, "sleep"):
+                mock.patch.object(self.cli, "UNLINK_SETTLE", 0):
             self.cli.unlink()
         self.assertFalse(self.cli.ROUTE_STATE.parent.exists())
         self.assertFalse(self.cli.STATE.exists())
+
+    def test_unlink_waits_for_a_running_route_and_a_late_route_writes_nothing(self):
+        import fcntl
+        import threading
+        self.cli.STATE.mkdir(parents=True, exist_ok=True)
+        self.cli.READY = self.cli.STATE / "ready"
+        self.cli.READY.touch()
+        lock = open(self.cli.ROUTE_STATE.with_name("lock"), "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)          # a route call in progress
+        done = threading.Event()
+
+        def run_unlink():
+            with mock.patch.object(self.cli, "bridge_connected", return_value=False), \
+                    mock.patch.object(self.cli, "UNLINK_SETTLE", 0):
+                self.cli.unlink()
+            done.set()
+        worker = threading.Thread(target=run_unlink)
+        worker.start()
+        self.assertFalse(done.wait(1.0), "unlink must wait for the running route")
+        self.assertTrue(self.cli.ROUTE_STATE.parent.exists())
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        lock.close()
+        self.assertTrue(done.wait(5))
+        worker.join()
+        self.assertFalse(self.cli.ROUTE_STATE.parent.exists())
+        # A route that only now gets to run finds WhatsApp unlinked.
+        with mock.patch.object(self.cli.sys, "stdin", io.StringIO(json.dumps(self.REQUEST))):
+            with self.assertRaisesRegex(RuntimeError, "unlinked"):
+                self.cli.route()
+        self.assertFalse(self.cli.ROUTE_STATE.exists())
+
+    def test_unlink_gives_up_if_a_route_never_finishes(self):
+        import fcntl
+        self.cli.STATE.mkdir(parents=True, exist_ok=True)
+        self.cli.READY = self.cli.STATE / "ready"
+        lock = open(self.cli.ROUTE_STATE.with_name("lock"), "a")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        self.addCleanup(lock.close)
+        with mock.patch.object(self.cli, "bridge_connected", return_value=False), \
+                mock.patch.object(self.cli, "UNLINK_SETTLE", 0), \
+                mock.patch.object(self.cli, "ROUTE_UNLINK_WAIT", 0.3):
+            with self.assertRaisesRegex(RuntimeError, "still running"):
+                self.cli.unlink()
+        self.assertTrue(self.cli.STATE.exists())   # nothing half-removed
 
     def test_bad_request_is_refused(self):
         for bad in ({}, {"message": {"id": "../x"}}, {"message": "hi"}):

@@ -202,10 +202,8 @@ def unlink():
     if STATE.is_symlink():
         raise RuntimeError("WhatsApp state cannot be a symlink")
     READY.unlink(missing_ok=True)
-    # The router's history holds message text too; Unlink forgets it.
-    if ROUTE_STATE.parent.is_dir() and not ROUTE_STATE.parent.is_symlink():
-        shutil.rmtree(ROUTE_STATE.parent)
     if not STATE.exists():
+        forget_route_state()
         return
     # The supervisor reconciles every two seconds. An absent socket before one
     # full tick does not prove a bridge is stopped: it may still be installing
@@ -216,7 +214,29 @@ def unlink():
         if time.monotonic() >= deadline:
             raise RuntimeError("WhatsApp bridge did not stop; try unlinking again")
         time.sleep(0.1)
+    forget_route_state()
     shutil.rmtree(STATE)
+
+
+def forget_route_state():
+    """The router's history holds message text too; Unlink forgets it. A
+    route call runs in its own process group and can outlive the bridge, so
+    wait for it under the route lock; a call that gets the lock afterwards
+    sees READY gone and writes nothing (see route())."""
+    root = ROUTE_STATE.parent
+    if not root.is_dir() or root.is_symlink():
+        return
+    with open(root / "lock", "a") as lock:
+        deadline = time.monotonic() + ROUTE_UNLINK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("a message route is still running; try unlinking again")
+                time.sleep(0.2)
+        shutil.rmtree(root)
 
 
 def serve():
@@ -276,6 +296,7 @@ ROUTE_NO_BACKEND_TTL = 600
 # routing call stay inside the bridge's 180 s route deadline.
 PROBE_LIMITS = {"claude": {"timeout": 40}, "codex": {"timeout": 60}}
 ROUTE_DECISIONS_MAX = 300   # message ids remembered for replay
+ROUTE_UNLINK_WAIT = 200     # longer than the bridge's 180 s route deadline
 INBOX_TTL_HOURS = "8"       # local-webhook's longest session TTL; renewed on every delivery
 SESSION_BIN = os.environ.get("AGENT_BOX_SESSION_BIN", "agent-box-session")
 WEBHOOK_BIN = os.environ.get("AGENT_BOX_WEBHOOK_BIN", "agent-box-webhook")
@@ -583,8 +604,11 @@ def route_request(request, router=None):
 def route():
     request = json.loads(sys.stdin.read(400_000))
     ROUTE_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with open(ROUTE_STATE.with_name("lock"), "w") as lock:
+    with open(ROUTE_STATE.with_name("lock"), "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        # Unlink may have run while this call waited for the lock.
+        if not READY.is_file():
+            raise RuntimeError("WhatsApp is unlinked; not routing")
         print(json.dumps(route_request(request)))
 
 
