@@ -2640,8 +2640,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "a54bb56dba4e6c8aafb57231ba81211eeb1e78ab";
-  sha256 = "sha256-kV4+XsRsb2NbCbhmZooKxNBRLG7I4z3hsz/RsyV5usY=";
+  rev = "c0021f6c491d3710c498a3b8739ecd9d7932fe8d";
+  sha256 = "sha256-2+lTrqU3+ZJSA5+CN9WQ1XbWoRe5tmaTmlVwEDPm6js=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
@@ -6242,6 +6242,9 @@ import time as hibernate_time
 
 
 HIBERNATE_IDLE_S = 30
+# Claude record types that carry or announce input. One of these after the
+# last closed turn means the session is not quiet.
+HIBERNATE_CLAUDE_INPUT_TYPES = ("user", "assistant", "attachment", "queue-operation")
 HIBERNATE_TAIL_LINES = 400
 HIBERNATE_TAIL_BYTES = 2 * 1024 * 1024
 HIBERNATE_CODEX_HEAD_BYTES = 64 * 1024
@@ -6343,15 +6346,28 @@ def _hibernate_transcript_state(path, harness):
     if records is None:
         return None
     if harness == "claude":
-        relevant = [record for record in records
+        relevant = [(index, record) for index, record in enumerate(records)
                     if record.get("type") in ("assistant", "user")
                     and isinstance(record.get("message"), dict)]
         if not relevant:
             return None
-        last = relevant[-1]
+        last_index, last = relevant[-1]
         closed = (last.get("type") == "assistant"
                   and last["message"].get("stop_reason") == "end_turn")
         marker = [last.get("type"), last["message"].get("stop_reason")]
+        # Claude Code also appends records that are not conversation:
+        # last-prompt, cost-state, file-history-snapshot, ai-title and more,
+        # some of them when the process EXITS (2.1.322). Those must not read
+        # as new input, or the check after the kill always fails and every
+        # hibernation is undone and resumed. Input is a user or assistant
+        # record (above), or an attachment or queue record that comes with
+        # one; any of those after the last turn record is a change.
+        if any(record.get("type") in HIBERNATE_CLAUDE_INPUT_TYPES
+               for record in records[last_index + 1:]):
+            return None
+        conversation = hibernate_hashlib.sha256(hibernate_json.dumps(
+            last, sort_keys=True, separators=(",", ":"))
+            .encode("utf-8")).hexdigest()
     elif harness == "codex":
         relevant = [(index, record) for index, record in enumerate(records)
                     if record.get("type") == "event_msg"
@@ -6361,6 +6377,7 @@ def _hibernate_transcript_state(path, harness):
         if not relevant:
             return None
         last_index, last = relevant[-1]
+        conversation = None
         closed = last["payload"].get("type") == "task_complete"
         marker = ["event_msg", last["payload"].get("type")]
         # Codex normally appends thread_settings_applied while sitting at the
@@ -6390,6 +6407,9 @@ def _hibernate_transcript_state(path, harness):
         "size": stat.st_size,
         "mtimeNs": stat.st_mtime_ns,
         "marker": marker,
+        # What the quiet check compares instead of size and mtime, when the
+        # harness writes records after its last turn that are not input.
+        "conversation": conversation,
     }
 
 
@@ -6650,7 +6670,10 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
         return None
     now = hibernate_time.time() if now is None else now
     idle_since = transcript_state["mtimeNs"] / 1_000_000_000
-    if now - idle_since < _hibernate_idle_seconds():
+    # A parked re-probe (the quiet checks around the kill) skips the age
+    # test: the selection already proved the idle time, and an exiting
+    # Claude writes its last records just then, which renews the mtime.
+    if not parked and now - idle_since < _hibernate_idle_seconds():
         return None
     evidence = {
         "name": name,
@@ -6669,8 +6692,16 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
     # Narrower than the token: only what native input or routing can change.
     # The token also covers the registry entry and session state file, which
     # hibernate_one itself rewrites while parking.
+    # For Claude, the transcript part is the file identity and the last turn
+    # record, not size and mtime: records that are not input (see
+    # _hibernate_transcript_state) may still arrive, for example on exit.
+    if transcript_state["conversation"] is not None:
+        quiet_transcript = [transcript_state["path"], transcript_state["device"],
+                            transcript_state["inode"], transcript_state["conversation"]]
+    else:
+        quiet_transcript = transcript_state
     quiet = hibernate_hashlib.sha256(hibernate_json.dumps(
-        [evidence["transcript"], evidence["lease"], evidence["watch"],
+        [quiet_transcript, evidence["lease"], evidence["watch"],
          evidence["whatsapp"]], sort_keys=True, separators=(",", ":"))
         .encode("utf-8")).hexdigest()
     return {
@@ -11138,6 +11169,13 @@ def owner_lines(request, ack, reply):
     return lines
 
 
+def text_topic(text, words=6):
+    """A topic from the message itself, for a decision that has none: the
+    router decides the first message (no sessions yet) and a fallback without
+    a model call, so those sessions would all be called wa-chat."""
+    return " ".join((text or "").split()[:words])[:80]
+
+
 def new_session_name(topic, taken):
     slug = re.sub(r"[^a-z0-9]+", "-", (topic or "").lower()).strip("-")[:30].strip("-") or "chat"
     base = "wa-" + slug
@@ -11320,7 +11358,7 @@ def route_request(request, router=None):
             ROUTE_BACKEND_CACHE.unlink()
         except OSError:
             pass
-    topic = decision.get("topic") or ""
+    topic = decision.get("topic") or text_topic(message.get("text"))
     if decision["action"] == "CONTINUE":
         name = decision["session"]
         # Recorded BEFORE the delivery, so a crash after it replays, not re-decides.

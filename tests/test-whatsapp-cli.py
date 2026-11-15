@@ -364,11 +364,20 @@ class WhatsAppRouteTest(unittest.TestCase):
     def test_new_session_uses_the_whatsapp_profile_and_a_free_name(self):
         self.cli.profile = lambda value=None: "phone-agent"
         self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False},
-                   {"name": "wa-chat", "harness": "codex", "stopped": False, "selected": False}])
+                   {"name": "wa-and-in-greece", "harness": "codex", "stopped": False, "selected": False}])
         self.cli.route_request(self.REQUEST, FakeRouter(
             {"action": "NEW", "session": None, "links": [], "topic": "", "reason": "fallback"}))
         add = next(c["argv"] for c in self.calls("agent-box-session") if c["argv"][0] == "add")
-        self.assertEqual(add[:5], ["add", "wa-chat-2", "--profile", "phone-agent", "--origin"])
+        # No topic from the router: the name and topic come from the text.
+        self.assertEqual(add[:5], ["add", "wa-and-in-greece-2", "--profile", "phone-agent", "--origin"])
+        self.assertEqual(self.state()["sessions"]["wa-and-in-greece-2"]["messages"][0]["topic"],
+                         "and in Greece?")
+
+    def test_text_topic_takes_the_first_words(self):
+        self.assertEqual(self.cli.text_topic("  Which Node.js\nversion does the T3 spike use? Just tell me"),
+                         "Which Node.js version does the T3")
+        self.assertEqual(self.cli.text_topic(""), "")
+        self.assertEqual(self.cli.new_session_name(self.cli.text_topic("?!"), set()), "wa-chat")
 
     def test_full_box_hibernates_one_session_then_retries_the_start(self):
         self.live([], **{"agent-box-session add wa-greece": ["once75", ""]})

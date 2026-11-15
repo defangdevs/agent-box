@@ -433,6 +433,13 @@ def owner_lines(request, ack, reply):
     return lines
 
 
+def text_topic(text, words=6):
+    """A topic from the message itself, for a decision that has none: the
+    router decides the first message (no sessions yet) and a fallback without
+    a model call, so those sessions would all be called wa-chat."""
+    return " ".join((text or "").split()[:words])[:80]
+
+
 def new_session_name(topic, taken):
     slug = re.sub(r"[^a-z0-9]+", "-", (topic or "").lower()).strip("-")[:30].strip("-") or "chat"
     base = "wa-" + slug
@@ -615,7 +622,7 @@ def route_request(request, router=None):
             ROUTE_BACKEND_CACHE.unlink()
         except OSError:
             pass
-    topic = decision.get("topic") or ""
+    topic = decision.get("topic") or text_topic(message.get("text"))
     if decision["action"] == "CONTINUE":
         name = decision["session"]
         # Recorded BEFORE the delivery, so a crash after it replays, not re-decides.
