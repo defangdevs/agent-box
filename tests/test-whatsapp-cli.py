@@ -463,6 +463,7 @@ class WhatsAppRouteTest(unittest.TestCase):
             self.cli.write_private(self.root / "x.json", {})
 
     def test_replayed_continue_redelivers_without_deciding_again(self):
+        self.live([{"name": "wa-vat", "harness": "claude", "stopped": True, "selected": False, "id": "v1"}])
         decision = {"action": "CONTINUE", "session": "wa-vat", "links": [], "topic": "t", "reason": "llm"}
         self.cli.route_request(self.REQUEST, FakeRouter(decision))
         again = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "x", "reason": "llm"})
@@ -475,15 +476,91 @@ class WhatsAppRouteTest(unittest.TestCase):
         self.assertEqual(ids[0], ids[1])
         self.assertRegex(ids[0], r"^route-[0-9a-f]{40}$")
 
+    def started_live(self, sid):
+        """Candidates without wa-greece until `add` ran, then with it (id sid)."""
+        before = [{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False, "id": "v1"}]
+        after = before + [{"name": "wa-greece", "harness": "claude", "stopped": False, "selected": False, "id": sid}]
+        real = self.cli.run_json
+
+        def fake(argv, env=None, timeout=60):
+            if argv[1:3] == ["whatsapp", "candidates"]:
+                added = any(c["argv"][0] == "add" for c in self.calls("agent-box-session"))
+                return after if added else before
+            return real(argv, env, timeout)
+        return mock.patch.object(self.cli, "run_json", side_effect=fake)
+
     def test_replayed_new_does_not_start_a_second_session(self):
         router = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"})
-        self.cli.route_request(self.REQUEST, router)
-        self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False},
-                   {"name": "wa-greece", "harness": "claude", "stopped": False, "selected": False, "id": "b1"}])
-        out = self.cli.route_request(self.REQUEST, FakeRouter({}))
+        with self.started_live("g1"):
+            self.cli.route_request(self.REQUEST, router)
+            out = self.cli.route_request(self.REQUEST, FakeRouter({}))
         self.assertEqual((out["session"], out["reason"]), ("wa-greece", "replay"))
         adds = [c for c in self.calls("agent-box-session") if c["argv"][0] == "add"]
         self.assertEqual(len(adds), 1)
+        self.assertEqual(self.state()["decisions"]["M2"]["id"], "g1")
+
+    def interrupted_start(self, collide):
+        """Route a NEW message, but die right after `add` succeeded (before the
+        id is read back and the history written)."""
+        stub = Path(self.cli.SESSION_BIN)
+        stub.write_text(stub.read_text().replace(
+            'sys.stdout.write(out)', 'sys.stderr.write("session already exists\\n" if code == 2 else ""); sys.stdout.write(out)'))
+        extra = {"agent-box-session add wa-greece": [2, ""]} if collide else {}
+        self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False, "id": "v1"}], **extra)
+        real = self.cli.run_json
+
+        def dies_after_add(argv, env=None, timeout=60):
+            if argv[1:3] == ["whatsapp", "candidates"] and any(
+                    c["argv"][0] == "add" and c["argv"][1] != "wa-greece" * collide
+                    for c in self.calls("agent-box-session")):
+                raise KeyboardInterrupt("bridge killed")
+            return real(argv, env, timeout)
+        with mock.patch.object(self.cli, "run_json", side_effect=dies_after_add):
+            with self.assertRaises(KeyboardInterrupt):
+                self.cli.route_request(self.REQUEST, FakeRouter(
+                    {"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"}))
+
+    def test_replay_restores_a_session_started_just_before_an_interruption(self):
+        for collide, started in ((False, "wa-greece"), (True, "wa-greece-2")):
+            with self.subTest(collide=collide):
+                self.setUp()
+                self.interrupted_start(collide)
+                self.assertEqual(self.state()["decisions"]["M2"]["session"], started)
+                self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False, "id": "v1"},
+                           {"name": started, "harness": "claude", "stopped": False, "selected": False, "id": "g9"}])
+                again = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "x", "reason": "llm"})
+                out = self.cli.route_request(self.REQUEST, again)
+                self.assertEqual((out["session"], out["reason"]), (started, "replay"))
+                self.assertEqual(again.calls, [])
+                adds = [c["argv"][1] for c in self.calls("agent-box-session") if c["argv"][0] == "add"]
+                self.assertEqual(adds.count(started), 1, adds)
+                state = self.state()
+                self.assertEqual(state["decisions"]["M2"]["id"], "g9")
+                self.assertEqual(state["current"], started)
+                self.assertEqual([m["id"] for m in state["sessions"][started]["messages"]], ["M2"])
+                self.assertEqual(state["sessions"][started]["id"], "g9")
+
+    def test_replay_never_goes_to_a_replacement_session(self):
+        # CONTINUE recorded for wa-vat (id v1), then wa-vat is re-created (id v2).
+        self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False, "id": "v1"}])
+        self.cli.route_request(self.REQUEST, FakeRouter(
+            {"action": "CONTINUE", "session": "wa-vat", "links": [], "topic": "t", "reason": "llm"}))
+        self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False, "id": "v2"}])
+        again = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "fresh", "reason": "llm"})
+        out = self.cli.route_request(self.REQUEST, again)
+        self.assertEqual(out["reason"], "llm")          # decided again, not replayed
+        self.assertEqual(again.calls[0]["sessions"], [])  # the replacement is not a candidate either
+        self.assertEqual(out["session"], "wa-fresh")
+        # NEW recorded for wa-greece (g1); a replacement wa-greece (g2) is not "already started".
+        with self.started_live("g1"):
+            self.cli.route_request(dict(self.REQUEST, message=dict(self.REQUEST["message"], id="M5")),
+                                   FakeRouter({"action": "NEW", "session": None, "links": [],
+                                               "topic": "Greece", "reason": "llm"}))
+        self.live([{"name": "wa-greece", "harness": "claude", "stopped": False, "selected": False, "id": "g2"}])
+        out = self.cli.route_request(dict(self.REQUEST, message=dict(self.REQUEST["message"], id="M5")),
+                                     FakeRouter({"action": "NEW", "session": None, "links": [],
+                                                 "topic": "other", "reason": "llm"}))
+        self.assertEqual((out["session"], out["reason"]), ("wa-other", "llm"))
 
     def test_a_replaced_session_is_forgotten(self):
         self.cli.write_private(self.cli.ROUTE_STATE, {"current": "wa-vat", "sessions": {
@@ -553,6 +630,28 @@ class WhatsAppRouteTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unlinked"):
                 self.cli.route()
         self.assertFalse(self.cli.ROUTE_STATE.exists())
+
+    def test_a_route_from_before_unlink_cannot_write_into_a_new_pairing(self):
+        self.cli.STATE.mkdir(parents=True, exist_ok=True)
+        self.cli.READY = self.cli.STATE / "ready"
+        self.cli.READY.touch()
+        # A route opened the lock file, then paused before taking it.
+        paused = open(self.cli.ROUTE_STATE.with_name("lock"), "a")
+        self.addCleanup(paused.close)
+        with mock.patch.object(self.cli, "bridge_connected", return_value=False), \
+                mock.patch.object(self.cli, "UNLINK_SETTLE", 0):
+            self.cli.unlink()
+        # Pair again: a new ready marker and fresh router state.
+        self.cli.STATE.mkdir(parents=True)
+        self.cli.READY.touch()
+        self.cli.ROUTE_STATE.parent.mkdir(parents=True)
+        self.cli.ROUTE_STATE.with_name("lock").touch()
+        with self.assertRaisesRegex(RuntimeError, "unlinked while this route waited"):
+            self.cli.take_route_lock(paused)
+        self.assertFalse(self.cli.ROUTE_STATE.exists())
+        # A route that opens the CURRENT lock file proceeds.
+        with open(self.cli.ROUTE_STATE.with_name("lock"), "a") as fresh:
+            self.cli.take_route_lock(fresh)
 
     def test_unlink_gives_up_if_a_route_never_finishes(self):
         import fcntl

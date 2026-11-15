@@ -422,12 +422,15 @@ def new_session_name(topic, taken):
     return name
 
 
-def start_session(name, prompt):
+def start_session(name, prompt, before_attempt=None):
     """Start the session; returns the name it got. A name taken by a session
-    the candidate list does not show (a shell, say) moves to the next suffix."""
+    the candidate list does not show (a shell, say) moves to the next suffix.
+    before_attempt(name) runs before each `add`, so the caller can save it."""
     base, n, hibernated = checked_name(name), 2, False
     configured = profile()
     for _ in range(12):
+        if before_attempt:
+            before_attempt(name)
         argv = [SESSION_BIN, "add", checked_name(name), "--origin", "webhook", "--prompt", prompt]
         if configured:
             argv[3:3] = ["--profile", configured]
@@ -521,19 +524,52 @@ def route_request(request, router=None):
         return bool(known[n].get("id")) and live[n].get("id") != known[n].get("id")
     for name in [n for n in known if gone(n)]:
         del known[name]
+
+    def remember(name, topic):
+        """Record that this message went to NAME, and save. Idempotent, so a
+        replay can restore what an interrupted call did not get to write."""
+        entry = known.setdefault(name, {"messages": [], "startedAt": time.time()})
+        if not entry.get("id"):
+            entry["id"] = live.get(name, {}).get("id")
+        msgs = list(entry.get("messages") or [])
+        if not any(m.get("id") == message["id"] and m.get("role") == "user" for m in msgs):
+            msgs.append({"id": message["id"], "role": "user", "text": (message.get("text") or "")[:2000],
+                         "ts": message.get("ts"), "topic": topic or ""})
+        entry["messages"] = msgs[-ROUTE_HISTORY_MAX:]
+        state["current"] = name
+        for old in list(decisions)[:max(0, len(decisions) - ROUTE_DECISIONS_MAX)]:
+            del decisions[old]
+        if len(known) > ROUTE_SESSIONS_MAX:
+            def last(n):
+                ms = known[n].get("messages") or []
+                return (ms[-1].get("ts") or 0) if ms else known[n].get("startedAt", 0)
+            for old in sorted(known, key=last)[:len(known) - ROUTE_SESSIONS_MAX]:
+                del known[old]
+        write_private(ROUTE_STATE, state)
+
     # A replay (the bridge restarted after this call delivered but before it
     # recorded the answer) repeats the recorded decision instead of deciding
-    # again. Its side effects are idempotent: an existing session is not
-    # started again, and the emit carries the same delivery id.
+    # again, and restores the history the interrupted call did not write.
+    # Its side effects are idempotent: an existing session is not started
+    # again, and the emit carries the same delivery id.
     done = decisions.get(message["id"])
     if isinstance(done, dict) and done.get("session") in live:
         name = done["session"]
-        if done.get("action") == "CONTINUE":
-            deliver(name, live[name]["harness"], request, ack, reply)
-        # NEW / NEW_LINKS: the session exists, so it was started with the
-        # message as its kickoff; nothing to repeat.
-        return {"session": name, "action": done.get("action"), "links": done.get("links") or [],
-                "reason": "replay"}
+        sid = live[name].get("id")
+        if done.get("id"):
+            # Only into the SAME session, never one re-created under the name.
+            ours = sid == done["id"]
+        else:
+            # A start attempt saved its name just before it ran, when no
+            # session had that name; the session there now is that start.
+            ours = done.get("action") != "CONTINUE" and bool(sid)
+        if ours:
+            done["id"] = sid
+            if done.get("action") == "CONTINUE":
+                deliver(name, live[name]["harness"], request, ack, reply)
+            remember(name, done.get("topic"))
+            return {"session": name, "action": done.get("action"), "links": done.get("links") or [],
+                    "reason": "replay"}
     # Answers the channel already sent become the assistant side of history.
     for item in request.get("recent") or []:
         if not isinstance(item, dict):
@@ -555,48 +591,37 @@ def route_request(request, router=None):
             ROUTE_BACKEND_CACHE.unlink()
         except OSError:
             pass
+    topic = decision.get("topic") or ""
     if decision["action"] == "CONTINUE":
         name = decision["session"]
         # Recorded BEFORE the delivery, so a crash after it replays, not re-decides.
-        decisions[message["id"]] = {"session": name, "action": "CONTINUE", "links": []}
+        decisions[message["id"]] = {"session": name, "action": "CONTINUE", "links": [],
+                                    "id": live[name].get("id"), "topic": topic}
         write_private(ROUTE_STATE, state)
         deliver(name, live[name]["harness"], request, ack, reply)
     else:
-        name = new_session_name(decision.get("topic"), set(live) | set(known))
+        name = new_session_name(topic, set(live) | set(known))
         lines = owner_lines(request, ack, reply)
         if decision["action"] == "NEW_LINKS" and decision.get("links"):
             lines.append("Earlier sessions with related context (read their transcripts if you need the details):")
-            for sid in decision["links"]:
-                topics = [m.get("topic") for m in known.get(sid, {}).get("messages", []) if m.get("topic")]
-                lines.append("- %s: %s" % (sid, "; ".join(dict.fromkeys(topics[-3:])) or "no topic labels"))
+            for link in decision["links"]:
+                topics = [m.get("topic") for m in known.get(link, {}).get("messages", []) if m.get("topic")]
+                lines.append("- %s: %s" % (link, "; ".join(dict.fromkeys(topics[-3:])) or "no topic labels"))
         lines.append("(This session was started by the message router for this topic. Later owner messages "
                      "on the same topic arrive here as OWNER messages via inbox.)")
-        decisions[message["id"]] = {"session": name, "action": decision["action"],
-                                    "links": decision.get("links") or []}
-        write_private(ROUTE_STATE, state)
-        name = start_session(name, "\n".join(lines))
+
+        def attempt(candidate):
+            # Saved before EACH start attempt, so an interrupted start under
+            # a suffixed name is found again by a replay.
+            decisions[message["id"]] = {"session": candidate, "action": decision["action"],
+                                        "links": decision.get("links") or [], "id": None, "topic": topic}
+            write_private(ROUTE_STATE, state)
+        name = start_session(name, "\n".join(lines), attempt)
         started = (run_json([SESSION_BIN, "whatsapp", "candidates"]) or [])
         sid = next((i.get("id") for i in started if isinstance(i, dict) and i.get("name") == name), None)
-        known[name] = {"messages": [], "startedAt": time.time(), "id": sid}
-        decisions[message["id"]] = {"session": name, "action": decision["action"],
-                                    "links": decision.get("links") or []}
-    entry = known.setdefault(name, {"messages": []})
-    if not entry.get("id"):
-        entry["id"] = live.get(name, {}).get("id")
-    for old in list(decisions)[:max(0, len(decisions) - ROUTE_DECISIONS_MAX)]:
-        del decisions[old]
-    entry["messages"] = (entry.get("messages") or []) + [{
-        "id": message["id"], "role": "user", "text": (message.get("text") or "")[:2000],
-        "ts": message.get("ts"), "topic": decision.get("topic") or ""}]
-    entry["messages"] = entry["messages"][-ROUTE_HISTORY_MAX:]
-    state["current"] = name
-    if len(known) > ROUTE_SESSIONS_MAX:
-        def last(n):
-            msgs = known[n].get("messages") or []
-            return (msgs[-1].get("ts") or 0) if msgs else known[n].get("startedAt", 0)
-        for old in sorted(known, key=last)[:len(known) - ROUTE_SESSIONS_MAX]:
-            del known[old]
-    write_private(ROUTE_STATE, state)
+        live[name] = {"name": name, "id": sid}
+        decisions[message["id"]]["id"] = sid
+    remember(name, topic)
     return {"session": name, "action": decision["action"], "links": decision.get("links") or [],
             "reason": decision.get("reason")}
 
@@ -605,11 +630,26 @@ def route():
     request = json.loads(sys.stdin.read(400_000))
     ROUTE_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with open(ROUTE_STATE.with_name("lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        # Unlink may have run while this call waited for the lock.
-        if not READY.is_file():
-            raise RuntimeError("WhatsApp is unlinked; not routing")
+        take_route_lock(lock)
         print(json.dumps(route_request(request)))
+
+
+def take_route_lock(lock):
+    """Lock, then prove the lock still means this pairing. Unlink removes
+    the router directory, lock file included; a call that opened the old file
+    before that would otherwise lock a deleted inode with no contention and,
+    after a new pairing, write into the new state. So the file we hold must
+    still be the one at the path, and WhatsApp must still be linked."""
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        current = os.stat(ROUTE_STATE.with_name("lock"))
+    except OSError:
+        current = None
+    held = os.fstat(lock.fileno())
+    if current is None or (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+        raise RuntimeError("WhatsApp was unlinked while this route waited; not routing")
+    if not READY.is_file():
+        raise RuntimeError("WhatsApp is unlinked; not routing")
 
 
 def pair():
