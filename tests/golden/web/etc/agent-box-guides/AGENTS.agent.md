@@ -324,21 +324,34 @@ stays installed so pairing again does not need another download. WhatsApp may
 continue to list the now-inactive device until it is also removed from the
 primary phone's Linked devices screen.
 
-WhatsApp has one destination session at a time. From the phone, send
-`@agent /sessions` to list Claude and Codex sessions, then `@agent /target NAME`
-to choose one. `@agent /target auto` clears that choice, so the next message
-starts a new session with the profile selected in Connections; with no
-selection, it uses the box's default profile. Send `@agent /profile NAME` to
-change the profile and make the next message start fresh, or
-`@agent /profile default` to use the default profile. The CLI equivalents are
-`agent-box-session whatsapp candidates`, `select NAME`, `activate NAME`,
-`clear`, and `spawn PROFILE|default`. A stopped session is a cold conversation:
-the next message asks the shared capacity policy to reactivate that exact
-session and resume its native harness thread. If no slot is available or that
-selected session no longer exists, the message remains queued on the same
-target instead of starting a replacement.
-Selecting a different target does not require pairing again. Restart a running
-Claude session after selecting it so it loads the WhatsApp channel.
+A self-chat has no threads, so a router chooses the session for each
+message. `agent-box-whatsapp route` asks local-router (a small model through
+the first signed-in harness, Claude Haiku first) whether the message continues
+one of the sessions the router started, starts a new topic, or starts a new
+topic that needs facts from older ones. A new topic starts a new session, with
+the profile selected in Connections or the box's default profile; its kickoff
+prompt is the message. A follow-up wakes its session if it is stopped or
+hibernated, and arrives there as an `[OWNER message via inbox ...]` on the
+webhook bus: it is the owner's request, not untrusted data. Answer it with the
+`reply` command it names. The router never chooses a session you started
+yourself, and the chat shows no route notice unless `LOCAL_WHATSAPP_DEBUG=1`.
+`AGENT_BOX_ROUTER_BACKEND` (`auto`, `claude`, `codex`, `anthropic`, `openai`,
+`none`) and `AGENT_BOX_ROUTER_MODEL` in the env store override the model;
+`AGENT_BOX_WHATSAPP_ROUTER=off` turns routing off.
+
+To pin one session instead, send `@agent /sessions` to list Claude and Codex
+sessions, then `@agent /target NAME`. `@agent /target auto` removes the pin
+and routes again. Send `@agent /profile NAME` to change the profile for new
+sessions, or `@agent /profile default` to use the default profile. The CLI
+equivalents are `agent-box-session whatsapp candidates`, `select NAME`,
+`activate NAME`, `clear`, and `spawn PROFILE|default`; `wake NAME` revives any
+stopped Claude or Codex session through the same capacity gate. A stopped
+pinned session is a cold conversation: the next message asks the shared
+capacity policy to reactivate that exact session and resume its native harness
+thread. If no slot is available or the pinned session no longer exists, the
+message remains queued on the same target instead of starting a replacement.
+Pinning a different target does not require pairing again. Restart a running
+Claude session after pinning it so it loads the WhatsApp channel.
 
 A normal Codex TUI is registered automatically after its rollout starts, so
 WhatsApp resolves the agent-box session name to the real Codex thread ID. A

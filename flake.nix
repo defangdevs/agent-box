@@ -3033,10 +3033,12 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               {
                 nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.util-linux ];
                 cli = ./tests/golden/vm/payloads/agent-box-session/bin/agent-box-session;
+                router = ./modules/src/whatsapp-cli.py;
                 tests = ./tests/test-whatsapp-session.py;
               } ''
-              install -d repo/tests/golden/vm/payloads/agent-box-session/bin repo/tests
+              install -d repo/tests/golden/vm/payloads/agent-box-session/bin repo/tests repo/modules/src
               cp "$cli" repo/tests/golden/vm/payloads/agent-box-session/bin/agent-box-session
+              cp "$router" repo/modules/src/whatsapp-cli.py
               cp "$tests" repo/tests/test-whatsapp-session.py
               python3 repo/tests/test-whatsapp-session.py > log 2>&1 || {
                 cat log

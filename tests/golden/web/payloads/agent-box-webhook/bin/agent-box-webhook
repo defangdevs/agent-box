@@ -396,6 +396,14 @@ source_template() {
     email)
       printf '%s' '{"format":"generic","keyPath":"recipient","senderPath":"envelopeSender","retainPayload":true}'
       ;;
+    inbox)
+      # Owner messages a router hands to the session it chose (agent-box-whatsapp
+      # route): keyed on the session name, so inbox:<name> reaches exactly one
+      # session, and rendered by local-webhook >= 0.39.0 as the owner's request
+      # rather than untrusted data. Only box-local producers that prove the
+      # owner wrote the text may emit here.
+      printf '%s' '{"format":"generic","keyPath":"session","trust":"owner"}'
+      ;;
     slack)
       # local-slack emits through `webhook.py emit`, which signs with this
       # source's own secret. It routes on `route` (<team>/<channel>), so a topic

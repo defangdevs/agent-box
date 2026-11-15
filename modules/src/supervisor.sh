@@ -1084,6 +1084,11 @@ sync_codex_threads() {
   codex_sync_last=$_now
   _target="$($JQ -r '.session // empty' \
     "$HOME/.local/state/local-whatsapp/target.json" 2>/dev/null)" || _target=""
+  # Sessions the message router started are never the selected target, but
+  # it delivers to them too and needs their thread (agent-box-whatsapp route).
+  _routed="$($JQ -c '[.sessions // {} | keys[]]' \
+    "$HOME/.local/state/agent-box/router/state.json" 2>/dev/null)" || _routed='[]'
+  [ -n "$_routed" ] || _routed='[]'
   while IFS=$'\t' read -r _name _rc _profile; do
     case "$_name" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
     [ "$_profile" != "." ] || _profile=""
@@ -1107,11 +1112,12 @@ sync_codex_threads() {
       codex_publish_thread "$_name" "$_thread"
       record_native_session "$_name" "$_thread"
     fi
-  done < <($JQ -r --arg target "$_target" '
+  done < <($JQ -r --arg target "$_target" --argjson routed "$_routed" '
     .sessions | to_entries[]
     | select((.value.agent // "") == "codex"
         and .value.stopped != true
-        and (.value.whatsapp == true or .key == $target))
+        and (.value.whatsapp == true or .key == $target
+             or (.key as $k | $routed | index($k)) != null))
     | [.key,
        (if (.value.remoteControlDaemon == true
              or .value.remoteControl == true)
@@ -1863,17 +1869,29 @@ supervise_whatsapp() {
   codex_cli="$(agent_bin codex stable 2>/dev/null)" || codex_cli=""
   # Diagnostic receipts are opt-in from the env store; this unit does not load
   # the store itself, so read the one setting the bridge honours.
-  wa_debug=""
+  # The message router's switches come from the store the same way, so
+  # saving AGENT_BOX_WHATSAPP_ROUTER=off or a router backend/model takes
+  # effect at the next bridge start. Empty keeps the bridge's default.
+  wa_debug=""; wa_router=""; wa_backend=""; wa_model=""
   envstore="${AGENT_BOX_ENVSTORE_BIN:-}"
   if [ -x "$envstore" ]; then
-    wa_debug="$("$envstore" json 2>/dev/null \
-      | "$JQ" -r '.LOCAL_WHATSAPP_DEBUG // empty' 2>/dev/null)" || wa_debug=""
+    wa_env="$("$envstore" json 2>/dev/null)" || wa_env=""
+    if [ -n "$wa_env" ]; then
+      wa_debug="$("$JQ" -r '.LOCAL_WHATSAPP_DEBUG // empty' <<<"$wa_env" 2>/dev/null)" || wa_debug=""
+      wa_router="$("$JQ" -r '.AGENT_BOX_WHATSAPP_ROUTER // empty' <<<"$wa_env" 2>/dev/null)" || wa_router=""
+      wa_backend="$("$JQ" -r '.AGENT_BOX_ROUTER_BACKEND // empty' <<<"$wa_env" 2>/dev/null)" || wa_backend=""
+      wa_model="$("$JQ" -r '.AGENT_BOX_ROUTER_MODEL // empty' <<<"$wa_env" 2>/dev/null)" || wa_model=""
+    fi
   fi
   if [ -n "$codex_cli" ]; then
     LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
+      AGENT_BOX_WHATSAPP_ROUTER="$wa_router" AGENT_BOX_ROUTER_BACKEND="$wa_backend" \
+      AGENT_BOX_ROUTER_MODEL="$wa_model" \
       LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$whatsapp" serve &
   else
     LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
+      AGENT_BOX_WHATSAPP_ROUTER="$wa_router" AGENT_BOX_ROUTER_BACKEND="$wa_backend" \
+      AGENT_BOX_ROUTER_MODEL="$wa_model" \
       "$whatsapp" serve &
   fi
   whatsapp_pid=$!

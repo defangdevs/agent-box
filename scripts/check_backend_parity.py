@@ -107,6 +107,15 @@ INTERNAL = {
     "AGENT_BOX_CODEX_UTS": "codex-remote-control.sh re-execs itself",
     "AGENT_BOX_CODEX_PID": "the shared supervisor's exec wrapper passes "
                            "the runtime owner pid to its SessionStart hook",
+    # The message router's switches: the supervisor reads them from the
+    # user's env store and hands them to `agent-box-whatsapp serve`
+    # (supervise_whatsapp), like LOCAL_WHATSAPP_DEBUG. No backend sets them.
+    "AGENT_BOX_WHATSAPP_ROUTER": "supervisor hands the env store's router "
+                                 "switch to the WhatsApp bridge",
+    "AGENT_BOX_ROUTER_BACKEND": "supervisor hands the env store's router "
+                                "backend to the WhatsApp bridge",
+    "AGENT_BOX_ROUTER_MODEL": "supervisor hands the env store's router "
+                              "model to the WhatsApp bridge",
 }
 
 # Divergences that are CORRECT. Each needs a reason a reader can check -
