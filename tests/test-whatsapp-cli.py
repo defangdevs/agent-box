@@ -531,7 +531,7 @@ class WhatsAppRouteTest(unittest.TestCase):
                 self.assertEqual(pending["session"], started)
                 self.assertRegex(pending["nonce"], r"^[0-9a-f]{32}$")
                 add = [c["argv"] for c in self.calls("agent-box-session") if c["argv"][0] == "add"][-1]
-                self.assertIn("[router start %s]" % pending["nonce"], add[add.index("--prompt") + 1])
+                self.assertEqual(add[add.index("--route-start") + 1], pending["nonce"])
                 self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False, "id": "v1"},
                            {"name": started, "harness": "claude", "stopped": False, "selected": False, "id": "g9",
                             "start": pending["nonce"]}])
@@ -564,7 +564,7 @@ class WhatsAppRouteTest(unittest.TestCase):
         # name appears from elsewhere.
         real_start = self.cli.start_session
 
-        def dies_before_add(name, prompt, before_attempt=None):
+        def dies_before_add(name, prompt, before_attempt=None, route_start=None):
             before_attempt(name)
             raise KeyboardInterrupt("bridge killed")
         with mock.patch.object(self.cli, "start_session", side_effect=dies_before_add):

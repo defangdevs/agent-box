@@ -9971,8 +9971,7 @@ case "$cmd" in
                       ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
           {name: .key, harness: .value.agent, stopped: (.value.stopped == true),
            selected: (.value.whatsapp == true), id: (.value.boxSessionId // null),
-           start: (try (.value.initialPrompt | capture("\\[router start (?<n>[0-9a-f]{32})\\]").n)
-                   catch null)}]' "$REGISTRY_FILE"
+           start: (.value.routeStart // null)}]' "$REGISTRY_FILE"
       else
         echo '[]'
       fi
@@ -10152,7 +10151,7 @@ case "$cmd" in
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
     profile=""; has_harness=0; ephemeral=0; remote_control=""; remote_control_daemon=false; daemon_option=false; whatsapp=false
-    origin="user"; hook_source=""; hook_repo=""
+    origin="user"; hook_source=""; hook_repo=""; route_start=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --harness) harness="''${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
@@ -10199,6 +10198,16 @@ case "$cmd" in
           esac
           shift 2 ;;
         --hook) hook_source="''${2:?--hook needs SOURCE REPOSITORY}"; hook_repo="''${3?--hook needs SOURCE REPOSITORY}"; shift 3 ;;
+        # The message router's mark of the start that created this session
+        # (agent-box-whatsapp route). Unlike the kickoff prompt, which the
+        # supervisor clears at the first spawn, it stays for the session's
+        # life, so an interrupted route can prove the session is its own.
+        --route-start)
+          case "''${2:?--route-start needs 32 hex characters}" in
+            (*[!0-9a-f]*) echo "agent-box-session: --route-start must be 32 lowercase hex characters" >&2; exit 2 ;;
+          esac
+          [ "''${#2}" -eq 32 ] || { echo "agent-box-session: --route-start must be 32 lowercase hex characters" >&2; exit 2; }
+          route_start="$2"; shift 2 ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
@@ -10415,6 +10424,7 @@ case "$cmd" in
       --argjson rcd "$remote_control_daemon" \
       --argjson whatsapp "$whatsapp" \
       --arg origin "$origin" --arg hsrc "$hook_source" --arg hrepo "$hook_repo" \
+      --arg rstart "$route_start" \
       '(if $whatsapp then .sessions |= with_entries(.value.whatsapp = false) else . end)
        | .sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
                         remoteControlDaemon: $rcd,
@@ -10438,7 +10448,8 @@ case "$cmd" in
                           else {} end)
                        # Added only when set, so every session that is NOT
                        # one-shot keeps the entry shape it has always had.
-                       + (if $eph == "1" then {ephemeral: true} else {} end))' \
+                       + (if $eph == "1" then {ephemeral: true} else {} end)
+                       + (if $rstart != "" then {routeStart: $rstart} else {} end))' \
       --args -- "''${sargs[@]}"
     registry_unlock
 
@@ -11136,7 +11147,7 @@ def new_session_name(topic, taken):
     return name
 
 
-def start_session(name, prompt, before_attempt=None):
+def start_session(name, prompt, before_attempt=None, route_start=None):
     """Start the session; returns the name it got. A name taken by a session
     the candidate list does not show (a shell, say) moves to the next suffix.
     before_attempt(name) runs before each `add`, so the caller can save it."""
@@ -11146,6 +11157,8 @@ def start_session(name, prompt, before_attempt=None):
         if before_attempt:
             before_attempt(name)
         argv = [SESSION_BIN, "add", checked_name(name), "--origin", "webhook", "--prompt", prompt]
+        if route_start:
+            argv += ["--route-start", route_start]
         if configured:
             argv[3:3] = ["--profile", configured]
         result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
@@ -11274,8 +11287,8 @@ def route_request(request, router=None):
             # Only into the SAME session, never one re-created under the name.
             ours = sid == done["id"]
         else:
-            # An interrupted start: adopt the session only if its kickoff
-            # prompt carries this route's nonce. A session someone created by
+            # An interrupted start: adopt the session only if the registry
+            # recorded this route's nonce for it (add --route-start). A session someone created by
             # hand under that name cannot, so it is decided again (fail closed).
             nonce = done.get("nonce") if done.get("action") != "CONTINUE" else None
             ours = bool(nonce) and live[name].get("start") == nonce
@@ -11325,10 +11338,10 @@ def route_request(request, router=None):
                 lines.append("- %s: %s" % (link, "; ".join(dict.fromkeys(topics[-3:])) or "no topic labels"))
         lines.append("(This session was started by the message router for this topic. Later owner messages "
                      "on the same topic arrive here as OWNER messages via inbox.)")
-        # A durable mark of THIS start: the registry keeps the kickoff prompt,
-        # and `whatsapp candidates` reads the nonce back as "start".
+        # A durable mark of THIS start: `add --route-start` stores it in the
+        # registry for the session's life, and `whatsapp candidates` reads it
+        # back as "start" (the kickoff prompt is cleared at the first spawn).
         nonce = secrets.token_hex(16)
-        lines.append("[router start %s]" % nonce)
 
         def attempt(candidate):
             # Saved before EACH start attempt, so an interrupted start under
@@ -11337,7 +11350,7 @@ def route_request(request, router=None):
                                         "links": decision.get("links") or [], "id": None, "topic": topic,
                                         "nonce": nonce}
             write_private(ROUTE_STATE, state)
-        name = start_session(name, "\n".join(lines), attempt)
+        name = start_session(name, "\n".join(lines), attempt, route_start=nonce)
         started = (run_json([SESSION_BIN, "whatsapp", "candidates"]) or [])
         sid = next((i.get("id") for i in started if isinstance(i, dict) and i.get("name") == name), None)
         live[name] = {"name": name, "id": sid}

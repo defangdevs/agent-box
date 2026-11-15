@@ -141,6 +141,27 @@ class WhatsAppSessionTest(unittest.TestCase):
         self.assertEqual(75, refused.returncode)
         self.assertTrue(json.loads(self.registry.read_text())["sessions"]["codex1"]["stopped"])
 
+    def test_route_start_survives_in_the_registry_and_is_listed(self):
+        nonce = "0123456789abcdef0123456789abcdef"
+        added = subprocess.run(["bash", str(self.cli), "add", "wa-x", "--harness", "claude",
+                                "--origin", "webhook", "--prompt", "hi", "--route-start", nonce],
+                               env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(0, added.returncode, added.stderr)
+        entry = json.loads(self.registry.read_text())["sessions"]["wa-x"]
+        self.assertEqual(entry["routeStart"], nonce)
+        # The supervisor clears the kickoff prompt at the first spawn; the mark stays.
+        registry = json.loads(self.registry.read_text())
+        registry["sessions"]["wa-x"]["initialPrompt"] = None
+        self.registry.write_text(json.dumps(registry))
+        listed = {i["name"]: i for i in json.loads(self.run_cli("candidates").stdout)}
+        self.assertEqual(listed["wa-x"]["start"], nonce)
+        self.assertIsNone(listed["claude1"]["start"])
+        for bad in ("XYZ", "0123", "0123456789ABCDEF0123456789ABCDEF"):
+            refused = subprocess.run(["bash", str(self.cli), "add", "wa-y", "--harness", "claude",
+                                      "--route-start", bad],
+                                     env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(2, refused.returncode, bad)
+
 
 if __name__ == "__main__":
     unittest.main()
