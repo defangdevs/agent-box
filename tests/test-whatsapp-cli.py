@@ -201,6 +201,15 @@ with open(log, "a") as f:
     f.write(json.dumps({"bin": os.path.basename(sys.argv[0]), "argv": sys.argv[1:], "stdin": stdin,
                         "session": os.environ.get("LOCAL_WEBHOOK_SESSION"),
                         "thread": os.environ.get("LOCAL_WEBHOOK_CODEX_THREAD")}) + "\n")
+if sys.argv[1:3] == ["setup", "inbox"] and os.environ.get("STUB_SOURCES"):
+    # Like the real setup: the template fills in, existing fields win.
+    path = os.environ["STUB_SOURCES"]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    cfg = json.load(open(path)) if os.path.exists(path) else {"sources": {}}
+    entry = {"format": "generic", "keyPath": "session", "trust": "owner"}
+    entry.update(cfg["sources"].get("inbox", {}))
+    cfg["sources"]["inbox"] = entry
+    json.dump(cfg, open(path, "w"))
 key = " ".join([os.path.basename(sys.argv[0])] + sys.argv[1:3])
 answers = json.load(open(os.environ["STUB_ANSWERS"]))
 code, out = answers.get(key, [0, ""])
@@ -219,19 +228,21 @@ class FakeRouter(object):
     """Stands in for local-router's router.py: records what it was shown."""
 
     class Backend(object):
-        name = "claude"
+        name = "fake"
 
-        def __init__(self, model="haiku"):
-            self.model = model
+        def __init__(self, model="haiku", timeout=None):
+            self.model, self.timeout = model, timeout
 
-    def __init__(self, decision):
+    DEFAULT_ORDER = ("fake",)
+
+    def __init__(self, decision, answers=True):
         self.decision, self.calls = decision, []
-        self.BACKENDS = {"claude": self.Backend, "codex": self.Backend}
-        self.probes = 0
+        self.BACKENDS = {"fake": self.Backend, "codex": self.Backend}
+        self.probes, self.answers = 0, answers
 
-    def auto_backend(self):
+    def probe(self, backend):
         self.probes += 1
-        return self.Backend()
+        return self.answers
 
     def route(self, message, sessions, current, backend=None):
         if callable(backend) and not hasattr(backend, "complete"):
@@ -266,7 +277,8 @@ class WhatsAppRouteTest(unittest.TestCase):
         self.cli.SESSION_BIN = str(bins / "agent-box-session")
         self.cli.WEBHOOK_BIN = str(bins / "agent-box-webhook")
         self.env = mock.patch.dict(self.cli.os.environ, {
-            "STUB_LOG": str(self.log), "STUB_ANSWERS": str(self.answers), "USER": "agent"})
+            "STUB_LOG": str(self.log), "STUB_ANSWERS": str(self.answers), "USER": "agent",
+            "STUB_SOURCES": str(self.root / ".local/state/local-webhook/sources.json")})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.cli.os.environ.pop("AGENT_BOX_ROUTER_BACKEND", None)
@@ -361,15 +373,21 @@ class WhatsAppRouteTest(unittest.TestCase):
         self.cli.route_request(self.REQUEST, FakeRouter(
             {"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"}))
         argv = [c["argv"][0] for c in self.calls("agent-box-session")]
-        self.assertEqual(argv, ["whatsapp", "add", "hibernate", "add"])
+        self.assertEqual(argv, ["whatsapp", "add", "hibernate", "add", "whatsapp"])
 
-    def test_failed_start_leaves_state_unchanged(self):
-        self.live([], **{"agent-box-session add wa-greece": [2, ""]})
-        before = self.cli.ROUTE_STATE.read_text()
+    def test_failed_start_records_no_session(self):
+        self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False}],
+                  **{"agent-box-session add wa-greece": [3, ""]})
         with self.assertRaises(self.cli.RouteError):
             self.cli.route_request(self.REQUEST, FakeRouter(
                 {"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"}))
-        self.assertEqual(before, self.cli.ROUTE_STATE.read_text())
+        state = self.state()
+        self.assertEqual(list(state["sessions"]), ["wa-vat"])
+        self.assertEqual(state["current"], "wa-vat")
+        # The pending decision names a session that does not exist, so the
+        # retry decides again instead of replaying.
+        retry = FakeRouter({"action": "CONTINUE", "session": "wa-vat", "links": [], "topic": "t", "reason": "llm"})
+        self.assertEqual(self.cli.route_request(self.REQUEST, retry)["reason"], "llm")
 
     def test_codex_delivery_needs_its_registered_thread(self):
         self.live([{"name": "wa-vat", "harness": "codex", "stopped": False, "selected": False}])
@@ -401,13 +419,25 @@ class WhatsAppRouteTest(unittest.TestCase):
         self.cli.os.environ["AGENT_BOX_ROUTER_BACKEND"] = "nonsense"
         with self.assertRaisesRegex(RuntimeError, "AGENT_BOX_ROUTER_BACKEND"):
             self.cli.router_backend(router)
-        # auto probes once, then reuses the cached answer.
+        # auto probes once, then reuses the cached answer, with the model
+        # override applied to the discovered backend too.
         self.cli.os.environ["AGENT_BOX_ROUTER_BACKEND"] = "auto"
-        self.cli.os.environ.pop("AGENT_BOX_ROUTER_MODEL")
         factory = self.cli.router_backend(router)
-        factory(); factory()
+        first, second = factory(), factory()
         self.assertEqual(router.probes, 1)
-        self.assertEqual(json.loads(self.cli.ROUTE_BACKEND_CACHE.read_text())["name"], "claude")
+        self.assertEqual((first.model, second.model), ("gpt-6-luna", "gpt-6-luna"))
+        self.assertEqual(json.loads(self.cli.ROUTE_BACKEND_CACHE.read_text())["name"], "fake")
+
+    def test_discovery_with_no_answer_is_remembered_briefly(self):
+        router = FakeRouter({}, answers=False)
+        factory = self.cli.router_backend(router)
+        self.assertIsNone(factory())
+        self.assertIsNone(factory())
+        self.assertEqual(router.probes, 1)       # no probe storm on every retry
+        self.assertIsNone(json.loads(self.cli.ROUTE_BACKEND_CACHE.read_text())["name"])
+
+    def test_probe_limits_fit_the_bridge_deadline(self):
+        self.assertLess(sum(v["timeout"] for v in self.cli.PROBE_LIMITS.values()), 120)
 
     def test_backend_error_drops_the_cached_choice(self):
         self.cli.write_private(self.cli.ROUTE_BACKEND_CACHE, {"name": "claude", "at": 1e12})
@@ -431,6 +461,68 @@ class WhatsAppRouteTest(unittest.TestCase):
             self.cli.write_private(self.cli.ROUTE_STATE.parent / ".." / "elsewhere.json", {})
         with self.assertRaisesRegex(RuntimeError, "refusing to write outside"):
             self.cli.write_private(self.root / "x.json", {})
+
+    def test_replayed_continue_redelivers_without_deciding_again(self):
+        decision = {"action": "CONTINUE", "session": "wa-vat", "links": [], "topic": "t", "reason": "llm"}
+        self.cli.route_request(self.REQUEST, FakeRouter(decision))
+        again = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "x", "reason": "llm"})
+        out = self.cli.route_request(self.REQUEST, again)
+        self.assertEqual((out["session"], out["reason"]), ("wa-vat", "replay"))
+        self.assertEqual(again.calls, [])
+        emits = [c["argv"] for c in self.calls("agent-box-webhook") if c["argv"][0] == "emit"]
+        self.assertEqual(len(emits), 2)
+        ids = [a[a.index("--delivery-id") + 1] for a in emits]
+        self.assertEqual(ids[0], ids[1])
+        self.assertRegex(ids[0], r"^route-[0-9a-f]{40}$")
+
+    def test_replayed_new_does_not_start_a_second_session(self):
+        router = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"})
+        self.cli.route_request(self.REQUEST, router)
+        self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False},
+                   {"name": "wa-greece", "harness": "claude", "stopped": False, "selected": False, "id": "b1"}])
+        out = self.cli.route_request(self.REQUEST, FakeRouter({}))
+        self.assertEqual((out["session"], out["reason"]), ("wa-greece", "replay"))
+        adds = [c for c in self.calls("agent-box-session") if c["argv"][0] == "add"]
+        self.assertEqual(len(adds), 1)
+
+    def test_a_replaced_session_is_forgotten(self):
+        self.cli.write_private(self.cli.ROUTE_STATE, {"current": "wa-vat", "sessions": {
+            "wa-vat": {"id": "old", "messages": [{"id": "M1", "role": "user", "text": "x", "ts": 1}]}}})
+        self.live([{"name": "wa-vat", "harness": "claude", "stopped": False, "selected": False, "id": "new"}])
+        router = FakeRouter({"action": "NEW", "session": None, "links": [], "topic": "y", "reason": "llm"})
+        self.cli.route_request(self.REQUEST, router)
+        self.assertEqual(router.calls[0]["sessions"], [])
+
+    def test_a_name_taken_by_another_session_kind_moves_on(self):
+        self.live([], **{"agent-box-session add wa-greece": [2, ""]})
+        answers = json.loads(self.answers.read_text())
+        answers["agent-box-session add wa-greece"] = [2, ""]
+        self.answers.write_text(json.dumps(answers))
+        # The stub prints nothing on stderr; make it say "already exists".
+        stub = Path(self.cli.SESSION_BIN)
+        stub.write_text(stub.read_text().replace(
+            'sys.stdout.write(out)', 'sys.stderr.write("session already exists\\n" if code == 2 else ""); sys.stdout.write(out)'))
+        out = self.cli.route_request(self.REQUEST, FakeRouter(
+            {"action": "NEW", "session": None, "links": [], "topic": "Greece", "reason": "llm"}))
+        self.assertEqual(out["session"], "wa-greece-2")
+
+    def test_an_incompatible_inbox_source_fails_closed(self):
+        sources = self.root / ".local/state/local-webhook/sources.json"
+        sources.parent.mkdir(parents=True)
+        sources.write_text(json.dumps({"sources": {"inbox": {"keyPath": "recipient", "trust": "owner"}}}))
+        with self.assertRaisesRegex(RuntimeError, 'keyPath "session"'):
+            self.cli.route_request(self.REQUEST, FakeRouter(
+                {"action": "CONTINUE", "session": "wa-vat", "links": [], "topic": "t", "reason": "llm"}))
+        self.assertEqual([c for c in self.calls("agent-box-webhook") if c["argv"][0] == "emit"], [])
+
+    def test_unlink_forgets_the_routing_history(self):
+        self.cli.STATE.mkdir(parents=True, exist_ok=True)
+        self.cli.READY = self.cli.STATE / "ready"
+        with mock.patch.object(self.cli, "bridge_connected", return_value=False), \
+                mock.patch.object(self.cli.time, "sleep"):
+            self.cli.unlink()
+        self.assertFalse(self.cli.ROUTE_STATE.parent.exists())
+        self.assertFalse(self.cli.STATE.exists())
 
     def test_bad_request_is_refused(self):
         for bad in ({}, {"message": {"id": "../x"}}, {"message": "hi"}):

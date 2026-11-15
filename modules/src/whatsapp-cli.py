@@ -202,6 +202,9 @@ def unlink():
     if STATE.is_symlink():
         raise RuntimeError("WhatsApp state cannot be a symlink")
     READY.unlink(missing_ok=True)
+    # The router's history holds message text too; Unlink forgets it.
+    if ROUTE_STATE.parent.is_dir() and not ROUTE_STATE.parent.is_symlink():
+        shutil.rmtree(ROUTE_STATE.parent)
     if not STATE.exists():
         return
     # The supervisor reconciles every two seconds. An absent socket before one
@@ -268,6 +271,11 @@ ROUTE_BACKEND_CACHE = HOME / ".local/state/agent-box/router/backend.json"
 ROUTE_HISTORY_MAX = 40      # messages kept per session
 ROUTE_SESSIONS_MAX = 40     # sessions remembered
 ROUTE_BACKEND_TTL = 24 * 3600
+ROUTE_NO_BACKEND_TTL = 600
+# Per-call limits for discovery and routing: two probes (40 + 60 s) and one
+# routing call stay inside the bridge's 180 s route deadline.
+PROBE_LIMITS = {"claude": {"timeout": 40}, "codex": {"timeout": 60}}
+ROUTE_DECISIONS_MAX = 300   # message ids remembered for replay
 INBOX_TTL_HOURS = "8"       # local-webhook's longest session TTL; renewed on every delivery
 SESSION_BIN = os.environ.get("AGENT_BOX_SESSION_BIN", "agent-box-session")
 WEBHOOK_BIN = os.environ.get("AGENT_BOX_WEBHOOK_BIN", "agent-box-webhook")
@@ -316,17 +324,34 @@ def router_backend(router):
             raise RuntimeError("AGENT_BOX_ROUTER_BACKEND must be auto, none or one of: " + choices)
         return router.BACKENDS[name](**({"model": model} if model else {}))
 
+    def make(name):
+        kwargs = dict(PROBE_LIMITS.get(name, {}))
+        if model:
+            kwargs["model"] = model
+        return router.BACKENDS[name](**kwargs)
+
     def factory():
         try:
             cached = json.loads(ROUTE_BACKEND_CACHE.read_text())
-            if time.time() - cached["at"] < ROUTE_BACKEND_TTL and cached["name"] in router.BACKENDS:
-                return router.BACKENDS[cached["name"]]()
+            fresh = time.time() - cached["at"] < (ROUTE_BACKEND_TTL if cached["name"] else ROUTE_NO_BACKEND_TTL)
+            if fresh and cached["name"] is None:
+                return None          # nothing answered recently: no probe storm on every retry
+            if fresh and cached["name"] in router.BACKENDS:
+                return make(cached["name"])
         except (OSError, ValueError, KeyError, TypeError):
             pass
-        backend = router.auto_backend()
-        if backend is not None:
-            write_private(ROUTE_BACKEND_CACHE, {"name": backend.name, "at": time.time()})
-        return backend
+        # Probe with short timeouts so discovery plus one routing call fits
+        # inside the bridge's 180 s deadline, and record the result even when
+        # nothing answers.
+        found = None
+        for name in router.DEFAULT_ORDER:
+            if name in ("claude", "codex") and not shutil.which(name):
+                continue
+            if router.probe(make(name)):
+                found = name
+                break
+        write_private(ROUTE_BACKEND_CACHE, {"name": found, "at": time.time()})
+        return make(found) if found else None
     return factory
 
 
@@ -377,20 +402,29 @@ def new_session_name(topic, taken):
 
 
 def start_session(name, prompt):
-    argv = [SESSION_BIN, "add", checked_name(name), "--origin", "webhook", "--prompt", prompt]
+    """Start the session; returns the name it got. A name taken by a session
+    the candidate list does not show (a shell, say) moves to the next suffix."""
+    base, n, hibernated = checked_name(name), 2, False
     configured = profile()
-    if configured:
-        argv[3:3] = ["--profile", configured]
-    for attempt in (1, 2):
+    for _ in range(12):
+        argv = [SESSION_BIN, "add", checked_name(name), "--origin", "webhook", "--prompt", prompt]
+        if configured:
+            argv[3:3] = ["--profile", configured]
         result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
         if result.returncode == 0:
-            return
+            return name
+        detail = (result.stderr or result.stdout).strip()[-500:]
+        if result.returncode == 2 and "already exists" in detail:
+            name, n = "%s-%d" % (base, n), n + 1
+            continue
         # 75 = no free worker slot: ask the session manager to hibernate one
         # quiescent hook session, then try once more.
-        if result.returncode == 75 and attempt == 1 and \
+        if result.returncode == 75 and not hibernated and \
                 subprocess.run([SESSION_BIN, "hibernate"], capture_output=True, timeout=120).returncode == 0:
+            hibernated = True
             continue
-        raise RouteError(result.returncode, (result.stderr or result.stdout).strip()[-500:])
+        raise RouteError(result.returncode, detail)
+    raise RuntimeError("no free session name near %s" % base)
 
 
 def ensure_inbox_source():
@@ -402,6 +436,13 @@ def ensure_inbox_source():
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         pass
     subprocess.run([WEBHOOK_BIN, "setup", "inbox"], capture_output=True, timeout=30, check=True)
+    # setup keeps fields an existing entry already has, so check the result.
+    try:
+        entry = json.loads(sources.read_text())["sources"]["inbox"]
+    except (OSError, ValueError, KeyError, TypeError):
+        entry = None
+    if not isinstance(entry, dict) or entry.get("trust") != "owner" or entry.get("keyPath") != "session":
+        raise RuntimeError("the inbox source in %s must have keyPath \"session\" and trust \"owner\"" % sources)
 
 
 def codex_thread(name):
@@ -432,7 +473,10 @@ def deliver(name, harness, request, ack, reply):
                "id": message["id"], "attachments": message.get("attachments") or "",
                "reply": "acknowledge when you start with `%s`, answer with `%s`" % (ack, reply)}
     # On stdin, not as an argument: the payload carries the owner's text.
-    subprocess.run([WEBHOOK_BIN, "emit", "inbox", "-", "--event", "message"],
+    # A stable delivery id per message: a replayed route re-emits the same
+    # delivery, which the bus drops as already seen.
+    delivery = "route-" + hashlib.sha256(message["id"].encode()).hexdigest()[:40]
+    subprocess.run([WEBHOOK_BIN, "emit", "inbox", "-", "--event", "message", "--delivery-id", delivery],
                    input=json.dumps(payload), text=True, capture_output=True, timeout=60, check=True)
 
 
@@ -446,8 +490,29 @@ def route_request(request, router=None):
             if isinstance(item, dict) and NAME_RE.fullmatch(str(item.get("name", "")))}
     state = load_route_state()
     known = state["sessions"]
-    for name in [n for n in known if n not in live or not NAME_RE.fullmatch(n)]:
-        del known[name]                 # removed (or malformed) sessions are forgotten
+    decisions = state.setdefault("decisions", {})
+    # Removed, malformed, or REPLACED sessions are forgotten: a session the
+    # user re-creates under a router name has another registry id.
+
+    def gone(n):
+        if n not in live or not NAME_RE.fullmatch(n):
+            return True
+        return bool(known[n].get("id")) and live[n].get("id") != known[n].get("id")
+    for name in [n for n in known if gone(n)]:
+        del known[name]
+    # A replay (the bridge restarted after this call delivered but before it
+    # recorded the answer) repeats the recorded decision instead of deciding
+    # again. Its side effects are idempotent: an existing session is not
+    # started again, and the emit carries the same delivery id.
+    done = decisions.get(message["id"])
+    if isinstance(done, dict) and done.get("session") in live:
+        name = done["session"]
+        if done.get("action") == "CONTINUE":
+            deliver(name, live[name]["harness"], request, ack, reply)
+        # NEW / NEW_LINKS: the session exists, so it was started with the
+        # message as its kickoff; nothing to repeat.
+        return {"session": name, "action": done.get("action"), "links": done.get("links") or [],
+                "reason": "replay"}
     # Answers the channel already sent become the assistant side of history.
     for item in request.get("recent") or []:
         if not isinstance(item, dict):
@@ -471,6 +536,9 @@ def route_request(request, router=None):
             pass
     if decision["action"] == "CONTINUE":
         name = decision["session"]
+        # Recorded BEFORE the delivery, so a crash after it replays, not re-decides.
+        decisions[message["id"]] = {"session": name, "action": "CONTINUE", "links": []}
+        write_private(ROUTE_STATE, state)
         deliver(name, live[name]["harness"], request, ack, reply)
     else:
         name = new_session_name(decision.get("topic"), set(live) | set(known))
@@ -482,9 +550,20 @@ def route_request(request, router=None):
                 lines.append("- %s: %s" % (sid, "; ".join(dict.fromkeys(topics[-3:])) or "no topic labels"))
         lines.append("(This session was started by the message router for this topic. Later owner messages "
                      "on the same topic arrive here as OWNER messages via inbox.)")
-        start_session(name, "\n".join(lines))
-        known[name] = {"messages": [], "startedAt": time.time()}
+        decisions[message["id"]] = {"session": name, "action": decision["action"],
+                                    "links": decision.get("links") or []}
+        write_private(ROUTE_STATE, state)
+        name = start_session(name, "\n".join(lines))
+        started = (run_json([SESSION_BIN, "whatsapp", "candidates"]) or [])
+        sid = next((i.get("id") for i in started if isinstance(i, dict) and i.get("name") == name), None)
+        known[name] = {"messages": [], "startedAt": time.time(), "id": sid}
+        decisions[message["id"]] = {"session": name, "action": decision["action"],
+                                    "links": decision.get("links") or []}
     entry = known.setdefault(name, {"messages": []})
+    if not entry.get("id"):
+        entry["id"] = live.get(name, {}).get("id")
+    for old in list(decisions)[:max(0, len(decisions) - ROUTE_DECISIONS_MAX)]:
+        del decisions[old]
     entry["messages"] = (entry.get("messages") or []) + [{
         "id": message["id"], "role": "user", "text": (message.get("text") or "")[:2000],
         "ts": message.get("ts"), "topic": decision.get("topic") or ""}]

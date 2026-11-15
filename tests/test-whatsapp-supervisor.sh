@@ -22,8 +22,9 @@ chmod +x "$TEST_ROOT/bin/agent-box-session"
 
 cat > "$TEST_ROOT/bin/agent-box-whatsapp" <<'EOF'
 #!/bin/sh
-printf '%s\t%s\t%s\t%s\n' "$*" "${LOCAL_WHATSAPP_SESSION_BIN:-}" \
-  "${LOCAL_WHATSAPP_CODEX_BIN:-}" "${LOCAL_WHATSAPP_DEBUG:-}" >> "$CALLS"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$*" "${LOCAL_WHATSAPP_SESSION_BIN:-}" \
+  "${LOCAL_WHATSAPP_CODEX_BIN:-}" "${LOCAL_WHATSAPP_DEBUG:-}" \
+  "${AGENT_BOX_WHATSAPP_ROUTER:-}" "${AGENT_BOX_ROUTER_BACKEND:-}" "${AGENT_BOX_ROUTER_MODEL:-}" >> "$CALLS"
 trap 'exit 0' TERM INT
 while :; do sleep 1; done
 EOF
@@ -39,7 +40,7 @@ chmod +x "$TEST_ROOT/bin/codex"
 # must hand that one setting to the bridge it starts.
 cat > "$TEST_ROOT/bin/envstore" <<'EOF'
 #!/bin/sh
-printf '{"LOCAL_WHATSAPP_DEBUG":"1"}\n'
+printf '{"LOCAL_WHATSAPP_DEBUG":"1","AGENT_BOX_WHATSAPP_ROUTER":"off","AGENT_BOX_ROUTER_BACKEND":"codex","AGENT_BOX_ROUTER_MODEL":"gpt-6-luna"}\n'
 EOF
 chmod +x "$TEST_ROOT/bin/envstore"
 AGENT_BOX_ENVSTORE_BIN="$TEST_ROOT/bin/envstore"
@@ -72,6 +73,10 @@ grep '^serve' "$CALLS" >/dev/null
 grep "$TEST_ROOT/bin/agent-box-session" "$CALLS" >/dev/null
 grep "$TEST_ROOT/bin/codex" "$CALLS" >/dev/null
 [ "$(cut -f4 "$CALLS")" = 1 ]
+# The message router's switches come from the same store.
+[ "$(cut -f5 "$CALLS")" = off ]
+[ "$(cut -f6 "$CALLS")" = codex ]
+[ "$(cut -f7 "$CALLS")" = gpt-6-luna ]
 [ "$(wc -l < "$CALLS")" -eq 1 ]
 
 # A live helper is retained; removing the marker stops it.
