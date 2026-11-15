@@ -1,0 +1,4 @@
+# Files rewritten by the automated local-webhook bump PRs (e.g. #1037).
+# The box account owns them so those PRs request its review.
+/nix/webhook-pin.nix  @defangdevs
+/modules/agent-box.nix  @defangdevs
