@@ -1,0 +1,2 @@
+[Unit]
+Wants=agent-box-secret-broker@agent.socket

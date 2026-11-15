@@ -2302,15 +2302,12 @@ in
     };
 
     secrets = {
-      # OFF by default, unlike containers/webhook above (issue #922): this
-      # is a root-privileged custodian daemon whose OS boundary - the one
-      # thing the whole feature is for - has no VM test yet
-      # (tests/secrets.nix does not exist), so it has never been proven on
-      # a real two-user box. "Default off during rollout" is the issue's
-      # own instruction. Flip this only once that test exists and passes.
+      # ON by default (issue #922). NOTE: the OS boundary this feature is
+      # for - root custody, a two-user box - still has no VM test
+      # (tests/secrets.nix does not exist yet).
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = false;
+        default = true;
         example = true;
         description = ''
           Start a root-owned secret-custody broker per configured terminal
@@ -3926,14 +3923,8 @@ in
     # keyed, web-gated block the webhook/settings units are instantiated
     # in further down. Every configured user gets one, not just the ones
     # with a web front door.
-    systemd.tmpfiles.rules = [
-      # Root-only store parent (the broker creates its own per-user
-      # subdirectory under this at startup) and a world-traversable
-      # socket dir - listing a socket's NAME is not a secret, its 0600
-      # mode is what gates connect().
-      "d /var/lib/agent-box-secrets 0700 root root - -"
-      "d /run/agent-box-secrets 0755 root root - -"
-    ];
+    # (Its two tmpfiles rules live in `tmpfilesRules` below, gated on
+    # secretsEnabled, so the golden inventory sees them.)
     systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
       overrideStrategy = "asDropin";
       # Same restart-in-one-step reasoning as the webhook receiver's own
@@ -4422,7 +4413,14 @@ in
       # already been fixed. A predicate that can miss is the wrong shape for
       # an inventory; the module states its own instead (see
       # internal.tmpfilesRules).
-      tmpfilesRules = [
+      tmpfilesRules = lib.optionals secretsEnabled [
+        # Secret custody (issue #922). Root-only store parent (the broker
+        # creates its own per-user subdirectory under this at startup) and
+        # a world-traversable socket dir - listing a socket's NAME is not
+        # a secret, its 0600 mode is what gates connect().
+        "d /var/lib/agent-box-secrets 0700 root root - -"
+        "d /run/agent-box-secrets 0755 root root - -"
+      ] ++ [
         "d /var/lib/agent-box-web 0700 root root - -"
         "d /run/agent-box-web 0700 root root - -"
         # Snippet dirs: parent is world-traversable so caddy (primary group

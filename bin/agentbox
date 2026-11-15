@@ -744,13 +744,12 @@ BOX_SCHEMA = _Obj({
         hint=" - to turn the container runtime off, write "
              "`containers: {enable: false}`"),
     # secrets.enable: the root-owned custody broker (issue #922). Same
-    # _Obj-with-a-hint shape as containers above, but OFF by default (see
-    # Spec.__init__) - unlike containers, this one is a feature preview
-    # with no VM test yet, not an established capability.
+    # _Obj-with-a-hint shape as containers above; ON by default (see
+    # Spec.__init__).
     "secrets": _Obj(
         {"enable": BOOL},
-        hint=" - to turn the secret broker on, write "
-             "`secrets: {enable: true}`"),
+        hint=" - to turn the secret broker off, write "
+             "`secrets: {enable: false}`"),
     "users": _Map("user", USER_SCHEMA),
 })
 
@@ -912,14 +911,13 @@ class Spec:
         # default straight back to true - the same trap osUpdates has.
         containers = data.get("containers") or {}
         self.containers_enable = bool(containers.get("enable", True))
-        # Secret custody (issue #922). OFF by default, unlike containers
-        # above: the OS boundary this feature is for has no VM test yet
-        # (tests/secrets.nix does not exist), so it has never been proven
-        # on a real two-user box - "Default off during rollout" is the
-        # issue's own instruction, matching services.agent-box.secrets.
-        # enable's default on the NixOS side.
+        # Secret custody (issue #922). ON by default, matching
+        # services.agent-box.secrets.enable's default on the NixOS side.
+        # NOTE: the OS boundary this feature is for still has no VM test
+        # (tests/secrets.nix does not exist); `secrets: {enable: false}`
+        # turns it off.
         secrets = data.get("secrets") or {}
-        self.secrets_enable = bool(secrets.get("enable", False))
+        self.secrets_enable = bool(secrets.get("enable", True))
         # Base-OS patching (see APT_CONF). Default on, because the failure
         # it prevents is silent: an unattended patch run that installs a
         # fix and restarts nothing looks exactly like one that worked.
