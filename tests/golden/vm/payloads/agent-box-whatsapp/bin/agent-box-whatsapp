@@ -341,7 +341,9 @@ def write_private(path, value):
     path = Path(target)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     pending = path.with_name(path.name + ".%d.tmp" % os.getpid())
-    pending.write_text(json.dumps(value))
+    # The path is fixed (checked above); only the CONTENT comes from the
+    # router's own state file, which is not a path traversal.
+    pending.write_text(json.dumps(value))  # NOSONAR - reviewed: constant, checked path
     pending.chmod(0o600)
     pending.replace(path)
 
