@@ -713,6 +713,12 @@ class WhatsAppRouteTest(unittest.TestCase):
         with open(self.cli.ROUTE_STATE.with_name("lock"), "a") as lock:
             self.cli.take_route_lock(lock)
 
+    def test_only_a_well_formed_token_counts(self):
+        self.cli.STATE.mkdir(parents=True, exist_ok=True)
+        for raw, want in (("ab" * 16, "ab" * 16), ("x=1\nPATH=/evil", ""), ("AB" * 16, ""), ("", "")):
+            self.cli.READY.write_text(raw)
+            self.assertEqual(self.cli.pairing_token(), want, raw)
+
     def test_activate_keeps_an_existing_token(self):
         self.cli.STATE.mkdir(parents=True, exist_ok=True)
         with mock.patch.object(self.cli, "paired", return_value=True):

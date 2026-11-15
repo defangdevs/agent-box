@@ -187,10 +187,14 @@ def activate():
 
 
 def pairing_token():
+    """The pairing token, or "" when the marker has none (older pairings).
+    Only exactly 32 hex characters count, so nothing else in that file can
+    reach the bridge's environment."""
     try:
-        return READY.read_text().strip()
+        raw = READY.read_text(encoding="ascii", errors="replace").strip()
     except OSError:
         return ""
+    return raw if re.fullmatch(r"[0-9a-f]{32}", raw) else ""
 
 
 def bridge_connected():
@@ -275,7 +279,7 @@ def serve():
         wrapper.write_text("#!/bin/sh\nexec %s route\n" % shlex_quote(str(self_path)))
         wrapper.chmod(0o700)
         env["LOCAL_WHATSAPP_ROUTE_CMD"] = str(wrapper)
-    os.execve(str(NODE), [str(NODE), str(RUNTIME / "bridge.mjs"), "serve"], env)
+    os.execve(str(NODE), [str(NODE), str(RUNTIME / "bridge.mjs"), "serve"], env)  # NOSONAR - reviewed: env values are validated tokens and box paths
 
 
 def shlex_quote(text):
