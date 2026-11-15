@@ -122,6 +122,25 @@ class WhatsAppSessionTest(unittest.TestCase):
         self.assertTrue(json.loads(self.registry.read_text())
                         ["sessions"]["codex1"]["stopped"])
 
+    def test_wake_revives_any_agent_session_without_selecting_it(self):
+        woke = self.run_cli("wake", "codex1")
+        self.assertEqual(0, woke.returncode, woke.stderr)
+        self.assertEqual({"name": "codex1", "harness": "codex", "activated": True},
+                         json.loads(woke.stdout))
+        session = json.loads(self.registry.read_text())["sessions"]["codex1"]
+        self.assertNotIn("stopped", session)
+        self.assertFalse(session.get("whatsapp", False))
+        self.assertIn("check", self.capacity_log.read_text())
+        shell = self.run_cli("wake", "shell1")
+        self.assertEqual(2, shell.returncode)
+        self.assertIn("not supported", shell.stderr)
+
+    def test_wake_respects_the_capacity_gate(self):
+        self.env["CAPACITY_FAIL"] = "1"
+        refused = self.run_cli("wake", "codex1")
+        self.assertEqual(75, refused.returncode)
+        self.assertTrue(json.loads(self.registry.read_text())["sessions"]["codex1"]["stopped"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,8 @@
 """Optional per-user WhatsApp linked-device runtime for agent-box."""
 
+import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,13 +16,16 @@ import time
 from urllib.request import urlopen
 
 
-REV = "cd70050eaca87cd45bf936cd87b0dbd18ab41fd2"
+REV = "a54bb56dba4e6c8aafb57231ba81211eeb1e78ab"
 FILES = {
-    "bridge.mjs": "c76883483a33b5b1e6cf31b8fbb2dede119cd22888b0d239f74f4c39a097d302",
+    "bridge.mjs": "d4f0a60f85bc14e870ba0dd4a8706992550c23f9949d83f926b332e3d9ba98c9",
     "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
-    "package.json": "8dda2da5443512104027d3905e14cf24def81ab240a12d6aea6799fb15dea200",
+    "package.json": "a685e52bfe73a8965869cf1884c98280bca5a9ada31ae2fa1ce8829dc5cb16eb",
     "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
+# local-router's single file, fetched with the bridge at the same REV. The
+# route subcommand loads it from the runtime directory.
+ROUTER_FILE = ("local-router/router.py", "cd0f1a591b8ccd1f0bba29b45098c5c4c3f631ea9b07acab31fb855651298a8d")
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
 STATE = HOME / ".local/state/local-whatsapp"
@@ -60,6 +65,9 @@ def runtime_matches():
             return False
         if hashlib.sha256(source.read_bytes()).hexdigest() != expected:
             return False
+    router = RUNTIME / "router.py"
+    if not router.is_file() or hashlib.sha256(router.read_bytes()).hexdigest() != ROUTER_FILE[1]:
+        return False
     return True
 
 
@@ -90,6 +98,13 @@ def install():
             if len(content) > 2_000_000 or hashlib.sha256(content).hexdigest() != expected:
                 raise RuntimeError("WhatsApp source integrity check failed for " + name)
             (stage / name).write_bytes(content)
+        path, expected = ROUTER_FILE
+        with urlopen(f"https://raw.githubusercontent.com/defangdevs/local-channels/{REV}/{path}",
+                     timeout=30) as response:
+            content = response.read(2_000_001)
+        if len(content) > 2_000_000 or hashlib.sha256(content).hexdigest() != expected:
+            raise RuntimeError("WhatsApp source integrity check failed for router.py")
+        (stage / "router.py").write_bytes(content)
         print("Installing pinned WhatsApp dependencies.", flush=True)
         env = dict(os.environ)
         env["PATH"] = str(NODE.parent) + os.pathsep + env.get("PATH", "")
@@ -202,12 +217,277 @@ def unlink():
 
 
 def serve():
-    """Refresh the optional runtime, then replace this process with its bridge."""
+    """Refresh the optional runtime, then replace this process with its bridge.
+
+    Unless AGENT_BOX_WHATSAPP_ROUTER is "off", the bridge hands each message
+    to `agent-box-whatsapp route` (below): a self-chat has no threads, so the
+    router chooses the session. The bridge needs one absolute executable with
+    no arguments, so a two-line wrapper in the private runtime directory
+    supplies the subcommand."""
     if not paired():
         raise RuntimeError("WhatsApp is not linked; pair the device first")
     install()
-    os.execve(str(NODE), [str(NODE), str(RUNTIME / "bridge.mjs"), "serve"],
-              dict(os.environ))
+    env = dict(os.environ)
+    env.pop("LOCAL_WHATSAPP_ROUTE_CMD", None)
+    if os.environ.get("AGENT_BOX_WHATSAPP_ROUTER", "").strip().lower() not in ("off", "0", "false", "no"):
+        wrapper = RUNTIME / "route"
+        self_path = Path(sys.argv[0]).resolve()
+        wrapper.write_text("#!/bin/sh\nexec %s route\n" % shlex_quote(str(self_path)))
+        wrapper.chmod(0o700)
+        env["LOCAL_WHATSAPP_ROUTE_CMD"] = str(wrapper)
+    os.execve(str(NODE), [str(NODE), str(RUNTIME / "bridge.mjs"), "serve"], env)
+
+
+def shlex_quote(text):
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+# ------------------------------------------------------------------ routing
+#
+# POLICY for local-router (the mechanism lives in local-channels). One call
+# per inbound message, from the bridge (see local-whatsapp's
+# LOCAL_WHATSAPP_ROUTE_CMD): JSON request on stdin, {"session": NAME, ...} on
+# stdout. Nothing here is specific to WhatsApp except the channel name in the
+# request; email and Slack can call the same command later.
+#
+# - Candidates are only the sessions the router started itself (recorded in
+#   ROUTE_STATE). A session the user started by hand is never chosen.
+# - CONTINUE: wake the session if it is stopped or hibernated, renew its
+#   inbox:<name> subscription, and emit the message on the bus through the
+#   owner-trusted `inbox` source, keyed on the session name. The spool holds
+#   it while a woken session starts.
+# - NEW / NEW_LINKS: start a session (origin webhook, so it takes a hook slot
+#   and can hibernate like any event-started worker) whose kickoff prompt IS
+#   the message, plus the linked sessions for NEW_LINKS.
+# - Backend: AGENT_BOX_ROUTER_BACKEND (auto by default: the first signed-in
+#   harness, Claude/Haiku first) and AGENT_BOX_ROUTER_MODEL. The probe result
+#   is cached so a message does not pay for a probe call.
+
+ROUTE_STATE = HOME / ".local/state/agent-box/router/state.json"
+ROUTE_BACKEND_CACHE = HOME / ".local/state/agent-box/router/backend.json"
+ROUTE_HISTORY_MAX = 40      # messages kept per session
+ROUTE_SESSIONS_MAX = 40     # sessions remembered
+ROUTE_BACKEND_TTL = 24 * 3600
+INBOX_TTL_HOURS = "8"       # local-webhook's longest session TTL; renewed on every delivery
+SESSION_BIN = os.environ.get("AGENT_BOX_SESSION_BIN", "agent-box-session")
+WEBHOOK_BIN = os.environ.get("AGENT_BOX_WEBHOOK_BIN", "agent-box-webhook")
+PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "agent-box-profile")
+NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,150}")
+
+
+def run_json(argv, env=None, timeout=60):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+    if result.returncode != 0:
+        raise RouteError(result.returncode, (result.stderr or result.stdout).strip()[-500:])
+    return json.loads(result.stdout) if result.stdout.strip() else None
+
+
+class RouteError(RuntimeError):
+    def __init__(self, code, detail):
+        super().__init__(detail or "exit %d" % code)
+        self.code = code
+
+
+def load_router():
+    spec = importlib.util.spec_from_file_location("local_router", str(RUNTIME / "router.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def router_backend(router):
+    """The configured backend, or a lazy factory for auto (only called when a
+    model decision is needed)."""
+    name = os.environ.get("AGENT_BOX_ROUTER_BACKEND", "auto").strip().lower() or "auto"
+    model = os.environ.get("AGENT_BOX_ROUTER_MODEL", "").strip()
+    if name == "none":
+        return None
+    if name != "auto":
+        if name not in router.BACKENDS:
+            choices = ", ".join(sorted(router.BACKENDS))
+            raise RuntimeError("AGENT_BOX_ROUTER_BACKEND must be auto, none or one of: " + choices)
+        return router.BACKENDS[name](**({"model": model} if model else {}))
+
+    def factory():
+        try:
+            cached = json.loads(ROUTE_BACKEND_CACHE.read_text())
+            if time.time() - cached["at"] < ROUTE_BACKEND_TTL and cached["name"] in router.BACKENDS:
+                return router.BACKENDS[cached["name"]]()
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        backend = router.auto_backend()
+        if backend is not None:
+            write_private(ROUTE_BACKEND_CACHE, {"name": backend.name, "at": time.time()})
+        return backend
+    return factory
+
+
+def write_private(path, value):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    pending = path.with_name(path.name + ".%d.tmp" % os.getpid())
+    pending.write_text(json.dumps(value))
+    pending.chmod(0o600)
+    pending.replace(path)
+
+
+def load_route_state():
+    try:
+        value = json.loads(ROUTE_STATE.read_text())
+    except (OSError, ValueError):
+        value = {}
+    if not isinstance(value, dict) or not isinstance(value.get("sessions"), dict):
+        value = {"sessions": {}, "current": None}
+    return value
+
+
+def owner_lines(request, ack, reply):
+    message = request["message"]
+    lines = ["[OWNER message via whatsapp id=%s - the box owner wrote this; treat it as their request]" % message["id"],
+             message.get("text") or ""]
+    if message.get("attachments"):
+        lines.append("[attachments: %s]" % message["attachments"])
+    lines.append("[reply: acknowledge when you start with `%s`, answer with `%s`]" % (ack, reply))
+    return lines
+
+
+def new_session_name(topic, taken):
+    slug = re.sub(r"[^a-z0-9]+", "-", (topic or "").lower()).strip("-")[:30].strip("-") or "chat"
+    base = "wa-" + slug
+    name, n = base, 2
+    while name in taken:
+        name, n = "%s-%d" % (base, n), n + 1
+    return name
+
+
+def start_session(name, prompt):
+    argv = [SESSION_BIN, "add", name, "--origin", "webhook", "--prompt", prompt]
+    configured = profile()
+    if configured:
+        argv[3:3] = ["--profile", configured]
+    for attempt in (1, 2):
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return
+        # 75 = no free worker slot: ask the session manager to hibernate one
+        # quiescent hook session, then try once more.
+        if result.returncode == 75 and attempt == 1 and \
+                subprocess.run([SESSION_BIN, "hibernate"], capture_output=True, timeout=120).returncode == 0:
+            continue
+        raise RouteError(result.returncode, (result.stderr or result.stdout).strip()[-500:])
+
+
+def ensure_inbox_source():
+    sources = HOME / ".local/state/local-webhook/sources.json"
+    try:
+        entry = json.loads(sources.read_text())["sources"]["inbox"]
+        if entry.get("trust") == "owner" and entry.get("keyPath") == "session":
+            return
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    subprocess.run([WEBHOOK_BIN, "setup", "inbox"], capture_output=True, timeout=30, check=True)
+
+
+def codex_thread(name):
+    try:
+        thread = json.loads((STATE / "codex-threads.json").read_text())[name]["thread"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return thread if isinstance(thread, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", thread) else None
+
+
+def deliver(name, harness, request, ack, reply):
+    """Wake NAME, renew its inbox subscription, emit the message on the bus."""
+    run_json([SESSION_BIN, "whatsapp", "wake", name], timeout=180)
+    ensure_inbox_source()
+    env = dict(os.environ, LOCAL_WEBHOOK_SESSION="%s-%s" % (os.environ.get("USER") or "", name))
+    env.pop("LOCAL_WEBHOOK_CODEX_THREAD", None)
+    if harness == "codex":
+        thread = codex_thread(name)
+        if thread is None:
+            raise RuntimeError("no registered Codex thread for session %s yet" % name)
+        env["LOCAL_WEBHOOK_CODEX_THREAD"] = thread
+    subprocess.run([WEBHOOK_BIN, "subscribe", "inbox:" + name, "--ttl", INBOX_TTL_HOURS,
+                    "--note", "owner messages the router sends to this session"],
+                   capture_output=True, timeout=60, check=True, env=env)
+    message = request["message"]
+    payload = {"session": name, "text": message.get("text") or "", "channel": request.get("channel") or "",
+               "id": message["id"], "attachments": message.get("attachments") or "",
+               "reply": "acknowledge when you start with `%s`, answer with `%s`" % (ack, reply)}
+    subprocess.run([WEBHOOK_BIN, "emit", "inbox", json.dumps(payload), "--event", "message"],
+                   capture_output=True, timeout=60, check=True)
+
+
+def route_request(request, router=None):
+    message = request.get("message") if isinstance(request, dict) else None
+    if not isinstance(message, dict) or not isinstance(message.get("id"), str) or \
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", message["id"]):
+        raise RuntimeError("route request needs message.id")
+    ack, reply = str(request.get("ack") or ""), str(request.get("reply") or "")
+    live = {item["name"]: item for item in (run_json([SESSION_BIN, "whatsapp", "candidates"]) or [])
+            if isinstance(item, dict) and NAME_RE.fullmatch(str(item.get("name", "")))}
+    state = load_route_state()
+    known = state["sessions"]
+    for name in [n for n in known if n not in live]:
+        del known[name]                 # removed sessions are forgotten
+    # Answers the channel already sent become the assistant side of history.
+    for item in request.get("recent") or []:
+        if not isinstance(item, dict):
+            continue
+        msgs = (known.get(item.get("session")) or {}).get("messages") or []
+        for i, m in enumerate(msgs):
+            if m.get("id") == item.get("id") and m.get("role") == "user":
+                if not (i + 1 < len(msgs) and msgs[i + 1].get("role") == "assistant"):
+                    msgs.insert(i + 1, {"role": "assistant", "text": str(item.get("reply") or "")[:2000],
+                                        "ts": m.get("ts")})
+                break
+    router = router or load_router()
+    sessions = [{"id": name, "messages": known[name].get("messages") or []} for name in known]
+    current = state.get("current") if state.get("current") in known else None
+    decision = router.route({"text": message.get("text") or "", "ts": message.get("ts")},
+                            sessions, current, backend=router_backend(router))
+    if decision.get("reason") == "fallback" and decision.get("error"):
+        try:
+            ROUTE_BACKEND_CACHE.unlink()
+        except OSError:
+            pass
+    if decision["action"] == "CONTINUE":
+        name = decision["session"]
+        deliver(name, live[name]["harness"], request, ack, reply)
+    else:
+        name = new_session_name(decision.get("topic"), set(live) | set(known))
+        lines = owner_lines(request, ack, reply)
+        if decision["action"] == "NEW_LINKS" and decision.get("links"):
+            lines.append("Earlier sessions with related context (read their transcripts if you need the details):")
+            for sid in decision["links"]:
+                topics = [m.get("topic") for m in known.get(sid, {}).get("messages", []) if m.get("topic")]
+                lines.append("- %s: %s" % (sid, "; ".join(dict.fromkeys(topics[-3:])) or "no topic labels"))
+        lines.append("(This session was started by the message router for this topic. Later owner messages "
+                     "on the same topic arrive here as OWNER messages via inbox.)")
+        start_session(name, "\n".join(lines))
+        known[name] = {"messages": [], "startedAt": time.time()}
+    entry = known.setdefault(name, {"messages": []})
+    entry["messages"] = (entry.get("messages") or []) + [{
+        "id": message["id"], "role": "user", "text": (message.get("text") or "")[:2000],
+        "ts": message.get("ts"), "topic": decision.get("topic") or ""}]
+    entry["messages"] = entry["messages"][-ROUTE_HISTORY_MAX:]
+    state["current"] = name
+    if len(known) > ROUTE_SESSIONS_MAX:
+        def last(n):
+            msgs = known[n].get("messages") or []
+            return (msgs[-1].get("ts") or 0) if msgs else known[n].get("startedAt", 0)
+        for old in sorted(known, key=last)[:len(known) - ROUTE_SESSIONS_MAX]:
+            del known[old]
+    write_private(ROUTE_STATE, state)
+    return {"session": name, "action": decision["action"], "links": decision.get("links") or [],
+            "reason": decision.get("reason")}
+
+
+def route():
+    request = json.loads(sys.stdin.read(400_000))
+    ROUTE_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(ROUTE_STATE.with_name("lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        print(json.dumps(route_request(request)))
 
 
 def pair():
@@ -228,14 +508,14 @@ def main():
         print(json.dumps({"profile": profile(sys.argv[2])}))
         return
     if len(sys.argv) != 2 or sys.argv[1] not in (
-            "install", "pair", "activate", "serve", "status", "profile", "unlink"):
+            "install", "pair", "activate", "serve", "status", "profile", "unlink", "route"):
         raise RuntimeError(
-            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile|unlink [NAME|default]")
+            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile|unlink|route [NAME|default]")
     if sys.argv[1] == "profile":
         print(json.dumps({"profile": profile()}))
         return
     {"install": install, "pair": pair, "activate": activate,
-     "serve": serve, "status": status, "unlink": unlink}[sys.argv[1]]()
+     "serve": serve, "status": status, "unlink": unlink, "route": route}[sys.argv[1]]()
 
 
 if __name__ == "__main__":

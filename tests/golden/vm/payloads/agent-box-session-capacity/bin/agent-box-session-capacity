@@ -485,7 +485,15 @@ def _hibernate_has_watch(name):
     if not isinstance(topics, list):
         return True, path, _hibernate_hash(path)
     enabled = value.get("enabled") is not False
-    return enabled and bool(topics), path, _hibernate_hash(path)
+    # inbox:<name> is the message router's delivery address for this session.
+    # The router wakes the session before every delivery and the bus spools
+    # the message while it starts, so that subscription alone is no reason to
+    # keep the runtime resident. Anything else, or an unreadable entry, is.
+    blocking = [topic for topic in topics
+                if not (isinstance(topic, dict) and isinstance(topic.get("topic"), str)
+                        and topic["topic"].startswith("inbox:")
+                        and topic.get("deliverTo", "session") == "session")]
+    return enabled and bool(blocking), path, _hibernate_hash(path)
 
 
 def _hibernate_has_lease(name):

@@ -749,7 +749,7 @@ usage() {
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session hibernate [--exclude NAME...]"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | clear"
+  echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | wake NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
@@ -1505,7 +1505,11 @@ case "$cmd" in
       registry_unlock
       exit 0
     fi
-    if [ "$name" = activate ]; then
+    # activate wakes the selected WhatsApp target; wake does the same for any
+    # Claude or Codex session (the message router's own sessions, which are
+    # never "selected"), through the same capacity gate.
+    if [ "$name" = activate ] || [ "$name" = wake ]; then
+      wa_verb="$name"
       selected="${2:-}"
       [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
       registry_ensure
@@ -1525,7 +1529,7 @@ case "$cmd" in
           echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
           exit 2
         fi
-        "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
+        [ "$wa_verb" = wake ] || "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
           "$REGISTRY_FILE" >/dev/null || {
             echo "session '$selected' is not the selected WhatsApp target" >&2
             exit 2

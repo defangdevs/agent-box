@@ -10036,9 +10036,10 @@ def render_connect_step(state):
             user = html.escape(pwd.getpwuid(os.getuid()).pw_name)
             return (
                 '<div class="conn-step"><p class="note">The linked device is '
-                f'connected. Send <code>@{user} /sessions</code> from Message Yourself '
-                f'to choose its one recipient, or <code>@{user} /target auto</code> to '
-                'start a new one automatically.</p>'
+                'connected. Each message from Message Yourself goes to the session '
+                'the router chooses, and a new topic starts a new session. Send '
+                f'<code>@{user} /target NAME</code> to pin one session, or '
+                f'<code>@{user} /target auto</code> to route again.</p>'
                 f'<form method="post" action="{base}/connect/configure" class="row conn-form">'
                 f'<input type="hidden" name="flow" value="{flow_id}">'
                 f'{render_whatsapp_profile_field()}'

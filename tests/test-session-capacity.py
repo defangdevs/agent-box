@@ -335,6 +335,20 @@ class Hibernation(unittest.TestCase):
             "messages": {"m": {"reply": None, "control": False}}})
         self.assertIsNone(capacity.hibernation_candidate(sessions))
 
+    def test_router_inbox_subscription_alone_does_not_block_hibernation(self):
+        sessions, _ = self.claude()
+        self.write_json("webhook/filter.tester-idle.json", {
+            "enabled": True, "topics": [{"topic": "inbox:idle", "ttlHours": 8}]})
+        self.assertEqual(capacity.hibernation_candidate(sessions)["name"], "idle")
+        # Any other topic next to it still keeps the runtime resident.
+        self.write_json("webhook/filter.tester-idle.json", {
+            "enabled": True, "topics": [{"topic": "inbox:idle"}, {"topic": "github:o/r"}]})
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        # A standing-watch shape or an unreadable entry is not the router's.
+        for odd in ({"topic": "inbox:idle", "deliverTo": "subagent"}, "inbox:idle", {"topic": 5}):
+            self.write_json("webhook/filter.tester-idle.json", {"enabled": True, "topics": [odd]})
+            self.assertIsNone(capacity.hibernation_candidate(sessions), odd)
+
     def test_completed_codex_rollout_is_candidate_but_remote_control_is_not(self):
         launch = "22222222-2222-4222-8222-222222222222"
         native = "33333333-3333-4333-8333-333333333333"
