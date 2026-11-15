@@ -49,6 +49,11 @@ def main(argv):
     # so a helper missing now is looked up again after the load.
     resolver = shutil.which("agent-box-webhook-self")
     sweeper = shutil.which("agent-box-webhook-backfill")
+    # The secret CLI too: a profile that sets PATH=/usr/bin:/bin would hide
+    # it, the guard below would skip the strip, and the harness would keep
+    # stale protected values from the files above. Looked up again after the
+    # load only as a fallback.
+    secret_cli = shutil.which("agent-box-secret")
 
     # Captured before the env store and profile loads below can touch
     # os.environ, not read back out of it afterwards: a profile is user-
@@ -113,7 +118,11 @@ def main(argv):
     # stronger guarantee to fall back on without making a hung or
     # restarting broker block every session on this user's box from
     # starting at all.
-    secret_cli = shutil.which("agent-box-secret")
+    secret_cli = secret_cli or shutil.which("agent-box-secret")
+    if secret_socket:
+        # An empty AGENT_BOX_SECRET_SOCKET= in a file above must not reach
+        # the harness: put the unit's own value back.
+        os.environ["AGENT_BOX_SECRET_SOCKET"] = secret_socket
     if secret_cli and secret_socket:
         env = dict(os.environ, AGENT_BOX_SECRET_SOCKET=secret_socket)
         query = ["--json"]

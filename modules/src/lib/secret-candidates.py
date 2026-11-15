@@ -27,6 +27,7 @@
 # already exists when this runs.
 import os
 import re
+import stat
 
 # A heuristic, not a classifier: suffix-shaped names a human would
 # recognize as "probably a credential". False positives are fine and
@@ -44,7 +45,20 @@ def looks_like_a_secret(name):
     return bool(CANDIDATE_NAME_RE.search(name))
 
 
+MAX_ENV_FILE_BYTES = 1024 * 1024
+
+
 def _names_in(path):
+    """Advisory only, and run as root at activation: a FIFO with no writer
+    would block open() forever and a symlink to an endless stream would
+    never stop reading, so anything but a small regular file is skipped
+    before load() ever opens it."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return []
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ENV_FILE_BYTES:
+        return []
     return [key for key, _ in load(path)]
 
 

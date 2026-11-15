@@ -2716,6 +2716,11 @@ def main(argv):
     # so a helper missing now is looked up again after the load.
     resolver = shutil.which("agent-box-webhook-self")
     sweeper = shutil.which("agent-box-webhook-backfill")
+    # The secret CLI too: a profile that sets PATH=/usr/bin:/bin would hide
+    # it, the guard below would skip the strip, and the harness would keep
+    # stale protected values from the files above. Looked up again after the
+    # load only as a fallback.
+    secret_cli = shutil.which("agent-box-secret")
 
     # Captured before the env store and profile loads below can touch
     # os.environ, not read back out of it afterwards: a profile is user-
@@ -2780,7 +2785,11 @@ def main(argv):
     # stronger guarantee to fall back on without making a hung or
     # restarting broker block every session on this user's box from
     # starting at all.
-    secret_cli = shutil.which("agent-box-secret")
+    secret_cli = secret_cli or shutil.which("agent-box-secret")
+    if secret_socket:
+        # An empty AGENT_BOX_SECRET_SOCKET= in a file above must not reach
+        # the harness: put the unit's own value back.
+        os.environ["AGENT_BOX_SECRET_SOCKET"] = secret_socket
     if secret_cli and secret_socket:
         env = dict(os.environ, AGENT_BOX_SECRET_SOCKET=secret_socket)
         query = ["--json"]
@@ -3729,6 +3738,15 @@ def load_root_key(path):
     finally:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
+    # The file fsync above does not make the new directory entry durable:
+    # without this, a power loss could drop .rootkey while records already
+    # encrypted under it survive, and the next start would mint a different
+    # key that cannot decrypt them.
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     return load_root_key(path)
 
 
@@ -3800,8 +3818,14 @@ class Store:
             os.close(root_fd)
         self.user = user
         self.namespace = namespace
-        self._key = _namespace_key(root_key, user, namespace)
-        self._bind(user, uid)
+        try:
+            self._key = _namespace_key(root_key, user, namespace)
+            self._bind(user, uid)
+        except BaseException:
+            # The broker does not cache a Store that failed to build, so
+            # every retry would otherwise leak one more descriptor.
+            os.close(self.dir_fd)
+            raise
 
     def close(self):
         os.close(self.dir_fd)
@@ -3859,10 +3883,19 @@ class Store:
                         "configured": not rec.get("tombstone", False)})
         return out
 
+    def _name_count(self):
+        return sum(1 for entry in os.listdir(self.dir_fd)
+                   if entry.endswith(".rec") and valid_secret_name(entry[:-4]))
+
     def set(self, name, value):
         lock = self._locked()
         try:
             old = self._read(name + ".rec") or {}
+            if not old and self._name_count() >= SECRET_MAX_NAMES:
+                # list() reports at most SECRET_MAX_NAMES names, and env-exec
+                # strips only names it is told about, so the store must
+                # never hold more names than one response can carry.
+                raise SecretError("too many secrets")
             version = _next_version(old)
             nonce, ct = _encrypt(self._key, _aad(self.user, self.namespace, name, version), value)
             self._write(name + ".rec", {
@@ -4134,7 +4167,17 @@ class JobManager:
             self._jobs[job.id] = job
             if key is not None:
                 self._by_idempotency[(namespace, key)] = job.id
-        self._dispatch(job, req, resolve_secret)
+        try:
+            self._dispatch(job, req, resolve_secret)
+        except Exception:
+            # Anything unexpected (an OSError reading a record, say) must
+            # not leave the registered job "pending": two of those would
+            # consume this user's whole execution capacity until restart.
+            with job.lock:
+                if job.state in ACTIVE_STATES:
+                    job.state = "error"
+                    job.stderr = b"internal error resolving secrets"
+                    job.finished_at = time.time()
         return job.id
 
     def _dispatch(self, job, req, resolve_secret):
@@ -4194,34 +4237,53 @@ class JobManager:
         longest_value = max((len(v.encode("utf-8")) for v in redact_values), default=0)
         raw_cap = self.max_output_bytes + longest_value
 
+        hold = max(longest_value - 1, 0)
+
         def pump(stream, attr):
             raw = bytearray()
             truncated = False
-            while True:
-                # Keep reading even once the cap below is hit, so a child
-                # that fills its pipe buffer never blocks on a reader that
-                # has stopped reading; the extra bytes are simply discarded.
-                chunk = stream.read(4096)
-                if not chunk:
-                    break
-                room = raw_cap - len(raw)
-                if room <= 0:
-                    truncated = True
-                    with job.lock:
-                        setattr(job, attr + "_truncated", True)
-                    continue
-                if len(chunk) > room:
-                    raw.extend(chunk[:room])
-                    truncated = True
-                else:
-                    raw.extend(chunk)
+
+            def publish(eof):
+                nonlocal truncated
                 clean = redact(bytes(raw), redact_values)
+                if not eof and hold:
+                    # The last hold bytes may be the start of a secret whose
+                    # end has not been read yet; publishing them would leak
+                    # an unresolved prefix through status.
+                    clean = clean[:max(len(clean) - hold, 0)]
                 if len(clean) > self.max_output_bytes:
                     clean = clean[:self.max_output_bytes]
                     truncated = True
                 with job.lock:
                     setattr(job, attr, clean)
                     setattr(job, attr + "_truncated", truncated)
+
+            try:
+                while True:
+                    # Keep reading even once the cap below is hit, so a child
+                    # that fills its pipe buffer never blocks on a reader that
+                    # has stopped reading; the extra bytes are simply discarded.
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    room = raw_cap - len(raw)
+                    if room <= 0:
+                        truncated = True
+                        with job.lock:
+                            setattr(job, attr + "_truncated", True)
+                        continue
+                    if len(chunk) > room:
+                        raw.extend(chunk[:room])
+                        truncated = True
+                    else:
+                        raw.extend(chunk)
+                    publish(False)
+                publish(True)
+            finally:
+                # Job.handle outlives the child for the retention window;
+                # without this each finished job keeps two descriptors open.
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
 
         out_thread = threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True)
         err_thread = threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True)
@@ -4235,6 +4297,11 @@ class JobManager:
             if deadline is not None and time.time() >= deadline:
                 timed_out = True
                 self.launcher.kill(job)
+                # Reap it: the retained job still owns the process handle.
+                for _ in range(100):
+                    if self.launcher.poll(job) is not None:
+                        break
+                    time.sleep(0.05)
                 break
             time.sleep(0.05)
         out_thread.join(timeout=5)
@@ -4320,6 +4387,7 @@ class JobManager:
 # already exists when this runs.
 import os
 import re
+import stat
 
 # A heuristic, not a classifier: suffix-shaped names a human would
 # recognize as "probably a credential". False positives are fine and
@@ -4337,7 +4405,20 @@ def looks_like_a_secret(name):
     return bool(CANDIDATE_NAME_RE.search(name))
 
 
+MAX_ENV_FILE_BYTES = 1024 * 1024
+
+
 def _names_in(path):
+    """Advisory only, and run as root at activation: a FIFO with no writer
+    would block open() forever and a symlink to an endless stream would
+    never stop reading, so anything but a small regular file is skipped
+    before load() ever opens it."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return []
+    if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_ENV_FILE_BYTES:
+        return []
     return [key for key, _ in load(path)]
 
 
@@ -4748,17 +4829,34 @@ class Broker:
 
 
 def _safe_send(conn, reply):
-    """send_frame itself can refuse (SecretError("response too large")) -
-    a job's own (already-capped) output can still JSON-escape past
-    SECRET_MAX_FRAME in the pathological case (every byte a control
-    character escapes to \\u00NN, a 6x blow-up). Fall back to a reply that
-    is guaranteed small rather than let that escape as an exception."""
+    """send_frame itself can refuse (SecretError("response too large")): a
+    job's own (already-capped) output plus the JSON metadata can pass
+    SECRET_MAX_FRAME, and in the pathological case (every byte a control
+    character escapes to \\u00NN, a 6x blow-up) by a lot. A reply that
+    carries output is shrunk - halving stdout/stderr and marking them
+    truncated - until it fits, so the caller still gets the job's state, its
+    exit code and what output fits. Only a reply that cannot be made to fit
+    at all becomes a refusal, and that one says ok=false."""
     try:
         send_frame(conn, reply)
+        return
     except SecretError:
-        send_frame(conn, {"ok": reply.get("ok", False),
-                          "error": "response too large to return in full",
-                          "jobId": reply.get("jobId"), "state": reply.get("state")})
+        pass
+    shrunk = dict(reply)
+    for _ in range(16):
+        for key in ("stdout", "stderr"):
+            text = shrunk.get(key)
+            if isinstance(text, str) and text:
+                shrunk[key] = text[:len(text) // 2]
+                shrunk[key + "Truncated"] = True
+        try:
+            send_frame(conn, shrunk)
+            return
+        except SecretError:
+            continue
+    send_frame(conn, {"ok": False,
+                      "error": "response too large to return in full",
+                      "jobId": reply.get("jobId"), "state": reply.get("state")})
 
 
 def serve_one(listener, broker, expect_uid):
@@ -4933,6 +5031,20 @@ def read_frame(stream):
     return json.loads(body.decode("utf-8"))
 
 
+# The packaged build replaces the placeholder with the store path of bash
+# (a literal /bin/bash does not exist on NixOS). Unpackaged runs - tests, a
+# root-less dev box - leave it alone and fall back to what is on this host.
+BASH_PLACEHOLDER = "@" + "BASH@"
+PACKAGED_BASH = "@BASH@"
+
+
+def _bash_path():
+    if PACKAGED_BASH != BASH_PLACEHOLDER:
+        return PACKAGED_BASH
+    import shutil
+    return shutil.which("bash") or "/bin/bash"
+
+
 def main():
     frame = read_frame(sys.stdin.buffer)
 
@@ -4955,7 +5067,7 @@ def main():
         raise SystemExit(126)
 
     if frame.get("shell"):
-        shell = "/bin/bash" if frame["shell"] == "bash" else "/bin/sh"
+        shell = _bash_path() if frame["shell"] == "bash" else "/bin/sh"
         argv = [shell, "-c", frame["command"]]
     else:
         argv = frame["argv"]
@@ -5013,12 +5125,14 @@ INLINE_WAIT_BUDGET_S = 3.0
 mcp = FastMCP("agent-box-secrets")
 
 
-def _call(req):
+def _call(req, profile=None):
     # Resolved per call, not once at import: a box with no default profile
     # and no AGENT_BOX_PROFILE must not fail to even START this server over
-    # it - each tool call reports the refusal instead.
+    # it - each tool call reports the refusal instead. A job's own follow-up
+    # calls pass the profile it was started under, so a default that changes
+    # meanwhile cannot make status/cancel look in another namespace.
     try:
-        profile = resolve_profile(os.environ.get("AGENT_BOX_PROFILE") or None)
+        profile = resolve_profile(profile or os.environ.get("AGENT_BOX_PROFILE") or None)
     except SecretError as exc:
         return {"ok": False, "error": str(exc)}
     return connect_and_call(SOCKET_PATH, dict(req, profile=profile))
@@ -5066,35 +5180,41 @@ def exec_with_secrets(
         req["timeoutMs"] = timeoutMs
     if idempotencyKey is not None:
         req["idempotencyKey"] = idempotencyKey
-    resp = _call(req)
+    try:
+        profile = resolve_profile(os.environ.get("AGENT_BOX_PROFILE") or None)
+    except SecretError as exc:
+        return {"ok": False, "error": str(exc)}
+    resp = _call(req, profile)
     if not resp.get("ok"):
         return resp
     job_id = resp["jobId"]
     deadline = time.time() + INLINE_WAIT_BUDGET_S
-    status = _call({"op": "status", "jobId": job_id})
+    status = _call({"op": "status", "jobId": job_id}, profile)
     # Not lib/secret-jobs.py's ACTIVE_STATES: this file only splices with
     # secret-protocol.py (see the header), to keep the unprivileged adapter's
     # dependency closure small - a second literal here is cheaper than
     # pulling in the whole job-manager module for one tuple.
     while status.get("ok") and status.get("state") in ("pending", "running") and time.time() < deadline:
         time.sleep(POLL_INTERVAL_S)
-        status = _call({"op": "status", "jobId": job_id})
+        status = _call({"op": "status", "jobId": job_id}, profile)
     status["jobId"] = job_id
+    status["profile"] = profile
     return status
 
 
 @mcp.tool()
-def exec_with_secrets_status(jobId: str) -> dict:
-    """Poll a job started by exec_with_secrets."""
-    return _call({"op": "status", "jobId": jobId})
+def exec_with_secrets_status(jobId: str, profile: str | None = None) -> dict:
+    """Poll a job started by exec_with_secrets. Pass the profile that call
+    returned, if any, so the lookup uses the profile the job started under."""
+    return _call({"op": "status", "jobId": jobId}, profile)
 
 
 @mcp.tool()
-def exec_with_secrets_cancel(jobId: str) -> dict:
+def exec_with_secrets_cancel(jobId: str, profile: str | None = None) -> dict:
     """Stop a running job started by exec_with_secrets. A job that already
     finished is returned unchanged; cancellation cannot undo an effect the
     command already caused outside this box (e.g. a detached deployment)."""
-    return _call({"op": "cancel", "jobId": jobId})
+    return _call({"op": "cancel", "jobId": jobId}, profile)
 
 
 def main():
@@ -23920,7 +24040,7 @@ in
     # and suspenders: this must never be the reason a switch fails.
     system.activationScripts.agent-box-secret-candidates-report = {
       text = ''
-        ${secretCandidatesReport}/bin/agent-box-secret-candidates-report ${
+        ${pkgs.coreutils}/bin/timeout 60 ${secretCandidatesReport}/bin/agent-box-secret-candidates-report ${
           lib.concatStringsSep " " (map lib.escapeShellArg (lib.attrNames cfg.users))
         } || true
       '';
