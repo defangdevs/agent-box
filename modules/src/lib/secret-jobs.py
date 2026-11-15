@@ -284,14 +284,17 @@ class JobManager:
         def pump(stream, attr):
             raw = bytearray()
             truncated = False
+            discarded = False
 
             def publish(eof):
                 nonlocal truncated
                 clean = redact(bytes(raw), redact_values)
-                if not eof and hold:
+                if hold and (not eof or discarded):
                     # The last hold bytes may be the start of a secret whose
-                    # end has not been read yet; publishing them would leak
-                    # an unresolved prefix through status.
+                    # end has not been read yet - or, once the raw cap has
+                    # discarded bytes, whose end was cut off for good, so EOF
+                    # does not resolve it. Publishing them would leak an
+                    # unresolved prefix through status.
                     clean = clean[:max(len(clean) - hold, 0)]
                 if len(clean) > self.max_output_bytes:
                     clean = clean[:self.max_output_bytes]
@@ -311,12 +314,14 @@ class JobManager:
                     room = raw_cap - len(raw)
                     if room <= 0:
                         truncated = True
+                        discarded = True
                         with job.lock:
                             setattr(job, attr + "_truncated", True)
                         continue
                     if len(chunk) > room:
                         raw.extend(chunk[:room])
                         truncated = True
+                        discarded = True
                     else:
                         raw.extend(chunk)
                     publish(False)
