@@ -7,6 +7,7 @@ import io
 import json
 from pathlib import Path
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -191,7 +192,8 @@ class WhatsAppInstallTest(unittest.TestCase):
         sleep.assert_not_called()
 
 
-STUB = r"""#!/usr/bin/env python3
+# The interpreter by absolute path: the Nix build sandbox has no /usr/bin/env.
+STUB = "#!" + sys.executable + r"""
 import json, os, sys
 log = os.environ["STUB_LOG"]
 with open(log, "a") as f:
