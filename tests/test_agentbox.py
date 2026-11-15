@@ -3448,6 +3448,7 @@ class ConfigSchemaTest(unittest.TestCase):
                 "web": mod.BOX_SCHEMA.fields["web"],
                 "os_updates": mod.BOX_SCHEMA.fields["osUpdates"],
                 "containers": mod.BOX_SCHEMA.fields["containers"],
+                "secrets": mod.BOX_SCHEMA.fields["secrets"],
                 # Not config: the webhook pin shipped beside the profile's
                 # own webhook.py, read from the profile's asset directory.
                 "pin": None,
