@@ -31,6 +31,7 @@ jobs:
       - name: Cancel stale runs
         run: |
           set -euo pipefail
+          : > "${RUNNER_TEMP}/cancel-failures"
           cutoff=$(date -u -d "-${MAX_AGE_MINUTES} minutes" +%Y-%m-%dT%H:%M:%SZ)
           for status in in_progress queued; do
             gh api --paginate \
@@ -39,7 +40,15 @@ jobs:
             while IFS=$'\t' read -r id branch started; do
               echo "::warning::force-cancelling run ${id} (${branch}), started ${started}, older than ${MAX_AGE_MINUTES} min"
               # force-cancel works when a plain cancel is ignored by a dead runner
-              gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/force-cancel" || \
-                gh run cancel "${id}" --repo "${GITHUB_REPOSITORY}"
+              # A run can finish between the listing and the cancel; keep
+              # sweeping and report the failure after the loop.
+              if ! gh api -X POST "repos/${GITHUB_REPOSITORY}/actions/runs/${id}/force-cancel" &&
+                 ! gh run cancel "${id}" --repo "${GITHUB_REPOSITORY}"; then
+                echo "::error::could not cancel run ${id}"
+                echo "${id}" >> "${RUNNER_TEMP}/cancel-failures"
+              fi
             done
           done
+          if [ -s "${RUNNER_TEMP}/cancel-failures" ]; then
+            exit 1
+          fi
