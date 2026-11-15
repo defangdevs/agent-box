@@ -2591,6 +2591,19 @@ let
   # No web.enable dependency, unlike webhookEnabled above: this is a plain
   # Unix socket, not an HTTP endpoint behind the per-user Caddy vhost.
   secretsEnabled = cfg.secrets.enable;
+  # Secret custody (issue #922): the store parent is root-only (the broker
+  # creates its own per-user subdirectory under it at startup) and the
+  # socket dir is world-traversable - listing a socket's NAME is not a
+  # secret, its 0600 mode is what gates connect(). Applied by the broker
+  # block's own systemd.tmpfiles.rules, NOT by the web-gated `tmpfilesRules`
+  # below: a box with web.enable off still runs the broker, and without
+  # these the unit fails 226/NAMESPACE (ReadWritePaths= names a directory
+  # that does not exist). They are added to the golden inventory by hand,
+  # see internal.tmpfilesRules.
+  secretsTmpfilesRules = lib.optionals secretsEnabled [
+    "d /var/lib/agent-box-secrets 0700 root root - -"
+    "d /run/agent-box-secrets 0755 root root - -"
+  ];
   webhookSocketDir = "/run/agent-box-webhook";
   webhookSocketOf = name: "${webhookSocketDir}/${name}.sock";
   webhookStateDirOf = name: "/home/${name}/.local/state/local-webhook";
@@ -4772,9 +4785,13 @@ class SystemdLauncher(Launcher):
     actually runs.
     """
 
-    def __init__(self, user, worker_path, python_bin="python3"):
+    def __init__(self, user, worker_path, python_bin=None):
         self.user = user
         self.worker_path = worker_path
+        # None: exec the worker by its own absolute path. It is a generated
+        # script with a store-path shebang, so nothing here depends on a
+        # bare `python3` being on the PATH of the broker's unit or of the
+        # transient job unit - neither of which has one on NixOS.
         self.python_bin = python_bin
 
     @staticmethod
@@ -4793,7 +4810,7 @@ class SystemdLauncher(Launcher):
             "--property=PrivateTmp=yes",
             "--property=TimeoutStopSec=5",
             "--",
-            self.python_bin, self.worker_path,
+            *([self.python_bin] if self.python_bin else []), self.worker_path,
         ]
         job.handle = spawn_worker(cmd, frame_bytes)
         return job.handle
@@ -24533,8 +24550,7 @@ in
     # keyed, web-gated block the webhook/settings units are instantiated
     # in further down. Every configured user gets one, not just the ones
     # with a web front door.
-    # (Its two tmpfiles rules live in `tmpfilesRules` below, gated on
-    # secretsEnabled, so the golden inventory sees them.)
+    systemd.tmpfiles.rules = secretsTmpfilesRules;
     systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
       overrideStrategy = "asDropin";
       # Same restart-in-one-step reasoning as the webhook receiver's own
@@ -39996,14 +40012,7 @@ if __name__ == "__main__":
       # already been fixed. A predicate that can miss is the wrong shape for
       # an inventory; the module states its own instead (see
       # internal.tmpfilesRules).
-      tmpfilesRules = lib.optionals secretsEnabled [
-        # Secret custody (issue #922). Root-only store parent (the broker
-        # creates its own per-user subdirectory under this at startup) and
-        # a world-traversable socket dir - listing a socket's NAME is not
-        # a secret, its 0600 mode is what gates connect().
-        "d /var/lib/agent-box-secrets 0700 root root - -"
-        "d /run/agent-box-secrets 0755 root root - -"
-      ] ++ [
+      tmpfilesRules = [
         "d /var/lib/agent-box-web 0700 root root - -"
         "d /run/agent-box-web 0700 root root - -"
         # Snippet dirs: parent is world-traversable so caddy (primary group
@@ -40145,7 +40154,7 @@ if __name__ == "__main__":
       # hand instead of recovering with a substring match (see
       # tmpfilesRules above). Internal: it is this module's own
       # inventory of what it renders, not a knob.
-      services.agent-box.internal.tmpfilesRules = tmpfilesRules;
+      services.agent-box.internal.tmpfilesRules = tmpfilesRules ++ secretsTmpfilesRules;
 
       services.caddy = {
         enable = true;

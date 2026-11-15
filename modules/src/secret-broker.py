@@ -54,9 +54,13 @@ class SystemdLauncher(Launcher):
     actually runs.
     """
 
-    def __init__(self, user, worker_path, python_bin="python3"):
+    def __init__(self, user, worker_path, python_bin=None):
         self.user = user
         self.worker_path = worker_path
+        # None: exec the worker by its own absolute path. It is a generated
+        # script with a store-path shebang, so nothing here depends on a
+        # bare `python3` being on the PATH of the broker's unit or of the
+        # transient job unit - neither of which has one on NixOS.
         self.python_bin = python_bin
 
     @staticmethod
@@ -75,7 +79,7 @@ class SystemdLauncher(Launcher):
             "--property=PrivateTmp=yes",
             "--property=TimeoutStopSec=5",
             "--",
-            self.python_bin, self.worker_path,
+            *([self.python_bin] if self.python_bin else []), self.worker_path,
         ]
         job.handle = spawn_worker(cmd, frame_bytes)
         return job.handle

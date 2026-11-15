@@ -36,7 +36,7 @@
         };
         host = {
           jobs = 1;
-          checks = [ "ipv4-tcp-mitigation" "containers" "memory-protection" "ttyd-isolation" "web-surface" "email" ];
+          checks = [ "ipv4-tcp-mitigation" "containers" "secrets" "memory-protection" "ttyd-isolation" "web-surface" "email" ];
         };
       };
 
@@ -85,6 +85,13 @@
 
           containers = pkgs.testers.runNixOSTest
             (import ./tests/containers.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Secret custody (issue #922): the root/uid boundary the unit
+          # tests cannot reach - a second Linux user, a root-owned broker,
+          # SO_PEERCRED against root, a real systemd-run User= job, and
+          # control-group reaping on cancel/timeout.
+          secrets = pkgs.testers.runNixOSTest
+            (import ./tests/secrets.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue #59): sessions are runtime data — the
           # seeded "main" session starts, `agent-box-session add/rm` brings a
