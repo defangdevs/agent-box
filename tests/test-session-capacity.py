@@ -282,6 +282,31 @@ class Hibernation(unittest.TestCase):
         # The fake tmux only answers for the exact target "=idle:".
         self.assertEqual(capacity.archived_sessions(sessions), ["idle"])
 
+    def test_claude_records_after_the_turn_change_quiet_only_for_input(self):
+        sessions, transcript = self.claude()
+        selected = capacity.hibernation_candidate(sessions)
+        self.append(transcript, {"type": "last-prompt", "lastPrompt": "work"},
+                    {"type": "cost-state", "costUSD": 0.1},
+                    {"type": "file-history-snapshot", "snapshot": {}})
+        self.assertIsNotNone(capacity.hibernation_candidate(
+            sessions, name="idle", quiet=selected["quiet"]))
+        for record in ({"type": "attachment", "attachment": {}},
+                       {"type": "queue-operation", "operation": "enqueue"}):
+            sessions, transcript = self.claude()
+            selected = capacity.hibernation_candidate(sessions)
+            self.append(transcript, record)
+            self.assertIsNone(capacity.hibernation_candidate(sessions))
+            self.assertIsNone(capacity.hibernation_candidate(
+                sessions, name="idle", quiet=selected["quiet"]))
+        # A new closed turn is a change even though it is closed again.
+        sessions, transcript = self.claude()
+        selected = capacity.hibernation_candidate(sessions)
+        self.append(transcript, {"type": "user", "message": {"content": "more"}},
+                    {"type": "assistant", "message": {"stop_reason": "end_turn",
+                                                      "content": [{"type": "text", "text": "ok"}]}})
+        self.assertIsNone(capacity.hibernation_candidate(
+            sessions, name="idle", quiet=selected["quiet"]))
+
     def test_open_truncated_and_recent_claude_turns_stay_resident(self):
         sessions, transcript = self.claude(closed=False)
         self.assertIsNone(capacity.hibernation_candidate(sessions))
@@ -583,6 +608,10 @@ class Cli(unittest.TestCase):
             "    fi\n"
             "    cat \"$TEST_LIVE_FILE\" ;;\n"
             "  kill-session)\n"
+            "    if [ -n \"${TEST_EXIT_RECORDS_ON_KILL:-}\" ]; then\n"
+            "      printf '%s\\n' '{\"type\":\"last-prompt\",\"lastPrompt\":\"work\"}' "
+            "'{\"type\":\"cost-state\",\"costUSD\":0.1}' >> \"$TEST_EXIT_RECORDS_ON_KILL\"\n"
+            "    fi\n"
             "    if [ -n \"${TEST_INPUT_ON_KILL:-}\" ]; then\n"
             "      printf '%s\\n' '{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}' >> \"$TEST_INPUT_ON_KILL\"\n"
             "    fi\n"
@@ -725,6 +754,29 @@ reap_ephemeral
         self.env["TEST_INPUT_ON_KILL"] = str(transcript)
         result = self.run_cli("hibernate")
         self._assert_unparked_after_input("kill", result)
+
+    def test_claude_exit_records_do_not_undo_parking(self):
+        # Claude Code 2.1.322 appends last-prompt and cost-state when it
+        # exits, which renews the mtime and grows the file. Before the fix
+        # the check after the kill saw a change, un-parked the session and
+        # the supervisor resumed it with an "interrupted" turn.
+        live = self.make_live_claude()
+        self.limit.write_text("1\n")
+        transcript = (self.work / ".claude/projects/-work/"
+                      "44444444-4444-4444-8444-444444444444.jsonl")
+        # The real idle time, with a turn that closed long ago.
+        self.env["AGENT_BOX_HIBERNATE_IDLE_S"] = "30"
+        os.utime(transcript, (1_000_000_000, 1_000_000_000))
+        self.env["TEST_EXIT_RECORDS_ON_KILL"] = str(transcript)
+        result = self.run_cli("hibernate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["name"], "idle")
+        entry = json.loads(self.registry.read_text())["sessions"]["idle"]
+        self.assertTrue(entry["stopped"])
+        self.assertIn("hibernatedAt", entry)
+        self.assertEqual(live.read_text(), "")
+        self.assertEqual(json.loads(transcript.read_text().splitlines()[-1])["type"],
+                         "cost-state")
 
 
 if __name__ == "__main__":
