@@ -35,12 +35,14 @@ INLINE_WAIT_BUDGET_S = 3.0
 mcp = FastMCP("agent-box-secrets")
 
 
-def _call(req):
+def _call(req, profile=None):
     # Resolved per call, not once at import: a box with no default profile
     # and no AGENT_BOX_PROFILE must not fail to even START this server over
-    # it - each tool call reports the refusal instead.
+    # it - each tool call reports the refusal instead. A job's own follow-up
+    # calls pass the profile it was started under, so a default that changes
+    # meanwhile cannot make status/cancel look in another namespace.
     try:
-        profile = resolve_profile(os.environ.get("AGENT_BOX_PROFILE") or None)
+        profile = resolve_profile(profile or os.environ.get("AGENT_BOX_PROFILE") or None)
     except SecretError as exc:
         return {"ok": False, "error": str(exc)}
     return connect_and_call(SOCKET_PATH, dict(req, profile=profile))
@@ -88,35 +90,41 @@ def exec_with_secrets(
         req["timeoutMs"] = timeoutMs
     if idempotencyKey is not None:
         req["idempotencyKey"] = idempotencyKey
-    resp = _call(req)
+    try:
+        profile = resolve_profile(os.environ.get("AGENT_BOX_PROFILE") or None)
+    except SecretError as exc:
+        return {"ok": False, "error": str(exc)}
+    resp = _call(req, profile)
     if not resp.get("ok"):
         return resp
     job_id = resp["jobId"]
     deadline = time.time() + INLINE_WAIT_BUDGET_S
-    status = _call({"op": "status", "jobId": job_id})
+    status = _call({"op": "status", "jobId": job_id}, profile)
     # Not lib/secret-jobs.py's ACTIVE_STATES: this file only splices with
     # secret-protocol.py (see the header), to keep the unprivileged adapter's
     # dependency closure small - a second literal here is cheaper than
     # pulling in the whole job-manager module for one tuple.
     while status.get("ok") and status.get("state") in ("pending", "running") and time.time() < deadline:
         time.sleep(POLL_INTERVAL_S)
-        status = _call({"op": "status", "jobId": job_id})
+        status = _call({"op": "status", "jobId": job_id}, profile)
     status["jobId"] = job_id
+    status["profile"] = profile
     return status
 
 
 @mcp.tool()
-def exec_with_secrets_status(jobId: str) -> dict:
-    """Poll a job started by exec_with_secrets."""
-    return _call({"op": "status", "jobId": jobId})
+def exec_with_secrets_status(jobId: str, profile: str | None = None) -> dict:
+    """Poll a job started by exec_with_secrets. Pass the profile that call
+    returned, if any, so the lookup uses the profile the job started under."""
+    return _call({"op": "status", "jobId": jobId}, profile)
 
 
 @mcp.tool()
-def exec_with_secrets_cancel(jobId: str) -> dict:
+def exec_with_secrets_cancel(jobId: str, profile: str | None = None) -> dict:
     """Stop a running job started by exec_with_secrets. A job that already
     finished is returned unchanged; cancellation cannot undo an effect the
     command already caused outside this box (e.g. a detached deployment)."""
-    return _call({"op": "cancel", "jobId": jobId})
+    return _call({"op": "cancel", "jobId": jobId}, profile)
 
 
 def main():

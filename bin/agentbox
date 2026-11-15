@@ -5025,7 +5025,8 @@ def activate(spec, tree, removed, advisory, act, profile):
     wanted = set(tree.units)
     for prefix in ("agent-box@", "agent-web-terminal@",
                    "agent-box-settings@", "agent-box-webhook@",
-                   DOCKER_UNIT_PREFIX, "agent-box-email-source@"):
+                   DOCKER_UNIT_PREFIX, "agent-box-email-source@",
+                   SECRET_BROKER_UNIT_PREFIX):
         for unit in systemd_units_live(prefix):
             if unit not in wanted and "@." not in unit:
                 # `disable` would be a no-op for the same reason; the
@@ -5035,6 +5036,17 @@ def activate(spec, tree, removed, advisory, act, profile):
                 # be what the config asks for.
                 print(f"stopping {unit} (not in config)")
                 act.optional(f"stop {unit}", ["systemctl", "stop", unit])
+                if (prefix == SECRET_BROKER_UNIT_PREFIX
+                        and unit.endswith(".socket")):
+                    # The broker is socket-activated, so only its .socket
+                    # is enabled and listed; the running .service instance
+                    # it started has to be stopped by name or custody stays
+                    # live after secrets.enable goes false (or the user is
+                    # removed).
+                    service = unit[:-len(".socket")] + ".service"
+                    print(f"stopping {service} (not in config)")
+                    act.optional(f"stop {service}",
+                                 ["systemctl", "stop", service])
     if spec.web_enable:
         # The front door, and the last thing to move: everything it proxies
         # to is up by now. Required - a box whose caddy kept the previous
@@ -5077,7 +5089,8 @@ def activate(spec, tree, removed, advisory, act, profile):
     report_bin = profile / "bin" / "agent-box-secret-candidates-report"
     if report_bin.exists() and spec.users:
         act.optional("secret candidates report",
-                     [str(report_bin), *(u.name for u in spec.users)])
+                     ["timeout", "60", str(report_bin),
+                      *(u.name for u in spec.users)])
     return failed_starts
 
 

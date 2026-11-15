@@ -316,6 +316,15 @@ def load_root_key(path):
     finally:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
+    # The file fsync above does not make the new directory entry durable:
+    # without this, a power loss could drop .rootkey while records already
+    # encrypted under it survive, and the next start would mint a different
+    # key that cannot decrypt them.
+    dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     return load_root_key(path)
 
 
@@ -387,8 +396,14 @@ class Store:
             os.close(root_fd)
         self.user = user
         self.namespace = namespace
-        self._key = _namespace_key(root_key, user, namespace)
-        self._bind(user, uid)
+        try:
+            self._key = _namespace_key(root_key, user, namespace)
+            self._bind(user, uid)
+        except BaseException:
+            # The broker does not cache a Store that failed to build, so
+            # every retry would otherwise leak one more descriptor.
+            os.close(self.dir_fd)
+            raise
 
     def close(self):
         os.close(self.dir_fd)
@@ -446,10 +461,19 @@ class Store:
                         "configured": not rec.get("tombstone", False)})
         return out
 
+    def _name_count(self):
+        return sum(1 for entry in os.listdir(self.dir_fd)
+                   if entry.endswith(".rec") and valid_secret_name(entry[:-4]))
+
     def set(self, name, value):
         lock = self._locked()
         try:
             old = self._read(name + ".rec") or {}
+            if not old and self._name_count() >= SECRET_MAX_NAMES:
+                # list() reports at most SECRET_MAX_NAMES names, and env-exec
+                # strips only names it is told about, so the store must
+                # never hold more names than one response can carry.
+                raise SecretError("too many secrets")
             version = _next_version(old)
             nonce, ct = _encrypt(self._key, _aad(self.user, self.namespace, name, version), value)
             self._write(name + ".rec", {

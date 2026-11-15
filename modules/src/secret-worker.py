@@ -37,6 +37,20 @@ def read_frame(stream):
     return json.loads(body.decode("utf-8"))
 
 
+# The packaged build replaces the placeholder with the store path of bash
+# (a literal /bin/bash does not exist on NixOS). Unpackaged runs - tests, a
+# root-less dev box - leave it alone and fall back to what is on this host.
+BASH_PLACEHOLDER = "@" + "BASH@"
+PACKAGED_BASH = "@BASH@"
+
+
+def _bash_path():
+    if PACKAGED_BASH != BASH_PLACEHOLDER:
+        return PACKAGED_BASH
+    import shutil
+    return shutil.which("bash") or "/bin/bash"
+
+
 def main():
     frame = read_frame(sys.stdin.buffer)
 
@@ -59,7 +73,7 @@ def main():
         raise SystemExit(126)
 
     if frame.get("shell"):
-        shell = "/bin/bash" if frame["shell"] == "bash" else "/bin/sh"
+        shell = _bash_path() if frame["shell"] == "bash" else "/bin/sh"
         argv = [shell, "-c", frame["command"]]
     else:
         argv = frame["argv"]

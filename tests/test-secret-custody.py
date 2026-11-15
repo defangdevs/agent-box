@@ -43,6 +43,13 @@ CANARY = "canary-7f3a9-not-a-real-secret"
 
 PYBIN = os.environ.get("AGENT_BOX_TEST_PYBIN", sys.executable)
 
+# Run under the selected interpreter BEFORE importing the composed library,
+# which needs `cryptography`: otherwise a bare invoking python3 dies with
+# ModuleNotFoundError and AGENT_BOX_TEST_PYBIN never gets a say.
+if PYBIN != sys.executable and not os.environ.get("AGENT_BOX_TEST_REEXEC"):
+    os.environ["AGENT_BOX_TEST_REEXEC"] = "1"
+    os.execv(PYBIN, [PYBIN, *sys.argv])
+
 ns = {"__name__": "secret_lib"}
 # LIB (protocol + jobs) is also what composes BROKER below, so it stays
 # minimal; ENVSTORE/CANDIDATES are only for this process's own direct calls
@@ -466,6 +473,49 @@ class Custody(unittest.TestCase):
         self.assertEqual(status["state"], "done")
         self.assertNotIn(CANARY, status["stdout"])
         self.assertIn("***redacted***", status["stdout"])
+
+    def test_split_secret_prefix_is_never_published_while_running(self):
+        self.broker.ask({"op": "set", "name": "TOKEN", "value": CANARY})
+        script = ('import os,sys,time; v=os.environ["TOKEN"]; '
+                  'sys.stdout.write("x"*10+v[:-1]); sys.stdout.flush(); time.sleep(1.5); '
+                  'sys.stdout.write(v[-1]); sys.stdout.flush()')
+        resp = self.broker.ask({"op": "exec", "argv": [PYBIN, "-c", script],
+                                "secretNames": ["TOKEN"], "cwd": self.tmp})
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            status = self.broker.ask({"op": "status", "jobId": resp["jobId"]})
+            self.assertNotIn(CANARY[:-1], status["stdout"])
+            self.assertNotIn(CANARY[:8], status["stdout"])
+            time.sleep(0.05)
+        final = self.broker.wait_job(resp["jobId"])
+        self.assertNotIn(CANARY, final["stdout"])
+        self.assertIn("***redacted***", final["stdout"])
+
+    def test_store_refuses_more_names_than_a_list_can_carry(self):
+        for index in range(ns["SECRET_MAX_NAMES"]):
+            self.assertTrue(self.broker.ask({"op": "set", "name": f"N{index}", "value": "v"})["ok"])
+        over = self.broker.ask({"op": "set", "name": "ONE_TOO_MANY", "value": "v"})
+        self.assertFalse(over["ok"])
+        # An existing name can still be rotated.
+        self.assertTrue(self.broker.ask({"op": "set", "name": "N0", "value": "w"})["ok"])
+
+    def test_scan_skips_a_fifo_instead_of_blocking(self):
+        home = tempfile.mkdtemp()
+        config = Path(home) / ".config" / "agent-box"
+        config.mkdir(parents=True)
+        os.mkfifo(config / "env")
+        started = time.time()
+        self.assertEqual(ns["scan"](home), [])
+        self.assertLess(time.time() - started, 5)
+
+    def test_oversize_status_reply_keeps_its_output_and_marks_truncation(self):
+        self.broker.ask({"op": "set", "name": "TOKEN", "value": "t"})
+        resp = self.broker.ask({"op": "exec", "argv": [PYBIN, "-c", "import sys; sys.stdout.write('a'*65536)"],
+                                "secretNames": ["TOKEN"], "cwd": self.tmp})
+        status = self.broker.wait_job(resp["jobId"])
+        self.assertTrue(status["ok"], status)
+        self.assertTrue(status["stdout"].startswith("aaaa"))
+        self.assertTrue(status["stdoutTruncated"])
 
     def test_exec_rejects_unknown_secret_name(self):
         resp = self.broker.ask({"op": "exec", "argv": ["echo", "hi"],

@@ -148,17 +148,34 @@ class Broker:
 
 
 def _safe_send(conn, reply):
-    """send_frame itself can refuse (SecretError("response too large")) -
-    a job's own (already-capped) output can still JSON-escape past
-    SECRET_MAX_FRAME in the pathological case (every byte a control
-    character escapes to \\u00NN, a 6x blow-up). Fall back to a reply that
-    is guaranteed small rather than let that escape as an exception."""
+    """send_frame itself can refuse (SecretError("response too large")): a
+    job's own (already-capped) output plus the JSON metadata can pass
+    SECRET_MAX_FRAME, and in the pathological case (every byte a control
+    character escapes to \\u00NN, a 6x blow-up) by a lot. A reply that
+    carries output is shrunk - halving stdout/stderr and marking them
+    truncated - until it fits, so the caller still gets the job's state, its
+    exit code and what output fits. Only a reply that cannot be made to fit
+    at all becomes a refusal, and that one says ok=false."""
     try:
         send_frame(conn, reply)
+        return
     except SecretError:
-        send_frame(conn, {"ok": reply.get("ok", False),
-                          "error": "response too large to return in full",
-                          "jobId": reply.get("jobId"), "state": reply.get("state")})
+        pass
+    shrunk = dict(reply)
+    for _ in range(16):
+        for key in ("stdout", "stderr"):
+            text = shrunk.get(key)
+            if isinstance(text, str) and text:
+                shrunk[key] = text[:len(text) // 2]
+                shrunk[key + "Truncated"] = True
+        try:
+            send_frame(conn, shrunk)
+            return
+        except SecretError:
+            continue
+    send_frame(conn, {"ok": False,
+                      "error": "response too large to return in full",
+                      "jobId": reply.get("jobId"), "state": reply.get("state")})
 
 
 def serve_one(listener, broker, expect_uid):

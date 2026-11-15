@@ -209,7 +209,17 @@ class JobManager:
             self._jobs[job.id] = job
             if key is not None:
                 self._by_idempotency[(namespace, key)] = job.id
-        self._dispatch(job, req, resolve_secret)
+        try:
+            self._dispatch(job, req, resolve_secret)
+        except Exception:
+            # Anything unexpected (an OSError reading a record, say) must
+            # not leave the registered job "pending": two of those would
+            # consume this user's whole execution capacity until restart.
+            with job.lock:
+                if job.state in ACTIVE_STATES:
+                    job.state = "error"
+                    job.stderr = b"internal error resolving secrets"
+                    job.finished_at = time.time()
         return job.id
 
     def _dispatch(self, job, req, resolve_secret):
@@ -269,34 +279,53 @@ class JobManager:
         longest_value = max((len(v.encode("utf-8")) for v in redact_values), default=0)
         raw_cap = self.max_output_bytes + longest_value
 
+        hold = max(longest_value - 1, 0)
+
         def pump(stream, attr):
             raw = bytearray()
             truncated = False
-            while True:
-                # Keep reading even once the cap below is hit, so a child
-                # that fills its pipe buffer never blocks on a reader that
-                # has stopped reading; the extra bytes are simply discarded.
-                chunk = stream.read(4096)
-                if not chunk:
-                    break
-                room = raw_cap - len(raw)
-                if room <= 0:
-                    truncated = True
-                    with job.lock:
-                        setattr(job, attr + "_truncated", True)
-                    continue
-                if len(chunk) > room:
-                    raw.extend(chunk[:room])
-                    truncated = True
-                else:
-                    raw.extend(chunk)
+
+            def publish(eof):
+                nonlocal truncated
                 clean = redact(bytes(raw), redact_values)
+                if not eof and hold:
+                    # The last hold bytes may be the start of a secret whose
+                    # end has not been read yet; publishing them would leak
+                    # an unresolved prefix through status.
+                    clean = clean[:max(len(clean) - hold, 0)]
                 if len(clean) > self.max_output_bytes:
                     clean = clean[:self.max_output_bytes]
                     truncated = True
                 with job.lock:
                     setattr(job, attr, clean)
                     setattr(job, attr + "_truncated", truncated)
+
+            try:
+                while True:
+                    # Keep reading even once the cap below is hit, so a child
+                    # that fills its pipe buffer never blocks on a reader that
+                    # has stopped reading; the extra bytes are simply discarded.
+                    chunk = stream.read(4096)
+                    if not chunk:
+                        break
+                    room = raw_cap - len(raw)
+                    if room <= 0:
+                        truncated = True
+                        with job.lock:
+                            setattr(job, attr + "_truncated", True)
+                        continue
+                    if len(chunk) > room:
+                        raw.extend(chunk[:room])
+                        truncated = True
+                    else:
+                        raw.extend(chunk)
+                    publish(False)
+                publish(True)
+            finally:
+                # Job.handle outlives the child for the retention window;
+                # without this each finished job keeps two descriptors open.
+                with contextlib.suppress(OSError, ValueError):
+                    stream.close()
 
         out_thread = threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True)
         err_thread = threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True)
@@ -310,6 +339,11 @@ class JobManager:
             if deadline is not None and time.time() >= deadline:
                 timed_out = True
                 self.launcher.kill(job)
+                # Reap it: the retained job still owns the process handle.
+                for _ in range(100):
+                    if self.launcher.poll(job) is not None:
+                        break
+                    time.sleep(0.05)
                 break
             time.sleep(0.05)
         out_thread.join(timeout=5)
