@@ -6525,6 +6525,29 @@ def render_reboot_line():
             + " &mdash; restart agent-box to finish installing the update.")
 
 
+def render_restart_banner(settings_href):
+    """A persistent red banner while the distro says a restart is waiting.
+
+    The reason used to live only in the Maintenance card at the bottom of
+    Settings, which nobody opens (issue #1044). Unlike the action banner
+    it has no dismiss: it clears itself when the marker file goes away,
+    which is the only thing that should clear it.
+    """
+    pending, packages = reboot_pending()
+    if not pending:
+        return ""
+    reason = ""
+    if packages:
+        reason = " (" + html.escape(", ".join(packages)) + ")"
+    return (
+        '<div class="msg msg-restart" data-kind="error" role="alert">'
+        '<span class="msg-text"><strong>A restart is required</strong>'
+        + reason + ' to finish installing an update. '
+        f'<a href="{html.escape(settings_href, quote=True)}">'
+        'Open Settings &rarr; Maintenance to restart agent-box</a>.</span>'
+        '</div>')
+
+
 def render_update_line():
     """Running rev plus a progressively enhanced GitHub update status.
 
@@ -7252,7 +7275,8 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False,
             not message or prefer_connect_feedback):
         message = take_connect_feedback(connect_feedback)
         kind = "ok"
-    msg_html = render_msg(message, BASE + "/", kind)
+    msg_html = (render_restart_banner(BASE + "/")
+                + render_msg(message, BASE + "/", kind))
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
     # rows and the standing watches must not each pay for their own.
@@ -7367,7 +7391,8 @@ def render_home(message="", selected=None, kind="ok", view="tabs"):
     died = {n for n, v in entries.items() if crashed_status(v) is not None}
     # Dismissing keeps the selected tab and the layout it was dismissed in
     # (SESSION_RE names are URL-safe, so nothing here is escaped away).
-    msg_html = render_msg(message, view_href(selected, view), kind)
+    msg_html = (render_restart_banner(BASE + "/")
+                + render_msg(message, view_href(selected, view), kind))
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
         + STYLE
