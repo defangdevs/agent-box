@@ -3708,6 +3708,17 @@ class SelfUpdateLogicTest(unittest.TestCase):
         parse = self.mod.parse_flake_url
         self.assertEqual(parse(f"github:{FAKE_REPO}/{FAKE_REV}"),
                          (FAKE_REPO, FAKE_REV))
+        # The locked `url` nix records in manifest.json carries a narHash
+        # query after the rev; the rev must still be found.
+        self.assertEqual(
+            parse(f"github:{FAKE_REPO}/{FAKE_REV}?narHash=sha256-abc%3D"),
+            (FAKE_REPO, FAKE_REV))
+        self.assertEqual(
+            parse(f"github:{FAKE_REPO}?narHash=sha256-abc%3D"),
+            (FAKE_REPO, None))
+        self.assertEqual(
+            parse(f"github:{FAKE_REPO}/master?narHash=sha256-abc%3D"),
+            (FAKE_REPO, None))
         # An unlocked entry: a repo, but no rev to compare against.
         self.assertEqual(parse("github:defangdevs/agent-box"),
                          ("defangdevs/agent-box", None))
