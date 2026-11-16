@@ -43,7 +43,7 @@
     def as_user(user, cmd, sock=True):
         """Run cmd as `user` with that user's own broker socket exported,
         the way a session sees it. Returns (status, output)."""
-        env = f"AGENT_BOX_SECRET_SOCKET=/run/agent-box-secrets/{user}.sock " if sock else ""
+        env = f"export AGENT_BOX_SECRET_SOCKET=/run/agent-box-secrets/{user}.sock; " if sock else ""
         return machine.execute(f"su -s /bin/sh {user} -c {shlex.quote(env + cmd)} 2>&1")
 
     def agent(cmd):
@@ -120,7 +120,7 @@
         # File mode: robot cannot even connect.
         status, out = machine.execute(
             "su -s /bin/sh robot -c "
-            + shlex.quote(f"AGENT_BOX_SECRET_SOCKET={SOCK} agent-box-secret --profile t list")
+            + shlex.quote(f"export AGENT_BOX_SECRET_SOCKET={SOCK}; agent-box-secret --profile t list")
             + " 2>&1")
         assert status != 0, f"robot reached agent's broker: {out}"
         assert "K" not in out.split(), out
@@ -130,7 +130,7 @@
         # Root bypasses file modes, so ONLY the SO_PEERCRED check can refuse
         # this one. It must: root is not the user this broker serves.
         status, out = machine.execute(
-            f"AGENT_BOX_SECRET_SOCKET={SOCK} agent-box-secret --profile t list 2>&1")
+            f"export AGENT_BOX_SECRET_SOCKET={SOCK}; agent-box-secret --profile t list 2>&1")
         assert status != 0, f"root was served by agent's broker: {out}"
         assert "configured" not in out, out
 
