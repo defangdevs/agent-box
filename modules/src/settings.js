@@ -243,8 +243,8 @@
       fetch(here + window.location.search, { headers: sectionHeaders(sections) }),
       here);
   }
-  var SESSION_REGIONS = ["msg-slot", "sessions-list", "tab-bar"];
-  var CONNECT_REGIONS = ["msg-slot", "connect-list"];
+  var SESSION_REGIONS = ["msg-slot", "restart-banner", "sessions-list", "tab-bar"];
+  var CONNECT_REGIONS = ["msg-slot", "restart-banner", "connect-list"];
   // Re-fetch the current page and patch the live session list/tabs, so
   // the visible list tracks a restart even when nothing was "starting"
   // at submit time (which is what otherwise gates schedulePoll).
@@ -1425,10 +1425,10 @@
     // Signing out deletes a provider's keys (GH_TOKEN) and starting WhatsApp
     // stores its phone number, so a card's own form keeps the secrets too.
     if (f.closest("#connect-list")) {
-      return ["msg-slot", "connect-list", "secrets-list"];
+      return ["msg-slot", "restart-banner", "connect-list", "secrets-list"];
     }
     if (f.closest("#secret-editor, #secrets-list")) {
-      return ["msg-slot", "secrets-list", "connect-list"];
+      return ["msg-slot", "restart-banner", "secrets-list", "connect-list"];
     }
     return null;
   }
@@ -1493,7 +1493,7 @@
       // could not offer the profile the operator had just made.
       var doc = parseHTML(t);
       applyDoc(doc, sections ||
-        ["msg-slot", "secrets-list", "sessions-list", "profiles-list",
+        ["msg-slot", "restart-banner", "secrets-list", "sessions-list", "profiles-list",
          "profile-picker", "webhook-endpoint", "webhooks-list",
          "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");

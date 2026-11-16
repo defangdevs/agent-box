@@ -5060,7 +5060,7 @@ CONNECT_SECTION_TPL = """<section>
 # layout does not navigate, since a navigation would tear down every
 # attached terminal on the page.
 HOME_BODY = """<body class="ws" data-view="{view}">
-{restart_banner}<div id="msg-slot">{message}</div>
+<div id="restart-banner">{restart_banner}</div><div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}"
      data-sess-base="{action_base}">
   {tabs}
@@ -5100,7 +5100,7 @@ BODY = """<main>
   </a>
   <a class="back" href="{term_home}">&larr; workspace</a>
   <h1><span class="mark">{mark}</span>Settings</h1>
-  {restart_banner}<div id="msg-slot">{message}</div>
+  <div id="restart-banner">{restart_banner}</div><div id="msg-slot">{message}</div>
   <section aria-labelledby="resource-usage" data-resources-url="{base}/resources">
     <h2 id="resource-usage">Resource usage<a class="heading-anchor" href="#resource-usage" aria-label="Copy link to Resource usage" title="Copy link to Resource usage"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     <p class="note">Box CPU, memory and disk; hook session slots. Manual sessions bypass the limit. Refreshes every 5 seconds.</p>
@@ -7235,7 +7235,8 @@ def render_head(title):
 # the no-JS form flow and every other client see no difference.
 SECTIONS_HEADER = "X-Agent-Box-Sections"
 PAGE_SECTIONS = frozenset((
-    "msg-slot", "secrets-list", "sessions-list", "profile-picker",
+    "msg-slot", "restart-banner", "secrets-list", "sessions-list",
+    "profile-picker",
     "profiles-list", "webhook-endpoint", "webhooks-list", "connect-list",
 ))
 _request_local = threading.local()
