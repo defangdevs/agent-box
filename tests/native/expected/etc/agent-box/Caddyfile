@@ -73,6 +73,17 @@
   }
 }
 
+# A private IPv4 domain (RFC 1918, the 100.64.0.0/10 shared range Tailscale
+# and Headscale hand out, loopback, link-local) is one no public CA can
+# validate, and Caddy rejects an explicit ACME policy for it outright
+# ("hostname appears in more than one automation policy"), so the box would
+# fail `caddy validate` and every update would roll back. Such a box is
+# reached over a private network, so Caddy's own local CA is the cert it can
+# actually have; clients trust it once, as with any internal CA.
+(internal_ca) {
+  tls internal
+}
+
 # Preserve HTTP-to-HTTPS redirects for every hostname, including imported
 # sites, while stripping implementation identifiers before writing responses.
 http:// {

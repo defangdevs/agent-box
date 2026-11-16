@@ -23546,7 +23546,10 @@ in
         description = ''
           Public IPv4 address or DNS name for the browser terminal. An IPv4
           address uses a Let's Encrypt shortlived certificate; a DNS name uses
-          the normal ACME profile. Caddy renews certificates in its persistent
+          the normal ACME profile. A private IPv4 address (RFC 1918,
+          100.64.0.0/10 as handed out by Tailscale/Headscale, loopback,
+          link-local) cannot get a public certificate, so it uses Caddy's
+          internal CA instead. Caddy renews certificates in its persistent
           /var/lib/caddy state directory.
         '';
       };
@@ -39861,6 +39864,21 @@ if __name__ == "__main__":
       ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
       isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
       webDomainIsIpv4 = isIpv4 cfg.web.domain;
+      # Mirrors private_ipv4 in bin/agentbox octet for octet (see there):
+      # RFC 1918, 100.64.0.0/10 (Tailscale/Headscale), loopback, link-local.
+      # No public CA issues for these, so the box uses Caddy's internal CA.
+      privateIpv4 = value:
+        let
+          o = map lib.toIntBase10 (lib.splitString "." value);
+          a = builtins.elemAt o 0;
+          b = builtins.elemAt o 1;
+        in
+        a == 10 || a == 127
+        || (a == 100 && b >= 64 && b < 128)
+        || (a == 169 && b == 254)
+        || (a == 172 && b >= 16 && b < 32)
+        || (a == 192 && b == 168);
+      webDomainIsPrivateIpv4 = webDomainIsIpv4 && privateIpv4 cfg.web.domain;
       # Preserve a configured destination; only an unset one uses the
       # issuer's origin. Neither HTML nor Caddy may interpret URL syntax.
       portalHint =
@@ -40306,7 +40324,8 @@ if __name__ == "__main__":
       lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
           caddyReloadCmd
-          (if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
+          (if webDomainIsPrivateIpv4 then "internal_ca"
+           else if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
           (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "")
           portalHint ] ''
         # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
@@ -40381,6 +40400,17 @@ if __name__ == "__main__":
               disable_http_challenge
             }
           }
+        }
+
+        # A private IPv4 domain (RFC 1918, the 100.64.0.0/10 shared range Tailscale
+        # and Headscale hand out, loopback, link-local) is one no public CA can
+        # validate, and Caddy rejects an explicit ACME policy for it outright
+        # ("hostname appears in more than one automation policy"), so the box would
+        # fail `caddy validate` and every update would roll back. Such a box is
+        # reached over a private network, so Caddy's own local CA is the cert it can
+        # actually have; clients trust it once, as with any internal CA.
+        (internal_ca) {
+          tls internal
         }
 
         # Preserve HTTP-to-HTTPS redirects for every hostname, including imported
@@ -40672,7 +40702,7 @@ if __name__ == "__main__":
     {
       assertions = [
         {
-          assertion = !webDomainIsIpv4 || lib.versionAtLeast pkgs.caddy.version "2.11.4";
+          assertion = !webDomainIsIpv4 || webDomainIsPrivateIpv4 || lib.versionAtLeast pkgs.caddy.version "2.11.4";
           message = "services.agent-box.web.domain is an IPv4 address, which requires Caddy 2.11.4 or newer for ACME IP certificates.";
         }
         {

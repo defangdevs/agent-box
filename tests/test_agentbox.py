@@ -20,6 +20,7 @@ import ast
 import contextlib
 import importlib.util
 import io
+import ipaddress
 import json
 import os
 import re
@@ -251,6 +252,33 @@ class RenderTest(unittest.TestCase):
             # Byte-for-byte unit copies remain recognizable by feature-off cleanup.
             shared = (out / "etc/systemd/system/agent-box-settings@.service").read_text()
             self.assertEqual(shared, (SRC / "units/agent-box-settings@.service").read_text())
+
+    def test_private_ip_uses_internal_ca(self):
+        # A Tailscale/Headscale or LAN address cannot get a public cert, and
+        # Caddy rejects an ACME policy for it, so it must use `tls internal`
+        # while keeping default_sni (clients connecting by IP send no SNI).
+        mod = load_agentbox()
+        for addr, private in [("100.64.0.13", True), ("100.127.255.1", True),
+                              ("10.0.0.5", True), ("172.16.0.1", True),
+                              ("172.31.255.1", True), ("192.168.1.10", True),
+                              ("127.0.0.1", True), ("169.254.1.1", True),
+                              ("100.63.255.255", False), ("100.128.0.1", False),
+                              ("172.15.0.1", False), ("172.32.0.1", False),
+                              ("203.0.113.7", False), ("8.8.8.8", False)]:
+            self.assertEqual(
+                mod.private_ipv4(ipaddress.ip_address(addr)), private, addr)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "100.64.0.13",
+                "web": {"enable": True},
+                "users": {"agent": {"root": True}},
+            }))
+            caddyfile = (render(tmp, cfg) / "etc/agent-box/Caddyfile").read_text()
+            self.assertIn("default_sni 100.64.0.13", caddyfile)
+            site = caddyfile.split("\n100.64.0.13 {", 1)[1].split("\n}", 1)[0]
+            self.assertIn("import internal_ca", site)
+            self.assertNotIn("import acme_", site)
 
     def test_ip_certificate_and_optional_dns_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
