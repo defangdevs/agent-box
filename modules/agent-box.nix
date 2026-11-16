@@ -13098,6 +13098,15 @@ _hc_main "$@"
 
     ensure_state() { mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; }
 
+    # Read-only diagnosis: `status` must leave state untouched, so it never
+    # repairs the mode. It only creates a MISSING directory (first run), and a
+    # failure to do so is reported and not fatal (issue #1048).
+    ensure_state_for_read() {
+      [ -d "$STATE_DIR" ] && return 0
+      mkdir -p "$STATE_DIR" 2>/dev/null && return 0
+      echo "webhook: state directory $STATE_DIR is unavailable (read-only filesystem?); continuing" >&2
+    }
+
     valid_source() {
       case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
     }
@@ -14183,7 +14192,7 @@ _hc_main "$@"
         # Same status webhook.py prints (its own version is the pin, since this
         # wrapper runs the pinned script), plus the two facts only the box can
         # see: what a NEW session would load, and what the live ones DID load.
-        ensure_state
+        ensure_state_for_read
         out="$("$PY" "$SCRIPT" status "$@")" || exit $?
         pinned="$(printf '%s' "$out" | "$JQ" -r '.version // ""')"
         installed="$(plugin_versions | tr '\n' ' ')"; installed="''${installed% }"
