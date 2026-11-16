@@ -17965,9 +17965,22 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
   include="$(claim_include)" || include=""
   note="$(claim_note "$LOCAL_WEBHOOK_SPAWN_KEY")" || note=""
   [ -n "$note" ] || note="seeded at spawn: this session was started for an event on $own"
+  # Mute this box's own DIRECT echoes (its comments, pushes, PR edits), never
+  # the CI those pushes trigger. This used to be ignoreSenders ["@self"], but
+  # since local-webhook 0.23.0 that is a pure sender mute, and GitHub stamps a
+  # CI run with whoever pushed. So a hook session that pushed a fix lost its own
+  # CI: no delivery, and no claim, so the standing watch spawned a stranger
+  # for the red run instead (PR #1041). The list matches local-webhook's
+  # DEFAULT_DIRECT_GITHUB_ECHO_EVENTS, the exclude it seeds for a fresh
+  # session subscription. A re-subscribe keeps it, as it kept ignoreSenders.
+  self_login="''${LOCAL_WEBHOOK_SELF:-}"
+  if [ -z "$self_login" ] && [ -r "$LOCAL_WEBHOOK_STATE_DIR/self.env" ]; then
+    self_login="$(sed -n 's/^LOCAL_WEBHOOK_SELF=//p' "$LOCAL_WEBHOOK_STATE_DIR/self.env" | tail -n 1)"
+  fi
+  self_login="$(printf '%s' "$self_login" | tr -cd 'A-Za-z0-9._-' | tr 'A-Z' 'a-z')"
   if "$JQ" -n --arg topic "$own" --arg ts "$ts" --arg note "$note" \
-      --argjson include "''${include:-null}" \
-      '{"//": "Seeded by agent-box-webhook-spawn for a dispatched hook-* session, so the dispatch brake can see which OBJECT this session owns (agent-box#251). Same schema as any session filter; webhook_subscribe rewrites it.", enabled: true, ttlHours: 2, topics: [{topic: $topic, note: $note, ignoreSenders: ["@self"], renewOnEvent: true, subscribedAt: $ts, lastActivityAt: $ts} + (if $include == null then {} else {include: $include} end)]}' \
+      --argjson include "''${include:-null}" --arg self "$self_login" \
+      '{"//": "Seeded by agent-box-webhook-spawn for a dispatched hook-* session, so the dispatch brake can see which OBJECT this session owns (agent-box#251). Same schema as any session filter; webhook_subscribe rewrites it.", enabled: true, ttlHours: 2, topics: [{topic: $topic, note: $note, renewOnEvent: true, subscribedAt: $ts, lastActivityAt: $ts} + (if $include == null then {} else {include: $include} end) + (if $self == "" or ($topic | startswith("github:") | not) then {} else {exclude: {all: [{path: "_senderLower", in: [$self]}, {path: "event", in: ["commit_comment", "create", "discussion", "discussion_comment", "issue_comment", "issues", "pull_request", "pull_request_review", "pull_request_review_comment", "pull_request_review_thread", "push", "release"]}]}} end)]}' \
       > "$ff.$$" && mv -f "$ff.$$" "$ff"; then
     seeded="$own"
   else
