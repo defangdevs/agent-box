@@ -336,13 +336,13 @@ USAGE
 
 ensure_state() { mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; }
 
-# Read-only diagnosis: an existing state directory is enough. Repairing its
-# mode must not be a prerequisite, or `status` aborts on a read-only home
-# (ext4 emergency_ro) before reporting anything (issue #1048).
+# Read-only diagnosis: `status` must leave state untouched, so it never
+# repairs the mode. It only creates a MISSING directory (first run), and a
+# failure to do so is reported and not fatal (issue #1048).
 ensure_state_for_read() {
-  [ -d "$STATE_DIR" ] || { ensure_state; return; }
-  chmod 700 "$STATE_DIR" 2>/dev/null ||
-    echo "webhook: cannot chmod $STATE_DIR (read-only filesystem?); continuing" >&2
+  [ -d "$STATE_DIR" ] && return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null && return 0
+  echo "webhook: state directory $STATE_DIR is unavailable (read-only filesystem?); continuing" >&2
 }
 
 valid_source() {
