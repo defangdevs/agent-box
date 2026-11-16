@@ -39,6 +39,8 @@
     SOCK = "/run/agent-box-secrets/agent.sock"
     STORE = "/var/lib/agent-box-secrets"
     VALUE = "s3cr3t-VALUE-0123456789"
+    # Jobs start with no PATH (minimal ambient env); give the shell one.
+    SYSPATH = "PATH=/run/current-system/sw/bin; "
 
     def as_user(user, cmd, sock=True):
         """Run cmd as `user` with that user's own broker socket exported,
@@ -137,7 +139,7 @@
     with subtest("exec: uid drop, scoped injection, redaction"):
         _, reply = run_job(
             "--secret K --command "
-            "'echo uid=$(id -u) user=$(id -un); echo val=$K; env | grep -c ^K=; "
+            "'"+SYSPATH+"echo uid=$(id -u) user=$(id -un); echo val=$K; env | grep -c ^K=; "
             "cat " + key + " 2>&1; echo END'")
         out = reply.get("stdout", "")
         agent_uid = machine.succeed("id -u agent").strip()
@@ -147,7 +149,7 @@
         assert "Permission denied" in out, out          # not root: cannot read the key
         assert reply["exitCode"] == 0, reply
         # Nothing but what was asked for, plus the minimal ambient set.
-        _, reply = run_job("--command 'env | sort | cut -d= -f1 | tr \"\\n\" \" \"'")
+        _, reply = run_job("--command '" + SYSPATH + "env | sort | cut -d= -f1 | tr \"\\n\" \" \"'")
         names = reply.get("stdout", "").split()
         assert "K" not in names and not any("SECRET" in n for n in names), names
 
@@ -168,7 +170,7 @@
         # cancel: a shell that backgrounds a second sleep, so killing only
         # the leader would leave an orphan behind.
         status, out = as_user("agent",
-            "agent-box-secret --profile t exec --command 'sleep 300 & sleep 300'")
+            "agent-box-secret --profile t exec --command '" + SYSPATH + "sleep 300 & sleep 300'")
         job = out.strip().splitlines()[-1]
         machine.wait_until_succeeds("pgrep -u agent -x sleep >/dev/null", timeout=20)
         agent(f"agent-box-secret --profile t cancel {job}")
@@ -177,7 +179,7 @@
         assert not units and not procs, f"cancel left units={units!r} procs={procs!r}"
 
         # timeout: same shape, reaped by the deadline instead of the caller.
-        _, reply = run_job("--timeout-ms 2000 --command 'sleep 300 & sleep 300'", wait=30)
+        _, reply = run_job("--timeout-ms 2000 --command '" + SYSPATH + "sleep 300 & sleep 300'", wait=30)
         assert reply["state"] == "timeout", reply
         machine.wait_until_succeeds("! pgrep -u agent -x sleep", timeout=20)
         units, procs = leftovers()
