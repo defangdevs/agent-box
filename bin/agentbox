@@ -367,6 +367,23 @@ def manifest_element(manifest, attr=RUNTIME_ATTR):
     return None, None
 
 
+def private_ipv4(ip):
+    """True for an IPv4 address no public CA will issue a certificate for.
+
+    An explicit octet list rather than `not ip.is_global`, whose answer has
+    moved between Python releases: it must match `privateIpv4` in the NixOS
+    module exactly, or the two backends would render different TLS policies
+    for the same domain. RFC 1918, the 100.64.0.0/10 shared range (Tailscale
+    and Headscale addresses), loopback and link-local.
+    """
+    a, b = ip.packed[0], ip.packed[1]
+    return (a == 10 or a == 127
+            or (a == 100 and 64 <= b < 128)
+            or (a == 169 and b == 254)
+            or (a == 172 and 16 <= b < 32)
+            or (a == 192 and b == 168))
+
+
 def parse_flake_url(url):
     """github:owner/repo[/ref] -> ("owner/repo", "<40-hex rev>" or None).
 
@@ -4008,8 +4025,9 @@ class Renderer:
                     ip = ipaddress.ip_address(self.spec.domain)
                 except ValueError:
                     ip = None
-                policy = ("acme_ip_shortlived"
-                          if isinstance(ip, ipaddress.IPv4Address)
+                ipv4 = isinstance(ip, ipaddress.IPv4Address)
+                policy = ("internal_ca" if ipv4 and private_ipv4(ip)
+                          else "acme_ip_shortlived" if ipv4
                           else "acme_alpn_only")
                 text = text.replace("@TLS_POLICY@", policy)
                 text = text.replace(
