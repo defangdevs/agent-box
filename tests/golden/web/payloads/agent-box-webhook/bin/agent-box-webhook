@@ -349,6 +349,15 @@ USAGE
 
 ensure_state() { mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; }
 
+# Read-only diagnosis: an existing state directory is enough. Repairing its
+# mode must not be a prerequisite, or `status` aborts on a read-only home
+# (ext4 emergency_ro) before reporting anything (issue #1048).
+ensure_state_for_read() {
+  [ -d "$STATE_DIR" ] || { ensure_state; return; }
+  chmod 700 "$STATE_DIR" 2>/dev/null ||
+    echo "webhook: cannot chmod $STATE_DIR (read-only filesystem?); continuing" >&2
+}
+
 valid_source() {
   case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
 }
@@ -1434,7 +1443,7 @@ case "$cmd" in
     # Same status webhook.py prints (its own version is the pin, since this
     # wrapper runs the pinned script), plus the two facts only the box can
     # see: what a NEW session would load, and what the live ones DID load.
-    ensure_state
+    ensure_state_for_read
     out="$("$PY" "$SCRIPT" status "$@")" || exit $?
     pinned="$(printf '%s' "$out" | "$JQ" -r '.version // ""')"
     installed="$(plugin_versions | tr '\n' ' ')"; installed="${installed% }"
