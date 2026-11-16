@@ -252,7 +252,7 @@
     return fetchPage(SESSION_REGIONS)
       .then(function (t) {
         if (t === null) { return; }
-        applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+        applyRefreshDoc(parseHTML(t), ["restart-banner", "sessions-list", "tab-bar"]);
         wsSync();
       })
       .catch(function () {});
@@ -452,7 +452,7 @@
       fetchPage(SESSION_REGIONS)
         .then(function (t) {
           if (t === null) { return; }
-          applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+          applyRefreshDoc(parseHTML(t), ["restart-banner", "sessions-list", "tab-bar"]);
           wsSync();
           schedulePoll();
         });
@@ -504,7 +504,7 @@
       // banner slot with the card state so that result appears where every
       // other transient action message lives (issue #835).
       .then(function (t) {
-        if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
+        if (t) { applyRefreshDoc(parseHTML(t), ["restart-banner", "connect-list"]); }
         connectRetries = 0;
         return true;
       }, function () { return false; })
