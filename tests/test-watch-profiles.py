@@ -48,7 +48,7 @@ class Watches(unittest.TestCase):
                         AGENT_BOX_WEBHOOK_STATE_DIR=str(self.state),
                         AGENT_BOX_WEBHOOK_PYTHON=sys.executable,
                         AGENT_BOX_PROFILES_DIR=str(self.profiles))
-        for key in ('CODEX_THREAD_ID', 'LOCAL_WEBHOOK_SPAWN_CONFIG',
+        for key in ('CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'LOCAL_WEBHOOK_SPAWN_CONFIG',
                     'AGENT_BOX_HOOK_PROFILE', 'LOCAL_WEBHOOK_SELF'):
             self.env.pop(key, None)
         src = REPO / 'modules/src'
@@ -395,6 +395,43 @@ class Watches(unittest.TestCase):
         self.assertEqual(len(seeded), 1, seeded)
         entry = json.loads(seeded[0].read_text())['topics'][0]
         self.assertIn('box-bot', json.dumps(entry.get('exclude')))
+
+    def test_claude_daemon_conversation_cannot_take_session_events(self):
+        # A Claude Remote Control daemon conversation has no channel: its
+        # session subscription would drop every event, and its claim would
+        # still brake the standing watch (PR #1051's review reached nobody).
+        sessions = self.root / '.config/agent-box/sessions.json'
+        sessions.write_text(json.dumps({'sessions': {
+            'rc': {'agent': 'claude', 'remoteControlDaemon': True},
+            'old': {'agent': 'claude', 'remoteControlServer': True},
+            'tui': {'agent': 'claude', 'remoteControlDaemon': False}}}))
+        user = subprocess.run(['id', '-un'], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        args = ['subscribe', 'owner/repo', '--note', 'n', '--claim', '7',
+                '--events', 'actionable']
+        def run(session, *extra, delivery=None):
+            env = dict(self.env, LOCAL_WEBHOOK_SESSION=user + '-' + session)
+            env.pop('LOCAL_WEBHOOK_CLAUDE_DELIVERY', None)
+            if delivery:
+                env['LOCAL_WEBHOOK_CLAUDE_DELIVERY'] = delivery
+            return subprocess.run(['bash', str(REPO / 'modules/src/webhook-cli.sh'),
+                                   *extra], env=env, capture_output=True,
+                                  text=True, timeout=15)
+        p = run('rc', *args)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('Remote Control daemon', p.stderr)
+        self.assertFalse((self.state / ('filter.%s-rc.json' % user)).exists())
+        p = run('old', *args)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        # A daemon the supervisor started with inbox delivery
+        # (local-channels#149) can take session events.
+        p = run('rc', *args, delivery='send')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        p = run('tui', *args)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        p = run('rc', 'subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                '--note', 'n', '--when', '{"path":"action","in":["opened"]}')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
 
 
 if __name__ == '__main__':
