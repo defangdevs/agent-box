@@ -63,6 +63,7 @@ def ci_runs(rev, branch):
 
 
 RELEASE_BOT = "github-actions[bot]"
+COMMIT_FILES_PAGE_LIMIT = 300
 
 
 def version_only_release_parent(rev, target_version):
@@ -80,14 +81,17 @@ def version_only_release_parent(rev, target_version):
     files = commit.get("files") or []
     if author != RELEASE_BOT or not message.startswith("release:") or len(parents) != 1 or not files:
         return None
+    # GitHub lists at most 300 files per commit page; a full page may hide more.
+    if len(files) >= COMMIT_FILES_PAGE_LIMIT:
+        return None
     new = ".".join(map(str, target_version))
 
     def pairs(file):
         patch = file.get("patch") or ""
         removed = [line[1:] for line in patch.splitlines()
-                   if line.startswith("-") and not line.startswith("---")]
+                   if line.startswith("-")]
         added = [line[1:] for line in patch.splitlines()
-                 if line.startswith("+") and not line.startswith("+++")]
+                 if line.startswith("+")]
         return list(zip(removed, added)) if removed and len(removed) == len(added) else None
 
     source = [file for file in files if file.get("filename") == "local-webhook/webhook.py"]

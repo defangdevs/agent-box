@@ -224,6 +224,11 @@ class UpdaterTests(unittest.TestCase):
                 "filename": "local-webhook/webhook.py",
                 "patch": "-VERSION = '0.9.0'\n+VERSION = '0.11.0'"})),
             ("no source change", lambda c: c["files"].pop(1)),
+            ("dashed content line", lambda c: c["files"].__setitem__(1, {
+                "filename": "local-webhook/webhook.py",
+                "patch": "-VERSION = '0.9.0'\n+VERSION = '0.10.0'\n--old_handler()\n++new_handler()"})),
+            ("possibly truncated file listing", lambda c: c["files"].extend(
+                {"filename": f"docs/{n}.md", "patch": "-a 0.9.0\n+a 0.10.0"} for n in range(298))),
         ):
             with self.subTest(name):
                 self.release_commit = copy.deepcopy(base)
