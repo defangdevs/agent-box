@@ -940,6 +940,26 @@ else
   no "subscribe --help points worker instructions at a profile"
 fi
 
+# --- an agent session cannot emit on an owner-trusted source ------------
+# A delivery on `inbox` reads as the box owner's own request, so a session
+# that emitted there could launder text it read from an untrusted event into
+# an OWNER message for a sibling. Other sources, and the router outside any
+# session, still pass through.
+printf '%s' '{"sources":{"inbox":{"format":"generic","keyPath":"session","trust":"owner"},"slack":{"format":"generic","keyPath":"route"}}}' \
+  > "$LOCAL_WEBHOOK_STATE_DIR/sources.json"
+emit_case() {  # NAME WANT_STATUS SESSION_ID SOURCE
+  out=$(AGENT_BOX_SESSION_ID=$3 bash "$SCRIPT" emit "$4" - --event message 2>"$work/err" </dev/null)
+  st=$?
+  if [ "$st" -eq "$2" ]; then ok "$1"; else no "$1" "exit $st, stdout: $out, stderr: $(cat "$work/err")"; fi
+}
+emit_case "a session's emit on the owner-trusted inbox is refused" 2 sess-1 inbox
+grep -q "owner-trusted source 'inbox'" "$work/err" \
+  && ok "the refusal names the source" || no "the refusal names the source" "$(cat "$work/err")"
+emit_case "a session's emit on an ordinary source passes" 0 sess-1 slack
+emit_case "the router outside a session still emits on inbox" 0 "" inbox
+emit_case "an unknown source is left to webhook.py" 0 sess-1 nosuch
+rm -f "$LOCAL_WEBHOOK_STATE_DIR/sources.json"
+
 echo
 if [ "$fails" -eq 0 ]; then echo "all assertions passed"; else
   echo "$fails assertion(s) failed"; exit 1

@@ -1872,6 +1872,22 @@ EOF
     ;;
   ""|-h|--help|help) usage ;;
   emit|read-content)
+    # An owner-trusted source (`inbox`) renders what it carries as the box
+    # owner's own request. Its producers are box daemons that prove the owner
+    # wrote the text (the WhatsApp bridge's router); none of them runs in an
+    # agent session. A session emitting there is how a prompt injection read
+    # from a GitHub comment or an email would turn into an OWNER message in a
+    # sibling session, so refuse it. This is friction, not a boundary: the
+    # session's user can read the source secret (issue #1062).
+    if [ "$cmd" = emit ] && [ -n "${AGENT_BOX_SESSION_ID:-}" ] && [ -f "$SOURCES" ]; then
+      trust="$("$JQ" -r --arg s "${1:-}" '.sources[$s].trust // empty' "$SOURCES" 2>/dev/null || true)"
+      if [ "$trust" = owner ]; then
+        echo "agent-box-webhook: refusing to emit on owner-trusted source '$1' from an agent session." >&2
+        echo "  Its deliveries read as the box owner's own request; only box daemons that" >&2
+        echo "  prove the owner wrote the text emit there (agent-box-whatsapp route)." >&2
+        exit 2
+      fi
+    fi
     exec "$PY" "$SCRIPT" "$cmd" "$@"
     ;;
   *) usage >&2; exit 2 ;;
