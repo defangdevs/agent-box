@@ -20,6 +20,7 @@ import update_webhook_pin as updater  # noqa: E402
 
 OLD = "a" * 40
 NEW = "b" * 40
+PARENT = "e" * 40
 CURRENT = b"VERSION = '0.9.0'\n"
 RELEASE = b"VERSION = '0.10.0'\nraise RuntimeError('must never execute upstream source')\n"
 
@@ -53,6 +54,17 @@ class UpdaterTests(unittest.TestCase):
             {"sha": NEW, "commit": {"message": "local-webhook 0.10.0: change defaults\n\nDetails"}},
         ]}]
         self.payloads = {OLD: CURRENT, NEW: RELEASE}
+        self.runs_by_sha = False
+        self.release_commit = {
+            "author": {"login": "github-actions[bot]"},
+            "commit": {"message": "release: local-webhook 0.9.0 -> 0.10.0"},
+            "parents": [{"sha": PARENT}],
+            "files": [
+                {"filename": "README.md", "patch": "@@ -1 +1 @@\n-| x | 0.9.0 | y |\n+| x | 0.10.0 | y |"},
+                {"filename": "local-webhook/webhook.py",
+                 "patch": "@@ -1 +1 @@\n-VERSION = '0.9.0'\n+VERSION = '0.10.0'"},
+            ],
+        }
         self.api_calls = []
         self.start_patch("api", side_effect=self.api)
         self.start_patch("download", side_effect=lambda sha: self.payloads[sha])
@@ -74,8 +86,13 @@ class UpdaterTests(unittest.TestCase):
         elif endpoint == f"repos/{updater.UPSTREAM}":
             result = {"default_branch": "main"}
         elif "/actions/workflows/ci.yml/runs?" in endpoint:
-            self.assertIn(f"event=push&head_sha={NEW}", endpoint)
-            result = {"workflow_runs": self.runs}
+            sha = endpoint.rsplit("head_sha=", 1)[1].split("&", 1)[0]
+            self.assertIn(sha, (NEW, PARENT))
+            self.assertIn("event=push", endpoint)
+            result = {"workflow_runs": [run for run in self.runs if run["head_sha"] == sha]
+                      or ([] if self.runs_by_sha else self.runs)}
+        elif endpoint == f"repos/{updater.UPSTREAM}/commits/{NEW}":
+            result = self.release_commit
         elif "/compare/" in endpoint:
             result = self.comparison
         else:
@@ -176,6 +193,53 @@ class UpdaterTests(unittest.TestCase):
                     self.prepare()
                 self.assertEqual(self.pin.read_text(), self.original)
         self.runs = []
+        with self.assertRaisesRegex(ValueError, "not green"):
+            self.prepare()
+
+    def release_without_own_run(self):
+        # Upstream's release job pushes with the workflow token: no CI run of
+        # its own, only the parent's.
+        self.runs_by_sha = True
+        self.runs[0]["head_sha"] = PARENT
+
+    def test_version_only_release_commit_uses_its_parents_green_run(self):
+        self.release_without_own_run()
+        plan, _updated, body = self.prepare()
+        self.assertEqual(plan, {"changed": True, "version": "v0.10.0", "rev": NEW})
+        self.assertIn("https://github.com/ci/1", body)
+
+    def test_release_fallback_refuses_anything_but_a_version_bump(self):
+        self.release_without_own_run()
+        base = copy.deepcopy(self.release_commit)
+        extra_line = {"filename": "local-webhook/webhook.py",
+                      "patch": "-VERSION = '0.9.0'\n+VERSION = '0.10.0'\n-a = 1\n+a = 2"}
+        for name, change in (
+            ("human author", lambda c: c.update(author={"login": "someone"})),
+            ("not a release subject", lambda c: c["commit"].update(message="fix: things")),
+            ("merge commit", lambda c: c.update(parents=[{"sha": PARENT}, {"sha": OLD}])),
+            ("extra code change", lambda c: c["files"].__setitem__(1, extra_line)),
+            ("other file changed", lambda c: c["files"].append(
+                {"filename": "x.py", "patch": "-a\n+b"})),
+            ("wrong target version", lambda c: c["files"].__setitem__(1, {
+                "filename": "local-webhook/webhook.py",
+                "patch": "-VERSION = '0.9.0'\n+VERSION = '0.11.0'"})),
+            ("no source change", lambda c: c["files"].pop(1)),
+            ("dashed content line", lambda c: c["files"].__setitem__(1, {
+                "filename": "local-webhook/webhook.py",
+                "patch": "-VERSION = '0.9.0'\n+VERSION = '0.10.0'\n--old_handler()\n++new_handler()"})),
+            ("possibly truncated file listing", lambda c: c["files"].extend(
+                {"filename": f"docs/{n}.md", "patch": "-a 0.9.0\n+a 0.10.0"} for n in range(298))),
+        ):
+            with self.subTest(name):
+                self.release_commit = copy.deepcopy(base)
+                change(self.release_commit)
+                with self.assertRaisesRegex(ValueError, "not green"):
+                    self.prepare()
+                self.assertEqual(self.pin.read_text(), self.original)
+
+    def test_release_fallback_still_needs_a_green_parent_run(self):
+        self.release_without_own_run()
+        self.runs[0]["conclusion"] = "failure"
         with self.assertRaisesRegex(ValueError, "not green"):
             self.prepare()
 
