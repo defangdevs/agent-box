@@ -250,6 +250,16 @@ class LoginProfile(ProfileFixture):
             'value="claude"',
             module.render_profile_options(module.read_profiles()))
 
+    def test_gemini_is_offered_and_resolves_to_its_own_harness(self):
+        """A third harness shows in the assistant picker and the profile
+        harness list, and its profile launches as gemini with -m."""
+        module = self.daemon(AGENT_BOX_AGENTS="claude,codex,gemini,shell")
+        self.write_profile("gem", "HARNESS=gemini\nMODEL=gemini-2.5-pro\n")
+        self.assertIn('value="gemini"', module.render_harness_options())
+        self.assertIn("gemini", module.PROFILE_AGENTS)
+        self.assertIn('value="gem"',
+                      module.render_profile_options(module.read_profiles()))
+
     def test_login_preserves_custom_settings_and_resolves_them(self):
         self.write_profile("claude", "HARNESS=claude\nMODEL=sonnet\nTOKEN=private\n")
         module = self.daemon()
