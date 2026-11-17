@@ -2608,6 +2608,19 @@ let
   # No web.enable dependency, unlike webhookEnabled above: this is a plain
   # Unix socket, not an HTTP endpoint behind the per-user Caddy vhost.
   secretsEnabled = cfg.secrets.enable;
+  # Secret custody (issue #922): the store parent is root-only (the broker
+  # creates its own per-user subdirectory under it at startup) and the
+  # socket dir is world-traversable - listing a socket's NAME is not a
+  # secret, its 0600 mode is what gates connect(). Applied by the broker
+  # block's own systemd.tmpfiles.rules, NOT by the web-gated `tmpfilesRules`
+  # below: a box with web.enable off still runs the broker, and without
+  # these the unit fails 226/NAMESPACE (ReadWritePaths= names a directory
+  # that does not exist). The broker block also publishes them in
+  # internal.tmpfilesRules, whether or not web is enabled.
+  secretsTmpfilesRules = lib.optionals secretsEnabled [
+    "d /var/lib/agent-box-secrets 0700 root root - -"
+    "d /run/agent-box-secrets 0755 root root - -"
+  ];
   webhookSocketDir = "/run/agent-box-webhook";
   webhookSocketOf = name: "${webhookSocketDir}/${name}.sock";
   webhookStateDirOf = name: "/home/${name}/.local/state/local-webhook";
@@ -3474,6 +3487,7 @@ import json
 import os
 import re
 import socket
+import stat
 import struct
 
 from cryptography.hazmat.primitives import hashes
@@ -3497,6 +3511,18 @@ SECRET_MAX_TIMEOUT_MS = 60 * 60 * 1000
 SECRET_MAX_JOBS_PER_USER = 2
 SECRET_MAX_OUTPUT_BYTES = 64 * 1024
 SECRET_JOB_RETENTION_SECONDS = 24 * 60 * 60
+# Finished jobs keep their (capped) output for the retention window above, and
+# a finished job no longer counts against SECRET_MAX_JOBS_PER_USER. Without a
+# second bound a caller could run jobs back to back and grow the broker's
+# memory for a whole day: 256 retained jobs is at most 256 x 2 x 64 KiB = 32
+# MiB per user. A new exec is refused at the bound, not an old result evicted,
+# so a result stays readable for its whole retention window.
+SECRET_MAX_RETAINED_JOBS_PER_USER = 256
+# A profile name is cheap to mint and each new one is a persistent directory
+# plus meta.json under the user's store. The broker's open-store cache bounds
+# descriptors, not disk, so the number of namespaces is capped here; existing
+# namespaces stay reachable past the cap, only a NEW one is refused.
+SECRET_MAX_NAMESPACES_PER_USER = 128
 
 # Where agent-box-profile's own default pointer lives (profile-cli.sh's
 # DIR/DEFAULT_FILE). Secrets have no separate "global" bucket (deprecated in
@@ -3824,6 +3850,34 @@ def _next_version(old_record):
         return 1
 
 
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _makedirs_durable(path):
+    """os.makedirs(path, 0o700), then fsync EVERY ancestor of path, on every
+    call (fsync(2): syncing a directory does not persist its own entry in
+    ITS parent). Unconditional because a retry cannot tell which levels an
+    earlier attempt created before one of its syncs failed: it finds them
+    all existing, and every entry on the way down must still be made
+    durable before a write under them is acknowledged. The Store is cached
+    per namespace, so this is a handful of fsyncs per profile, not per
+    request."""
+    path = os.path.abspath(path)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    ancestor = os.path.dirname(path)
+    while True:
+        _fsync_dir(ancestor)
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            break
+        ancestor = parent
+
+
 class Store:
     """Root-only records for ONE (user, profile) namespace.
 
@@ -3839,16 +3893,38 @@ class Store:
     about atomic JSON records.
     """
 
+    @staticmethod
+    def exists(root, namespace):
+        """True if this namespace already has a directory. Read-only ops
+        ask this first so a `list` with an invented profile name does not
+        create (and permanently spend a quota slot on) a namespace."""
+        try:
+            return stat.S_ISDIR(os.lstat(os.path.join(root, namespace)).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+
     def __init__(self, root, namespace, user, uid, root_key):
         if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", namespace) or namespace in (".", ".."):
             raise SecretError("invalid namespace")
-        os.makedirs(root, mode=0o700, exist_ok=True)
+        _makedirs_durable(root)
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             try:
-                os.mkdir(namespace, 0o700, dir_fd=root_fd)
-            except FileExistsError:
-                pass
+                os.stat(namespace, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = [e for e in os.listdir(root_fd) if not e.startswith(".")]
+                if len(existing) >= SECRET_MAX_NAMESPACES_PER_USER:
+                    raise SecretError("too many secret profiles for this user") from None
+                try:
+                    os.mkdir(namespace, 0o700, dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+            # Every time, not only after our own mkdir: fsync on the
+            # namespace itself (in _write) does not persist its ENTRY in
+            # the parent, and a retry after a failed sync finds the
+            # directory already there. Without this a crash after an
+            # acknowledged `set` could lose the whole profile.
+            os.fsync(root_fd)
             self.dir_fd = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                   dir_fd=root_fd)
         finally:
@@ -4176,10 +4252,12 @@ class JobManager:
     of that user - the "2 active jobs per user" limit in the issue is a
     per-user limit, not per-profile."""
 
-    def __init__(self, launcher, max_output_bytes, max_jobs):
+    def __init__(self, launcher, max_output_bytes, max_jobs,
+                 max_retained=SECRET_MAX_RETAINED_JOBS_PER_USER):
         self.launcher = launcher
         self.max_output_bytes = max_output_bytes
         self.max_jobs = max_jobs
+        self.max_retained = max_retained
         self._jobs = {}
         self._by_idempotency = {}  # (namespace, key) -> job id
         self._lock = threading.Lock()
@@ -4200,6 +4278,10 @@ class JobManager:
                     return existing.id
             if self._active_count() >= self.max_jobs:
                 raise SecretError("too many active jobs")
+            if len(self._jobs) >= self.max_retained:
+                # See SECRET_MAX_RETAINED_JOBS_PER_USER: finished results are
+                # kept for the retention window, so refuse instead of evicting.
+                raise SecretError("too many retained job results; try again later")
             job = Job(new_job_id(), namespace, fingerprint, req, time.time())
             self._jobs[job.id] = job
             if key is not None:
@@ -4789,9 +4871,13 @@ class SystemdLauncher(Launcher):
     actually runs.
     """
 
-    def __init__(self, user, worker_path, python_bin="python3"):
+    def __init__(self, user, worker_path, python_bin=None):
         self.user = user
         self.worker_path = worker_path
+        # None: exec the worker by its own absolute path. It is a generated
+        # script with a store-path shebang, so nothing here depends on a
+        # bare `python3` being on the PATH of the broker's unit or of the
+        # transient job unit - neither of which has one on NixOS.
         self.python_bin = python_bin
 
     @staticmethod
@@ -4810,7 +4896,7 @@ class SystemdLauncher(Launcher):
             "--property=PrivateTmp=yes",
             "--property=TimeoutStopSec=5",
             "--",
-            self.python_bin, self.worker_path,
+            *([self.python_bin] if self.python_bin else []), self.worker_path,
         ]
         job.handle = spawn_worker(cmd, frame_bytes)
         return job.handle
@@ -4834,11 +4920,12 @@ class Broker:
     # PROFILE_NAME_RE), and each new one costs this process a directory, a
     # meta.json, a lock fd and a cached Store with its own open dir_fd. None
     # of that is reclaimed on its own, so without a bound the agent user can
-    # exhaust this root process's file descriptors (and, at the fs level,
-    # fill /var/lib/agent-box-secrets with empty namespaces) just by asking
-    # `list` for enough distinct names. Evicting the least-recently-used
-    # Store when the cache is full bounds both; a profile that is actually
-    # in use stays resident because it keeps getting touched.
+    # exhaust this root process's file descriptors just by asking `list` for
+    # enough distinct names. Evicting the least-recently-used Store when the
+    # cache is full bounds the descriptors; a profile that is actually in use
+    # stays resident because it keeps getting touched. Eviction never deletes
+    # anything on disk: the persistent namespaces are bounded separately, by
+    # SECRET_MAX_NAMESPACES_PER_USER in Store.
     MAX_OPEN_STORES = 64
 
     def __init__(self, user, uid, store_root, root_key, job_manager):
@@ -4850,7 +4937,12 @@ class Broker:
         self._stores = {}
         self._stores_lock = threading.Lock()
 
-    def _store(self, profile):
+    def _store(self, profile, create):
+        """The cached Store for this profile. With create=False (every op
+        but `set`) a namespace that does not exist yet is NOT made: the
+        answer is None, so a `list` or `exec` naming an invented profile
+        costs nothing on disk and no slot of SECRET_MAX_NAMESPACES_PER_USER.
+        """
         # Already validated by validate_request (every request names a
         # concrete profile - see resolve_profile's docstring): "profile" is
         # the namespace, with no further resolution needed here.
@@ -4858,6 +4950,8 @@ class Broker:
         with self._stores_lock:
             store = self._stores.pop(namespace, None)
             if store is None:
+                if not create and not Store.exists(self.store_root, namespace):
+                    return None
                 store = Store(self.store_root, namespace, self.user, self.uid, self.root_key)
             self._stores[namespace] = store  # re-insert: most-recently-used
             while len(self._stores) > self.MAX_OPEN_STORES:
@@ -4869,16 +4963,27 @@ class Broker:
 
     def handle(self, req):
         op = validate_request(req)
-        store = self._store(req.get("profile"))
+        profile = req.get("profile")
+        # status/cancel only need the job manager, which keys jobs by the
+        # profile name; they never touch the store.
+        if op == "status":
+            return {"ok": True, **self.job_manager.status(profile, req["jobId"])}
+        if op == "cancel":
+            return {"ok": True, **self.job_manager.cancel(profile, req["jobId"])}
+        store = self._store(profile, create=(op == "set"))
         if op in ("list", "set", "remove"):
+            if store is None:
+                if op == "list":
+                    return {"ok": True, "secrets": []}
+                raise SecretError("no such secret")
             return handle_request(store, req)
         if op == "exec":
-            job_id = self.job_manager.start(store.namespace, req, store.get)
+            # A missing namespace resolves no name, so _dispatch reports
+            # "no such secret: NAME" for each; with no secretNames the job
+            # simply runs.
+            resolve = store.get if store is not None else (lambda name: None)
+            job_id = self.job_manager.start(profile, req, resolve)
             return {"ok": True, "jobId": job_id}
-        if op == "status":
-            return {"ok": True, **self.job_manager.status(store.namespace, req["jobId"])}
-        if op == "cancel":
-            return {"ok": True, **self.job_manager.cancel(store.namespace, req["jobId"])}
         raise SecretError("unsupported operation")
 
 
@@ -24066,15 +24171,12 @@ in
     };
 
     secrets = {
-      # OFF by default, unlike containers/webhook above (issue #922): this
-      # is a root-privileged custodian daemon whose OS boundary - the one
-      # thing the whole feature is for - has no VM test yet
-      # (tests/secrets.nix does not exist), so it has never been proven on
-      # a real two-user box. "Default off during rollout" is the issue's
-      # own instruction. Flip this only once that test exists and passes.
+      # ON by default (issue #922). NOTE: the OS boundary this feature is
+      # for - root custody, a two-user box - still has no VM test
+      # (tests/secrets.nix does not exist yet).
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = false;
+        default = true;
         example = true;
         description = ''
           Start a root-owned secret-custody broker per configured terminal
@@ -25704,14 +25806,11 @@ in
     # keyed, web-gated block the webhook/settings units are instantiated
     # in further down. Every configured user gets one, not just the ones
     # with a web front door.
-    systemd.tmpfiles.rules = [
-      # Root-only store parent (the broker creates its own per-user
-      # subdirectory under this at startup) and a world-traversable
-      # socket dir - listing a socket's NAME is not a secret, its 0600
-      # mode is what gates connect().
-      "d /var/lib/agent-box-secrets 0700 root root - -"
-      "d /run/agent-box-secrets 0755 root root - -"
-    ];
+    systemd.tmpfiles.rules = secretsTmpfilesRules;
+    # Published HERE, not in the web-gated block: a box with web.enable off
+    # still applies these rules, so the inventory has to name them too.
+    # mkAfter keeps them after the web rules, the order the golden records.
+    services.agent-box.internal.tmpfilesRules = lib.mkAfter secretsTmpfilesRules;
     systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
       overrideStrategy = "asDropin";
       # Same restart-in-one-step reasoning as the webhook receiver's own

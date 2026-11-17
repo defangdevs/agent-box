@@ -54,9 +54,13 @@ class SystemdLauncher(Launcher):
     actually runs.
     """
 
-    def __init__(self, user, worker_path, python_bin="python3"):
+    def __init__(self, user, worker_path, python_bin=None):
         self.user = user
         self.worker_path = worker_path
+        # None: exec the worker by its own absolute path. It is a generated
+        # script with a store-path shebang, so nothing here depends on a
+        # bare `python3` being on the PATH of the broker's unit or of the
+        # transient job unit - neither of which has one on NixOS.
         self.python_bin = python_bin
 
     @staticmethod
@@ -75,7 +79,7 @@ class SystemdLauncher(Launcher):
             "--property=PrivateTmp=yes",
             "--property=TimeoutStopSec=5",
             "--",
-            self.python_bin, self.worker_path,
+            *([self.python_bin] if self.python_bin else []), self.worker_path,
         ]
         job.handle = spawn_worker(cmd, frame_bytes)
         return job.handle
@@ -99,11 +103,12 @@ class Broker:
     # PROFILE_NAME_RE), and each new one costs this process a directory, a
     # meta.json, a lock fd and a cached Store with its own open dir_fd. None
     # of that is reclaimed on its own, so without a bound the agent user can
-    # exhaust this root process's file descriptors (and, at the fs level,
-    # fill /var/lib/agent-box-secrets with empty namespaces) just by asking
-    # `list` for enough distinct names. Evicting the least-recently-used
-    # Store when the cache is full bounds both; a profile that is actually
-    # in use stays resident because it keeps getting touched.
+    # exhaust this root process's file descriptors just by asking `list` for
+    # enough distinct names. Evicting the least-recently-used Store when the
+    # cache is full bounds the descriptors; a profile that is actually in use
+    # stays resident because it keeps getting touched. Eviction never deletes
+    # anything on disk: the persistent namespaces are bounded separately, by
+    # SECRET_MAX_NAMESPACES_PER_USER in Store.
     MAX_OPEN_STORES = 64
 
     def __init__(self, user, uid, store_root, root_key, job_manager):
@@ -115,7 +120,12 @@ class Broker:
         self._stores = {}
         self._stores_lock = threading.Lock()
 
-    def _store(self, profile):
+    def _store(self, profile, create):
+        """The cached Store for this profile. With create=False (every op
+        but `set`) a namespace that does not exist yet is NOT made: the
+        answer is None, so a `list` or `exec` naming an invented profile
+        costs nothing on disk and no slot of SECRET_MAX_NAMESPACES_PER_USER.
+        """
         # Already validated by validate_request (every request names a
         # concrete profile - see resolve_profile's docstring): "profile" is
         # the namespace, with no further resolution needed here.
@@ -123,6 +133,8 @@ class Broker:
         with self._stores_lock:
             store = self._stores.pop(namespace, None)
             if store is None:
+                if not create and not Store.exists(self.store_root, namespace):
+                    return None
                 store = Store(self.store_root, namespace, self.user, self.uid, self.root_key)
             self._stores[namespace] = store  # re-insert: most-recently-used
             while len(self._stores) > self.MAX_OPEN_STORES:
@@ -134,16 +146,27 @@ class Broker:
 
     def handle(self, req):
         op = validate_request(req)
-        store = self._store(req.get("profile"))
+        profile = req.get("profile")
+        # status/cancel only need the job manager, which keys jobs by the
+        # profile name; they never touch the store.
+        if op == "status":
+            return {"ok": True, **self.job_manager.status(profile, req["jobId"])}
+        if op == "cancel":
+            return {"ok": True, **self.job_manager.cancel(profile, req["jobId"])}
+        store = self._store(profile, create=(op == "set"))
         if op in ("list", "set", "remove"):
+            if store is None:
+                if op == "list":
+                    return {"ok": True, "secrets": []}
+                raise SecretError("no such secret")
             return handle_request(store, req)
         if op == "exec":
-            job_id = self.job_manager.start(store.namespace, req, store.get)
+            # A missing namespace resolves no name, so _dispatch reports
+            # "no such secret: NAME" for each; with no secretNames the job
+            # simply runs.
+            resolve = store.get if store is not None else (lambda name: None)
+            job_id = self.job_manager.start(profile, req, resolve)
             return {"ok": True, "jobId": job_id}
-        if op == "status":
-            return {"ok": True, **self.job_manager.status(store.namespace, req["jobId"])}
-        if op == "cancel":
-            return {"ok": True, **self.job_manager.cancel(store.namespace, req["jobId"])}
         raise SecretError("unsupported operation")
 
 

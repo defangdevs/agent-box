@@ -181,10 +181,12 @@ class JobManager:
     of that user - the "2 active jobs per user" limit in the issue is a
     per-user limit, not per-profile."""
 
-    def __init__(self, launcher, max_output_bytes, max_jobs):
+    def __init__(self, launcher, max_output_bytes, max_jobs,
+                 max_retained=SECRET_MAX_RETAINED_JOBS_PER_USER):
         self.launcher = launcher
         self.max_output_bytes = max_output_bytes
         self.max_jobs = max_jobs
+        self.max_retained = max_retained
         self._jobs = {}
         self._by_idempotency = {}  # (namespace, key) -> job id
         self._lock = threading.Lock()
@@ -205,6 +207,10 @@ class JobManager:
                     return existing.id
             if self._active_count() >= self.max_jobs:
                 raise SecretError("too many active jobs")
+            if len(self._jobs) >= self.max_retained:
+                # See SECRET_MAX_RETAINED_JOBS_PER_USER: finished results are
+                # kept for the retention window, so refuse instead of evicting.
+                raise SecretError("too many retained job results; try again later")
             job = Job(new_job_id(), namespace, fingerprint, req, time.time())
             self._jobs[job.id] = job
             if key is not None:

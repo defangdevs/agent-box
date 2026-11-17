@@ -376,6 +376,19 @@ let
   # No web.enable dependency, unlike webhookEnabled above: this is a plain
   # Unix socket, not an HTTP endpoint behind the per-user Caddy vhost.
   secretsEnabled = cfg.secrets.enable;
+  # Secret custody (issue #922): the store parent is root-only (the broker
+  # creates its own per-user subdirectory under it at startup) and the
+  # socket dir is world-traversable - listing a socket's NAME is not a
+  # secret, its 0600 mode is what gates connect(). Applied by the broker
+  # block's own systemd.tmpfiles.rules, NOT by the web-gated `tmpfilesRules`
+  # below: a box with web.enable off still runs the broker, and without
+  # these the unit fails 226/NAMESPACE (ReadWritePaths= names a directory
+  # that does not exist). The broker block also publishes them in
+  # internal.tmpfilesRules, whether or not web is enabled.
+  secretsTmpfilesRules = lib.optionals secretsEnabled [
+    "d /var/lib/agent-box-secrets 0700 root root - -"
+    "d /run/agent-box-secrets 0755 root root - -"
+  ];
   webhookSocketDir = "/run/agent-box-webhook";
   webhookSocketOf = name: "${webhookSocketDir}/${name}.sock";
   webhookStateDirOf = name: "/home/${name}/.local/state/local-webhook";
@@ -2309,15 +2322,12 @@ in
     };
 
     secrets = {
-      # OFF by default, unlike containers/webhook above (issue #922): this
-      # is a root-privileged custodian daemon whose OS boundary - the one
-      # thing the whole feature is for - has no VM test yet
-      # (tests/secrets.nix does not exist), so it has never been proven on
-      # a real two-user box. "Default off during rollout" is the issue's
-      # own instruction. Flip this only once that test exists and passes.
+      # ON by default (issue #922). NOTE: the OS boundary this feature is
+      # for - root custody, a two-user box - still has no VM test
+      # (tests/secrets.nix does not exist yet).
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = false;
+        default = true;
         example = true;
         description = ''
           Start a root-owned secret-custody broker per configured terminal
@@ -3936,14 +3946,11 @@ in
     # keyed, web-gated block the webhook/settings units are instantiated
     # in further down. Every configured user gets one, not just the ones
     # with a web front door.
-    systemd.tmpfiles.rules = [
-      # Root-only store parent (the broker creates its own per-user
-      # subdirectory under this at startup) and a world-traversable
-      # socket dir - listing a socket's NAME is not a secret, its 0600
-      # mode is what gates connect().
-      "d /var/lib/agent-box-secrets 0700 root root - -"
-      "d /run/agent-box-secrets 0755 root root - -"
-    ];
+    systemd.tmpfiles.rules = secretsTmpfilesRules;
+    # Published HERE, not in the web-gated block: a box with web.enable off
+    # still applies these rules, so the inventory has to name them too.
+    # mkAfter keeps them after the web rules, the order the golden records.
+    services.agent-box.internal.tmpfilesRules = lib.mkAfter secretsTmpfilesRules;
     systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
       overrideStrategy = "asDropin";
       # Same restart-in-one-step reasoning as the webhook receiver's own

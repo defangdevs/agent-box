@@ -22,6 +22,7 @@ import socket
 import struct
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 import unittest
@@ -659,6 +660,29 @@ class Custody(unittest.TestCase):
         last = ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": tmp, "profile": "testprofile"})
         self.assertTrue(last["ok"], last)
 
+    def test_read_only_ops_do_not_create_a_namespace(self):
+        ghost = os.path.join(self.broker.root, "ghost")
+        resp = self.broker.ask({"op": "list", "profile": "ghost"})
+        self.assertEqual(resp, {"ok": True, "secrets": []})
+        resp = self.broker.ask({"op": "remove", "name": "K", "profile": "ghost"})
+        self.assertFalse(resp["ok"], resp)
+        # exec without secrets still runs; with one, it is "no such secret".
+        resp = self.broker.ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [],
+                                "cwd": self.tmp, "profile": "ghost"})
+        self.assertTrue(resp["ok"], resp)
+        done = self.broker.wait_job(resp["jobId"], profile="ghost")
+        self.assertEqual(done["state"], "done", done)
+        resp = self.broker.ask({"op": "exec", "argv": ["true"], "secretNames": ["K"],
+                                "cwd": self.tmp, "profile": "ghost"})
+        done = self.broker.wait_job(resp["jobId"], profile="ghost")
+        self.assertEqual(done["state"], "error", done)
+        self.assertIn("no such secret", done["stderr"])
+        self.assertFalse(os.path.exists(ghost), "a read-only op created a namespace")
+        # set is what creates it.
+        resp = self.broker.ask({"op": "set", "name": "K", "value": "v", "profile": "ghost"})
+        self.assertTrue(resp["ok"], resp)
+        self.assertTrue(os.path.isdir(ghost))
+
     def test_exec_concurrency_cap_per_user(self):
         jobs = []
         for _ in range(ns["SECRET_MAX_JOBS_PER_USER"]):
@@ -671,6 +695,96 @@ class Custody(unittest.TestCase):
         self.assertFalse(over["ok"])
         for job_id in jobs:
             self.broker.ask({"op": "cancel", "jobId": job_id})
+
+
+class Bounds(unittest.TestCase):
+    """In-process checks of the broker's persistent and in-memory bounds."""
+
+    def setUp(self):
+        check_crypto_available()
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_namespace_quota_refuses_new_keeps_existing(self):
+        root = os.path.join(self.tmp, "nested", "store")
+        key = b"\x00" * 32
+        limit = ns["SECRET_MAX_NAMESPACES_PER_USER"]
+        for i in range(limit):
+            ns["Store"](root, f"p{i}", "agent", os.getuid(), key).close()
+        with self.assertRaises(ns["SecretError"]):
+            ns["Store"](root, "one-too-many", "agent", os.getuid(), key)
+        self.assertFalse(os.path.exists(os.path.join(root, "one-too-many")))
+        # An existing namespace stays reachable at the cap.
+        ns["Store"](root, "p0", "agent", os.getuid(), key).close()
+
+    def test_retry_after_failed_parent_sync_still_syncs(self):
+        """A parent fsync that fails after mkdir leaves the directories in
+        place; the retry finds them existing and must sync the parents
+        anyway, or a later write is acknowledged without durable entries."""
+        root = os.path.join(self.tmp, "u", "store")
+        # Fail the sync of each level in turn: the namespace's parent (the
+        # user root), the user root's parent, and the parent of the first
+        # directory the failed attempt created.
+        for target in (root, os.path.dirname(root), self.tmp):
+            with self.subTest(failed_sync=target):
+                self._retry_after_failed_sync(root, target)
+
+    def _retry_after_failed_sync(self, root, target):
+        shutil.rmtree(os.path.join(self.tmp, "u"), ignore_errors=True)
+        key = b"\x00" * 32
+        real_fsync = os.fsync
+        synced = []
+
+        def path_of(fd):
+            return os.readlink(f"/proc/self/fd/{fd}")
+
+        def failing(fd):
+            if path_of(fd) == target:
+                raise OSError(5, "injected fsync failure")
+            real_fsync(fd)
+
+        def recording(fd):
+            synced.append(path_of(fd))
+            real_fsync(fd)
+
+        os.fsync = failing
+        try:
+            with self.assertRaises(OSError):
+                ns["Store"](root, "p", "agent", os.getuid(), key)
+        finally:
+            os.fsync = real_fsync
+        self.assertTrue(os.path.isdir(root),
+                        "the failed attempt was expected to leave its directories")
+        os.fsync = recording
+        try:
+            ns["Store"](root, "p", "agent", os.getuid(), key).close()
+        finally:
+            os.fsync = real_fsync
+        for level in (root, os.path.dirname(root), self.tmp):
+            self.assertIn(level, synced, f"retry did not sync {level}")
+
+    def test_retained_job_results_are_bounded(self):
+        class Launcher:
+            def start(self, job, *args):
+                job.state = "done"
+                job.exit_code = 0
+                job.finished_at = time.time()
+
+            def kill(self, job):
+                pass
+
+        manager = ns["JobManager"](Launcher(), 1024, 2, max_retained=3)
+        manager._drain = lambda *a: None
+        req = {"op": "exec", "argv": ["true"], "secretNames": [], "cwd": self.tmp}
+        for _ in range(3):
+            manager.start("p", dict(req), lambda name: None)
+        with self.assertRaises(ns["SecretError"]):
+            manager.start("p", dict(req), lambda name: None)
+        # The retention sweep frees the slots again.
+        manager.sweep(-1)
+        manager.start("p", dict(req), lambda name: None)
 
 
 if __name__ == "__main__":

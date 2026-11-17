@@ -212,26 +212,16 @@ BY_DESIGN = {
         "actual store-built payload; native "
         "has no equivalent capture to give "
         "this checker"),
-    "AGENT_BOX_SECRET_SOCKET": (
+    "AGENT_BOX_SECRET_BROKER_ALLOW_DEV_LAUNCHER": (
         "module",
-        "issue #922: env-exec.py sets this (env-exec.py is already shared, "
-        "built as a real Nix derivation on both backends - nix/runtime.nix's "
-        "envExecWrapper natively, modules/agent-box.nix.in's own copy for "
-        "the module), same shape as AGENT_BOX_WEBHOOK_POLICY_FILE above. "
-        "tests/native/expected can only ever show the native side one-"
-        "sided here too: test_agentbox.py's fake profile stubs EVERY "
-        "profile binary as an empty `#!/bin/sh\\n:\\n`, so env-exec.py's "
-        "real body - the only place this name appears - is never in that "
-        "fixture to find. The golden snapshot sees the module's copy only "
-        "because it captures the actual store-built payload; native has no "
-        "equivalent capture to give this checker. Confirmed by hand (not "
-        "by this check, which cannot see it): `nix build .#runtime` then "
-        "`agentbox apply --profile <that store path> --root DIR` with "
-        "`secrets: {enable: true}` in config.yaml renders "
-        "AGENT_BOX_SECRET_SOCKET into /etc/agent-box/units/<user>.env, the "
-        "unit drop-in, tmpfiles and the target .wants files identically to "
-        "the module side (verified against a NixOS eval of the same "
-        "config)."),
+        "issue #922: a DEV/TEST gate the broker payload only READS "
+        "(secret-broker.py refuses --dev-direct-launcher unless it is set). "
+        "No unit on either backend supplies it, on purpose - production "
+        "must never set it, so a stray flag cannot make a broker run jobs "
+        "as its own uid. It shows up as module-only solely because the "
+        "golden snapshot captures the module's store-built payload, which "
+        "contains the name; native has no equivalent capture for this "
+        "checker to read."),
     "AGENT_BOX_HOOK_SESSION_ARGS": (
         "module",
         "same shape as AGENT_BOX_WEBHOOK_POLICY_"
