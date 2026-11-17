@@ -409,8 +409,11 @@ class Watches(unittest.TestCase):
                               check=True).stdout.strip()
         args = ['subscribe', 'owner/repo', '--note', 'n', '--claim', '7',
                 '--events', 'actionable']
-        def run(session, *extra):
+        def run(session, *extra, delivery=None):
             env = dict(self.env, LOCAL_WEBHOOK_SESSION=user + '-' + session)
+            env.pop('LOCAL_WEBHOOK_CLAUDE_DELIVERY', None)
+            if delivery:
+                env['LOCAL_WEBHOOK_CLAUDE_DELIVERY'] = delivery
             return subprocess.run(['bash', str(REPO / 'modules/src/webhook-cli.sh'),
                                    *extra], env=env, capture_output=True,
                                   text=True, timeout=15)
@@ -420,6 +423,10 @@ class Watches(unittest.TestCase):
         self.assertFalse((self.state / ('filter.%s-rc.json' % user)).exists())
         p = run('old', *args)
         self.assertEqual(p.returncode, 2, p.stderr)
+        # A daemon the supervisor started with inbox delivery
+        # (local-channels#149) can take session events.
+        p = run('rc', *args, delivery='send')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         p = run('tui', *args)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         p = run('rc', 'subscribe', 'owner/repo', '--deliver-to', 'subagent',

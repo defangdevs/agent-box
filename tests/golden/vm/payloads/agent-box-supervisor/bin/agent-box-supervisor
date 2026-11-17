@@ -3003,6 +3003,14 @@ start_session() {
   whargs=""
   if [ -n "${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
     whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$WEBHOOK_STATE_DIR -e LOCAL_WEBHOOK_PORT=0"
+    # A Claude Remote Control daemon cannot pass --channels to the
+    # conversations it starts, so channel notifications from local-webhook are
+    # dropped there. This tells the plugin in each conversation to deliver
+    # through Claude's cross-session inbox instead (local-channels#149). Only
+    # here: a session that has the channel would get every event twice.
+    if [ "$agent" = claude ] && [ "$rcdaemon" = true ]; then
+      whargs="$whargs -e LOCAL_WEBHOOK_CLAUDE_DELIVERY=send"
+    fi
   fi
   # AGENT_BOX_SESSION_ID rides the same session environment: it is the
   # launch id the SessionStart hook keys its live-id record by (the

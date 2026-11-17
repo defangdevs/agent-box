@@ -14340,14 +14340,19 @@ _hc_main "$@"
           # spawns nobody and reaches nobody (PR #1051's CodeRabbit review). The
           # guide already says a daemon is no webhook target; refuse here rather
           # than write a subscription that silently swallows its events.
-          if [ "$deliver_to" = session ] && claude_rc_daemon_conversation; then
+          # A daemon started by a supervisor that knows the inbox path carries
+          # LOCAL_WEBHOOK_CLAUDE_DELIVERY=send, and then the plugin delivers
+          # through Claude's cross-session inbox (local-channels#149). Only a
+          # daemon without it (started before that release) is refused.
+          if [ "$deliver_to" = session ] && [ "''${LOCAL_WEBHOOK_CLAUDE_DELIVERY:-}" != send ] \
+              && claude_rc_daemon_conversation; then
             echo "agent-box-webhook: this is a conversation of the Claude Remote" \
                  "Control daemon ''\'''${LOCAL_WEBHOOK_SESSION#"$(id -un)"-}', which has no" \
                  "channel to deliver session events into: they would be dropped," \
                  "and a --claim would also stop the standing watch from spawning" \
-                 "anyone for them. Use a standing watch (--deliver-to subagent), or" \
-                 "do the work in an interactive session (agent-box-session add" \
-                 "NAME --harness claude)" >&2
+                 "anyone for them. Restart the daemon after a box update (agent-box-session" \
+                 "restart NAME) so it delivers through the Claude inbox, use a standing" \
+                 "watch (--deliver-to subagent), or work in an interactive session" >&2
             exit 2
           fi
           # The relevance dimension, resolved once: a named policy or the
@@ -23060,6 +23065,14 @@ esac
       whargs=""
       if [ -n "''${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
         whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$WEBHOOK_STATE_DIR -e LOCAL_WEBHOOK_PORT=0"
+        # A Claude Remote Control daemon cannot pass --channels to the
+        # conversations it starts, so channel notifications from local-webhook are
+        # dropped there. This tells the plugin in each conversation to deliver
+        # through Claude's cross-session inbox instead (local-channels#149). Only
+        # here: a session that has the channel would get every event twice.
+        if [ "$agent" = claude ] && [ "$rcdaemon" = true ]; then
+          whargs="$whargs -e LOCAL_WEBHOOK_CLAUDE_DELIVERY=send"
+        fi
       fi
       # AGENT_BOX_SESSION_ID rides the same session environment: it is the
       # launch id the SessionStart hook keys its live-id record by (the
