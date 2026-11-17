@@ -31656,8 +31656,9 @@ STYLE = """<style>
   /* A field stacks its label over the input, so the .row default of
      align-items:center parked the button level with the label+input pair's
      middle. Bottom-align it with the input instead (same fix as
-     .new-session-row). */
-  .conn-form { align-items: flex-end; }
+     .new-session-row). It needs the .row. prefix: .row is defined later
+     with the same specificity, so a bare .conn-form lost to it. */
+  .row.conn-form { align-items: flex-end; }
   .conn-country { flex: 0 0 7em; }
   .conn-national { flex: 1 1 180px; }
   .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
