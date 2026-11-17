@@ -138,7 +138,7 @@ plainly rather than handing it back.
   memory guarantee.
 - Manage your own sessions without a rebuild:
   `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
-  plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
+  plus `--harness claude|codex|gemini|shell`, `--cwd DIR` and `--prompt "TASK"` -
   use it to fan out work, add a reviewer agent, or open a plain shell. The
   kickoff prompt fires once: a later respawn (crash, reboot, Spot restart)
   resumes that session's transcript instead of redoing the work. An agent
@@ -169,7 +169,14 @@ plainly rather than handing it back.
   unavailable. The same is true of any other CLI: `nix profile add
   nixpkgs#<pkg>` puts it in `~/.nix-profile/bin`, which is FIRST on your
   PATH, so an install is visible to a pane that is already running.
-- `--harness` picks the CLI PROGRAM (claude, codex, shell). An agent PROFILE
+- The `gemini` harness (Google's Gemini CLI) has no sign-in card, because the
+  CLI has no non-interactive login command. Give it a key with
+  `agent-box-session env set GEMINI_API_KEY VALUE` (or the Vertex variables),
+  or sign in with Google from inside the session's own terminal. It has no
+  Remote Control, WhatsApp or webhook channel; a profile's MODEL maps to
+  `-m`, and EFFORT and SYSTEM_PROMPT are ignored (put instructions in
+  GEMINI.md, which is seeded as a link to the box guide).
+- `--harness` picks the CLI PROGRAM (claude, codex, gemini, shell). An agent PROFILE
   is the worker: a harness plus a model, an effort level, an appended system
   prompt and environment. Keep the two words apart, because the harnesses
   themselves do not: `claude --agent` and `opencode --agent` both name a

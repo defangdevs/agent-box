@@ -14091,7 +14091,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # real Codex profile opens its TUI; a real Claude
                         # profile preserves the older additive RC flag.
                         "remoteControl": (codex_daemon or claude_daemon
-                                          or agent != "codex"),
+                                          or agent not in ("codex", "gemini")),
                         "remoteControlDaemon": codex_daemon or claude_daemon,
                         # Compatibility for releases before issue #915.
                         "remoteControlServer": claude_daemon,

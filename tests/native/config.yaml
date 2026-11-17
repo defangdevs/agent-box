@@ -4,6 +4,7 @@
 agents:
 - claude
 - codex
+- gemini
 codexFullAccess: true
 containers:
   enable: true

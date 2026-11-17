@@ -158,6 +158,8 @@ setup attr
 is "agent_attr maps claude to the claude-code attribute" \
    "claude-code" "$(agent_attr claude)"
 is "agent_attr maps codex to itself" "codex" "$(agent_attr codex)"
+is "agent_attr maps gemini to the gemini-cli attribute" \
+   "gemini-cli" "$(agent_attr gemini)"
 if agent_attr shell >/dev/null 2>&1; then
   no "agent_attr refuses 'shell'" "it returned success"
 else

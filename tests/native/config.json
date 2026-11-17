@@ -1,7 +1,8 @@
 {
   "agents": [
     "claude",
-    "codex"
+    "codex",
+    "gemini"
   ],
   "codexFullAccess": true,
   "containers": {
