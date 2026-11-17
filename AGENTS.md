@@ -18,7 +18,7 @@ This file owns repo conventions; the wiki owns design rationale and maintainer n
 - a root service;
 - a relationship between any of these.
 
-Also update it when you move an item across a trust boundary. A new flag or a bug fix does not need an update unless it changes what a node's inspector text says.
+Also update it when you move an item across a trust boundary. A new flag or a bug fix does not need an update, unless it changes what a node's inspector text says, or it adds, removes or changes a relationship, or it affects a trust boundary.
 
 The page is data, not layout code: edit the `views` (nodes, rels, boundaries), `details` and `sourceLinks` objects. Do not change the renderer for a content change. Put new nodes in the gaps between columns, so that edges do not run behind other nodes. Check each view in headless chromium from `file://`, and attach the screenshots to the PR. It drifted once already: about 90 PRs merged between #870 and #1064 without an update, and that left mail, Slack, the router, ACP, the secret broker and the reboot helper off the map.
 
