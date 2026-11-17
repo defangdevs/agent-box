@@ -5179,6 +5179,16 @@ def run_sequence(trigger_fd, sleep, delays=True):
             sleep(pause)
 
 
+def shield_from_shutdown():
+    """An accepted request must reach its final `b` even if a late normal
+    shutdown sends SIGTERM meanwhile (systemd would still SIGKILL after its
+    stop timeout, far longer than the sequence)."""
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except ValueError:  # not the main thread (tests)
+        pass
+
+
 def serve(sock, allowed_uid, trigger_fd, mask_fd, sleep=time.sleep,
           delays=True, once=False):
     started = False
@@ -5204,6 +5214,7 @@ def serve(sock, allowed_uid, trigger_fd, mask_fd, sleep=time.sleep,
                 continue
             started = True
             reply(conn, b"OK\n")
+        shield_from_shutdown()
         try:
             run_sequence(trigger_fd, sleep, delays)
         except OSError as exc:
@@ -5271,14 +5282,21 @@ class Pinner:
 
     def refresh(self, paths):
         wanted = {}
+        unknown = set()
         for path in sorted(paths):
             try:
                 st = os.stat(path)
+            except FileNotFoundError:
+                continue
             except OSError:
+                # Could not look (a failing disk): not proof the file is
+                # gone, so an existing pin on it must stay.
+                unknown.add(path)
                 continue
             if pinnable(st, self.owner):
                 wanted.setdefault((st.st_dev, st.st_ino), (path, st.st_size))
-        for key in [k for k in self.pinned if k not in wanted]:
+        for key in [k for k, v in self.pinned.items()
+                    if k not in wanted and v[2] not in unknown]:
             addr, size, _ = self.pinned.pop(key)
             self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
         skipped = 0

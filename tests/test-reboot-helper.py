@@ -211,6 +211,26 @@ nolock.refresh({bin_a})
 check("a failed mlock is unmapped and not recorded",
       not nolock.pinned and not lc_fail.maps)
 
+lc_io = FakeLibc()
+keep = rh.Pinner(lc_io, owner=me)
+keep.refresh({bin_a})
+real_stat = os.stat
+
+
+def flaky_stat(path, *a, **k):
+    if path == bin_a:
+        raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+
+
+os.stat = flaky_stat
+try:
+    keep.refresh({bin_a})
+finally:
+    os.stat = real_stat
+check("a stat that fails (EIO) keeps the existing pin",
+      {v[2] for v in keep.pinned.values()} == {bin_a} and len(lc_io.maps) == 1)
+
 if failures:
     print("%d failure(s)" % len(failures))
     sys.exit(1)
