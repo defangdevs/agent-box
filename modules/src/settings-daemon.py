@@ -5638,6 +5638,9 @@ _MODEL_HINT_MAX = 12
 # holds spaces, so no match is possible there and the scan resumes at the
 # real opening quote of the example that follows.
 _MODEL_NAME_RE = re.compile(r"'([A-Za-z0-9][A-Za-z0-9._-]{1,63})'")
+# The same charset, for a name that arrives bare (codex's catalog) rather
+# than quoted in prose.
+_MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,63}")
 # harness_model_aliases()' answers, keyed on (binary, stamp) and holding
 # (names, retry_at). retry_at is None for a real answer - it stands until
 # the binary itself changes - and a monotonic deadline for a probe that
@@ -5658,17 +5661,78 @@ def binary_stamp(path):
     return (info.st_mtime_ns, info.st_size)
 
 
-def probe_model_aliases(binary):
+def probe_codex_catalog(binary):
+    """codex's own model catalog as a tuple of names.
+
+    () is an ANSWER: this codex ran and has no `debug models` (a non-zero
+    exit), which will not change until the binary does. None is a
+    NON-answer - a timeout, a spawn failure or output that is not the
+    catalog - which probe_model_aliases() must not let the help fallback
+    turn into a cached empty list.
+
+    codex's `--help` names no model, but `codex debug models` prints the
+    catalog its own /model picker reads (codex-cli 0.165 has it; an older
+    one does not, and answers with an error). That is the same "read it off
+    the harness" rule as the help scrape, from a better page: the slugs the
+    harness itself LISTS to its users (visibility "list"), in its own
+    priority order, so a hidden internal entry is never offered.
+
+    Only ever run for codex. The subcommand is codex's; handed to another
+    CLI, `debug models` could just as well be read as a prompt.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "debug", "models"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("profiles: codex model catalog: %s\n" % exc)
+        return None
+    if proc.returncode != 0:
+        return ()
+    try:
+        models = json.loads(proc.stdout).get("models")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(models, list):
+        return None
+    listed = [m for m in models if isinstance(m, dict)
+              and m.get("visibility") == "list"
+              and isinstance(m.get("slug"), str)
+              and _MODEL_SLUG_RE.fullmatch(m["slug"])]
+    listed.sort(key=lambda m: m.get("priority")
+                if isinstance(m.get("priority"), int) else 1 << 30)
+    names = []
+    for model in listed:
+        if model["slug"] not in names:
+            names.append(model["slug"])
+        if len(names) >= _MODEL_HINT_MAX:
+            break
+    return tuple(names)
+
+
+def probe_model_aliases(binary, harness=None):
     """Ask one harness what models it names, or None when it could not be
     asked at all.
 
+    codex first asks its catalog (probe_codex_catalog) and falls back to
+    its help page only when that cannot answer.
+
     The two answers are deliberately different things. () is an ANSWER -
-    the CLI ran and its `--model` puts no name forward, which is codex
-    today. None is a non-answer: the probe timed out, or raced a lazy
-    `nix profile add` still linking the binary, or the CLI printed nothing
+    the CLI ran and its `--model` puts no name forward, which is an old
+    codex without a catalog. None is a non-answer: the probe timed out, or
+    raced a lazy `nix profile add` still linking the binary, or the CLI printed nothing
     whatsoever, and asking again later may well succeed. Only the caller
     can act on that difference, and it does - see the cache above.
     """
+    catalog = None
+    if harness == "codex":
+        catalog = probe_codex_catalog(binary)
+        if catalog:
+            return catalog
     try:
         proc = subprocess.run(
             [binary, "--help"],
@@ -5688,6 +5752,10 @@ def probe_model_aliases(binary):
         return None
     opt = _MODEL_OPT_RE.search(text)
     if not opt:
+        if harness == "codex" and catalog is None:
+            # Same rule as below: without a catalog this help is not the
+            # CLI's final word, so keep the empty retryable.
+            return None
         return ()
     rest = text[opt.end():]
     end = _NEXT_OPT_RE.search(rest)
@@ -5698,18 +5766,24 @@ def probe_model_aliases(binary):
             names.append(name)
         if len(names) >= _MODEL_HINT_MAX:
             break
+    if harness == "codex" and catalog is None and not names:
+        # The catalog could not be asked and the help names nothing, which
+        # is what codex's help always says: that empty is the help's
+        # answer, not the catalog's, so keep it retryable.
+        return None
     return tuple(names)
 
 
-def harness_model_aliases(binary, stamp):
+def harness_model_aliases(binary, stamp, harness=None):
     """The model names a harness's own `--help` puts forward, as a tuple.
 
     claude names them ("an alias for the latest model (e.g. 'fable',
     'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')").
-    codex documents none - its `--model` says only "Model the agent should
-    use", and its shell completion file-completes the value - so it
-    contributes nothing here rather than us guessing a list on its behalf
-    and shipping it stale.
+    codex's help documents none - its `--model` says only "Model the agent
+    should use" - so codex is asked for its catalog instead (see
+    probe_codex_catalog). A codex too old to have one contributes nothing
+    here rather than us guessing a list on its behalf and shipping it
+    stale.
 
     Empty either way to the caller: the field is free text, so a probe
     that cannot run costs a suggestion and never a save. What the two
@@ -5724,11 +5798,11 @@ def harness_model_aliases(binary, stamp):
     """
     if not binary:
         return ()
-    key = (binary, stamp)
+    key = (binary, stamp, harness)
     hit = _model_alias_cache.get(key)
     if hit is not None and (hit[1] is None or time.monotonic() < hit[1]):
         return hit[0]
-    names = probe_model_aliases(binary)
+    names = probe_model_aliases(binary, harness)
     if len(_model_alias_cache) > 16:
         # Same reasoning as _transcript_cache: the keyspace grows with
         # every binary ever probed, and there is nothing here worth an
@@ -5758,7 +5832,8 @@ def model_hints(harness, profiles):
     binary = flow["bin"] if flow else None
     hints = []
     if binary:
-        for name in harness_model_aliases(binary, binary_stamp(binary)):
+        for name in harness_model_aliases(binary, binary_stamp(binary),
+                                          harness):
             if name not in hints:
                 hints.append(name)
     for name in sorted(profiles):

@@ -1614,8 +1614,14 @@
     } catch (err) { return []; }
   }
   function acFrag(input) {
-    return acKind(input) === "model"
-      ? input.value : acSplit(input.value).frag;
+    if (acKind(input) !== "model") { return acSplit(input.value).frag; }
+    // A model field filters only on what was TYPED since it opened. An
+    // existing profile's row opens on its saved model, and filtering by
+    // that showed the one name already in the field - or nothing at all
+    // for a full ID that no alias starts with - so editing a profile never
+    // offered the list that adding one did.
+    var st = input._dir;
+    return st && st.typed ? input.value : "";
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -1630,7 +1636,7 @@
     var ul = acList(input);
     if (ul) { ul.hidden = true; ul.innerHTML = ""; }
     var st = input._dir;
-    if (st) { st.active = -1; }
+    if (st) { st.active = -1; st.typed = false; }
   }
   function acRender(input) {
     var ul = acList(input);
@@ -1727,25 +1733,38 @@
   document.addEventListener("input", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    (input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 })).typed = true;
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    // A close still pending from a previous visit would fire into this
+    // one and wipe its typed state, so refocusing cancels it.
+    if (input._dir && input._dir.closeTimer) {
+      window.clearTimeout(input._dir.closeTimer);
+      input._dir.closeTimer = null;
+    }
     // The directory field starts on the untouched default "~": select it
     // so the first keystroke replaces it instead of appending, which is
     // what produced an invalid "~docu" (issue #308). A model field has no
     // such default - it starts empty, or on what the profile already says,
     // and selecting THAT would throw the value away on a stray focus.
     if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    if (input._dir) { input._dir.typed = false; }
     acFetch(input);
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
     // Delay so a mousedown-selected item still registers its click.
-    window.setTimeout(function () { acClose(input); }, 150);
+    var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+    if (st.closeTimer) { window.clearTimeout(st.closeTimer); }
+    st.closeTimer = window.setTimeout(function () {
+      st.closeTimer = null;
+      acClose(input);
+    }, 150);
   });
   document.addEventListener("keydown", function (e) {
     var input = e.target;
