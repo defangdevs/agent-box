@@ -4238,6 +4238,25 @@ class ApplyActivationTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertNotIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
 
+    def test_changed_reboot_helper_unit_restarts_an_active_helper(self):
+        # Issue #1054 review: the helper authorizes one uid read from its
+        # unit's environment at start, and `enable --now` leaves an active
+        # unit alone, so a changed root user needs an explicit restart.
+        unit = self.mod.REBOOT_HELPER_UNIT
+        path = "/etc/systemd/system/" + unit
+        self.extra_files[path] = "[Service]\n"
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: (
+            [unit] if pattern == unit else [])
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn(["systemctl", "restart", unit], self.calls)
+        self.calls.clear()
+        self.mod.write_if_changed = lambda *args: False
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(["systemctl", "restart", unit], self.calls)
+
     def test_a_failed_settings_environment_refresh_fails_apply(self):
         path = "/etc/agent-box/units/agent-box-settings-agent.env"
         self.extra_files[path] = "AGENT_BOX_PORTAL_REDIRECT_URL=https://x.test/new\n"

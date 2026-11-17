@@ -21,6 +21,8 @@ spec = importlib.util.spec_from_file_location("reboot_helper", path)
 rh = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rh)
 
+# Refusals that wait for a slow client would make the run take seconds.
+rh.CLIENT_TIMEOUT_S = 0.3
 failures = []
 
 
@@ -61,13 +63,20 @@ def scenario(mask, allowed_uid, payloads, once_after=None):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         c.settimeout(5)
         c.connect(sock_path)
-        if payload is not None:
-            c.sendall(payload)
+        # A refused client may be closed before it finishes sending; that
+        # is the refusal working, not a test error.
         try:
+            if payload is not None:
+                c.sendall(payload)
             replies.append(c.recv(64))
         except OSError:
             replies.append(b"<timeout>")
         c.close()
+    # close() alone does not reliably wake a thread blocked in accept().
+    try:
+        srv.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
     srv.close()
     done.wait(5)
     os.close(tfd)

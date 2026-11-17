@@ -30644,24 +30644,40 @@ def reboot_via_helper():
     return answer in (b"OK", b"BUSY")
 
 
+def _run_reboot_cmd(result):
+    try:
+        proc = subprocess.run(REBOOT_CMD.split(), check=False,
+                              capture_output=True)
+        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
+        result.append(proc.returncode)
+    except OSError as exc:
+        sys.stderr.write("reboot_box: %s\n" % exc)
+
+
 def reboot_box():
     """Trigger the reboot through the allowlisted sudo command, and when
     that cannot run (no disk to exec sudo from), through the root helper.
+
+    The normal command runs in a worker thread and this function waits for
+    it with a deadline. subprocess's own timeout is not enough: on a dying
+    disk the fork/exec itself, or the wait after a kill, can block, and the
+    helper would never be asked.
 
     The caller sends its HTTP response BEFORE calling this (see the
     /reboot route): --no-block returns immediately, but systemd starts
     stopping units at once, and this daemon is one of them — a response
     written afterwards can lose the race with its own socket going away.
     """
-    try:
-        proc = subprocess.run(REBOOT_CMD.split(), check=False,
-                              capture_output=True,
-                              timeout=REBOOT_CMD_TIMEOUT_S)
-        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
-        if proc.returncode == 0:
-            return
-    except (OSError, subprocess.SubprocessError) as exc:
-        sys.stderr.write("reboot_box: %s\n" % exc)
+    result = []
+    worker = threading.Thread(target=_run_reboot_cmd, args=(result,),
+                              daemon=True)
+    worker.start()
+    worker.join(REBOOT_CMD_TIMEOUT_S)
+    if result and result[0] == 0:
+        return
+    if worker.is_alive():
+        sys.stderr.write("reboot_box: trigger did not finish in %ds\n"
+                         % REBOOT_CMD_TIMEOUT_S)
     reboot_via_helper()
 
 

@@ -4846,6 +4846,11 @@ def commit(tree, args):
             if match:
                 tree.settings_restart.add(
                     f"agent-box-settings@{match.group(1)}.service")
+            # The reboot helper authorizes ONE uid, read from its unit's
+            # environment at start. `enable --now` leaves an active unit
+            # running, so a changed root user would keep the old uid.
+            if Path(path).name == REBOOT_HELPER_UNIT:
+                tree.settings_restart.add(REBOOT_HELPER_UNIT)
     for link, target in sorted(tree.links):
         if link_if_changed(link, target, args.dry_run):
             changed += 1
