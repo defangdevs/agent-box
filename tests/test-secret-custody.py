@@ -724,6 +724,15 @@ class Bounds(unittest.TestCase):
         place; the retry finds them existing and must sync the parents
         anyway, or a later write is acknowledged without durable entries."""
         root = os.path.join(self.tmp, "u", "store")
+        # Fail the sync of each level in turn: the namespace's parent (the
+        # user root), the user root's parent, and the parent of the first
+        # directory the failed attempt created.
+        for target in (root, os.path.dirname(root), self.tmp):
+            with self.subTest(failed_sync=target):
+                self._retry_after_failed_sync(root, target)
+
+    def _retry_after_failed_sync(self, root, target):
+        shutil.rmtree(os.path.join(self.tmp, "u"), ignore_errors=True)
         key = b"\x00" * 32
         real_fsync = os.fsync
         synced = []
@@ -732,7 +741,7 @@ class Bounds(unittest.TestCase):
             return os.readlink(f"/proc/self/fd/{fd}")
 
         def failing(fd):
-            if path_of(fd) == root:
+            if path_of(fd) == target:
                 raise OSError(5, "injected fsync failure")
             real_fsync(fd)
 
@@ -746,15 +755,15 @@ class Bounds(unittest.TestCase):
                 ns["Store"](root, "p", "agent", os.getuid(), key)
         finally:
             os.fsync = real_fsync
-        self.assertTrue(os.path.isdir(os.path.join(root, "p")),
-                        "the failed attempt was expected to leave the namespace")
+        self.assertTrue(os.path.isdir(root),
+                        "the failed attempt was expected to leave its directories")
         os.fsync = recording
         try:
             ns["Store"](root, "p", "agent", os.getuid(), key).close()
         finally:
             os.fsync = real_fsync
-        self.assertIn(root, synced, "retry did not sync the namespace's parent")
-        self.assertIn(os.path.dirname(root), synced, "retry did not sync the root's parent")
+        for level in (root, os.path.dirname(root), self.tmp):
+            self.assertIn(level, synced, f"retry did not sync {level}")
 
     def test_retained_job_results_are_bounded(self):
         class Launcher:
