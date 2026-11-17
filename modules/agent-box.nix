@@ -2611,8 +2611,8 @@ let
   # block's own systemd.tmpfiles.rules, NOT by the web-gated `tmpfilesRules`
   # below: a box with web.enable off still runs the broker, and without
   # these the unit fails 226/NAMESPACE (ReadWritePaths= names a directory
-  # that does not exist). They are added to the golden inventory by hand,
-  # see internal.tmpfilesRules.
+  # that does not exist). The broker block also publishes them in
+  # internal.tmpfilesRules, whether or not web is enabled.
   secretsTmpfilesRules = lib.optionals secretsEnabled [
     "d /var/lib/agent-box-secrets 0700 root root - -"
     "d /run/agent-box-secrets 0755 root root - -"
@@ -3506,6 +3506,18 @@ SECRET_MAX_TIMEOUT_MS = 60 * 60 * 1000
 SECRET_MAX_JOBS_PER_USER = 2
 SECRET_MAX_OUTPUT_BYTES = 64 * 1024
 SECRET_JOB_RETENTION_SECONDS = 24 * 60 * 60
+# Finished jobs keep their (capped) output for the retention window above, and
+# a finished job no longer counts against SECRET_MAX_JOBS_PER_USER. Without a
+# second bound a caller could run jobs back to back and grow the broker's
+# memory for a whole day: 256 retained jobs is at most 256 x 2 x 64 KiB = 32
+# MiB per user. A new exec is refused at the bound, not an old result evicted,
+# so a result stays readable for its whole retention window.
+SECRET_MAX_RETAINED_JOBS_PER_USER = 256
+# A profile name is cheap to mint and each new one is a persistent directory
+# plus meta.json under the user's store. The broker's open-store cache bounds
+# descriptors, not disk, so the number of namespaces is capped here; existing
+# namespaces stay reachable past the cap, only a NEW one is refused.
+SECRET_MAX_NAMESPACES_PER_USER = 128
 
 # Where agent-box-profile's own default pointer lives (profile-cli.sh's
 # DIR/DEFAULT_FILE). Secrets have no separate "global" bucket (deprecated in
@@ -3833,6 +3845,29 @@ def _next_version(old_record):
         return 1
 
 
+def _makedirs_durable(path):
+    """os.makedirs(path, 0o700), then fsync the parent of every directory it
+    created, so the new entries survive a crash (fsync(2): syncing a
+    directory does not persist its own entry in ITS parent)."""
+    missing = []
+    probe = os.path.abspath(path)
+    while not os.path.isdir(probe):
+        missing.append(probe)
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if not missing:
+        return
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    for created in reversed(missing):
+        fd = os.open(os.path.dirname(created), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 class Store:
     """Root-only records for ONE (user, profile) namespace.
 
@@ -3851,13 +3886,24 @@ class Store:
     def __init__(self, root, namespace, user, uid, root_key):
         if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", namespace) or namespace in (".", ".."):
             raise SecretError("invalid namespace")
-        os.makedirs(root, mode=0o700, exist_ok=True)
+        _makedirs_durable(root)
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             try:
-                os.mkdir(namespace, 0o700, dir_fd=root_fd)
-            except FileExistsError:
-                pass
+                os.stat(namespace, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = [e for e in os.listdir(root_fd) if not e.startswith(".")]
+                if len(existing) >= SECRET_MAX_NAMESPACES_PER_USER:
+                    raise SecretError("too many secret profiles for this user")
+                try:
+                    os.mkdir(namespace, 0o700, dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+                else:
+                    # fsync on the new directory itself (in _write) does not
+                    # persist its ENTRY in the parent; without this a crash
+                    # after an acknowledged `set` can lose the whole profile.
+                    os.fsync(root_fd)
             self.dir_fd = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                   dir_fd=root_fd)
         finally:
@@ -4185,10 +4231,12 @@ class JobManager:
     of that user - the "2 active jobs per user" limit in the issue is a
     per-user limit, not per-profile."""
 
-    def __init__(self, launcher, max_output_bytes, max_jobs):
+    def __init__(self, launcher, max_output_bytes, max_jobs,
+                 max_retained=SECRET_MAX_RETAINED_JOBS_PER_USER):
         self.launcher = launcher
         self.max_output_bytes = max_output_bytes
         self.max_jobs = max_jobs
+        self.max_retained = max_retained
         self._jobs = {}
         self._by_idempotency = {}  # (namespace, key) -> job id
         self._lock = threading.Lock()
@@ -4209,6 +4257,10 @@ class JobManager:
                     return existing.id
             if self._active_count() >= self.max_jobs:
                 raise SecretError("too many active jobs")
+            if len(self._jobs) >= self.max_retained:
+                # See SECRET_MAX_RETAINED_JOBS_PER_USER: finished results are
+                # kept for the retention window, so refuse instead of evicting.
+                raise SecretError("too many retained job results; try again later")
             job = Job(new_job_id(), namespace, fingerprint, req, time.time())
             self._jobs[job.id] = job
             if key is not None:
@@ -4847,11 +4899,12 @@ class Broker:
     # PROFILE_NAME_RE), and each new one costs this process a directory, a
     # meta.json, a lock fd and a cached Store with its own open dir_fd. None
     # of that is reclaimed on its own, so without a bound the agent user can
-    # exhaust this root process's file descriptors (and, at the fs level,
-    # fill /var/lib/agent-box-secrets with empty namespaces) just by asking
-    # `list` for enough distinct names. Evicting the least-recently-used
-    # Store when the cache is full bounds both; a profile that is actually
-    # in use stays resident because it keeps getting touched.
+    # exhaust this root process's file descriptors just by asking `list` for
+    # enough distinct names. Evicting the least-recently-used Store when the
+    # cache is full bounds the descriptors; a profile that is actually in use
+    # stays resident because it keeps getting touched. Eviction never deletes
+    # anything on disk: the persistent namespaces are bounded separately, by
+    # SECRET_MAX_NAMESPACES_PER_USER in Store.
     MAX_OPEN_STORES = 64
 
     def __init__(self, user, uid, store_root, root_key, job_manager):
@@ -25596,6 +25649,10 @@ in
     # in further down. Every configured user gets one, not just the ones
     # with a web front door.
     systemd.tmpfiles.rules = secretsTmpfilesRules;
+    # Published HERE, not in the web-gated block: a box with web.enable off
+    # still applies these rules, so the inventory has to name them too.
+    # mkAfter keeps them after the web rules, the order the golden records.
+    services.agent-box.internal.tmpfilesRules = lib.mkAfter secretsTmpfilesRules;
     systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
       overrideStrategy = "asDropin";
       # Same restart-in-one-step reasoning as the webhook receiver's own
@@ -41311,7 +41368,7 @@ if __name__ == "__main__":
       # hand instead of recovering with a substring match (see
       # tmpfilesRules above). Internal: it is this module's own
       # inventory of what it renders, not a knob.
-      services.agent-box.internal.tmpfilesRules = tmpfilesRules ++ secretsTmpfilesRules;
+      services.agent-box.internal.tmpfilesRules = tmpfilesRules;
 
       services.caddy = {
         enable = true;

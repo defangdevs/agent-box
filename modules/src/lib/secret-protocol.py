@@ -46,6 +46,18 @@ SECRET_MAX_TIMEOUT_MS = 60 * 60 * 1000
 SECRET_MAX_JOBS_PER_USER = 2
 SECRET_MAX_OUTPUT_BYTES = 64 * 1024
 SECRET_JOB_RETENTION_SECONDS = 24 * 60 * 60
+# Finished jobs keep their (capped) output for the retention window above, and
+# a finished job no longer counts against SECRET_MAX_JOBS_PER_USER. Without a
+# second bound a caller could run jobs back to back and grow the broker's
+# memory for a whole day: 256 retained jobs is at most 256 x 2 x 64 KiB = 32
+# MiB per user. A new exec is refused at the bound, not an old result evicted,
+# so a result stays readable for its whole retention window.
+SECRET_MAX_RETAINED_JOBS_PER_USER = 256
+# A profile name is cheap to mint and each new one is a persistent directory
+# plus meta.json under the user's store. The broker's open-store cache bounds
+# descriptors, not disk, so the number of namespaces is capped here; existing
+# namespaces stay reachable past the cap, only a NEW one is refused.
+SECRET_MAX_NAMESPACES_PER_USER = 128
 
 # Where agent-box-profile's own default pointer lives (profile-cli.sh's
 # DIR/DEFAULT_FILE). Secrets have no separate "global" bucket (deprecated in
@@ -373,6 +385,29 @@ def _next_version(old_record):
         return 1
 
 
+def _makedirs_durable(path):
+    """os.makedirs(path, 0o700), then fsync the parent of every directory it
+    created, so the new entries survive a crash (fsync(2): syncing a
+    directory does not persist its own entry in ITS parent)."""
+    missing = []
+    probe = os.path.abspath(path)
+    while not os.path.isdir(probe):
+        missing.append(probe)
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    if not missing:
+        return
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    for created in reversed(missing):
+        fd = os.open(os.path.dirname(created), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 class Store:
     """Root-only records for ONE (user, profile) namespace.
 
@@ -391,13 +426,24 @@ class Store:
     def __init__(self, root, namespace, user, uid, root_key):
         if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", namespace) or namespace in (".", ".."):
             raise SecretError("invalid namespace")
-        os.makedirs(root, mode=0o700, exist_ok=True)
+        _makedirs_durable(root)
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             try:
-                os.mkdir(namespace, 0o700, dir_fd=root_fd)
-            except FileExistsError:
-                pass
+                os.stat(namespace, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = [e for e in os.listdir(root_fd) if not e.startswith(".")]
+                if len(existing) >= SECRET_MAX_NAMESPACES_PER_USER:
+                    raise SecretError("too many secret profiles for this user")
+                try:
+                    os.mkdir(namespace, 0o700, dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+                else:
+                    # fsync on the new directory itself (in _write) does not
+                    # persist its ENTRY in the parent; without this a crash
+                    # after an acknowledged `set` can lose the whole profile.
+                    os.fsync(root_fd)
             self.dir_fd = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                   dir_fd=root_fd)
         finally:

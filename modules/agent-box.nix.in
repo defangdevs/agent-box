@@ -383,8 +383,8 @@ let
   # block's own systemd.tmpfiles.rules, NOT by the web-gated `tmpfilesRules`
   # below: a box with web.enable off still runs the broker, and without
   # these the unit fails 226/NAMESPACE (ReadWritePaths= names a directory
-  # that does not exist). They are added to the golden inventory by hand,
-  # see internal.tmpfilesRules.
+  # that does not exist). The broker block also publishes them in
+  # internal.tmpfilesRules, whether or not web is enabled.
   secretsTmpfilesRules = lib.optionals secretsEnabled [
     "d /var/lib/agent-box-secrets 0700 root root - -"
     "d /run/agent-box-secrets 0755 root root - -"
@@ -3947,6 +3947,10 @@ in
     # in further down. Every configured user gets one, not just the ones
     # with a web front door.
     systemd.tmpfiles.rules = secretsTmpfilesRules;
+    # Published HERE, not in the web-gated block: a box with web.enable off
+    # still applies these rules, so the inventory has to name them too.
+    # mkAfter keeps them after the web rules, the order the golden records.
+    services.agent-box.internal.tmpfilesRules = lib.mkAfter secretsTmpfilesRules;
     systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
       overrideStrategy = "asDropin";
       # Same restart-in-one-step reasoning as the webhook receiver's own
@@ -4593,7 +4597,7 @@ in
       # hand instead of recovering with a substring match (see
       # tmpfilesRules above). Internal: it is this module's own
       # inventory of what it renders, not a knob.
-      services.agent-box.internal.tmpfilesRules = tmpfilesRules ++ secretsTmpfilesRules;
+      services.agent-box.internal.tmpfilesRules = tmpfilesRules;
 
       services.caddy = {
         enable = true;

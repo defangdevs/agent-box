@@ -103,11 +103,12 @@ class Broker:
     # PROFILE_NAME_RE), and each new one costs this process a directory, a
     # meta.json, a lock fd and a cached Store with its own open dir_fd. None
     # of that is reclaimed on its own, so without a bound the agent user can
-    # exhaust this root process's file descriptors (and, at the fs level,
-    # fill /var/lib/agent-box-secrets with empty namespaces) just by asking
-    # `list` for enough distinct names. Evicting the least-recently-used
-    # Store when the cache is full bounds both; a profile that is actually
-    # in use stays resident because it keeps getting touched.
+    # exhaust this root process's file descriptors just by asking `list` for
+    # enough distinct names. Evicting the least-recently-used Store when the
+    # cache is full bounds the descriptors; a profile that is actually in use
+    # stays resident because it keeps getting touched. Eviction never deletes
+    # anything on disk: the persistent namespaces are bounded separately, by
+    # SECRET_MAX_NAMESPACES_PER_USER in Store.
     MAX_OPEN_STORES = 64
 
     def __init__(self, user, uid, store_root, root_key, job_manager):

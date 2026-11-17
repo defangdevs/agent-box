@@ -22,6 +22,7 @@ import socket
 import struct
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 import unittest
@@ -671,6 +672,50 @@ class Custody(unittest.TestCase):
         self.assertFalse(over["ok"])
         for job_id in jobs:
             self.broker.ask({"op": "cancel", "jobId": job_id})
+
+
+class Bounds(unittest.TestCase):
+    """In-process checks of the broker's persistent and in-memory bounds."""
+
+    def setUp(self):
+        check_crypto_available()
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_namespace_quota_refuses_new_keeps_existing(self):
+        root = os.path.join(self.tmp, "nested", "store")
+        key = b"\x00" * 32
+        limit = ns["SECRET_MAX_NAMESPACES_PER_USER"]
+        for i in range(limit):
+            ns["Store"](root, f"p{i}", "agent", os.getuid(), key).close()
+        with self.assertRaises(ns["SecretError"]):
+            ns["Store"](root, "one-too-many", "agent", os.getuid(), key)
+        self.assertFalse(os.path.exists(os.path.join(root, "one-too-many")))
+        # An existing namespace stays reachable at the cap.
+        ns["Store"](root, "p0", "agent", os.getuid(), key).close()
+
+    def test_retained_job_results_are_bounded(self):
+        class Launcher:
+            def start(self, job, *args):
+                job.state = "done"
+                job.exit_code = 0
+                job.finished_at = time.time()
+
+            def kill(self, job):
+                pass
+
+        manager = ns["JobManager"](Launcher(), 1024, 2, max_retained=3)
+        manager._drain = lambda *a: None
+        req = {"op": "exec", "argv": ["true"], "secretNames": [], "cwd": self.tmp}
+        for _ in range(3):
+            manager.start("p", dict(req), lambda name: None)
+        with self.assertRaises(ns["SecretError"]):
+            manager.start("p", dict(req), lambda name: None)
+        # The retention sweep frees the slots again.
+        manager.sweep(-1)
+        manager.start("p", dict(req), lambda name: None)
 
 
 if __name__ == "__main__":

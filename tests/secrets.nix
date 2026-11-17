@@ -205,14 +205,18 @@
     with subtest("a corrupt record is refused, not served, and does not wedge the broker"):
         rec = machine.succeed(f"find {STORE}/agent -name 'K*' -type f | head -1").strip()
         machine.succeed(f"cp {rec} /tmp/K.rec.bak && printf 'garbage' > {rec}")
-        status, out = as_user("agent", "agent-box-secret --profile t exec --secret K --command true")
-        job = out.strip().splitlines()[-1] if status == 0 else ""
-        if job:
-            machine.sleep(2)
-            _, out = as_user("agent", f"agent-box-secret --profile t --json status {job}")
-            assert VALUE not in out, out
-        # Still answering other requests.
-        agent("agent-box-secret --profile t list >/dev/null || true")
+        # The job must end in "error" naming the corrupt record: a job that
+        # ran anyway (state "done", exit 0) would also print no VALUE, so
+        # checking the output alone cannot tell refusal from execution.
+        _, reply = run_job("--secret K --command 'echo ran'")
+        assert reply["state"] == "error", reply
+        assert reply.get("exitCode") is None, reply
+        assert "corrupt" in reply.get("stderr", ""), reply
+        assert "ran" not in reply.get("stdout", ""), reply
+        assert VALUE not in json.dumps(reply), reply
+        # Still answering other requests while the corrupt record is present:
+        # a different profile's list must SUCCEED, not merely not hang.
+        agent("agent-box-secret --profile unaffected list")
         machine.succeed(f"cp /tmp/K.rec.bak {rec}")
 
     with subtest("env-exec strips protected names, tombstones included"):
