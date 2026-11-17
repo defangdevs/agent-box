@@ -1879,20 +1879,24 @@ let
 
     @CONTAINERS_SECTION@@WEBHOOK_SECTION@## Receiving a large file from the user
 
-    When the user needs to give this box a file that is too large for chat, mint
+    When the user needs to give this box files that are too large for chat, mint
     one temporary resumable upload link:
 
-        agent-box-receive --ttl 4h --max-size 2G
+        agent-box-receive --ttl 4h --max-size 2G --files 10
 
     Hand them the complete URL the command prints. The part after `#` is the
     upload credential: treat the whole link as a secret and revoke it if it is
-    sent to the wrong person. It authorizes one file up to the stated size and
-    never signs the holder into the terminal or settings page. Interrupted browser
-    uploads resume automatically, and the completed file appears in `~/uploads`.
+    sent to the wrong person. It authorizes up to `--files` files (default 10,
+    at most 100), each up to `--max-size`, and never signs the holder into the
+    terminal or settings page. The page takes several files in one go. Interrupted
+    browser uploads resume automatically, and the completed files appear in
+    `~/uploads`.
 
-    `agent-box-receive list` shows active slots. `agent-box-receive revoke SLOT`
-    invalidates one immediately and removes its unfinished bytes. Expired slots
-    are removed opportunistically. Do not open the upload URL yourself before
+    `agent-box-receive list` shows active slots; each file of a link is one slot,
+    and the LINK column names the link's first slot. `agent-box-receive revoke
+    SLOT` invalidates that slot immediately, and the first slot of a link revokes
+    the whole link, removing unfinished bytes. Expired slots are removed
+    opportunistically. Do not open the upload URL yourself before
     handing it over if your chat client or browser sync might expose its fragment.
 
     ## Handing a file to the user
@@ -16108,6 +16112,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -16389,18 +16394,74 @@ def receive_remove_locked(slot, record=None):
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
 
-def receive_create(ttl, max_bytes, now=None):
-    """Mint a capability, persist only its digest, and return slot+token."""
+RECEIVE_MAX_FILES = 100
+
+
+def receive_child(secret, index):
+    """Derive the slot id and secret that carry file INDEX of a link.
+
+    One link holds up to RECEIVE_MAX_FILES independent slots, each bound to
+    exactly one file, so the per-slot protocol is unchanged. File 0 is the
+    link's own slot and token. The others are HMAC-SHA256 of file 0's secret,
+    which the daemon only stores as a hash and so cannot derive. The page
+    computes the same values with WebCrypto. Hex keeps every id alphanumeric,
+    which RECEIVE_SLOT_RE and argparse both accept.
+    """
+    key = secret.encode("ascii")
+
+    def part(label, size):
+        message = ("agent-box-receive-v1\n%s\n%d" % (label, index)).encode()
+        return hmac.new(key, message, hashlib.sha256).hexdigest()[:size]
+    return part("slot", 24), part("secret", 64)
+
+
+def receive_store_new(record):
+    """Persist a brand-new record; FileExistsError if the slot is taken."""
+    path = receive_record_path(record["slot"])
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True,
+                      separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        receive_fsync_dir(RECEIVE_STATE_DIR)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+
+
+def receive_link_slots(slot):
+    """Return SLOT plus every child slot minted with it, for revoke."""
+    slots = [slot]
+    try:
+        names = sorted(os.listdir(RECEIVE_STATE_DIR))
+    except OSError:
+        return slots
+    for name in names:
+        child = name[:-5]
+        if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
+            continue
+        record = receive_read(child)
+        if record is not None and record.get("link") == slot:
+            slots.append(child)
+    return slots
+
+
+def receive_create(ttl, max_bytes, now=None, files=1):
+    """Mint a capability, persist only its digest, and return slot+token.
+
+    FILES > 1 also persists FILES - 1 derived slots (see receive_child), so
+    one link accepts that many files of up to MAX_BYTES each.
+    """
     receive_ensure_dirs()
     now = int(time.time() if now is None else now)
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
+    if not 1 <= files <= RECEIVE_MAX_FILES:
+        raise ValueError("files must be between 1 and %d" % RECEIVE_MAX_FILES)
+
+    def fresh(slot, secret, **extra):
         record = {
             "version": RECEIVE_VERSION,
             "slot": slot,
@@ -16410,23 +16471,32 @@ def receive_create(ttl, max_bytes, now=None):
             "max_bytes": max_bytes,
             "status": "waiting",
         }
-        path = receive_record_path(slot)
+        record.update(extra)
+        return record
+
+    for _attempt in range(32):
+        slot = secrets.token_urlsafe(12)
+        # A leading "-" is URL-safe but argparse reads it as an option in
+        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+        # as ordinary positional arguments without requiring a hidden `--`.
+        if not slot[0].isalnum():
+            continue
+        secret = secrets.token_urlsafe(32)
+        record = fresh(slot, secret, files=files)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
+            receive_store_new(record)
         except FileExistsError:
             continue
+        created = [slot]
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, sort_keys=True,
-                          separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            receive_fsync_dir(RECEIVE_STATE_DIR)
+            for index in range(1, files):
+                child, child_secret = receive_child(secret, index)
+                receive_store_new(fresh(child, child_secret, link=slot))
+                created.append(child)
         except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+            # Nobody holds the token yet, so no slot lock is needed.
+            for name in created:
+                receive_remove_locked(name)
             raise
         return slot, slot + "." + secret, record
     raise RuntimeError("could not allocate an upload slot")
@@ -16559,18 +16629,25 @@ def cmd_create(args):
         raise SystemExit("agent-box-receive: --ttl must be between 10m and 7d")
     if args.max_size < 1 or args.max_size > (1 << 40):
         raise SystemExit("agent-box-receive: --max-size must be at most 1T")
+    if not 1 <= args.files <= RECEIVE_MAX_FILES:
+        raise SystemExit("agent-box-receive: --files must be between 1 and %d"
+                         % RECEIVE_MAX_FILES)
     receive_prune()
-    slot, token, record = receive_create(args.ttl, args.max_size)
+    slot, token, record = receive_create(
+        args.ttl, args.max_size, files=args.files)
     url = base.rstrip("/") + "/receive/" + slot + "/#" + token
     if args.json:
         print(json.dumps({"slot": slot, "url": url,
                           "expires": record["expires"],
-                          "maxBytes": record["max_bytes"]},
+                          "maxBytes": record["max_bytes"],
+                          "files": args.files},
                          separators=(",", ":")))
     else:
         print(url)
-        print("agent-box-receive: slot %s accepts one file up to %s for %s"
-              % (slot, human_size(args.max_size), args.ttl_text),
+        print("agent-box-receive: slot %s accepts %s up to %s each for %s"
+              % (slot, "1 file" if args.files == 1
+                 else "%d files" % args.files,
+                 human_size(args.max_size), args.ttl_text),
               file=sys.stderr)
 
 
@@ -16580,7 +16657,7 @@ def cmd_list(_args):
         names = sorted(os.listdir(RECEIVE_STATE_DIR))
     except OSError:
         names = []
-    print("SLOT\tSTATUS\tOFFSET/TOTAL\tEXPIRES")
+    print("SLOT\tSTATUS\tOFFSET/TOTAL\tEXPIRES\tLINK")
     for name in names:
         if not name.endswith(".json"):
             continue
@@ -16595,23 +16672,30 @@ def cmd_list(_args):
             offset = total if record["status"] == "complete" else 0
         expires = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                 time.gmtime(record["expires"]))
-        print("%s\t%s\t%d/%d\t%s" %
-              (slot, record["status"], offset, total, expires))
+        print("%s\t%s\t%d/%d\t%s\t%s" %
+              (slot, record["status"], offset, total, expires,
+               record.get("link", "-")))
 
 
 def cmd_revoke(args):
     record = receive_read(args.slot)
     if record is None:
         raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
-    receive_mark_revoked(args.slot)
-    try:
-        with receive_slot_lock(args.slot, blocking=False):
-            receive_remove_locked(args.slot, receive_read(args.slot))
-    except BlockingIOError:
-        # The marker already makes authorization fail. An active PATCH checks
-        # it between reads and performs the same cleanup while holding the
-        # lock, so revocation itself never waits on a slow uploader.
-        pass
+    # A link's first slot also revokes the slots minted with it, so one
+    # command ends the whole multi-file capability.
+    slots = receive_link_slots(args.slot)
+    for slot in slots:
+        receive_mark_revoked(slot)
+    for slot in slots:
+        try:
+            with receive_slot_lock(slot, blocking=False):
+                receive_remove_locked(slot, receive_read(slot))
+        except BlockingIOError:
+            # The marker already makes authorization fail. An active PATCH
+            # checks it between reads and performs the same cleanup while
+            # holding the lock, so revocation itself never waits on a slow
+            # uploader.
+            pass
     print("revoked %s" % args.slot)
 
 
@@ -16622,7 +16706,11 @@ def parser():
     sub = result.add_subparsers(dest="command")
     create = sub.add_parser("create", help="create an upload link (default)")
     create.add_argument("--ttl", default="24h", type=parse_ttl_arg)
-    create.add_argument("--max-size", default="2G", type=parse_size)
+    create.add_argument("--max-size", default="2G", type=parse_size,
+                        help="size limit for EACH file (default 2G)")
+    create.add_argument("--files", default=10, type=int,
+                        help="how many files the link accepts, 1-%d "
+                        "(default 10)" % RECEIVE_MAX_FILES)
     create.add_argument("--url", help=argparse.SUPPRESS)
     create.add_argument("--json", action="store_true")
     sub.add_parser("list", help="list live upload slots")
@@ -26260,6 +26348,7 @@ import fcntl
 import functools
 import glob
 import hashlib
+import hmac
 import html
 import http.server
 import json
@@ -26891,18 +26980,74 @@ def receive_remove_locked(slot, record=None):
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
 
-def receive_create(ttl, max_bytes, now=None):
-    """Mint a capability, persist only its digest, and return slot+token."""
+RECEIVE_MAX_FILES = 100
+
+
+def receive_child(secret, index):
+    """Derive the slot id and secret that carry file INDEX of a link.
+
+    One link holds up to RECEIVE_MAX_FILES independent slots, each bound to
+    exactly one file, so the per-slot protocol is unchanged. File 0 is the
+    link's own slot and token. The others are HMAC-SHA256 of file 0's secret,
+    which the daemon only stores as a hash and so cannot derive. The page
+    computes the same values with WebCrypto. Hex keeps every id alphanumeric,
+    which RECEIVE_SLOT_RE and argparse both accept.
+    """
+    key = secret.encode("ascii")
+
+    def part(label, size):
+        message = ("agent-box-receive-v1\n%s\n%d" % (label, index)).encode()
+        return hmac.new(key, message, hashlib.sha256).hexdigest()[:size]
+    return part("slot", 24), part("secret", 64)
+
+
+def receive_store_new(record):
+    """Persist a brand-new record; FileExistsError if the slot is taken."""
+    path = receive_record_path(record["slot"])
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True,
+                      separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        receive_fsync_dir(RECEIVE_STATE_DIR)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+
+
+def receive_link_slots(slot):
+    """Return SLOT plus every child slot minted with it, for revoke."""
+    slots = [slot]
+    try:
+        names = sorted(os.listdir(RECEIVE_STATE_DIR))
+    except OSError:
+        return slots
+    for name in names:
+        child = name[:-5]
+        if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
+            continue
+        record = receive_read(child)
+        if record is not None and record.get("link") == slot:
+            slots.append(child)
+    return slots
+
+
+def receive_create(ttl, max_bytes, now=None, files=1):
+    """Mint a capability, persist only its digest, and return slot+token.
+
+    FILES > 1 also persists FILES - 1 derived slots (see receive_child), so
+    one link accepts that many files of up to MAX_BYTES each.
+    """
     receive_ensure_dirs()
     now = int(time.time() if now is None else now)
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
+    if not 1 <= files <= RECEIVE_MAX_FILES:
+        raise ValueError("files must be between 1 and %d" % RECEIVE_MAX_FILES)
+
+    def fresh(slot, secret, **extra):
         record = {
             "version": RECEIVE_VERSION,
             "slot": slot,
@@ -26912,23 +27057,32 @@ def receive_create(ttl, max_bytes, now=None):
             "max_bytes": max_bytes,
             "status": "waiting",
         }
-        path = receive_record_path(slot)
+        record.update(extra)
+        return record
+
+    for _attempt in range(32):
+        slot = secrets.token_urlsafe(12)
+        # A leading "-" is URL-safe but argparse reads it as an option in
+        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+        # as ordinary positional arguments without requiring a hidden `--`.
+        if not slot[0].isalnum():
+            continue
+        secret = secrets.token_urlsafe(32)
+        record = fresh(slot, secret, files=files)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
+            receive_store_new(record)
         except FileExistsError:
             continue
+        created = [slot]
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, sort_keys=True,
-                          separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            receive_fsync_dir(RECEIVE_STATE_DIR)
+            for index in range(1, files):
+                child, child_secret = receive_child(secret, index)
+                receive_store_new(fresh(child, child_secret, link=slot))
+                created.append(child)
         except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+            # Nobody holds the token yet, so no slot lock is needed.
+            for name in created:
+                receive_remove_locked(name)
             raise
         return slot, slot + "." + secret, record
     raise RuntimeError("could not allocate an upload slot")
@@ -37424,7 +37578,7 @@ RECEIVE_FILE_RE = re.compile(
 RECEIVE_PAGE = r''''<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Send a file to __USER__</title>
+<title>Send files to __USER__</title>
 <style nonce="__NONCE__">
 :root{color-scheme:light dark}body{margin:0;background:#0d1117;color:#e6edf3;
 font:15px/1.5 system-ui,sans-serif}.card{max-width:38rem;margin:8vh auto;
@@ -37439,14 +37593,18 @@ border-color:#58a6ff;background:#1f6feb26}.drop:focus-within{outline:2px solid
 #file{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;
 clip-path:inset(50%);white-space:nowrap;border:0}
 progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
+#queue{list-style:none;margin:0;padding:0}#queue li{padding:.25rem 0;
+border-top:1px solid #30363d;overflow-wrap:anywhere;color:#8b949e}
+#queue li.done{color:#3fb950}#queue li.error{color:#f85149}
 </style></head><body data-slot="__SLOT__"><main class="card">
-<h1>Send one file to __USER__</h1>
-<p>This private link accepts one resumable upload. It does not grant access
-to the terminal or any existing files.</p>
-<label id="drop" class="drop" for="file"><strong id="prompt">Drop a file here</strong>
-<span>or tap to choose one</span><input id="file" type="file"></label>
+<h1>Send files to __USER__</h1>
+<p>This private link accepts a limited number of resumable uploads. It does
+not grant access to the terminal or any existing files.</p>
+<label id="drop" class="drop" for="file"><strong id="prompt">Drop files here</strong>
+<span>or tap to choose them</span><input id="file" type="file" multiple></label>
 <progress id="progress" aria-label="Upload progress" value="0" max="1"></progress>
 <p id="status" role="status"></p>
+<ul id="queue" aria-label="Files"></ul>
 </main><script nonce="__NONCE__">
 (() => {
   'use strict';
@@ -37457,39 +37615,81 @@ to the terminal or any existing files.</p>
   const prompt = document.getElementById('prompt');
   const progress = document.getElementById('progress');
   const status = document.getElementById('status');
+  const queue = document.getElementById('queue');
+  const MAX_FILES = __MAX_FILES__;
   let uploading = false;
-  const collection = location.pathname.replace(/\/?$/, '/') + 'files';
-  const resource = collection + '/upload';
+  // /<user>/receive/<slot>/ -> /<user>/receive/
+  const base = location.pathname.replace(/[^/]+\/?$/, ''');
   const validToken = token.startsWith(slot + '.') &&
     /^[A-Za-z0-9_.-]+$/.test(token);
-  const auth = () => ({'Authorization': 'Bearer ' + token,
-                       'Tus-Resumable': '1.0.0'});
+  const master = token.slice(slot.length + 1);
+  const encoder = new TextEncoder();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const hex = bytes => Array.from(bytes, byte =>
+    byte.toString(16).padStart(2, '0')).join(''');
   const b64 = value => {
-    const bytes = new TextEncoder().encode(value);
+    const bytes = encoder.encode(value);
     let binary = ''';
     for (const byte of bytes) binary += String.fromCharCode(byte);
     return btoa(binary);
   };
+  // One link carries up to MAX_FILES slots, each bound to one file. Slot 0
+  // is the link itself; the rest are HMAC-SHA256 of its secret, the same
+  // derivation agent-box-receive uses when it mints them.
+  const derive = async (label, index, size) => {
+    const key = await crypto.subtle.importKey(
+      'raw', encoder.encode(master), {name: 'HMAC', hash: 'SHA-256'},
+      false, ['sign']);
+    const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(
+      'agent-box-receive-v1\n' + label + '\n' + index));
+    return hex(new Uint8Array(mac)).slice(0, size);
+  };
+  const lanes = [];
+  const lane = async index => {
+    if (!lanes[index]) {
+      let id = slot;
+      let bearer = token;
+      if (index > 0) {
+        id = await derive('slot', index, 24);
+        bearer = id + '.' + await derive('secret', index, 64);
+      }
+      const collection = base + id + '/files';
+      lanes[index] = {collection, resource: collection + '/upload',
+                      bearer};
+    }
+    return lanes[index];
+  };
+  const auth = l => ({'Authorization': 'Bearer ' + l.bearer,
+                      'Tus-Resumable': '1.0.0'});
   const metadata = (file, content) => 'filename ' + b64(file.name) +
     ',fingerprint ' + b64(file.name + '\n' + file.size + '\n' +
                           file.lastModified) + ',content ' + b64(content);
   const contentEtag = content => '"' + content + '"';
-  const hex = bytes => Array.from(bytes, byte =>
-    byte.toString(16).padStart(2, '0')).join(''');
-  const contentId = async file => {
+  // One bar for the whole batch: bytes of finished files plus the bytes of
+  // the file in flight, over the total size of every selected file.
+  const tally = {done: 0, total: 0};
+  const bar = offset => {
+    progress.max = Math.max(tally.total, 1);
+    progress.value = Math.min(tally.done + offset, progress.max);
+    return Math.floor(100 * progress.value / progress.max);
+  };
+  const show = (text, offset) => {
+    const percent = bar(offset);
+    status.textContent = text + ' ' + percent + '%';
+  };
+  const contentId = async (file, label) => {
     const leaves = [];
     let checked = 0;
-    show('Checking ' + file.name + '...', 0, file.size);
+    show('Checking ' + label + '...', 0);
     while (checked < file.size) {
       const end = Math.min(checked + __HASH_CHUNK__, file.size);
       const block = await file.slice(checked, end).arrayBuffer();
       leaves.push(new Uint8Array(
         await crypto.subtle.digest('SHA-256', block)));
       checked = end;
-      show('Checking ' + file.name + '...', checked, file.size);
+      show('Checking ' + label + '...', 0);
     }
-    const prefix = new TextEncoder().encode(
+    const prefix = encoder.encode(
       'agent-box-content-v1\n' + file.size + '\n');
     const tree = new Uint8Array(prefix.length + leaves.length * 32);
     tree.set(prefix);
@@ -37502,102 +37702,205 @@ to the terminal or any existing files.</p>
     try { detail = (await response.text()).trim(); } catch (_) {}
     throw new Error(detail || ('Upload request failed (' + response.status + ')'));
   };
-  const head = async (file, content) => {
-    const response = await fetch(resource, {method: 'HEAD', headers: auth(),
-                                            cache: 'no-store'});
-    if (response.status === 404) return null;
+  // What one slot holds: nothing yet (free), a file (bound), a transfer that
+  // failed its content check (dead), or no such slot (absent).
+  const probe = async (l, extra) => {
+    const headers = auth(l);
+    if (extra) Object.assign(headers, extra);
+    const response = await fetch(l.resource, {method: 'HEAD', headers,
+                                              cache: 'no-store'});
+    if (response.status === 404) return {state: 'free'};
+    if (response.status === 403) return {state: 'absent'};
+    if (response.status === 422) return {state: 'dead'};
+    if (response.status === 412) return {state: 'changed'};
     if (!response.ok) return fail(response);
-    if (Number(response.headers.get('Upload-Length')) !== file.size) {
-      throw new Error('This link is already bound to a different file.');
-    }
-    if (response.headers.get('Upload-Complete') === '?1') {
-      const headers = auth();
-      headers['If-Match'] = contentEtag(content);
-      const verified = await fetch(resource, {
-        method: 'HEAD', headers, cache: 'no-store'
-      });
-      if (verified.status === 412) {
-        throw new Error('This link is already bound to a different file.');
-      }
-      if (!verified.ok) return fail(verified);
-      return Number(verified.headers.get('Upload-Offset'));
-    }
-    if (response.headers.get('Upload-Content') !== content) {
-      throw new Error('This link is already bound to a different file.');
-    }
-    return Number(response.headers.get('Upload-Offset'));
+    const complete = response.headers.get('Upload-Complete') === '?1';
+    return {
+      state: 'bound', complete,
+      offset: Number(response.headers.get('Upload-Offset')),
+      content: complete
+        ? (response.headers.get('ETag') || ''').replace(/^"|"$/g, ''')
+        : response.headers.get('Upload-Content'),
+    };
   };
-  const create = async (file, details) => {
-    const headers = auth();
+  const survey = async () => {
+    const slots = [];
+    for (let index = 0; index < MAX_FILES; index++) {
+      const l = await lane(index);
+      const info = await probe(l);
+      if (info.state === 'absent') {
+        if (index === 0) {
+          throw new Error('This upload link is invalid, expired, or revoked.');
+        }
+        break;
+      }
+      slots.push(Object.assign({lane: l}, info));
+    }
+    return slots;
+  };
+  const create = async (l, file, details) => {
+    const headers = auth(l);
     headers['Upload-Length'] = String(file.size);
     headers['Upload-Metadata'] = details;
-    const response = await fetch(collection, {method: 'POST', headers});
+    const response = await fetch(l.collection, {method: 'POST', headers});
     if (!response.ok) return fail(response);
     return Number(response.headers.get('Upload-Offset') || '0');
   };
-  const show = (text, offset, size) => {
-    status.textContent = text;
-    progress.max = Math.max(size, 1);
-    progress.value = offset;
-  };
-  async function upload(file) {
-    const content = await contentId(file);
-    const details = metadata(file, content);
-    let offset = await head(file, content);
-    if (offset === null) offset = await create(file, details);
-    show('Uploading ' + file.name + '...', offset, file.size);
+  async function send(file, slots, caption) {
+    const content = await contentId(file, caption);
+    let target = slots.find(s => s.state === 'bound' && s.content === content);
+    let offset;
+    if (target) {
+      if (target.complete) {
+        // Trust the bytes, not the metadata: the server confirms the
+        // completed file's content before this one is skipped.
+        const verified = await probe(
+          target.lane, {'If-Match': contentEtag(content)});
+        if (verified.state !== 'bound') {
+          throw new Error('This link is already bound to a different file.');
+        }
+        return;
+      }
+      offset = target.offset;
+    } else {
+      target = slots.find(s => s.state === 'free');
+      if (!target) {
+        throw new Error(slots.length === 1
+          ? 'This link is already bound to a different file.'
+          : 'This link accepts at most ' + slots.length +
+            ' files and all of them are in use.');
+      }
+      offset = await create(target.lane, file, metadata(file, content));
+      target.state = 'bound';
+      target.content = content;
+      target.complete = false;
+    }
+    const l = target.lane;
+    show('Uploading ' + caption + '...', offset);
     let failures = 0;
     while (offset < file.size) {
       const end = Math.min(offset + __CHUNK__, file.size);
-      const headers = auth();
+      const headers = auth(l);
       headers['Upload-Offset'] = String(offset);
       headers['Content-Type'] = 'application/offset+octet-stream';
       try {
-        const response = await fetch(resource, {
+        const response = await fetch(l.resource, {
           method: 'PATCH', headers, body: file.slice(offset, end)
         });
         if (!response.ok) await fail(response);
         offset = Number(response.headers.get('Upload-Offset'));
         failures = 0;
-        show('Uploading ' + file.name + '...', offset, file.size);
+        show('Uploading ' + caption + '...', offset);
       } catch (error) {
         if (++failures > 6) throw error;
-        show('Connection interrupted; resuming...', offset, file.size);
+        show('Connection interrupted; resuming...', offset);
         await sleep(Math.min(1000 * (2 ** failures), 15000));
-        const resumed = await head(file, content);
-        if (resumed === null) throw error;
+        const resumed = await probe(l);
+        if (resumed.state !== 'bound' || resumed.content !== content) {
+          throw error;
+        }
         // A timed-out or cut-off chunk can still persist bytes. Count only
         // failures that made no progress, so a slow link is not abandoned.
-        if (resumed > offset) failures = 0;
-        offset = resumed;
+        if (resumed.offset > offset) failures = 0;
+        offset = resumed.offset;
       }
     }
-    show('Upload complete. You may close this page.', offset, file.size);
+    target.complete = true;
   }
+  const row = file => {
+    const item = document.createElement('li');
+    item.textContent = file.name + ' - waiting';
+    queue.appendChild(item);
+    return item;
+  };
+  const mark = (item, file, text, kind) => {
+    item.textContent = file.name + ' - ' + text;
+    item.className = kind || ''';
+  };
+  const upload = async (files, note) => {
+    uploading = true;
+    input.disabled = true;
+    drop.classList.add('disabled');
+    prompt.textContent = files.length === 1 ? files[0].name
+                                            : files.length + ' files';
+    queue.textContent = ''';
+    tally.done = 0;
+    tally.total = files.reduce((sum, file) => sum + file.size, 0);
+    bar(0);
+    const rows = files.map(row);
+    let done = 0;
+    let lastError = ''';
+    try {
+      const slots = await survey();
+      for (let n = 0; n < files.length; n++) {
+        const file = files[n];
+        const caption = files.length === 1 ? file.name
+          : file.name + ' (' + (n + 1) + ' of ' + files.length + ')';
+        try {
+          await send(file, slots, caption);
+          done++;
+          tally.done += file.size;
+          bar(0);
+          mark(rows[n], file, 'done', 'done');
+        } catch (error) {
+          lastError = error.message;
+          mark(rows[n], file, error.message, 'error');
+        }
+      }
+      if (done === files.length) {
+        status.textContent = files.length === 1
+          ? 'Upload complete. You may close this page.'
+          : 'Uploaded ' + done + ' of ' + files.length +
+            ' files. You may close this page.';
+        progress.max = Math.max(tally.total, 1);
+        progress.value = progress.max;
+      } else {
+        status.textContent = files.length === 1 ? lastError
+          : 'Uploaded ' + done + ' of ' + files.length + ' files.';
+      }
+    } catch (error) {
+      status.textContent = error.message;
+    }
+    if (note) status.textContent += ' ' + note;
+    uploading = false;
+    input.disabled = false;
+    input.value = ''';
+    drop.classList.remove('disabled');
+  };
   if (!validToken) {
     status.textContent = 'This upload link is incomplete.';
   } else {
-    const selectFile = async files => {
+    // A drop hands over every dragged item, folders included, and there is
+    // no accept filter as in the file dialog. Folders are skipped here.
+    const dropped = transfer => {
+      const files = [];
+      let folders = 0;
+      const items = Array.from(transfer.items || []);
+      if (items.length) {
+        for (const item of items) {
+          if (item.kind !== 'file') continue;
+          const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+          if (entry && entry.isDirectory) { folders++; continue; }
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      } else {
+        files.push(...transfer.files);
+      }
+      return {files, folders};
+    };
+    const selectFiles = (files, folders) => {
       if (uploading) return;
-      if (files.length !== 1) {
+      const note = folders
+        ? 'Skipped ' + folders + (folders === 1 ? ' folder' : ' folders') +
+          '; choose files only.' : ''';
+      if (!files.length) {
         input.value = ''';
-        prompt.textContent = 'Drop a file here';
-        status.textContent = 'Choose exactly one file.';
+        prompt.textContent = 'Drop files here';
+        status.textContent = note || 'Choose at least one file.';
         return;
       }
-      const file = files[0];
-      prompt.textContent = file.name;
-      uploading = true;
-      input.disabled = true;
-      drop.classList.add('disabled');
-      try { await upload(file); }
-      catch (error) {
-        uploading = false;
-        input.disabled = false;
-        input.value = ''';
-        drop.classList.remove('disabled');
-        status.textContent = error.message;
-      }
+      upload(files, note);
     };
     const stopDrag = event => {
       event.preventDefault();
@@ -37620,9 +37923,11 @@ to the terminal or any existing files.</p>
     drop.addEventListener('drop', event => {
       stopDrag(event);
       drop.classList.remove('dragging');
-      selectFile(event.dataTransfer.files);
+      const result = dropped(event.dataTransfer);
+      selectFiles(result.files, result.folders);
     });
-    input.addEventListener('change', () => selectFile(input.files));
+    input.addEventListener('change', () => selectFiles(
+      Array.from(input.files), 0));
   }
 })();
 </script></body></html>''''
@@ -37633,7 +37938,8 @@ def receive_page(slot, nonce):
             .replace("__SLOT__", slot)
             .replace("__NONCE__", nonce)
             .replace("__CHUNK__", str(RECEIVE_CHUNK_MAX))
-            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK)))
+            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK))
+            .replace("__MAX_FILES__", str(RECEIVE_MAX_FILES)))
 
 
 def receive_metadata(raw):

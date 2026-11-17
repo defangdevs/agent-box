@@ -5,6 +5,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -69,18 +70,25 @@ def cmd_create(args):
         raise SystemExit("agent-box-receive: --ttl must be between 10m and 7d")
     if args.max_size < 1 or args.max_size > (1 << 40):
         raise SystemExit("agent-box-receive: --max-size must be at most 1T")
+    if not 1 <= args.files <= RECEIVE_MAX_FILES:
+        raise SystemExit("agent-box-receive: --files must be between 1 and %d"
+                         % RECEIVE_MAX_FILES)
     receive_prune()
-    slot, token, record = receive_create(args.ttl, args.max_size)
+    slot, token, record = receive_create(
+        args.ttl, args.max_size, files=args.files)
     url = base.rstrip("/") + "/receive/" + slot + "/#" + token
     if args.json:
         print(json.dumps({"slot": slot, "url": url,
                           "expires": record["expires"],
-                          "maxBytes": record["max_bytes"]},
+                          "maxBytes": record["max_bytes"],
+                          "files": args.files},
                          separators=(",", ":")))
     else:
         print(url)
-        print("agent-box-receive: slot %s accepts one file up to %s for %s"
-              % (slot, human_size(args.max_size), args.ttl_text),
+        print("agent-box-receive: slot %s accepts %s up to %s each for %s"
+              % (slot, "1 file" if args.files == 1
+                 else "%d files" % args.files,
+                 human_size(args.max_size), args.ttl_text),
               file=sys.stderr)
 
 
@@ -90,7 +98,7 @@ def cmd_list(_args):
         names = sorted(os.listdir(RECEIVE_STATE_DIR))
     except OSError:
         names = []
-    print("SLOT\tSTATUS\tOFFSET/TOTAL\tEXPIRES")
+    print("SLOT\tSTATUS\tOFFSET/TOTAL\tEXPIRES\tLINK")
     for name in names:
         if not name.endswith(".json"):
             continue
@@ -105,23 +113,30 @@ def cmd_list(_args):
             offset = total if record["status"] == "complete" else 0
         expires = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                 time.gmtime(record["expires"]))
-        print("%s\t%s\t%d/%d\t%s" %
-              (slot, record["status"], offset, total, expires))
+        print("%s\t%s\t%d/%d\t%s\t%s" %
+              (slot, record["status"], offset, total, expires,
+               record.get("link", "-")))
 
 
 def cmd_revoke(args):
     record = receive_read(args.slot)
     if record is None:
         raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
-    receive_mark_revoked(args.slot)
-    try:
-        with receive_slot_lock(args.slot, blocking=False):
-            receive_remove_locked(args.slot, receive_read(args.slot))
-    except BlockingIOError:
-        # The marker already makes authorization fail. An active PATCH checks
-        # it between reads and performs the same cleanup while holding the
-        # lock, so revocation itself never waits on a slow uploader.
-        pass
+    # A link's first slot also revokes the slots minted with it, so one
+    # command ends the whole multi-file capability.
+    slots = receive_link_slots(args.slot)
+    for slot in slots:
+        receive_mark_revoked(slot)
+    for slot in slots:
+        try:
+            with receive_slot_lock(slot, blocking=False):
+                receive_remove_locked(slot, receive_read(slot))
+        except BlockingIOError:
+            # The marker already makes authorization fail. An active PATCH
+            # checks it between reads and performs the same cleanup while
+            # holding the lock, so revocation itself never waits on a slow
+            # uploader.
+            pass
     print("revoked %s" % args.slot)
 
 
@@ -132,7 +147,11 @@ def parser():
     sub = result.add_subparsers(dest="command")
     create = sub.add_parser("create", help="create an upload link (default)")
     create.add_argument("--ttl", default="24h", type=parse_ttl_arg)
-    create.add_argument("--max-size", default="2G", type=parse_size)
+    create.add_argument("--max-size", default="2G", type=parse_size,
+                        help="size limit for EACH file (default 2G)")
+    create.add_argument("--files", default=10, type=int,
+                        help="how many files the link accepts, 1-%d "
+                        "(default 10)" % RECEIVE_MAX_FILES)
     create.add_argument("--url", help=argparse.SUPPRESS)
     create.add_argument("--json", action="store_true")
     sub.add_parser("list", help="list live upload slots")

@@ -625,17 +625,20 @@ An agent can mint a short-lived, upload-only URL for a person who is using a
 native harness app and does not know the box password:
 
 ```bash
-agent-box-receive --ttl 4h --max-size 2G
+agent-box-receive --ttl 4h --max-size 2G --files 10
 ```
 
-The URL fragment is a bearer capability for one resumable file; it is never a
+The URL fragment is a bearer capability for up to `--files` resumable files
+(default 10, at most 100), each up to `--max-size`, and the page uploads
+several files in one go. Each file uses its own slot bound to exactly one file;
+a link minted before this option still accepts one. The fragment is never a
 terminal or settings credential and is not sent in the initial HTTP request.
 The public, inert receiver page reads it locally and attaches it only to the
 upload API's `Authorization` header. Upload state and offsets survive browser
 or network interruption, each request body is capped to an 8 MiB chunk, and
 the finished file appears in that agent user's `~/uploads`. The link expires
 at its declared time and can be invalidated immediately with
-`agent-box-receive revoke SLOT`.
+`agent-box-receive revoke SLOT`; the link's first slot revokes all of its files.
 
 ## Webhooks: the agent gets told, instead of polling (web setups)
 

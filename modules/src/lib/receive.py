@@ -267,18 +267,74 @@ def receive_remove_locked(slot, record=None):
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
 
-def receive_create(ttl, max_bytes, now=None):
-    """Mint a capability, persist only its digest, and return slot+token."""
+RECEIVE_MAX_FILES = 100
+
+
+def receive_child(secret, index):
+    """Derive the slot id and secret that carry file INDEX of a link.
+
+    One link holds up to RECEIVE_MAX_FILES independent slots, each bound to
+    exactly one file, so the per-slot protocol is unchanged. File 0 is the
+    link's own slot and token. The others are HMAC-SHA256 of file 0's secret,
+    which the daemon only stores as a hash and so cannot derive. The page
+    computes the same values with WebCrypto. Hex keeps every id alphanumeric,
+    which RECEIVE_SLOT_RE and argparse both accept.
+    """
+    key = secret.encode("ascii")
+
+    def part(label, size):
+        message = ("agent-box-receive-v1\n%s\n%d" % (label, index)).encode()
+        return hmac.new(key, message, hashlib.sha256).hexdigest()[:size]
+    return part("slot", 24), part("secret", 64)
+
+
+def receive_store_new(record):
+    """Persist a brand-new record; FileExistsError if the slot is taken."""
+    path = receive_record_path(record["slot"])
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True,
+                      separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        receive_fsync_dir(RECEIVE_STATE_DIR)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+
+
+def receive_link_slots(slot):
+    """Return SLOT plus every child slot minted with it, for revoke."""
+    slots = [slot]
+    try:
+        names = sorted(os.listdir(RECEIVE_STATE_DIR))
+    except OSError:
+        return slots
+    for name in names:
+        child = name[:-5]
+        if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
+            continue
+        record = receive_read(child)
+        if record is not None and record.get("link") == slot:
+            slots.append(child)
+    return slots
+
+
+def receive_create(ttl, max_bytes, now=None, files=1):
+    """Mint a capability, persist only its digest, and return slot+token.
+
+    FILES > 1 also persists FILES - 1 derived slots (see receive_child), so
+    one link accepts that many files of up to MAX_BYTES each.
+    """
     receive_ensure_dirs()
     now = int(time.time() if now is None else now)
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
+    if not 1 <= files <= RECEIVE_MAX_FILES:
+        raise ValueError("files must be between 1 and %d" % RECEIVE_MAX_FILES)
+
+    def fresh(slot, secret, **extra):
         record = {
             "version": RECEIVE_VERSION,
             "slot": slot,
@@ -288,23 +344,32 @@ def receive_create(ttl, max_bytes, now=None):
             "max_bytes": max_bytes,
             "status": "waiting",
         }
-        path = receive_record_path(slot)
+        record.update(extra)
+        return record
+
+    for _attempt in range(32):
+        slot = secrets.token_urlsafe(12)
+        # A leading "-" is URL-safe but argparse reads it as an option in
+        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+        # as ordinary positional arguments without requiring a hidden `--`.
+        if not slot[0].isalnum():
+            continue
+        secret = secrets.token_urlsafe(32)
+        record = fresh(slot, secret, files=files)
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
+            receive_store_new(record)
         except FileExistsError:
             continue
+        created = [slot]
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, sort_keys=True,
-                          separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            receive_fsync_dir(RECEIVE_STATE_DIR)
+            for index in range(1, files):
+                child, child_secret = receive_child(secret, index)
+                receive_store_new(fresh(child, child_secret, link=slot))
+                created.append(child)
         except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(path)
+            # Nobody holds the token yet, so no slot lock is needed.
+            for name in created:
+                receive_remove_locked(name)
             raise
         return slot, slot + "." + secret, record
     raise RuntimeError("could not allocate an upload slot")

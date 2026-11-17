@@ -152,9 +152,9 @@ class ReceiveHTTPTest(unittest.TestCase):
         status, headers, body = self.request("GET", self.page)
         self.assertEqual(status, 200)
         self.assertNotIn(self.token.encode(), body)
-        self.assertIn(b"one resumable upload", body)
-        self.assertIn(b"Drop a file here", body)
-        self.assertIn(b"event.dataTransfer.files", body)
+        self.assertIn(b"resumable uploads", body)
+        self.assertIn(b"Drop files here", body)
+        self.assertIn(b"dropped(event.dataTransfer)", body)
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
         self.assertIn("frame-ancestors 'none'",
                       headers["Content-Security-Policy"])
@@ -308,6 +308,54 @@ class ReceiveHTTPTest(unittest.TestCase):
         status, headers, _body = self.create("two.bin", 3)
         self.assertEqual(status, 409)
         self.assertEqual(headers["Location"], self.resource)
+
+    def test_one_link_carries_several_independent_file_slots(self):
+        slot, token, _record = daemon.receive_create(3600, 64 << 20, files=3)
+        secret = token.split(".", 1)[1]
+        lanes = [(slot, token)]
+        for index in (1, 2):
+            child, child_secret = daemon.receive_child(secret, index)
+            self.assertRegex(child, r"^[0-9a-f]{24}$")
+            lanes.append((child, child + "." + child_secret))
+        self.assertEqual(len({name for name, _ in lanes}), 3)
+        for number, (name, bearer) in enumerate(lanes):
+            headers = {"Authorization": "Bearer " + bearer,
+                       "Tus-Resumable": "1.0.0",
+                       "Upload-Length": "3",
+                       "Upload-Metadata": metadata(
+                           "f%d.bin" % number, 3, content=b"abc")}
+            path = "/alice/receive/%s/files" % name
+            self.assertEqual(
+                self.request("POST", path, headers=headers)[0], 201)
+            headers = {"Authorization": "Bearer " + bearer,
+                       "Tus-Resumable": "1.0.0", "Upload-Offset": "0",
+                       "Content-Type": "application/offset+octet-stream"}
+            self.assertEqual(self.request(
+                "PATCH", path + "/upload", body=b"abc",
+                headers=headers)[0], 204)
+        self.assertEqual(len(list(pathlib.Path(UPLOADS).glob("f*.bin"))), 3)
+        # A slot's token opens that slot and no other.
+        cross = {"Authorization": "Bearer " + lanes[1][1],
+                 "Tus-Resumable": "1.0.0"}
+        self.assertEqual(self.request(
+            "HEAD", "/alice/receive/%s/files/upload" % slot,
+            headers=cross)[0], 403)
+
+    def test_single_file_link_has_no_derived_slots(self):
+        secret = self.token.split(".", 1)[1]
+        child, child_secret = daemon.receive_child(secret, 1)
+        headers = {"Authorization": "Bearer %s.%s" % (child, child_secret),
+                   "Tus-Resumable": "1.0.0"}
+        status = self.request(
+            "HEAD", "/alice/receive/%s/files/upload" % child,
+            headers=headers)[0]
+        self.assertEqual(status, 403)
+        self.assertNotIn("link", self.record)
+
+    def test_file_count_is_bounded(self):
+        for files in (0, daemon.RECEIVE_MAX_FILES + 1):
+            with self.assertRaises(ValueError):
+                daemon.receive_create(3600, 1024, files=files)
 
     def test_size_limit_is_enforced_before_a_partial_is_created(self):
         record = daemon.receive_read(self.slot)
@@ -478,6 +526,44 @@ class ReceiveCLITest(unittest.TestCase):
         subprocess.run([sys.executable, assembled, "revoke", slot],
                        check=True, text=True, capture_output=True, env=env)
         self.assertFalse(os.path.exists(os.path.join(STATE, slot + ".json")))
+
+    def test_multi_file_link_lists_and_revokes_as_one(self):
+        assembled = os.path.join(WORK, "agent-box-receive.py")
+        with open(assembled, "w") as output:
+            subprocess.run([
+                sys.executable, str(REPO / "bin" / "assemble-module.py"),
+                "--resolve", str(REPO / "modules" / "src" / "receive-cli.py"),
+            ], check=True, stdout=output)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "HOME": WORK,
+               "AGENT_BOX_URL": "https://box.example/alice/",
+               "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
+               "AGENT_BOX_UPLOADS_DIR": UPLOADS}
+        shutil.rmtree(STATE, ignore_errors=True)
+
+        def run(*args, check=True):
+            return subprocess.run(
+                [sys.executable, assembled, *args], check=check, text=True,
+                capture_output=True, env=env)
+        made = run("--files", "4", "--json")
+        info = json.loads(made.stdout)
+        self.assertEqual(info["files"], 4)
+        slot = info["slot"]
+        names = sorted(n for n in os.listdir(STATE) if n.endswith(".json"))
+        self.assertEqual(len(names), 4)
+        listed = run("list").stdout.splitlines()
+        self.assertEqual(listed[0].split("\t")[-1], "LINK")
+        self.assertEqual(
+            sorted(line.split("\t")[-1] for line in listed[1:]),
+            sorted([slot] * 3 + ["-"]))
+        run("revoke", slot)
+        self.assertEqual(
+            [n for n in os.listdir(STATE) if n.endswith(".json")], [])
+        for bad in ("0", "101"):
+            refused = run("--files", bad, check=False)
+            self.assertNotEqual(refused.returncode, 0)
+        default = json.loads(run("--json").stdout)
+        self.assertEqual(default["files"], 10)
 
 
 if __name__ == "__main__":

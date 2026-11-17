@@ -1,14 +1,18 @@
 // Browser coverage for the temporary resumable receiver (issue #898).
 //
-// The link is minted on the target box, so this test is opt-in beside the
-// ordinary authenticated e2e suite:
+// The links are minted on the target box, so these tests are opt-in beside the
+// ordinary authenticated e2e suite. E2E_RECEIVE_URL comes from
+// `agent-box-receive --files 1`, E2E_RECEIVE_MULTI_URL from
+// `agent-box-receive --files 3`:
 //
 //   E2E_BASE_URL=https://box E2E_RECEIVE_URL='https://box/user/receive/.../#...'
+//     E2E_RECEIVE_MULTI_URL='https://box/user/receive/.../#...'
 //     playwright test -c tests/e2e tests/e2e/receive.spec.ts
 
 import { test, expect } from '@playwright/test';
 
 const receiveUrl = process.env.E2E_RECEIVE_URL;
+const multiUrl = process.env.E2E_RECEIVE_MULTI_URL;
 
 test('a dropped file resumes and the completed fast path checks content', async ({ page }) => {
   test.skip(!receiveUrl, 'E2E_RECEIVE_URL is not configured');
@@ -70,18 +74,6 @@ test('a dropped file resumes and the completed fast path checks content', async 
     await expect(drop).not.toHaveClass(/dragging/);
     await expect(page.locator('#prompt')).toHaveText('browser-resume.bin');
   };
-
-  // A multi-file drop must not bind the single-file link or send requests.
-  const multipleFiles = await page.evaluateHandle(() => {
-    const transfer = new DataTransfer();
-    transfer.items.add(new File(['first'], 'first.txt'));
-    transfer.items.add(new File(['second'], 'second.txt'));
-    return transfer;
-  });
-  await drop.dispatchEvent('drop', { dataTransfer: multipleFiles });
-  await multipleFiles.dispose();
-  await expect(page.locator('#status')).toHaveText('Choose exactly one file.');
-  expect(apiRequests).toHaveLength(0);
 
   await dropFile(0x5a);
   await expect(page.locator('#file')).toBeDisabled();
@@ -156,4 +148,56 @@ test('a dropped file resumes and the completed fast path checks content', async 
     expect(request.url).not.toContain(token);
     expect(request.url).not.toContain('#');
   }
+});
+
+test('several files upload from one link, resume by content, and report overflow', async ({ page }) => {
+  test.skip(!multiUrl, 'E2E_RECEIVE_MULTI_URL is not configured');
+  test.setTimeout(90_000);
+
+  const token = new URL(multiUrl!).hash.slice(1);
+  const requests: Array<{ method: string; auth?: string; url: string }> = [];
+  await page.route('**/files**', async route => {
+    const request = route.request();
+    requests.push({
+      method: request.method(),
+      auth: request.headers()['authorization'],
+      url: request.url(),
+    });
+    await route.continue();
+  });
+
+  await page.goto(multiUrl!);
+  await expect(page.locator('#file')).toHaveAttribute('multiple', '');
+  const pick = (names: string[], fill = 1) => page.locator('#file').setInputFiles(
+    names.map((name, index) => ({
+      name,
+      mimeType: 'text/plain',
+      buffer: Buffer.alloc(1024 + index, fill + index),
+    })));
+
+  await pick(['a.txt', 'b.txt']);
+  await expect(page.locator('#status')).toHaveText(
+    'Uploaded 2 of 2 files. You may close this page.', { timeout: 30_000 });
+  await expect(page.locator('#queue li.done')).toHaveCount(2);
+  await expect(page.locator('#file')).toBeEnabled();
+
+  // Each file travels on its own slot with its own derived bearer, and no
+  // request ever carries the link secret in its URL.
+  const bearers = new Set(requests.map(request => request.auth));
+  expect(bearers.size).toBeGreaterThanOrEqual(2);
+  expect(requests[0].auth).toBe('Bearer ' + token);
+  for (const request of requests) expect(request.url).not.toContain(token);
+
+  // The same bytes are matched to their slots and sent only once. Two new
+  // files then exceed the remaining slot, and the last one is refused.
+  const patches = () => requests.filter(request => request.method === 'PATCH').length;
+  const before = patches();
+  await page.reload();
+  await pick(['a.txt', 'b.txt', 'c.txt', 'd.txt']);
+  await expect(page.locator('#status')).toHaveText(
+    'Uploaded 3 of 4 files.', { timeout: 30_000 });
+  expect(patches()).toBe(before + 1);
+  await expect(page.locator('#queue li.error')).toHaveCount(1);
+  await expect(page.locator('#queue li.error')).toContainText(
+    'accepts at most 3 files');
 });
