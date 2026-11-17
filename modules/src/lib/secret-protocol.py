@@ -19,12 +19,18 @@ import base64
 import binascii
 import contextlib
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets as _secrets_rng
 import socket
 import stat
+import string
 import struct
+import time
+import urllib.parse
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -70,7 +76,29 @@ SECRET_MAX_NAMESPACES_PER_USER = 128
 PROFILES_DIR_PARTS = (".config", "agent-box", "profiles")
 DEFAULT_PROFILE_FILE = ".default"
 
-SECRET_OPS = ("list", "set", "remove", "exec", "status", "cancel")
+SECRET_OPS = ("list", "set", "remove", "exec", "status", "cancel",
+              "generate", "fill", "save-cookies", "load-cookies")
+# What a record's value IS, which decides what the broker hands out for it:
+#   value   - the plain value (the default; every record written before
+#             kinds existed reads as this one)
+#   totp    - a TOTP seed (base32, or an otpauth:// URI). exec and fill get
+#             the CURRENT one-time code; the seed itself never leaves the
+#             broker, not even into a job.
+#   cookies - a browser session: {"cookies": [...], "origins": []}, the
+#             shape Playwright's storageState uses, so an exec job can hand
+#             it straight to `browser.new_context(storage_state=...)`.
+SECRET_KINDS = ("value", "totp", "cookies")
+SECRET_MAX_ORIGINS = 8
+SECRET_MAX_ORIGIN_LEN = 256
+SECRET_MAX_SELECTOR_LEN = 1024
+SECRET_MAX_COOKIES = 300
+SECRET_GENERATE_DEFAULT_LENGTH = 24
+SECRET_GENERATE_MIN_LENGTH = 12
+SECRET_GENERATE_MAX_LENGTH = 128
+# Symbols every site we have met accepts in a password: no quote, backslash,
+# slash, backtick, pipe or space, which are the ones forms and shells mangle.
+SECRET_GENERATE_SYMBOLS = "!#$%&()*+,-.:;<=>?@[]^_{}~"
+CDP_TARGET_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,%d}$" % SECRET_MAX_IDEMPOTENCY_LEN)
 
@@ -216,12 +244,17 @@ def validate_request(req):
         raise SecretError("unknown operation")
     allowed = {
         "list": {"op", "profile"},
-        "set": {"op", "profile", "name", "value"},
+        "set": {"op", "profile", "name", "value", "kind", "origins", "fillOnly"},
         "remove": {"op", "profile", "name"},
         "exec": {"op", "profile", "argv", "command", "shell", "secretNames",
                  "cwd", "env", "timeoutMs", "idempotencyKey"},
         "status": {"op", "profile", "jobId"},
         "cancel": {"op", "profile", "jobId"},
+        "generate": {"op", "profile", "name", "length", "symbols", "origins", "fillOnly"},
+        "fill": {"op", "profile", "name", "cdpPort", "targetId", "selector", "timeoutMs"},
+        "save-cookies": {"op", "profile", "name", "cdpPort", "targetId", "origins",
+                         "fillOnly", "timeoutMs"},
+        "load-cookies": {"op", "profile", "name", "cdpPort", "targetId", "timeoutMs"},
     }[op]
     if set(req) - allowed:
         raise SecretError("unexpected field")
@@ -230,10 +263,29 @@ def validate_request(req):
     # before building the request at all.
     if not valid_profile(req.get("profile")):
         raise SecretError("invalid profile")
-    if op in ("set", "remove") and not valid_secret_name(req.get("name")):
+    if op in ("set", "remove", "generate", "fill", "save-cookies", "load-cookies") \
+            and not valid_secret_name(req.get("name")):
         raise SecretError("invalid name")
     if op == "set" and not valid_secret_value(req.get("value")):
         raise SecretError("invalid value")
+    if op in ("set", "generate", "save-cookies"):
+        _validate_meta_fields(op, req)
+    if op == "set":
+        kind = req.get("kind", "value")
+        if kind == "totp":
+            parse_totp(req["value"])
+        elif kind == "cookies":
+            parse_cookie_state(req["value"])
+    if op == "generate":
+        length = req.get("length", SECRET_GENERATE_DEFAULT_LENGTH)
+        if (not isinstance(length, int) or isinstance(length, bool)
+                or not SECRET_GENERATE_MIN_LENGTH <= length <= SECRET_GENERATE_MAX_LENGTH):
+            raise SecretError("invalid length (%d-%d)" % (
+                SECRET_GENERATE_MIN_LENGTH, SECRET_GENERATE_MAX_LENGTH))
+        if not isinstance(req.get("symbols", True), bool):
+            raise SecretError("invalid symbols")
+    if op in ("fill", "save-cookies", "load-cookies"):
+        _validate_browser_fields(op, req)
     if op in ("status", "cancel"):
         job_id = req.get("jobId")
         if not isinstance(job_id, str) or not re.match(r"^[A-Za-z0-9_-]{1,64}$", job_id):
@@ -241,6 +293,175 @@ def validate_request(req):
     if op == "exec":
         _validate_exec_request(req)
     return op
+
+
+def normalize_origin(text):
+    """Reduce a URL to the web origin a browser reports for it - scheme,
+    lower-case host, and a port only when it is not the scheme's default -
+    which is exactly the string Chromium puts in a frame's securityOrigin,
+    so a fill compares two strings and nothing else. https always; http
+    only for a loopback host, where a local test server lives. A host that
+    is not plain ASCII is refused rather than guessed at: give its punycode
+    (xn--) form, which is what the browser reports."""
+    if not isinstance(text, str) or not text or len(text) > SECRET_MAX_ORIGIN_LEN:
+        raise SecretError("invalid origin")
+    try:
+        parts = urllib.parse.urlsplit(text.strip())
+        port = parts.port
+    except ValueError:
+        raise SecretError(f"invalid origin: {text}")
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if not host or not host.isascii() or parts.username or parts.password:
+        raise SecretError(f"invalid origin: {text}")
+    if not re.match(r"^[a-z0-9.:\[\]-]+$", host):
+        raise SecretError(f"invalid origin: {text}")
+    loopback = host in ("localhost", "127.0.0.1", "::1")
+    if scheme != "https" and not (scheme == "http" and loopback):
+        raise SecretError(f"origin must be https (http only for localhost): {text}")
+    default_port = 443 if scheme == "https" else 80
+    shown_host = f"[{host}]" if ":" in host else host
+    if port is not None and port != default_port:
+        return f"{scheme}://{shown_host}:{port}"
+    return f"{scheme}://{shown_host}"
+
+
+def _validate_meta_fields(op, req):
+    kind = req.get("kind", "value")
+    if kind not in SECRET_KINDS:
+        raise SecretError("invalid kind")
+    origins = req.get("origins", [])
+    if (not isinstance(origins, list) or len(origins) > SECRET_MAX_ORIGINS
+            or any(normalize_origin(o) != o for o in origins)):
+        # The client normalizes; the broker only accepts what normalizing
+        # would not change, so what list shows is exactly what fill matches.
+        raise SecretError("invalid origins (give normalized origins, at most %d)"
+                          % SECRET_MAX_ORIGINS)
+    fill_only = req.get("fillOnly", False)
+    if not isinstance(fill_only, bool):
+        raise SecretError("invalid fillOnly")
+    if fill_only and not origins:
+        raise SecretError("fillOnly needs at least one origin")
+    if op == "save-cookies" and not origins:
+        raise SecretError("save-cookies needs at least one origin")
+
+
+def _validate_browser_fields(op, req):
+    port = req.get("cdpPort")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise SecretError("invalid cdpPort")
+    if "targetId" in req and not (isinstance(req["targetId"], str)
+                                  and CDP_TARGET_ID_RE.match(req["targetId"])):
+        raise SecretError("invalid targetId")
+    if op == "fill":
+        selector = req.get("selector")
+        if (not isinstance(selector, str) or not selector or "\0" in selector
+                or len(selector.encode("utf-8")) > SECRET_MAX_SELECTOR_LEN):
+            raise SecretError("invalid selector")
+    if "timeoutMs" in req:
+        timeout = req["timeoutMs"]
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or not (0 < timeout <= SECRET_MAX_TIMEOUT_MS):
+            raise SecretError("invalid timeoutMs")
+
+
+def record_meta_from_request(req, kind=None):
+    """The non-secret metadata a set/generate/save-cookies request asks the
+    record to carry. Only non-default fields are kept, so a plain `set`
+    writes a record byte-for-byte shaped like the ones before kinds."""
+    meta = {}
+    kind = kind or req.get("kind", "value")
+    if kind != "value":
+        meta["kind"] = kind
+    if req.get("origins"):
+        meta["origins"] = list(req["origins"])
+    if req.get("fillOnly"):
+        meta["fillOnly"] = True
+    return meta
+
+
+# --- TOTP (RFC 6238) ----------------------------------------------------------
+
+
+def parse_totp(value):
+    """(key, digits, period, algorithm) from a base32 seed or an
+    otpauth://totp/ URI - the two shapes a site's "set up your
+    authenticator" page offers. Refuses anything else, so a typo is caught
+    when the seed is stored rather than at the first login."""
+    text = value.strip()
+    digits, period, algorithm = 6, 30, "SHA1"
+    if text.lower().startswith("otpauth://"):
+        parts = urllib.parse.urlsplit(text)
+        if parts.netloc.lower() != "totp":
+            raise SecretError("only otpauth://totp/ URIs are supported")
+        query = urllib.parse.parse_qs(parts.query)
+        seed = (query.get("secret") or [""])[0]
+        try:
+            digits = int((query.get("digits") or ["6"])[0])
+            period = int((query.get("period") or ["30"])[0])
+        except ValueError:
+            raise SecretError("invalid TOTP parameters")
+        algorithm = (query.get("algorithm") or ["SHA1"])[0].upper()
+    else:
+        seed = text
+    seed = re.sub(r"[\s-]", "", seed).upper()
+    if not seed or not re.match(r"^[A-Z2-7]+=*$", seed):
+        raise SecretError("invalid TOTP seed (expected base32)")
+    try:
+        key = base64.b32decode(seed.rstrip("=") + "=" * (-len(seed.rstrip("=")) % 8))
+    except (binascii.Error, ValueError):
+        raise SecretError("invalid TOTP seed (expected base32)")
+    if not key or digits not in (6, 7, 8) or not 15 <= period <= 120 \
+            or algorithm not in ("SHA1", "SHA256", "SHA512"):
+        raise SecretError("invalid TOTP parameters")
+    return key, digits, period, algorithm
+
+
+def totp_code(value, now=None):
+    key, digits, period, algorithm = parse_totp(value)
+    counter = int((time.time() if now is None else now) // period)
+    mac = hmac.new(key, struct.pack(">Q", counter),
+                   getattr(hashlib, algorithm.lower())).digest()
+    offset = mac[-1] & 0x0F
+    code = (struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+# --- Generated passwords and stored browser sessions -----------------------------
+
+
+def generate_password(length=SECRET_GENERATE_DEFAULT_LENGTH, symbols=True):
+    """A random password with at least one character of every class it
+    draws from, because most sign-up forms refuse one without."""
+    classes = [string.ascii_lowercase, string.ascii_uppercase, string.digits]
+    if symbols:
+        classes.append(SECRET_GENERATE_SYMBOLS)
+    alphabet = "".join(classes)
+    while True:
+        candidate = "".join(_secrets_rng.choice(alphabet) for _ in range(length))
+        if all(any(ch in cls for ch in candidate) for cls in classes):
+            return candidate
+
+
+COOKIE_FIELDS = ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
+
+
+def parse_cookie_state(value):
+    """A stored browser session: Playwright's storageState shape, cookies
+    only. Returns the cookie list; refuses anything else so a load never
+    hands the browser something it did not come from."""
+    try:
+        state = json.loads(value)
+    except ValueError:
+        raise SecretError("cookies value is not JSON")
+    cookies = state.get("cookies") if isinstance(state, dict) else None
+    if not isinstance(cookies, list) or len(cookies) > SECRET_MAX_COOKIES:
+        raise SecretError("cookies value needs a \"cookies\" list")
+    for cookie in cookies:
+        if (not isinstance(cookie, dict) or not isinstance(cookie.get("name"), str)
+                or not isinstance(cookie.get("value"), str)
+                or not isinstance(cookie.get("domain"), str)):
+            raise SecretError("each cookie needs name, value and domain")
+    return cookies
 
 
 def _validate_exec_request(req):
@@ -528,15 +749,18 @@ class Store:
             if not entry.endswith(".rec") or not valid_secret_name(entry[:-4]):
                 continue
             rec = self._read(entry) or {}
-            out.append({"name": entry[:-4], "version": rec.get("version", 0),
-                        "configured": not rec.get("tombstone", False)})
+            item = {"name": entry[:-4], "version": rec.get("version", 0),
+                    "configured": not rec.get("tombstone", False)}
+            if item["configured"]:
+                item.update(_public_meta(rec))
+            out.append(item)
         return out
 
     def _name_count(self):
         return sum(1 for entry in os.listdir(self.dir_fd)
                    if entry.endswith(".rec") and valid_secret_name(entry[:-4]))
 
-    def set(self, name, value):
+    def set(self, name, value, meta=None):
         lock = self._locked()
         try:
             old = self._read(name + ".rec") or {}
@@ -547,11 +771,19 @@ class Store:
                 raise SecretError("too many secrets")
             version = _next_version(old)
             nonce, ct = _encrypt(self._key, _aad(self.user, self.namespace, name, version), value)
-            self._write(name + ".rec", {
+            record = {
                 "version": version,
                 "nonce": base64.b64encode(nonce).decode("ascii"),
                 "ct": base64.b64encode(ct).decode("ascii"),
-            })
+            }
+            if meta:
+                # Plaintext on purpose: list() shows it without decrypting.
+                # It is root-only like the ciphertext, and it changes only
+                # together with the value (set/generate/save-cookies), so a
+                # caller cannot move a fill-only secret to a new origin
+                # without also replacing what the old origin knew.
+                record["meta"] = meta
+            self._write(name + ".rec", record)
             return version
         finally:
             os.close(lock)
@@ -577,6 +809,14 @@ class Store:
         aad = _aad(self.user, self.namespace, name, version)
         return _decrypt(self._key, aad, nonce, ct)
 
+    def meta(self, name):
+        """The record's non-secret metadata, defaults filled in, or None for
+        a name that is missing or removed. Never decrypts anything."""
+        rec = self._read(name + ".rec")
+        if rec is None or rec.get("tombstone"):
+            return None
+        return _public_meta(rec)
+
     def remove(self, name):
         """Delete the value but keep a tombstone, so a retired name stays
         protected rather than reappearing from a stale legacy copy."""
@@ -592,6 +832,17 @@ class Store:
             os.close(lock)
 
 
+def _public_meta(rec):
+    meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+    kind = meta.get("kind", "value")
+    origins = meta.get("origins", [])
+    return {
+        "kind": kind if kind in SECRET_KINDS else "value",
+        "origins": [o for o in origins if isinstance(o, str)] if isinstance(origins, list) else [],
+        "fillOnly": meta.get("fillOnly") is True,
+    }
+
+
 def handle_request(store, req):
     """Handles the non-exec ops. exec/status/cancel are dispatched by the
     broker directly (they need the job manager, not just a Store)."""
@@ -599,7 +850,13 @@ def handle_request(store, req):
     if op == "list":
         return {"ok": True, "secrets": store.list()[:SECRET_MAX_NAMES]}
     if op == "set":
-        return {"ok": True, "version": store.set(req["name"], req["value"])}
+        return {"ok": True, "version": store.set(req["name"], req["value"],
+                                                 record_meta_from_request(req))}
+    if op == "generate":
+        value = generate_password(req.get("length", SECRET_GENERATE_DEFAULT_LENGTH),
+                                  req.get("symbols", True))
+        return {"ok": True, "version": store.set(req["name"], value,
+                                                 record_meta_from_request(req))}
     if op == "remove":
         return {"ok": True, "version": store.remove(req["name"])}
     raise SecretError("unsupported here")

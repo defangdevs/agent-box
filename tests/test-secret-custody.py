@@ -139,7 +139,8 @@ class Custody(unittest.TestCase):
         seen.append(self.broker.ask({"op": "list"}))
         self.assertNotIn(CANARY, repr(seen))
         self.assertEqual(seen[1]["secrets"],
-                         [{"name": "TOKEN", "version": 1, "configured": True}])
+                         [{"name": "TOKEN", "version": 1, "configured": True,
+                       "kind": "value", "origins": [], "fillOnly": False}])
         self.assertEqual(seen[3]["secrets"],
                          [{"name": "TOKEN", "version": 2, "configured": False}])
 
@@ -785,6 +786,299 @@ class Bounds(unittest.TestCase):
         # The retention sweep frees the slots again.
         manager.sweep(-1)
         manager.start("p", dict(req), lambda name: None)
+
+
+TOTP_RFC_SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"  # "12345678901234567890"
+
+
+class WebsiteSecrets(unittest.TestCase):
+    """Metadata, generated passwords, TOTP and fill-only (no browser)."""
+
+    @classmethod
+    def setUpClass(cls):
+        check_crypto_available()
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.broker = Broker(self.tmp)
+        self.addCleanup(self.broker.stop)
+
+    def run_exec(self, names, script):
+        resp = self.broker.ask({"op": "exec", "argv": ["sh", "-c", script],
+                                "secretNames": names, "cwd": self.tmp})
+        self.assertTrue(resp["ok"], resp)
+        return self.broker.wait_job(resp["jobId"])
+
+    def test_totp_matches_rfc6238_vectors(self):
+        uri = f"otpauth://totp/x?secret={TOTP_RFC_SEED}&digits=8"
+        self.assertEqual(ns["totp_code"](uri, now=59), "94287082")
+        self.assertEqual(ns["totp_code"](uri, now=1111111109), "07081804")
+        self.assertEqual(ns["totp_code"](TOTP_RFC_SEED.lower(), now=59), "287082")
+
+    def test_normalize_origin(self):
+        norm = ns["normalize_origin"]
+        self.assertEqual(norm("https://Example.COM/login?x=1"), "https://example.com")
+        self.assertEqual(norm("https://example.com:443"), "https://example.com")
+        self.assertEqual(norm("https://example.com:8443/"), "https://example.com:8443")
+        self.assertEqual(norm("http://127.0.0.1:8080/x"), "http://127.0.0.1:8080")
+        for bad in ("http://example.com", "ftp://example.com", "https://user@example.com",
+                    "https://exämple.com", "example.com", ""):
+            with self.assertRaises(ns["SecretError"], msg=bad):
+                norm(bad)
+
+    def test_generate_stores_a_value_nobody_sees(self):
+        resp = self.broker.ask({"op": "generate", "name": "PW", "length": 32})
+        self.assertTrue(resp["ok"], resp)
+        out = os.path.join(self.tmp, "pw")
+        status = self.run_exec(["PW"], f'printf %s "$PW" > {out}')
+        self.assertEqual(status["state"], "done", status)
+        value = Path(out).read_text()
+        self.assertEqual(len(value), 32)
+        for cls in ("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0123456789",
+                    ns["SECRET_GENERATE_SYMBOLS"]):
+            self.assertTrue(any(ch in cls for ch in value), cls)
+        self.assertNotIn(value, json.dumps(resp))
+
+    def test_origins_and_fill_only_show_in_list_and_block_exec(self):
+        resp = self.broker.ask({"op": "generate", "name": "SITE_PW",
+                                "origins": ["https://example.com"], "fillOnly": True})
+        self.assertTrue(resp["ok"], resp)
+        listed = self.broker.ask({"op": "list"})["secrets"]
+        self.assertEqual(listed, [{"name": "SITE_PW", "version": 1, "configured": True,
+                                   "kind": "value", "origins": ["https://example.com"],
+                                   "fillOnly": True}])
+        status = self.run_exec(["SITE_PW"], 'printf %s "$SITE_PW"')
+        self.assertEqual(status["state"], "error")
+        self.assertIn("fill-only", status["stderr"])
+        self.assertEqual(status["stdout"], "")
+
+    def test_meta_refusals(self):
+        for req in (
+            {"op": "set", "name": "A", "value": "v", "fillOnly": True},
+            {"op": "set", "name": "A", "value": "v", "origins": ["https://Example.com/"]},
+            {"op": "set", "name": "A", "value": "v", "kind": "bogus"},
+            {"op": "set", "name": "A", "value": "not base32!", "kind": "totp"},
+            {"op": "set", "name": "A", "value": "[]", "kind": "cookies"},
+            {"op": "generate", "name": "A", "length": 4},
+            {"op": "fill", "name": "A", "cdpPort": 0, "selector": "#p"},
+            {"op": "fill", "name": "A", "cdpPort": 9222},
+            {"op": "fill", "name": "A", "cdpPort": 9222, "selector": "#p", "targetId": "../x"},
+            {"op": "save-cookies", "name": "A", "cdpPort": 9222},
+        ):
+            resp = self.broker.ask(req)
+            self.assertFalse(resp["ok"], req)
+
+    def test_totp_exec_gets_the_code_never_the_seed(self):
+        self.broker.ask({"op": "set", "name": "OTP", "value": TOTP_RFC_SEED, "kind": "totp"})
+        out = os.path.join(self.tmp, "otp")
+        status = self.run_exec(["OTP"], f'printf %s "$OTP" > {out}')
+        self.assertEqual(status["state"], "done", status)
+        code = Path(out).read_text()
+        self.assertRegex(code, r"^[0-9]{6}$")
+        # Allow for a 30-second step boundary between the job and this check.
+        now = time.time()
+        self.assertIn(code, {ns["totp_code"](TOTP_RFC_SEED, now=t) for t in (now - 30, now)})
+
+    def test_fill_needs_origins_and_the_right_kind(self):
+        self.broker.ask({"op": "set", "name": "PLAIN", "value": "v"})
+        resp = self.broker.ask({"op": "fill", "name": "PLAIN", "cdpPort": 9, "selector": "#p"})
+        self.assertFalse(resp["ok"])
+        self.assertIn("no origins", resp["error"])
+        resp = self.broker.ask({"op": "load-cookies", "name": "PLAIN", "cdpPort": 9})
+        self.assertFalse(resp["ok"])
+
+    def test_cli_generate_with_origin_is_fill_only(self):
+        cli = Path(self.tmp) / "cli.py"
+        cli.write_text(CLI)
+
+        def run(*args, stdin=None):
+            return subprocess.run([PYBIN, "-I", str(cli), "--socket",
+                                   self.broker.sock, "--profile", "testprofile", *args],
+                                  input=stdin, capture_output=True, text=True)
+        made = run("generate", "SITE_PW", "--origin", "https://Example.com/signup")
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertEqual(run("set", "OTP", "--stdin", "--totp", "--origin", "https://example.com",
+                             stdin=TOTP_RFC_SEED + "\n").returncode, 0)
+        self.assertEqual(run("generate", "DB_PW", "--no-symbols").returncode, 0)
+        listed = run("list").stdout
+        self.assertIn("SITE_PW\tv1\tconfigured\tfill-only\thttps://example.com", listed)
+        self.assertIn("OTP\tv1\tconfigured\ttotp\tfill-only\thttps://example.com", listed)
+        self.assertIn("DB_PW\tv1\tconfigured\n", listed)
+        refused = run("exec", "--secret", "SITE_PW", "--", "true")
+        self.assertEqual(refused.returncode, 0)  # exec only starts a job
+        status = self.broker.wait_job(refused.stdout.strip())
+        self.assertIn("fill-only", status["stderr"])
+        bad = run("generate", "X", "--origin", "http://example.com")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("https", bad.stderr)
+
+    def test_fill_with_no_browser_fails_cleanly(self):
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": ["https://example.com"], "fillOnly": True})
+        port = socket.socket()
+        port.bind(("127.0.0.1", 0))
+        free = port.getsockname()[1]
+        port.close()
+        resp = self.broker.ask({"op": "fill", "name": "PW", "cdpPort": free, "selector": "#p"})
+        self.assertTrue(resp["ok"], resp)
+        status = self.broker.wait_job(resp["jobId"])
+        self.assertEqual(status["state"], "error")
+        self.assertIn("no DevTools endpoint", status["stderr"])
+        self.assertNotIn(CANARY, json.dumps(status))
+
+
+def find_chromium():
+    for candidate in (os.environ.get("AGENT_BOX_TEST_CHROMIUM"),
+                      os.path.expanduser("~/browser/chromium/bin/chromium"),
+                      "/opt/pw-browsers/chromium",
+                      shutil.which("chromium"), shutil.which("chromium-browser")):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+class BrowserJobs(unittest.TestCase):
+    """fill / save-cookies / load-cookies against a real headless Chromium
+    and a real local page. Skipped when no Chromium is found (set
+    AGENT_BOX_TEST_CHROMIUM)."""
+
+    @classmethod
+    def setUpClass(cls):
+        check_crypto_available()
+        cls.chromium = find_chromium()
+        if not cls.chromium:
+            raise unittest.SkipTest("no chromium (set AGENT_BOX_TEST_CHROMIUM)")
+        cls.tmp = tempfile.mkdtemp()
+        page = os.path.join(cls.tmp, "site")
+        os.mkdir(page)
+        Path(page, "login.html").write_text(
+            "<form><input id=user><input id=pw type=password><div id=d>x</div></form>")
+        cls.http = subprocess.Popen(
+            [sys.executable, "-I", "-c", (
+                "import http.server, sys\n"
+                "class H(http.server.SimpleHTTPRequestHandler):\n"
+                "    def end_headers(self):\n"
+                "        self.send_header('Set-Cookie', 'sid=s3ss10n-c00kie; Path=/; Max-Age=3600')\n"
+                "        super().end_headers()\n"
+                "    def log_message(self, *a): pass\n"
+                "s = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)\n"
+                "print(s.server_address[1], flush=True)\n"
+                "s.serve_forever()\n")],
+            cwd=page, stdout=subprocess.PIPE)
+        cls.http_port = int(cls.http.stdout.readline())
+        cls.origin = f"http://127.0.0.1:{cls.http_port}"
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        cls.cdp_port = sock.getsockname()[1]
+        sock.close()
+        cls.browser = subprocess.Popen(
+            [cls.chromium, "--headless=new", "--no-sandbox", "--disable-gpu",
+             f"--remote-debugging-port={cls.cdp_port}",
+             f"--user-data-dir={os.path.join(cls.tmp, 'profile')}",
+             f"{cls.origin}/login.html"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.wns = {"__name__": "worker_lib"}
+        exec(compile(WORKER, "worker.py", "exec"), cls.wns)
+        deadline = time.time() + 30
+        while True:
+            try:
+                pages = [t for t in cls.wns["_http_json"](cls.cdp_port, "/json/list")
+                         if t.get("type") == "page" and t.get("url", "").startswith(cls.origin)]
+                if pages:
+                    cls.target = pages[0]["id"]
+                    break
+            except Exception:  # noqa: BLE001 - not up yet
+                pass
+            if time.time() > deadline:
+                raise RuntimeError("chromium did not come up")
+            time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        for proc in (cls.browser, cls.http):
+            proc.kill()
+            proc.wait()
+        cls.http.stdout.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        self.btmp = tempfile.mkdtemp()
+        self.broker = Broker(self.btmp)
+        self.addCleanup(self.broker.stop)
+
+    def cdp(self):
+        conn = self.wns["Cdp"](self.cdp_port, self.target)
+        self.addCleanup(conn.close)
+        return conn
+
+    def page_eval(self, expression):
+        return self.cdp().call("Runtime.evaluate", expression=expression,
+                               returnByValue=True)["result"].get("value")
+
+    def run_job(self, req):
+        req = dict(req, cdpPort=self.cdp_port, targetId=self.target)
+        resp = self.broker.ask(req)
+        self.assertTrue(resp["ok"], resp)
+        return self.broker.wait_job(resp["jobId"], timeout=20)
+
+    def test_fill_types_the_value_on_a_matching_origin(self):
+        self.page_eval("document.getElementById('pw').value = 'old'")
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#pw"})
+        self.assertEqual(status["state"], "done", status)
+        self.assertNotIn(CANARY, json.dumps(status))
+        # select() first, so the old text is replaced rather than appended to.
+        self.assertEqual(self.page_eval("document.getElementById('pw').value"), CANARY)
+
+    def test_fill_refuses_another_origin_and_types_nothing(self):
+        self.page_eval("document.getElementById('user').value = ''")
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": ["https://example.com"], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#user"})
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["exitCode"], 3)
+        self.assertIn("refused", status["stderr"])
+        self.assertIn(self.origin, status["stderr"])
+        self.assertEqual(self.page_eval("document.getElementById('user').value"), "")
+
+    def test_fill_refuses_a_non_input(self):
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#d"})
+        self.assertEqual(status["state"], "error")
+        self.assertIn("not an input", status["stderr"])
+
+    def test_fill_totp_types_the_current_code(self):
+        self.broker.ask({"op": "set", "name": "OTP", "value": TOTP_RFC_SEED, "kind": "totp",
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "OTP", "selector": "#user"})
+        self.assertEqual(status["state"], "done", status)
+        typed = self.page_eval("document.getElementById('user').value")
+        now = time.time()
+        self.assertIn(typed, {ns["totp_code"](TOTP_RFC_SEED, now=t) for t in (now - 30, now)})
+
+    def test_cookies_round_trip_and_never_reach_the_caller(self):
+        self.page_eval("location.reload()")
+        time.sleep(1)
+        status = self.run_job({"op": "save-cookies", "name": "SESSION",
+                               "origins": [self.origin], "fillOnly": True})
+        self.assertEqual(status["state"], "done", status)
+        self.assertNotIn("s3ss10n", json.dumps(status))
+        self.assertIn("saved 1 cookies", status["stdout"])
+        listed = self.broker.ask({"op": "list"})["secrets"]
+        self.assertEqual(listed[0]["kind"], "cookies")
+        self.assertTrue(listed[0]["fillOnly"])
+
+        self.cdp().call("Network.clearBrowserCookies")
+        self.assertNotIn("s3ss10n", self.page_eval("document.cookie"))
+        status = self.run_job({"op": "load-cookies", "name": "SESSION"})
+        self.assertEqual(status["state"], "done", status)
+        self.assertIn("s3ss10n-c00kie", self.page_eval("document.cookie"))
+
+        # exec refuses a fill-only session...
+        resp = self.broker.ask({"op": "exec", "argv": ["true"], "secretNames": ["SESSION"]})
+        self.assertEqual(self.broker.wait_job(resp["jobId"])["state"], "error")
 
 
 if __name__ == "__main__":

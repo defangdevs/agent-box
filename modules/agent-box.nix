@@ -3487,12 +3487,18 @@ import base64
 import binascii
 import contextlib
 import fcntl
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets as _secrets_rng
 import socket
 import stat
+import string
 import struct
+import time
+import urllib.parse
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -3538,7 +3544,29 @@ SECRET_MAX_NAMESPACES_PER_USER = 128
 PROFILES_DIR_PARTS = (".config", "agent-box", "profiles")
 DEFAULT_PROFILE_FILE = ".default"
 
-SECRET_OPS = ("list", "set", "remove", "exec", "status", "cancel")
+SECRET_OPS = ("list", "set", "remove", "exec", "status", "cancel",
+              "generate", "fill", "save-cookies", "load-cookies")
+# What a record's value IS, which decides what the broker hands out for it:
+#   value   - the plain value (the default; every record written before
+#             kinds existed reads as this one)
+#   totp    - a TOTP seed (base32, or an otpauth:// URI). exec and fill get
+#             the CURRENT one-time code; the seed itself never leaves the
+#             broker, not even into a job.
+#   cookies - a browser session: {"cookies": [...], "origins": []}, the
+#             shape Playwright's storageState uses, so an exec job can hand
+#             it straight to `browser.new_context(storage_state=...)`.
+SECRET_KINDS = ("value", "totp", "cookies")
+SECRET_MAX_ORIGINS = 8
+SECRET_MAX_ORIGIN_LEN = 256
+SECRET_MAX_SELECTOR_LEN = 1024
+SECRET_MAX_COOKIES = 300
+SECRET_GENERATE_DEFAULT_LENGTH = 24
+SECRET_GENERATE_MIN_LENGTH = 12
+SECRET_GENERATE_MAX_LENGTH = 128
+# Symbols every site we have met accepts in a password: no quote, backslash,
+# slash, backtick, pipe or space, which are the ones forms and shells mangle.
+SECRET_GENERATE_SYMBOLS = "!#$%&()*+,-.:;<=>?@[]^_{}~"
+CDP_TARGET_ID_RE = re.compile(r"^[A-Za-z0-9]{1,64}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\Z")
 IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,%d}$" % SECRET_MAX_IDEMPOTENCY_LEN)
 
@@ -3684,12 +3712,17 @@ def validate_request(req):
         raise SecretError("unknown operation")
     allowed = {
         "list": {"op", "profile"},
-        "set": {"op", "profile", "name", "value"},
+        "set": {"op", "profile", "name", "value", "kind", "origins", "fillOnly"},
         "remove": {"op", "profile", "name"},
         "exec": {"op", "profile", "argv", "command", "shell", "secretNames",
                  "cwd", "env", "timeoutMs", "idempotencyKey"},
         "status": {"op", "profile", "jobId"},
         "cancel": {"op", "profile", "jobId"},
+        "generate": {"op", "profile", "name", "length", "symbols", "origins", "fillOnly"},
+        "fill": {"op", "profile", "name", "cdpPort", "targetId", "selector", "timeoutMs"},
+        "save-cookies": {"op", "profile", "name", "cdpPort", "targetId", "origins",
+                         "fillOnly", "timeoutMs"},
+        "load-cookies": {"op", "profile", "name", "cdpPort", "targetId", "timeoutMs"},
     }[op]
     if set(req) - allowed:
         raise SecretError("unexpected field")
@@ -3698,10 +3731,29 @@ def validate_request(req):
     # before building the request at all.
     if not valid_profile(req.get("profile")):
         raise SecretError("invalid profile")
-    if op in ("set", "remove") and not valid_secret_name(req.get("name")):
+    if op in ("set", "remove", "generate", "fill", "save-cookies", "load-cookies") \
+            and not valid_secret_name(req.get("name")):
         raise SecretError("invalid name")
     if op == "set" and not valid_secret_value(req.get("value")):
         raise SecretError("invalid value")
+    if op in ("set", "generate", "save-cookies"):
+        _validate_meta_fields(op, req)
+    if op == "set":
+        kind = req.get("kind", "value")
+        if kind == "totp":
+            parse_totp(req["value"])
+        elif kind == "cookies":
+            parse_cookie_state(req["value"])
+    if op == "generate":
+        length = req.get("length", SECRET_GENERATE_DEFAULT_LENGTH)
+        if (not isinstance(length, int) or isinstance(length, bool)
+                or not SECRET_GENERATE_MIN_LENGTH <= length <= SECRET_GENERATE_MAX_LENGTH):
+            raise SecretError("invalid length (%d-%d)" % (
+                SECRET_GENERATE_MIN_LENGTH, SECRET_GENERATE_MAX_LENGTH))
+        if not isinstance(req.get("symbols", True), bool):
+            raise SecretError("invalid symbols")
+    if op in ("fill", "save-cookies", "load-cookies"):
+        _validate_browser_fields(op, req)
     if op in ("status", "cancel"):
         job_id = req.get("jobId")
         if not isinstance(job_id, str) or not re.match(r"^[A-Za-z0-9_-]{1,64}$", job_id):
@@ -3709,6 +3761,175 @@ def validate_request(req):
     if op == "exec":
         _validate_exec_request(req)
     return op
+
+
+def normalize_origin(text):
+    """Reduce a URL to the web origin a browser reports for it - scheme,
+    lower-case host, and a port only when it is not the scheme's default -
+    which is exactly the string Chromium puts in a frame's securityOrigin,
+    so a fill compares two strings and nothing else. https always; http
+    only for a loopback host, where a local test server lives. A host that
+    is not plain ASCII is refused rather than guessed at: give its punycode
+    (xn--) form, which is what the browser reports."""
+    if not isinstance(text, str) or not text or len(text) > SECRET_MAX_ORIGIN_LEN:
+        raise SecretError("invalid origin")
+    try:
+        parts = urllib.parse.urlsplit(text.strip())
+        port = parts.port
+    except ValueError:
+        raise SecretError(f"invalid origin: {text}")
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if not host or not host.isascii() or parts.username or parts.password:
+        raise SecretError(f"invalid origin: {text}")
+    if not re.match(r"^[a-z0-9.:\[\]-]+$", host):
+        raise SecretError(f"invalid origin: {text}")
+    loopback = host in ("localhost", "127.0.0.1", "::1")
+    if scheme != "https" and not (scheme == "http" and loopback):
+        raise SecretError(f"origin must be https (http only for localhost): {text}")
+    default_port = 443 if scheme == "https" else 80
+    shown_host = f"[{host}]" if ":" in host else host
+    if port is not None and port != default_port:
+        return f"{scheme}://{shown_host}:{port}"
+    return f"{scheme}://{shown_host}"
+
+
+def _validate_meta_fields(op, req):
+    kind = req.get("kind", "value")
+    if kind not in SECRET_KINDS:
+        raise SecretError("invalid kind")
+    origins = req.get("origins", [])
+    if (not isinstance(origins, list) or len(origins) > SECRET_MAX_ORIGINS
+            or any(normalize_origin(o) != o for o in origins)):
+        # The client normalizes; the broker only accepts what normalizing
+        # would not change, so what list shows is exactly what fill matches.
+        raise SecretError("invalid origins (give normalized origins, at most %d)"
+                          % SECRET_MAX_ORIGINS)
+    fill_only = req.get("fillOnly", False)
+    if not isinstance(fill_only, bool):
+        raise SecretError("invalid fillOnly")
+    if fill_only and not origins:
+        raise SecretError("fillOnly needs at least one origin")
+    if op == "save-cookies" and not origins:
+        raise SecretError("save-cookies needs at least one origin")
+
+
+def _validate_browser_fields(op, req):
+    port = req.get("cdpPort")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise SecretError("invalid cdpPort")
+    if "targetId" in req and not (isinstance(req["targetId"], str)
+                                  and CDP_TARGET_ID_RE.match(req["targetId"])):
+        raise SecretError("invalid targetId")
+    if op == "fill":
+        selector = req.get("selector")
+        if (not isinstance(selector, str) or not selector or "\0" in selector
+                or len(selector.encode("utf-8")) > SECRET_MAX_SELECTOR_LEN):
+            raise SecretError("invalid selector")
+    if "timeoutMs" in req:
+        timeout = req["timeoutMs"]
+        if not isinstance(timeout, int) or isinstance(timeout, bool) or not (0 < timeout <= SECRET_MAX_TIMEOUT_MS):
+            raise SecretError("invalid timeoutMs")
+
+
+def record_meta_from_request(req, kind=None):
+    """The non-secret metadata a set/generate/save-cookies request asks the
+    record to carry. Only non-default fields are kept, so a plain `set`
+    writes a record byte-for-byte shaped like the ones before kinds."""
+    meta = {}
+    kind = kind or req.get("kind", "value")
+    if kind != "value":
+        meta["kind"] = kind
+    if req.get("origins"):
+        meta["origins"] = list(req["origins"])
+    if req.get("fillOnly"):
+        meta["fillOnly"] = True
+    return meta
+
+
+# --- TOTP (RFC 6238) ----------------------------------------------------------
+
+
+def parse_totp(value):
+    """(key, digits, period, algorithm) from a base32 seed or an
+    otpauth://totp/ URI - the two shapes a site's "set up your
+    authenticator" page offers. Refuses anything else, so a typo is caught
+    when the seed is stored rather than at the first login."""
+    text = value.strip()
+    digits, period, algorithm = 6, 30, "SHA1"
+    if text.lower().startswith("otpauth://"):
+        parts = urllib.parse.urlsplit(text)
+        if parts.netloc.lower() != "totp":
+            raise SecretError("only otpauth://totp/ URIs are supported")
+        query = urllib.parse.parse_qs(parts.query)
+        seed = (query.get("secret") or [""])[0]
+        try:
+            digits = int((query.get("digits") or ["6"])[0])
+            period = int((query.get("period") or ["30"])[0])
+        except ValueError:
+            raise SecretError("invalid TOTP parameters")
+        algorithm = (query.get("algorithm") or ["SHA1"])[0].upper()
+    else:
+        seed = text
+    seed = re.sub(r"[\s-]", "", seed).upper()
+    if not seed or not re.match(r"^[A-Z2-7]+=*$", seed):
+        raise SecretError("invalid TOTP seed (expected base32)")
+    try:
+        key = base64.b32decode(seed.rstrip("=") + "=" * (-len(seed.rstrip("=")) % 8))
+    except (binascii.Error, ValueError):
+        raise SecretError("invalid TOTP seed (expected base32)")
+    if not key or digits not in (6, 7, 8) or not 15 <= period <= 120 \
+            or algorithm not in ("SHA1", "SHA256", "SHA512"):
+        raise SecretError("invalid TOTP parameters")
+    return key, digits, period, algorithm
+
+
+def totp_code(value, now=None):
+    key, digits, period, algorithm = parse_totp(value)
+    counter = int((time.time() if now is None else now) // period)
+    mac = hmac.new(key, struct.pack(">Q", counter),
+                   getattr(hashlib, algorithm.lower())).digest()
+    offset = mac[-1] & 0x0F
+    code = (struct.unpack(">I", mac[offset:offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+
+# --- Generated passwords and stored browser sessions -----------------------------
+
+
+def generate_password(length=SECRET_GENERATE_DEFAULT_LENGTH, symbols=True):
+    """A random password with at least one character of every class it
+    draws from, because most sign-up forms refuse one without."""
+    classes = [string.ascii_lowercase, string.ascii_uppercase, string.digits]
+    if symbols:
+        classes.append(SECRET_GENERATE_SYMBOLS)
+    alphabet = "".join(classes)
+    while True:
+        candidate = "".join(_secrets_rng.choice(alphabet) for _ in range(length))
+        if all(any(ch in cls for ch in candidate) for cls in classes):
+            return candidate
+
+
+COOKIE_FIELDS = ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
+
+
+def parse_cookie_state(value):
+    """A stored browser session: Playwright's storageState shape, cookies
+    only. Returns the cookie list; refuses anything else so a load never
+    hands the browser something it did not come from."""
+    try:
+        state = json.loads(value)
+    except ValueError:
+        raise SecretError("cookies value is not JSON")
+    cookies = state.get("cookies") if isinstance(state, dict) else None
+    if not isinstance(cookies, list) or len(cookies) > SECRET_MAX_COOKIES:
+        raise SecretError("cookies value needs a \"cookies\" list")
+    for cookie in cookies:
+        if (not isinstance(cookie, dict) or not isinstance(cookie.get("name"), str)
+                or not isinstance(cookie.get("value"), str)
+                or not isinstance(cookie.get("domain"), str)):
+            raise SecretError("each cookie needs name, value and domain")
+    return cookies
 
 
 def _validate_exec_request(req):
@@ -3996,15 +4217,18 @@ class Store:
             if not entry.endswith(".rec") or not valid_secret_name(entry[:-4]):
                 continue
             rec = self._read(entry) or {}
-            out.append({"name": entry[:-4], "version": rec.get("version", 0),
-                        "configured": not rec.get("tombstone", False)})
+            item = {"name": entry[:-4], "version": rec.get("version", 0),
+                    "configured": not rec.get("tombstone", False)}
+            if item["configured"]:
+                item.update(_public_meta(rec))
+            out.append(item)
         return out
 
     def _name_count(self):
         return sum(1 for entry in os.listdir(self.dir_fd)
                    if entry.endswith(".rec") and valid_secret_name(entry[:-4]))
 
-    def set(self, name, value):
+    def set(self, name, value, meta=None):
         lock = self._locked()
         try:
             old = self._read(name + ".rec") or {}
@@ -4015,11 +4239,19 @@ class Store:
                 raise SecretError("too many secrets")
             version = _next_version(old)
             nonce, ct = _encrypt(self._key, _aad(self.user, self.namespace, name, version), value)
-            self._write(name + ".rec", {
+            record = {
                 "version": version,
                 "nonce": base64.b64encode(nonce).decode("ascii"),
                 "ct": base64.b64encode(ct).decode("ascii"),
-            })
+            }
+            if meta:
+                # Plaintext on purpose: list() shows it without decrypting.
+                # It is root-only like the ciphertext, and it changes only
+                # together with the value (set/generate/save-cookies), so a
+                # caller cannot move a fill-only secret to a new origin
+                # without also replacing what the old origin knew.
+                record["meta"] = meta
+            self._write(name + ".rec", record)
             return version
         finally:
             os.close(lock)
@@ -4045,6 +4277,14 @@ class Store:
         aad = _aad(self.user, self.namespace, name, version)
         return _decrypt(self._key, aad, nonce, ct)
 
+    def meta(self, name):
+        """The record's non-secret metadata, defaults filled in, or None for
+        a name that is missing or removed. Never decrypts anything."""
+        rec = self._read(name + ".rec")
+        if rec is None or rec.get("tombstone"):
+            return None
+        return _public_meta(rec)
+
     def remove(self, name):
         """Delete the value but keep a tombstone, so a retired name stays
         protected rather than reappearing from a stale legacy copy."""
@@ -4060,6 +4300,17 @@ class Store:
             os.close(lock)
 
 
+def _public_meta(rec):
+    meta = rec.get("meta") if isinstance(rec.get("meta"), dict) else {}
+    kind = meta.get("kind", "value")
+    origins = meta.get("origins", [])
+    return {
+        "kind": kind if kind in SECRET_KINDS else "value",
+        "origins": [o for o in origins if isinstance(o, str)] if isinstance(origins, list) else [],
+        "fillOnly": meta.get("fillOnly") is True,
+    }
+
+
 def handle_request(store, req):
     """Handles the non-exec ops. exec/status/cancel are dispatched by the
     broker directly (they need the job manager, not just a Store)."""
@@ -4067,7 +4318,13 @@ def handle_request(store, req):
     if op == "list":
         return {"ok": True, "secrets": store.list()[:SECRET_MAX_NAMES]}
     if op == "set":
-        return {"ok": True, "version": store.set(req["name"], req["value"])}
+        return {"ok": True, "version": store.set(req["name"], req["value"],
+                                                 record_meta_from_request(req))}
+    if op == "generate":
+        value = generate_password(req.get("length", SECRET_GENERATE_DEFAULT_LENGTH),
+                                  req.get("symbols", True))
+        return {"ok": True, "version": store.set(req["name"], value,
+                                                 record_meta_from_request(req))}
     if op == "remove":
         return {"ok": True, "version": store.remove(req["name"])}
     raise SecretError("unsupported here")
@@ -4155,25 +4412,34 @@ class Job:
         self.stdout_truncated = False
         self.stderr_truncated = False
         self.handle = None  # set by the Launcher; opaque to everything else
+        # A browser job whose stdout is a value to STORE (save-cookies), not
+        # output for the caller: called with the raw stdout once the worker
+        # exits 0, returns the summary to report instead. While it is set,
+        # status never shows stdout at all, not even a prefix mid-run.
+        self.capture = None
         self.lock = threading.Lock()
 
     def public(self):
         with self.lock:
+            hidden = self.capture is not None
             return {
                 "jobId": self.id,
                 "state": self.state,
                 "exitCode": self.exit_code,
-                "stdout": self.stdout.decode("utf-8", "replace"),
+                "stdout": "" if hidden else self.stdout.decode("utf-8", "replace"),
                 "stderr": self.stderr.decode("utf-8", "replace"),
                 "stdoutTruncated": self.stdout_truncated,
                 "stderrTruncated": self.stderr_truncated,
             }
 
-def encode_worker_frame(argv_or_command, shell, secret_values, nonsecret_env, cwd):
+def encode_worker_frame(argv_or_command, shell, secret_values, nonsecret_env, cwd,
+                        browser=None):
     """The one place that builds secret-worker.py's stdin frame, so a field
     added to it cannot land in one Launcher and not the other - the two
     launchers differ in how the child's uid is dropped, nothing about the
-    request it is handed."""
+    request it is handed. `browser` set means a built-in browser job (fill,
+    save-cookies, load-cookies): the worker runs its own fixed CDP code
+    instead of exec'ing a caller's command."""
     frame = json.dumps({
         "argv": argv_or_command if shell is None else None,
         "command": argv_or_command if shell is not None else None,
@@ -4181,6 +4447,7 @@ def encode_worker_frame(argv_or_command, shell, secret_values, nonsecret_env, cw
         "secrets": secret_values,
         "env": nonsecret_env,
         "cwd": cwd,
+        "browser": browser,
     }).encode("utf-8")
     return len(frame).to_bytes(4, "big") + frame
 
@@ -4207,7 +4474,8 @@ def spawn_worker(argv, frame_bytes):
 class Launcher:
     """How a job's child actually starts. Subclasses own the uid drop."""
 
-    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd,
+              browser=None):
         raise NotImplementedError
 
     def poll(self, job):
@@ -4229,9 +4497,10 @@ class DirectLauncher(Launcher):
         self.worker_path = worker_path
         self.python_bin = python_bin
 
-    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd,
+              browser=None):
         frame_bytes = encode_worker_frame(argv_or_command, shell, secret_values,
-                                          nonsecret_env, cwd)
+                                          nonsecret_env, cwd, browser)
         job.handle = spawn_worker([self.python_bin, self.worker_path], frame_bytes)
         return job.handle
 
@@ -4269,7 +4538,11 @@ class JobManager:
     def _active_count(self):
         return sum(1 for j in self._jobs.values() if j.state in ACTIVE_STATES)
 
-    def start(self, namespace, req, resolve_secret):
+    def start(self, namespace, req, resolve_secret, builtin=None):
+        """builtin, for the browser ops, is {"secretNames": [...],
+        "browser": {...}, "capture": callable-or-None}: the job runs the
+        worker's own CDP code with those names resolved, instead of the
+        caller's command."""
         fingerprint = fingerprint_request(req)
         key = req.get("idempotencyKey")
         with self._lock:
@@ -4291,7 +4564,7 @@ class JobManager:
             if key is not None:
                 self._by_idempotency[(namespace, key)] = job.id
         try:
-            self._dispatch(job, req, resolve_secret)
+            self._dispatch(job, req, resolve_secret, builtin)
         except Exception:
             # Anything unexpected (an OSError reading a record, say) must
             # not leave the registered job "pending": two of those would
@@ -4303,8 +4576,8 @@ class JobManager:
                     job.finished_at = time.time()
         return job.id
 
-    def _dispatch(self, job, req, resolve_secret):
-        names = req.get("secretNames", [])
+    def _dispatch(self, job, req, resolve_secret, builtin=None):
+        names = builtin["secretNames"] if builtin else req.get("secretNames", [])
         secret_values = {}
         for name in names:
             try:
@@ -4320,13 +4593,17 @@ class JobManager:
                 job.finished_at = time.time()
                 return
             secret_values[name] = value
-        argv_or_command = req["argv"] if "argv" in req else req["command"]
-        shell = req.get("shell")
+        if builtin:
+            argv_or_command, shell, browser = None, None, builtin["browser"]
+            job.capture = builtin.get("capture")
+        else:
+            argv_or_command = req["argv"] if "argv" in req else req["command"]
+            shell, browser = req.get("shell"), None
         job.started_at = time.time()
         job.state = "running"
         try:
             self.launcher.start(job, argv_or_command, shell, secret_values,
-                                req.get("env", {}), req.get("cwd"))
+                                req.get("env", {}), req.get("cwd"), browser)
         except Exception as exc:
             # A job that failed to even START (systemd-run missing, a fork
             # failure, a frame too large for the pipe) must not stay
@@ -4443,6 +4720,29 @@ class JobManager:
                 rc = self.launcher.poll(job)
                 job.exit_code = rc
                 job.state = "done" if rc == 0 else "error"
+            if job.capture is not None:
+                self._finish_capture(job)
+
+    def _finish_capture(self, job):
+        """Runs under job.lock. Hands a capture job's stdout to its sink and
+        replaces it with the sink's summary; on any failure the job is an
+        error and the captured bytes are dropped, never shown."""
+        captured, job.stdout = job.stdout, b""
+        sink, job.capture = job.capture, None
+        if job.state != "done":
+            return
+        if job.stdout_truncated:
+            job.state = "error"
+            job.stderr = b"captured value too large to store"
+            return
+        try:
+            job.stdout = sink(captured).encode("utf-8")
+        except SecretError as exc:
+            job.state = "error"
+            job.stderr = str(exc).encode("utf-8")
+        except Exception as exc:  # noqa: BLE001 - must not kill the drain thread
+            job.state = "error"
+            job.stderr = f"failed to store captured value: {type(exc).__name__}".encode("utf-8")
 
     def status(self, namespace, job_id):
         job = self._jobs.get(job_id)
@@ -4680,13 +4980,30 @@ def format_hint(candidates):
 
 """agent-box-secret - manage this user's protected secrets (#922).
 
-  list                       names and versions; never a value
-  set NAME --stdin           write-only: the value comes from stdin, never argv
+  list                       names, versions, kinds and origins; never a value
+  set NAME --stdin [--totp|--cookies] [--origin URL]... [--allow-exec]
+                             write-only: the value comes from stdin, never argv
+  generate NAME [--length N] [--no-symbols] [--origin URL]... [--allow-exec]
+                             store a new random password nobody has seen
   remove NAME                delete the value, keeping a protected-name tombstone
   exec (--argv ... | --command CMD --shell bash|sh) --secret NAME...
                              run a command with only the named secrets injected
+  fill NAME --cdp-port PORT --selector CSS [--target ID]
+                             type the secret into a field of your browser's
+                             page, only if the page is on one of its origins
+  save-cookies NAME --cdp-port PORT --origin URL... [--target ID] [--allow-exec]
+                             store the browser's cookies for those origins
+  load-cookies NAME --cdp-port PORT [--target ID]
+                             put stored cookies back into the browser
   status JOBID               poll a job started by exec
   cancel JOBID               stop a running job
+
+A secret with --origin is FILL-ONLY unless --allow-exec is given: exec
+refuses it, and fill types it only into a page whose origin the browser
+reports as one of those. A --totp secret is a TOTP seed (base32 or an
+otpauth:// URI); exec and fill get its current code, never the seed.
+fill/save-cookies/load-cookies talk to a Chromium you started with
+--remote-debugging-port=PORT, on 127.0.0.1 only.
 
 Talks to the root broker over its Unix socket. There is deliberately no verb
 that prints a value.
@@ -4703,6 +5020,7 @@ the ones you have.
 import argparse
 import json
 import sys
+import time
 
 
 def main():
@@ -4714,10 +5032,50 @@ def main():
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="verb", required=True)
     sub.add_parser("list")
+
+    def add_origin_args(sub_parser, required=False):
+        sub_parser.add_argument("--origin", dest="origins", action="append",
+                                default=[], required=required,
+                                help="a site this secret is for; repeat for more than one")
+        sub_parser.add_argument("--allow-exec", action="store_true",
+                                help="let exec inject it too (a secret with --origin is "
+                                     "fill-only without this)")
+
+    def add_browser_args(sub_parser):
+        sub_parser.add_argument("--cdp-port", type=int, required=True,
+                                help="the browser's --remote-debugging-port (127.0.0.1)")
+        sub_parser.add_argument("--target",
+                                help="DevTools target id of the page; needed only "
+                                     "when more than one page is open")
+        sub_parser.add_argument("--timeout-ms", type=int)
+
     set_p = sub.add_parser("set")
     set_p.add_argument("name")
     set_p.add_argument("--stdin", action="store_true", required=True)
+    kind_group = set_p.add_mutually_exclusive_group()
+    kind_group.add_argument("--totp", action="store_true",
+                            help="the value is a TOTP seed (base32 or otpauth:// URI)")
+    kind_group.add_argument("--cookies", action="store_true",
+                            help="the value is a Playwright storageState JSON")
+    add_origin_args(set_p)
+    gen_p = sub.add_parser("generate")
+    gen_p.add_argument("name")
+    gen_p.add_argument("--length", type=int)
+    gen_p.add_argument("--no-symbols", action="store_true")
+    add_origin_args(gen_p)
     sub.add_parser("remove").add_argument("name")
+
+    fill_p = sub.add_parser("fill")
+    fill_p.add_argument("name")
+    fill_p.add_argument("--selector", required=True)
+    add_browser_args(fill_p)
+    save_p = sub.add_parser("save-cookies")
+    save_p.add_argument("name")
+    add_origin_args(save_p, required=True)
+    add_browser_args(save_p)
+    load_p = sub.add_parser("load-cookies")
+    load_p.add_argument("name")
+    add_browser_args(load_p)
 
     exec_p = sub.add_parser("exec")
     exec_p.add_argument("--secret", dest="secrets", action="append", default=[],
@@ -4742,13 +5100,45 @@ def main():
         sys.stderr.write(f"agent-box-secret: {exc}\n")
         return 2
 
+    meta = {}
+    if args.verb in ("set", "generate", "save-cookies"):
+        try:
+            origins = [normalize_origin(o) for o in args.origins]
+        except SecretError as exc:
+            sys.stderr.write(f"agent-box-secret: {exc}\n")
+            return 2
+        if origins:
+            meta["origins"] = origins
+            meta["fillOnly"] = not args.allow_exec
+
     if args.verb == "list":
         req = {"op": "list", "profile": profile}
     elif args.verb == "set":
         value = sys.stdin.read()
         if value.endswith("\n"):
             value = value[:-1]
-        req = {"op": "set", "profile": profile, "name": args.name, "value": value}
+        req = {"op": "set", "profile": profile, "name": args.name, "value": value, **meta}
+        if args.totp:
+            req["kind"] = "totp"
+        elif args.cookies:
+            req["kind"] = "cookies"
+    elif args.verb == "generate":
+        req = {"op": "generate", "profile": profile, "name": args.name, **meta}
+        if args.length:
+            req["length"] = args.length
+        if args.no_symbols:
+            req["symbols"] = False
+    elif args.verb in ("fill", "save-cookies", "load-cookies"):
+        req = {"op": args.verb, "profile": profile, "name": args.name,
+               "cdpPort": args.cdp_port}
+        if args.target:
+            req["targetId"] = args.target
+        if args.timeout_ms:
+            req["timeoutMs"] = args.timeout_ms
+        if args.verb == "fill":
+            req["selector"] = args.selector
+        if args.verb == "save-cookies":
+            req.update(meta)
     elif args.verb == "remove":
         req = {"op": "remove", "profile": profile, "name": args.name}
     elif args.verb == "exec":
@@ -4773,6 +5163,20 @@ def main():
         req = {"op": "cancel", "profile": profile, "jobId": args.job_id}
 
     resp = connect_and_call(args.socket, req)
+    if resp.get("ok") and args.verb in ("fill", "save-cookies", "load-cookies"):
+        # A browser job takes a second or two; the caller wants its outcome,
+        # not a job id to poll, so wait for it here (bounded by the job's
+        # own timeout on the broker side).
+        job_id = resp["jobId"]
+        while True:
+            resp = connect_and_call(args.socket, {"op": "status", "profile": profile,
+                                                  "jobId": job_id})
+            if not resp.get("ok") or resp.get("state") not in ("pending", "running"):
+                break
+            time.sleep(0.1)
+        if resp.get("ok") and resp.get("state") != "done":
+            sys.stderr.write(resp.get("stderr") or f"agent-box-secret: job {resp.get('state')}\n")
+            return 1
     if not resp.get("ok"):
         sys.stderr.write(f"agent-box-secret: {resp.get('error', 'refused')}\n")
         return 1
@@ -4781,7 +5185,14 @@ def main():
     elif args.verb == "list":
         for item in resp["secrets"]:
             state = "configured" if item["configured"] else "removed"
-            print(f"{item['name']}\tv{item['version']}\t{state}")
+            extra = []
+            if item.get("kind", "value") != "value":
+                extra.append(item["kind"])
+            if item.get("fillOnly"):
+                extra.append("fill-only")
+            if item.get("origins"):
+                extra.append(" ".join(item["origins"]))
+            print("\t".join([item["name"], f"v{item['version']}", state, *extra]))
         # Advisory only (see lib/secret-candidates.py's header): this never
         # acts on what it finds, so it costs nothing to check on every plain
         # `list`. known_by_namespace[profile] is exactly what the broker
@@ -4795,8 +5206,10 @@ def main():
         hint = format_hint(scan(os.path.expanduser("~"), known_by_namespace=known_by_namespace))
         if hint:
             sys.stderr.write("\n" + hint + "\n")
-    elif args.verb in ("set", "remove"):
+    elif args.verb in ("set", "remove", "generate"):
         print(f"{args.verb} ok (v{resp['version']})")
+    elif args.verb in ("fill", "save-cookies", "load-cookies"):
+        sys.stdout.write(resp.get("stdout") or "")
     elif args.verb == "exec":
         print(resp["jobId"])
     else:
@@ -4888,9 +5301,10 @@ class SystemdLauncher(Launcher):
     def _unit_name(job):
         return f"agent-box-secret-job-{job.id}"
 
-    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd,
+              browser=None):
         frame_bytes = encode_worker_frame(argv_or_command, shell, secret_values,
-                                          nonsecret_env, cwd)
+                                          nonsecret_env, cwd, browser)
         cmd = [
             "systemd-run", "--pipe", "--quiet", "--collect",
             f"--unit={self._unit_name(job)}",
@@ -4974,8 +5388,8 @@ class Broker:
             return {"ok": True, **self.job_manager.status(profile, req["jobId"])}
         if op == "cancel":
             return {"ok": True, **self.job_manager.cancel(profile, req["jobId"])}
-        store = self._store(profile, create=(op == "set"))
-        if op in ("list", "set", "remove"):
+        store = self._store(profile, create=(op in ("set", "generate", "save-cookies")))
+        if op in ("list", "set", "remove", "generate"):
             if store is None:
                 if op == "list":
                     return {"ok": True, "secrets": []}
@@ -4985,10 +5399,86 @@ class Broker:
             # A missing namespace resolves no name, so _dispatch reports
             # "no such secret: NAME" for each; with no secretNames the job
             # simply runs.
-            resolve = store.get if store is not None else (lambda name: None)
+            resolve = self._exec_resolver(store)
             job_id = self.job_manager.start(profile, req, resolve)
             return {"ok": True, "jobId": job_id}
+        if op in ("fill", "save-cookies", "load-cookies"):
+            builtin = self._browser_job(store, profile, req, op)
+            job_id = self.job_manager.start(profile, req, self._fill_resolver(store), builtin)
+            return {"ok": True, "jobId": job_id}
         raise SecretError("unsupported operation")
+
+    @staticmethod
+    def _exec_resolver(store):
+        """What exec may inject for a name: the value, a TOTP secret's
+        current code (never its seed), and nothing at all for a fill-only
+        secret - that one goes only to the fill op, onto its own origins."""
+        def resolve(name):
+            if store is None:
+                return None
+            meta = store.meta(name)
+            if meta is None:
+                return None
+            if meta["fillOnly"]:
+                raise SecretError(f"{name} is fill-only: use fill, not exec")
+            value = store.get(name)
+            if value is not None and meta["kind"] == "totp":
+                return totp_code(value)
+            return value
+        return resolve
+
+    @staticmethod
+    def _fill_resolver(store):
+        def resolve(name):
+            value = store.get(name)
+            if value is not None and store.meta(name)["kind"] == "totp":
+                return totp_code(value)
+            return value
+        return resolve
+
+    def _browser_job(self, store, profile, req, op):
+        """The fixed worker-side CDP job for one browser op. The origins
+        that bound it come from the RECORD (fill, load-cookies) or from the
+        request that is about to replace the record (save-cookies) - never
+        from the page, which is what the worker checks against them."""
+        name = req["name"]
+        browser = {"mode": op, "port": req["cdpPort"], "targetId": req.get("targetId")}
+        if op == "save-cookies":
+            browser["origins"] = list(req["origins"])
+            meta = record_meta_from_request(req, kind="cookies")
+            return {"secretNames": [], "browser": browser,
+                    "capture": self._cookie_sink(profile, name, meta)}
+        meta = store.meta(name) if store is not None else None
+        if meta is None:
+            raise SecretError(f"no such secret: {name}")
+        if not meta["origins"]:
+            raise SecretError(f"{name} has no origins: set it again with --origin")
+        if op == "fill" and meta["kind"] == "cookies":
+            raise SecretError(f"{name} holds cookies: use load-cookies")
+        if op == "load-cookies" and meta["kind"] != "cookies":
+            raise SecretError(f"{name} does not hold cookies")
+        browser["origins"] = meta["origins"]
+        browser["secret"] = name
+        if op == "fill":
+            browser["selector"] = req["selector"]
+        return {"secretNames": [name], "browser": browser}
+
+    def _cookie_sink(self, profile, name, meta):
+        """Stores what a save-cookies worker printed. Runs on the job's
+        drain thread, so it opens a Store of its own rather than borrow the
+        cached one, which the serving thread may evict and close meanwhile."""
+        def sink(captured):
+            value = captured.decode("utf-8")
+            if not valid_secret_value(value):
+                raise SecretError("captured cookies are empty or too large to store")
+            count = len(parse_cookie_state(value))
+            store = Store(self.store_root, profile, self.user, self.uid, self.root_key)
+            try:
+                version = store.set(name, value, meta)
+            finally:
+                store.close()
+            return f"saved {count} cookies as {name} (v{version})\n"
+        return sink
 
 
 def _safe_send(conn, reply):
@@ -5568,10 +6058,15 @@ Deliberately standalone: this file needs nothing from secret-protocol.py (no
 closure stays as small as the ordinary agent user's own python3 - the broker
 and the crypto library are what need isolating, not this one.
 """
+import base64
+import hashlib
+import http.client
 import json
 import os
+import socket
 import struct
 import sys
+import urllib.parse
 
 
 def read_frame(stream):
@@ -5598,8 +6093,282 @@ def _bash_path():
     return shutil.which("bash") or "/bin/bash"
 
 
+# --- Built-in browser jobs (fill, save-cookies, load-cookies) ----------------
+#
+# A browser job runs THIS fixed code instead of a caller's command. It talks
+# Chrome DevTools Protocol to the agent's own browser on a LOOPBACK port -
+# the host is fixed here, only the port comes from the request - and it
+# checks the page's origin, as the browser itself reports it, against the
+# origins stored with the secret before a value goes anywhere.
+#
+# What that buys, and what it does not: it stops a value from being typed
+# into a page the agent did not mean to be on (a lookalike domain, a
+# redirect, an instruction injected into what the agent read). It does not
+# stop the agent itself, which controls this same browser and can read a
+# filled field back. See the PR and issue #922.
+#
+# stdlib only (see the header): a minimal RFC 6455 client is enough for
+# CDP's unfragmented JSON text messages.
+
+CDP_HOST = "127.0.0.1"
+CDP_TIMEOUT_S = 15
+CDP_MAX_MESSAGE = 16 * 1024 * 1024
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+class BrowserJobError(Exception):
+    """A refusal or failure to report; never carries a secret value."""
+
+    def __init__(self, message, code=4):
+        super().__init__(message)
+        self.code = code
+
+
+def _http_json(port, path):
+    conn = http.client.HTTPConnection(CDP_HOST, port, timeout=CDP_TIMEOUT_S)
+    try:
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read(CDP_MAX_MESSAGE)
+        if resp.status != 200:
+            raise BrowserJobError(f"{path} answered HTTP {resp.status}")
+        return json.loads(body.decode("utf-8"))
+    except (OSError, ValueError) as error:
+        raise BrowserJobError(f"no DevTools endpoint on {CDP_HOST}:{port}: {error}")
+    finally:
+        conn.close()
+
+
+def _pick_target(port, target_id):
+    if target_id:
+        return target_id
+    pages = [t for t in _http_json(port, "/json/list") if t.get("type") == "page"]
+    if len(pages) != 1:
+        raise BrowserJobError(
+            f"{len(pages)} pages are open; pass targetId (see http://{CDP_HOST}:{port}/json/list)")
+    return pages[0]["id"]
+
+
+class Cdp:
+    def __init__(self, port, target_id):
+        self.sock = socket.create_connection((CDP_HOST, port), timeout=CDP_TIMEOUT_S)
+        self.next_id = 0
+        self.buffer = b""
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        # No Origin header: Chromium refuses a DevTools websocket that sends
+        # one it was not told to allow, and accepts one that sends none.
+        self.sock.sendall((
+            f"GET /devtools/page/{target_id} HTTP/1.1\r\n"
+            f"Host: {CDP_HOST}:{port}\r\n"
+            "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii"))
+        head = self._read_until(b"\r\n\r\n")
+        status = head.split(b"\r\n", 1)[0]
+        if b" 101 " not in status + b" ":
+            raise BrowserJobError(f"DevTools refused target {target_id}: {status.decode('latin-1')}")
+        expect = base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest())
+        if expect not in head:
+            raise BrowserJobError("DevTools handshake failed")
+
+    def _read_until(self, marker):
+        while marker not in self.buffer:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise BrowserJobError("DevTools connection closed")
+            self.buffer += chunk
+            if len(self.buffer) > 65536 and marker == b"\r\n\r\n":
+                raise BrowserJobError("DevTools handshake too large")
+        head, self.buffer = self.buffer.split(marker, 1)
+        return head
+
+    def _read_exact(self, count):
+        while len(self.buffer) < count:
+            chunk = self.sock.recv(max(65536, count - len(self.buffer)))
+            if not chunk:
+                raise BrowserJobError("DevTools connection closed")
+            self.buffer += chunk
+        out, self.buffer = self.buffer[:count], self.buffer[count:]
+        return out
+
+    def _send_frame(self, opcode, payload):
+        mask = os.urandom(4)
+        header = bytes([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header += bytes([0x80 | length])
+        elif length < 65536:
+            header += bytes([0x80 | 126]) + struct.pack(">H", length)
+        else:
+            header += bytes([0x80 | 127]) + struct.pack(">Q", length)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(header + mask + masked)
+
+    def _recv_message(self):
+        message = b""
+        while True:
+            first, second = self._read_exact(2)
+            opcode = first & 0x0F
+            length = second & 0x7F
+            if length == 126:
+                (length,) = struct.unpack(">H", self._read_exact(2))
+            elif length == 127:
+                (length,) = struct.unpack(">Q", self._read_exact(8))
+            if length > CDP_MAX_MESSAGE or len(message) + length > CDP_MAX_MESSAGE:
+                raise BrowserJobError("DevTools message too large")
+            mask = self._read_exact(4) if second & 0x80 else None
+            payload = self._read_exact(length)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:
+                raise BrowserJobError("DevTools connection closed")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            message += payload
+            if first & 0x80:
+                return json.loads(message.decode("utf-8"))
+
+    def call(self, method, **params):
+        self.next_id += 1
+        call_id = self.next_id
+        self._send_frame(0x1, json.dumps({"id": call_id, "method": method,
+                                          "params": params}).encode("utf-8"))
+        while True:
+            message = self._recv_message()
+            if message.get("id") != call_id:
+                continue  # an event, or a stale reply
+            if "error" in message:
+                error = message["error"]
+                raise BrowserJobError(f"{method}: {error.get('message', 'failed')}")
+            return message.get("result", {})
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _main_frame(cdp):
+    frame = cdp.call("Page.getFrameTree")["frameTree"]["frame"]
+    return frame["id"], frame.get("loaderId"), frame.get("securityOrigin")
+
+
+def _host_matches(cookie_domain, origins):
+    """True if a cookie for cookie_domain would be sent to one of origins
+    (the host itself, or a parent domain it sits under)."""
+    domain = cookie_domain.lstrip(".").lower()
+    for origin in origins:
+        host = (urllib.parse.urlsplit(origin).hostname or "").lower()
+        if domain and (host == domain or host.endswith("." + domain)):
+            return True
+    return False
+
+
+def _browser_fill(cdp, spec, value):
+    origins = spec["origins"]
+    frame_id, loader_id, origin = _main_frame(cdp)
+    if origin not in origins:
+        raise BrowserJobError(
+            f"refused: the page origin is {origin}, not one this secret is for "
+            f"({', '.join(origins)})", code=3)
+    root = cdp.call("DOM.getDocument", depth=0)["root"]["nodeId"]
+    node_id = cdp.call("DOM.querySelector", nodeId=root, selector=spec["selector"])["nodeId"]
+    if not node_id:
+        raise BrowserJobError(f"no element matches {spec['selector']}")
+    node = cdp.call("DOM.describeNode", nodeId=node_id)["node"]
+    if node.get("localName") not in ("input", "textarea"):
+        raise BrowserJobError(f"{spec['selector']} is a <{node.get('localName')}>, not an input")
+    object_id = cdp.call("DOM.resolveNode", nodeId=node_id)["object"]["objectId"]
+    focused = cdp.call(
+        "Runtime.callFunctionOn", objectId=object_id, returnByValue=True,
+        functionDeclaration="function () { this.focus(); if (this.select) this.select();"
+                            " return document.activeElement === this; }")
+    if focused.get("result", {}).get("value") is not True:
+        raise BrowserJobError(f"{spec['selector']} would not take focus")
+    # Re-read the frame right before the value goes in: a navigation since
+    # the first check gives a new loaderId, and the value is not typed.
+    if _main_frame(cdp) != (frame_id, loader_id, origin):
+        raise BrowserJobError("refused: the page navigated during the fill", code=3)
+    cdp.call("Input.insertText", text=value)
+    return {"filled": True, "origin": origin, "selector": spec["selector"]}
+
+
+def _browser_save_cookies(cdp, spec):
+    origins = spec["origins"]
+    cookies = cdp.call("Network.getCookies", urls=[o + "/" for o in origins])["cookies"]
+    keep = []
+    for cookie in cookies:
+        if not _host_matches(cookie.get("domain", ""), origins):
+            continue
+        item = {key: cookie[key] for key in
+                ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
+                if key in cookie}
+        keep.append(item)
+    if not keep:
+        raise BrowserJobError(f"the browser holds no cookies for {', '.join(origins)}")
+    # stdout of a save-cookies job goes to the broker's store, never to the
+    # caller (Job.capture in lib/secret-jobs.py).
+    return {"cookies": keep, "origins": []}
+
+
+def _browser_load_cookies(cdp, spec, value):
+    origins = spec["origins"]
+    state = json.loads(value)
+    params = []
+    for cookie in state.get("cookies", []):
+        if not _host_matches(cookie.get("domain", ""), origins):
+            continue
+        item = {key: cookie[key] for key in
+                ("name", "value", "domain", "path", "httpOnly", "secure", "sameSite")
+                if key in cookie}
+        if isinstance(cookie.get("expires"), (int, float)) and cookie["expires"] > 0:
+            item["expires"] = cookie["expires"]
+        params.append(item)
+    if params:
+        cdp.call("Network.setCookies", cookies=params)
+    return {"loaded": len(params), "origins": origins}
+
+
+def run_browser_job(frame):
+    spec = frame["browser"]
+    mode = spec["mode"]
+    value = frame["secrets"].get(spec.get("secret")) if spec.get("secret") else None
+    cdp = None
+    try:
+        cdp = Cdp(spec["port"], _pick_target(spec["port"], spec.get("targetId")))
+        if mode == "fill":
+            result = _browser_fill(cdp, spec, value)
+        elif mode == "save-cookies":
+            result = _browser_save_cookies(cdp, spec)
+        elif mode == "load-cookies":
+            result = _browser_load_cookies(cdp, spec, value)
+        else:
+            raise BrowserJobError(f"unknown browser mode {mode}")
+    except BrowserJobError as error:
+        sys.stderr.write(f"agent-box-secret-worker: {error}\n")
+        return error.code
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        # Never str(error) for these: a KeyError/ValueError message can
+        # quote the data it choked on. The type is enough to debug with.
+        sys.stderr.write(f"agent-box-secret-worker: browser job failed ({type(error).__name__})\n")
+        return 4
+    finally:
+        if cdp is not None:
+            cdp.close()
+    sys.stdout.write(json.dumps(result) + ("" if mode == "save-cookies" else "\n"))
+    sys.stdout.flush()
+    return 0
+
+
 def main():
     frame = read_frame(sys.stdin.buffer)
+
+    if frame.get("browser"):
+        raise SystemExit(run_browser_job(frame))
 
     devnull = os.open(os.devnull, os.O_RDONLY)
     os.dup2(devnull, 0)
@@ -5646,10 +6415,13 @@ if __name__ == "__main__":
 An unprivileged stdio server. It never sees a value except as it flows back
 from a job's own (already redacted) stdout/stderr - it talks to the root
 broker over its per-user Unix socket exactly like the CLI does, using the
-same request schema (lib/secret-protocol.py). Four tools only, matching
-list_secret_names / exec_with_secrets / exec_with_secrets_status /
-exec_with_secrets_cancel from the issue; there is deliberately no tool that
-can read or export a value.
+same request schema (lib/secret-protocol.py). The four tools from the issue
+(list_secret_names / exec_with_secrets / exec_with_secrets_status /
+exec_with_secrets_cancel), plus the website-login tools: generate_secret,
+browser_fill, browser_save_cookies and browser_load_cookies. There is
+deliberately no tool that can read, export or SET a value - a value typed
+into a tool call would land in the transcript; `agent-box-secret set
+--stdin` is how a person stores one they already have.
 
 Scope: this process's AGENT_BOX_PROFILE (the supervisor already exports it
 into every session - see env-exec.py), or the box's current default
@@ -5674,6 +6446,7 @@ from mcp.server.fastmcp import FastMCP
 SOCKET_PATH = os.environ.get("AGENT_BOX_SECRET_SOCKET")
 POLL_INTERVAL_S = 0.1
 INLINE_WAIT_BUDGET_S = 3.0
+BROWSER_WAIT_BUDGET_S = 20.0
 
 mcp = FastMCP("agent-box-secrets")
 
@@ -5693,8 +6466,10 @@ def _call(req, profile=None):
 
 @mcp.tool()
 def list_secret_names() -> dict:
-    """List this profile's configured secret names and versions. Never a
-    value - use exec_with_secrets to run a command with one injected."""
+    """List this profile's configured secret names, versions, kinds
+    (value/totp/cookies), origins and whether each is fill-only. Never a
+    value - use exec_with_secrets to run a command with one injected, or
+    browser_fill to type one into a login form."""
     return _call({"op": "list"})
 
 
@@ -5753,6 +6528,100 @@ def exec_with_secrets(
     status["jobId"] = job_id
     status["profile"] = profile
     return status
+
+
+def _run_browser_job(req):
+    try:
+        profile = resolve_profile(os.environ.get("AGENT_BOX_PROFILE") or None)
+    except SecretError as exc:
+        return {"ok": False, "error": str(exc)}
+    resp = _call(req, profile)
+    if not resp.get("ok"):
+        return resp
+    job_id = resp["jobId"]
+    deadline = time.time() + BROWSER_WAIT_BUDGET_S
+    status = _call({"op": "status", "jobId": job_id}, profile)
+    while status.get("ok") and status.get("state") in ("pending", "running") and time.time() < deadline:
+        time.sleep(POLL_INTERVAL_S)
+        status = _call({"op": "status", "jobId": job_id}, profile)
+    status["jobId"] = job_id
+    status["profile"] = profile
+    return status
+
+
+def _origins(origins):
+    return [normalize_origin(o) for o in origins or []]
+
+
+@mcp.tool()
+def generate_secret(
+    name: str,
+    origins: list[str] | None = None,
+    length: int = SECRET_GENERATE_DEFAULT_LENGTH,
+    symbols: bool = True,
+    allowExec: bool = False,
+) -> dict:
+    """Create a new random password and store it as `name`, without anyone
+    (you included) ever seeing it. Use it when you sign up for a website:
+    give the site's URL in origins, then type it into the sign-up form with
+    browser_fill. With origins the secret is fill-only (exec refuses it)
+    unless allowExec is true. Set symbols=false for a site that refuses
+    punctuation. Replaces an existing secret of the same name."""
+    try:
+        normalized = _origins(origins)
+    except SecretError as exc:
+        return {"ok": False, "error": str(exc)}
+    req = {"op": "generate", "name": name, "length": length, "symbols": symbols}
+    if normalized:
+        req["origins"] = normalized
+        req["fillOnly"] = not allowExec
+    return _call(req)
+
+
+@mcp.tool()
+def browser_fill(name: str, cdpPort: int, selector: str, targetId: str | None = None) -> dict:
+    """Type secret `name` into the input that CSS `selector` matches, in
+    your Chromium on 127.0.0.1:cdpPort (start it with
+    --remote-debugging-port). The broker first checks that the page's
+    origin, as the browser reports it, is one of the secret's origins, and
+    refuses otherwise - so never retry a refusal on another page: it means
+    you are not on the site you think. A TOTP secret types its current
+    code. targetId (from http://127.0.0.1:PORT/json/list) is needed only
+    when several pages are open. Submit the form yourself afterwards."""
+    req = {"op": "fill", "name": name, "cdpPort": cdpPort, "selector": selector}
+    if targetId:
+        req["targetId"] = targetId
+    return _run_browser_job(req)
+
+
+@mcp.tool()
+def browser_save_cookies(name: str, cdpPort: int, origins: list[str],
+                         targetId: str | None = None, allowExec: bool = False) -> dict:
+    """After you log in, store the browser's cookies for `origins` as
+    secret `name`, so a later session can skip the login with
+    browser_load_cookies. The cookies go straight to the broker; they are
+    not returned to you. Fill-only unless allowExec is true (then exec can
+    inject them as a Playwright storageState JSON)."""
+    try:
+        normalized = _origins(origins)
+    except SecretError as exc:
+        return {"ok": False, "error": str(exc)}
+    req = {"op": "save-cookies", "name": name, "cdpPort": cdpPort,
+           "origins": normalized, "fillOnly": not allowExec}
+    if targetId:
+        req["targetId"] = targetId
+    return _run_browser_job(req)
+
+
+@mcp.tool()
+def browser_load_cookies(name: str, cdpPort: int, targetId: str | None = None) -> dict:
+    """Put the cookies stored as `name` back into your Chromium on
+    127.0.0.1:cdpPort, limited to the secret's own origins. Reload or
+    navigate the page afterwards to use the session."""
+    req = {"op": "load-cookies", "name": name, "cdpPort": cdpPort}
+    if targetId:
+        req["targetId"] = targetId
+    return _run_browser_job(req)
 
 
 @mcp.tool()
