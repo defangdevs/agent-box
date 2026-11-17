@@ -396,6 +396,33 @@ class Watches(unittest.TestCase):
         entry = json.loads(seeded[0].read_text())['topics'][0]
         self.assertIn('box-bot', json.dumps(entry.get('exclude')))
 
+    def test_claude_daemon_conversation_cannot_take_session_events(self):
+        # A Claude Remote Control daemon conversation has no channel: its
+        # session subscription would drop every event, and its claim would
+        # still brake the standing watch (PR #1051's review reached nobody).
+        sessions = self.root / '.config/agent-box/sessions.json'
+        sessions.write_text(json.dumps({'sessions': {
+            'rc': {'agent': 'claude', 'remoteControlDaemon': True},
+            'tui': {'agent': 'claude', 'remoteControlDaemon': False}}}))
+        user = subprocess.run(['id', '-un'], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        args = ['subscribe', 'owner/repo', '--note', 'n', '--claim', '7',
+                '--events', 'actionable']
+        def run(session, *extra):
+            env = dict(self.env, LOCAL_WEBHOOK_SESSION=user + '-' + session)
+            return subprocess.run(['bash', str(REPO / 'modules/src/webhook-cli.sh'),
+                                   *extra], env=env, capture_output=True,
+                                  text=True, timeout=15)
+        p = run('rc', *args)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('Remote Control daemon', p.stderr)
+        self.assertFalse((self.state / ('filter.%s-rc.json' % user)).exists())
+        p = run('tui', *args)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        p = run('rc', 'subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                '--note', 'n', '--when', '{"path":"action","in":["opened"]}')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+
 
 if __name__ == '__main__':
     unittest.main()

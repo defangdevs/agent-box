@@ -56,6 +56,21 @@ remember_codex_wake() {
   fi
 }
 
+# True when this process runs inside a conversation of a Claude Remote Control
+# daemon session (`agent-box-session add NAME --harness claude --daemon`).
+# LOCAL_WEBHOOK_SESSION is "<user>-<session>" (webhookSessionEnvArgs), and the
+# registry marks the daemon. A Codex caller is never one: Codex delivers through
+# its own peer, not a Claude channel.
+claude_rc_daemon_conversation() {
+  [ -z "${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}" ] || return 1
+  _cs="${LOCAL_WEBHOOK_SESSION:-}"
+  _cs="${_cs#"$(id -un)"-}"
+  [ -n "$_cs" ] && [ -r "$SESSIONS" ] || return 1
+  "$JQ" -e --arg s "$_cs" \
+    '.sessions[$s] | (.agent // "claude") == "claude" and .remoteControlDaemon == true' \
+    "$SESSIONS" >/dev/null 2>&1
+}
+
 forget_codex_wake_if_idle() {
   _wake="$(codex_wake_file)" || return 0
   _filter="$STATE_DIR/filter.${LOCAL_WEBHOOK_SESSION}.json"
@@ -1165,6 +1180,23 @@ case "$cmd" in
             fi
             set -- "$@" --spawn-config "profile=$profile" ;;
         esac
+      fi
+      # A Claude Remote Control DAEMON runs each app conversation as a
+      # `claude --print --sdk-url` child with no --channels, so its plugin peer
+      # starts and owns the socket but every delivery goes nowhere. Worse, a
+      # claim from it still brakes the standing watch, so a review on the PR
+      # spawns nobody and reaches nobody (PR #1051's CodeRabbit review). The
+      # guide already says a daemon is no webhook target; refuse here rather
+      # than write a subscription that silently swallows its events.
+      if [ "$deliver_to" = session ] && claude_rc_daemon_conversation; then
+        echo "agent-box-webhook: this is a conversation of the Claude Remote" \
+             "Control daemon '${LOCAL_WEBHOOK_SESSION#"$(id -un)"-}', which has no" \
+             "channel to deliver session events into: they would be dropped," \
+             "and a --claim would also stop the standing watch from spawning" \
+             "anyone for them. Use a standing watch (--deliver-to subagent), or" \
+             "do the work in an interactive session (agent-box-session add" \
+             "NAME --harness claude)" >&2
+        exit 2
       fi
       # The relevance dimension, resolved once: a named policy or the
       # caller's own predicate, never both — they are two spellings of the
