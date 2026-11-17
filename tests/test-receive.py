@@ -352,6 +352,58 @@ class ReceiveHTTPTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertNotIn("link", self.record)
 
+    def test_first_slot_reports_how_many_files_the_link_holds(self):
+        slot, token, _record = daemon.receive_create(3600, 64 << 20, files=3)
+        headers = {"Authorization": "Bearer " + token,
+                   "Tus-Resumable": "1.0.0"}
+        path = "/alice/receive/%s/files/upload" % slot
+        status, reply, _body = self.request("HEAD", path, headers=headers)
+        self.assertEqual(status, 404)
+        self.assertEqual(reply["Agent-Box-Link-Files"], "3")
+        # The count follows the slot through every later state.
+        create = dict(headers, **{
+            "Upload-Length": "3",
+            "Upload-Metadata": metadata("n.bin", 3, content=b"abc")})
+        self.assertEqual(self.request(
+            "POST", "/alice/receive/%s/files" % slot, headers=create)[0], 201)
+        status, reply, _body = self.request("HEAD", path, headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(reply["Agent-Box-Link-Files"], "3")
+        # A child, and a link minted before multi-file support, name none.
+        child, child_secret = daemon.receive_child(token.split(".", 1)[1], 1)
+        status, reply, _body = self.request(
+            "HEAD", "/alice/receive/%s/files/upload" % child,
+            headers={"Authorization": "Bearer %s.%s" % (child, child_secret),
+                     "Tus-Resumable": "1.0.0"})
+        self.assertEqual(status, 404)
+        self.assertNotIn("Agent-Box-Link-Files", reply)
+        legacy = daemon.receive_read(self.slot)
+        legacy.pop("files", None)
+        daemon.receive_write(legacy)
+        status, reply, _body = self.request("HEAD", self.resource,
+                                            headers=self.auth())
+        self.assertEqual(status, 404)
+        self.assertNotIn("Agent-Box-Link-Files", reply)
+
+    def test_link_creation_holds_the_lock_revocation_needs(self):
+        seen = []
+        original = daemon.receive_store_new
+
+        def watching(record):
+            fd = os.open(os.path.join(STATE, ".links.lock"), os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    seen.append(False)
+                except BlockingIOError:
+                    seen.append(True)
+            finally:
+                os.close(fd)
+            return original(record)
+        with mock.patch.object(daemon, "receive_store_new", watching):
+            daemon.receive_create(3600, 1024, files=3)
+        self.assertEqual(seen, [True, True, True])
+
     def test_file_count_is_bounded(self):
         for files in (0, daemon.RECEIVE_MAX_FILES + 1):
             with self.assertRaises(ValueError):
@@ -564,6 +616,78 @@ class ReceiveCLITest(unittest.TestCase):
             self.assertNotEqual(refused.returncode, 0)
         default = json.loads(run("--json").stdout)
         self.assertEqual(default["files"], 10)
+
+    def revoke_env(self):
+        assembled = os.path.join(WORK, "agent-box-receive.py")
+        with open(assembled, "w") as output:
+            subprocess.run([
+                sys.executable, str(REPO / "bin" / "assemble-module.py"),
+                "--resolve", str(REPO / "modules" / "src" / "receive-cli.py"),
+            ], check=True, stdout=output)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+               "HOME": WORK,
+               "AGENT_BOX_URL": "https://box.example/alice/",
+               "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
+               "AGENT_BOX_UPLOADS_DIR": UPLOADS}
+        shutil.rmtree(STATE, ignore_errors=True)
+
+        def run(*args):
+            return subprocess.run(
+                [sys.executable, assembled, *args], text=True,
+                capture_output=True, env=env)
+        return run
+
+    def test_revoke_finishes_after_the_first_record_was_pruned(self):
+        run = self.revoke_env()
+        slot = json.loads(run("--files", "3", "--json").stdout)["slot"]
+        # Marking the primary and then failing on a child leaves the
+        # primary revoked, and pruning removes its record.
+        daemon.receive_mark_revoked(slot)
+        self.assertEqual(daemon.receive_prune(), 1)
+        self.assertEqual(
+            len([n for n in os.listdir(STATE) if n.endswith(".json")]), 2)
+        done = run("revoke", slot)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(
+            [n for n in os.listdir(STATE) if n.endswith(".json")], [])
+        gone = run("revoke", slot)
+        self.assertNotEqual(gone.returncode, 0)
+        self.assertIn("no such slot", gone.stderr)
+
+    def test_revoke_refuses_when_the_link_cannot_be_enumerated(self):
+        run = self.revoke_env()
+        slot = json.loads(run("--files", "3", "--json").stdout)["slot"]
+        # Load the assembled CLI itself so its revoke runs in this process,
+        # where listing the state directory can be made to fail.
+        saved = dict(os.environ)
+        os.environ.update({"HOME": WORK,
+                           "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
+                           "AGENT_BOX_UPLOADS_DIR": UPLOADS})
+        try:
+            loader = importlib.machinery.SourceFileLoader(
+                "agent_box_receive_cli_under_test",
+                os.path.join(WORK, "agent-box-receive.py"))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            cli = importlib.util.module_from_spec(spec)
+            loader.exec_module(cli)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        real_listdir = os.listdir
+
+        def failing(path="."):
+            if os.fspath(path) == STATE:
+                raise PermissionError(13, "Permission denied", STATE)
+            return real_listdir(path)
+        with mock.patch.object(cli.os, "listdir", failing):
+            with self.assertRaises(SystemExit) as caught:
+                cli.cmd_revoke(mock.Mock(slot=slot))
+        self.assertIn("cannot revoke", str(caught.exception))
+        # Nothing was marked or removed, so the same command can run again.
+        names = os.listdir(STATE)
+        self.assertEqual(len([n for n in names if n.endswith(".json")]), 3)
+        self.assertEqual([n for n in names if n.endswith(".revoked")], [])
+        self.assertEqual(run("revoke", slot).returncode, 0)
 
 
 if __name__ == "__main__":

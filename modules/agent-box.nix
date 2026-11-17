@@ -16433,13 +16433,37 @@ def receive_store_new(record):
         raise
 
 
+@contextlib.contextmanager
+def receive_links_lock():
+    """Serialize link creation against link-wide revocation.
+
+    A revoke that listed a link's slots while its creator was still writing
+    the children would report success and leave them usable.
+    """
+    receive_ensure_dirs()
+    path = os.path.join(RECEIVE_STATE_DIR, ".links.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+                 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def receive_link_slots(slot):
-    """Return SLOT plus every child slot minted with it, for revoke."""
-    slots = [slot]
+    """Return the live slots a revoke of SLOT must cover.
+
+    SLOT itself, when its record exists, plus every child minted with it.
+    The children are found by their link field, so a link whose first
+    record is already gone can still be revoked. An unreadable state
+    directory raises OSError instead of passing for a complete answer.
+    """
     try:
         names = sorted(os.listdir(RECEIVE_STATE_DIR))
-    except OSError:
-        return slots
+    except FileNotFoundError:
+        names = []
+    slots = [slot] if receive_read(slot) is not None else []
     for name in names:
         child = name[:-5]
         if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
@@ -16474,32 +16498,34 @@ def receive_create(ttl, max_bytes, now=None, files=1):
         record.update(extra)
         return record
 
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
-        record = fresh(slot, secret, files=files)
-        try:
-            receive_store_new(record)
-        except FileExistsError:
-            continue
-        created = [slot]
-        try:
-            for index in range(1, files):
-                child, child_secret = receive_child(secret, index)
-                receive_store_new(fresh(child, child_secret, link=slot))
-                created.append(child)
-        except Exception:
-            # Nobody holds the token yet, so no slot lock is needed.
-            for name in created:
-                receive_remove_locked(name)
-            raise
-        return slot, slot + "." + secret, record
-    raise RuntimeError("could not allocate an upload slot")
+    with receive_links_lock():
+        for _attempt in range(32):
+            slot = secrets.token_urlsafe(12)
+            # A leading "-" is URL-safe but argparse reads it as an option in
+            # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+            # as ordinary positional arguments without requiring a hidden `--`.
+            if not slot[0].isalnum():
+                continue
+            secret = secrets.token_urlsafe(32)
+            record = fresh(slot, secret, files=files)
+            try:
+                receive_store_new(record)
+            except FileExistsError:
+                continue
+            created = [slot]
+            try:
+                for index in range(1, files):
+                    child, child_secret = receive_child(secret, index)
+                    receive_store_new(fresh(child, child_secret, link=slot))
+                    created.append(child)
+            except Exception:
+                # Nobody holds the token yet, so no slot lock is needed.
+                for name in created:
+                    receive_remove_locked(name)
+                raise
+            return slot, slot + "." + secret, record
+        # Every attempt collided with an existing slot.
+        raise RuntimeError("could not allocate an upload slot")
 
 
 def receive_prune(now=None):
@@ -16678,14 +16704,23 @@ def cmd_list(_args):
 
 
 def cmd_revoke(args):
-    record = receive_read(args.slot)
-    if record is None:
-        raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
     # A link's first slot also revokes the slots minted with it, so one
-    # command ends the whole multi-file capability.
-    slots = receive_link_slots(args.slot)
-    for slot in slots:
-        receive_mark_revoked(slot)
+    # command ends the whole multi-file capability. Discovery and marking
+    # share a lock with link creation, so no half-written link is missed,
+    # and an unreadable state directory stops here before any record is
+    # touched. The children are found by their link field, which lets a
+    # retry finish a revoke whose first record was already pruned.
+    try:
+        with receive_links_lock():
+            slots = receive_link_slots(args.slot)
+            if not slots:
+                raise SystemExit(
+                    "agent-box-receive: no such slot: %s" % args.slot)
+            for slot in slots:
+                receive_mark_revoked(slot)
+    except OSError as exc:
+        raise SystemExit(
+            "agent-box-receive: cannot revoke %s: %s" % (args.slot, exc))
     for slot in slots:
         try:
             with receive_slot_lock(slot, blocking=False):
@@ -27019,13 +27054,37 @@ def receive_store_new(record):
         raise
 
 
+@contextlib.contextmanager
+def receive_links_lock():
+    """Serialize link creation against link-wide revocation.
+
+    A revoke that listed a link's slots while its creator was still writing
+    the children would report success and leave them usable.
+    """
+    receive_ensure_dirs()
+    path = os.path.join(RECEIVE_STATE_DIR, ".links.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+                 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def receive_link_slots(slot):
-    """Return SLOT plus every child slot minted with it, for revoke."""
-    slots = [slot]
+    """Return the live slots a revoke of SLOT must cover.
+
+    SLOT itself, when its record exists, plus every child minted with it.
+    The children are found by their link field, so a link whose first
+    record is already gone can still be revoked. An unreadable state
+    directory raises OSError instead of passing for a complete answer.
+    """
     try:
         names = sorted(os.listdir(RECEIVE_STATE_DIR))
-    except OSError:
-        return slots
+    except FileNotFoundError:
+        names = []
+    slots = [slot] if receive_read(slot) is not None else []
     for name in names:
         child = name[:-5]
         if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
@@ -27060,32 +27119,34 @@ def receive_create(ttl, max_bytes, now=None, files=1):
         record.update(extra)
         return record
 
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
-        record = fresh(slot, secret, files=files)
-        try:
-            receive_store_new(record)
-        except FileExistsError:
-            continue
-        created = [slot]
-        try:
-            for index in range(1, files):
-                child, child_secret = receive_child(secret, index)
-                receive_store_new(fresh(child, child_secret, link=slot))
-                created.append(child)
-        except Exception:
-            # Nobody holds the token yet, so no slot lock is needed.
-            for name in created:
-                receive_remove_locked(name)
-            raise
-        return slot, slot + "." + secret, record
-    raise RuntimeError("could not allocate an upload slot")
+    with receive_links_lock():
+        for _attempt in range(32):
+            slot = secrets.token_urlsafe(12)
+            # A leading "-" is URL-safe but argparse reads it as an option in
+            # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+            # as ordinary positional arguments without requiring a hidden `--`.
+            if not slot[0].isalnum():
+                continue
+            secret = secrets.token_urlsafe(32)
+            record = fresh(slot, secret, files=files)
+            try:
+                receive_store_new(record)
+            except FileExistsError:
+                continue
+            created = [slot]
+            try:
+                for index in range(1, files):
+                    child, child_secret = receive_child(secret, index)
+                    receive_store_new(fresh(child, child_secret, link=slot))
+                    created.append(child)
+            except Exception:
+                # Nobody holds the token yet, so no slot lock is needed.
+                for name in created:
+                    receive_remove_locked(name)
+                raise
+            return slot, slot + "." + secret, record
+        # Every attempt collided with an existing slot.
+        raise RuntimeError("could not allocate an upload slot")
 
 
 def receive_prune(now=None):
@@ -37709,14 +37770,16 @@ not grant access to the terminal or any existing files.</p>
     if (extra) Object.assign(headers, extra);
     const response = await fetch(l.resource, {method: 'HEAD', headers,
                                               cache: 'no-store'});
-    if (response.status === 404) return {state: 'free'};
-    if (response.status === 403) return {state: 'absent'};
-    if (response.status === 422) return {state: 'dead'};
-    if (response.status === 412) return {state: 'changed'};
+    // Only the link's first slot says how many files it was minted for.
+    const files = Number(response.headers.get('Agent-Box-Link-Files')) || 0;
+    if (response.status === 404) return {state: 'free', files};
+    if (response.status === 403) return {state: 'absent', files};
+    if (response.status === 422) return {state: 'dead', files};
+    if (response.status === 412) return {state: 'changed', files};
     if (!response.ok) return fail(response);
     const complete = response.headers.get('Upload-Complete') === '?1';
     return {
-      state: 'bound', complete,
+      state: 'bound', complete, files,
       offset: Number(response.headers.get('Upload-Offset')),
       content: complete
         ? (response.headers.get('ETag') || ''').replace(/^"|"$/g, ''')
@@ -37724,17 +37787,19 @@ not grant access to the terminal or any existing files.</p>
     };
   };
   const survey = async () => {
-    const slots = [];
-    for (let index = 0; index < MAX_FILES; index++) {
+    const first = await lane(0);
+    const head = await probe(first);
+    if (head.state === 'absent') {
+      throw new Error('This upload link is invalid, expired, or revoked.');
+    }
+    const slots = [Object.assign({lane: first}, head)];
+    // A link minted before multi-file support reports no count: one file.
+    // A slot revoked on its own is skipped, not taken for the end.
+    const count = Math.min(head.files || 1, MAX_FILES);
+    for (let index = 1; index < count; index++) {
       const l = await lane(index);
       const info = await probe(l);
-      if (info.state === 'absent') {
-        if (index === 0) {
-          throw new Error('This upload link is invalid, expired, or revoked.');
-        }
-        break;
-      }
-      slots.push(Object.assign({lane: l}, info));
+      if (info.state !== 'absent') slots.push(Object.assign({lane: l}, info));
     }
     return slots;
   };
@@ -37761,7 +37826,17 @@ not grant access to the terminal or any existing files.</p>
         }
         return;
       }
-      offset = target.offset;
+      // An unfinished slot may have moved since it was cached, for example
+      // after an earlier file with the same bytes ran out of retries.
+      const fresh = await probe(target.lane);
+      if (fresh.state !== 'bound' || fresh.content !== content) {
+        throw new Error('This link is already bound to a different file.');
+      }
+      if (fresh.complete) {
+        target.complete = true;
+        return;
+      }
+      offset = fresh.offset;
     } else {
       target = slots.find(s => s.state === 'free');
       if (!target) {
@@ -37770,7 +37845,21 @@ not grant access to the terminal or any existing files.</p>
           : 'This link accepts at most ' + slots.length +
             ' files and all of them are in use.');
       }
-      offset = await create(target.lane, file, metadata(file, content));
+      try {
+        offset = await create(target.lane, file, metadata(file, content));
+      } catch (error) {
+        // The server may have stored the file even though the answer never
+        // arrived. Ask, so a later file does not pick the same slot again.
+        let now;
+        try { now = await probe(target.lane); } catch (_) { throw error; }
+        if (now.state === 'bound' || now.state === 'dead') {
+          Object.assign(target, now);
+        }
+        if (now.state !== 'bound' || now.content !== content) throw error;
+        // Created after all: carry on with the bytes it holds.
+        if (now.complete) return;
+        offset = now.offset;
+      }
       target.state = 'bound';
       target.content = content;
       target.complete = false;
@@ -38139,6 +38228,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if send_body:
             self.wfile.write(data)
 
+    @staticmethod
+    def _receive_link_headers(record):
+        """Tell the page how many slots the link was minted with.
+
+        Only a link's first record carries the count. A link minted before
+        multi-file support has none, and the page reads that as one file.
+        """
+        files = record.get("files")
+        if isinstance(files, int) and files > 0:
+            return {"Agent-Box-Link-Files": files}
+        return {}
+
     def _receive_headers(self, record, offset):
         headers = {
             "Tus-Resumable": "1.0.0",
@@ -38163,6 +38264,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The partial upload changes after each PATCH, so its target
             # identity is resume metadata rather than an HTTP entity tag.
             headers["Upload-Content"] = record["content"]
+        headers.update(self._receive_link_headers(record))
         return headers
 
     def _receive_create(self, slot):
@@ -38293,11 +38395,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if record is None:
                     return
                 if record["status"] == "waiting":
-                    self._receive_error(404, "No file has been started for this link.")
+                    self._receive_error(
+                        404, "No file has been started for this link.",
+                        self._receive_link_headers(record))
                     return
                 if record["status"] == "failed":
                     self._receive_error(
-                        422, "Uploaded bytes did not match the selected file.")
+                        422, "Uploaded bytes did not match the selected file.",
+                        self._receive_link_headers(record))
                     return
                 offset = receive_offset(record)
                 if offset is None:

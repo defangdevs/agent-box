@@ -306,13 +306,37 @@ def receive_store_new(record):
         raise
 
 
+@contextlib.contextmanager
+def receive_links_lock():
+    """Serialize link creation against link-wide revocation.
+
+    A revoke that listed a link's slots while its creator was still writing
+    the children would report success and leave them usable.
+    """
+    receive_ensure_dirs()
+    path = os.path.join(RECEIVE_STATE_DIR, ".links.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+                 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def receive_link_slots(slot):
-    """Return SLOT plus every child slot minted with it, for revoke."""
-    slots = [slot]
+    """Return the live slots a revoke of SLOT must cover.
+
+    SLOT itself, when its record exists, plus every child minted with it.
+    The children are found by their link field, so a link whose first
+    record is already gone can still be revoked. An unreadable state
+    directory raises OSError instead of passing for a complete answer.
+    """
     try:
         names = sorted(os.listdir(RECEIVE_STATE_DIR))
-    except OSError:
-        return slots
+    except FileNotFoundError:
+        names = []
+    slots = [slot] if receive_read(slot) is not None else []
     for name in names:
         child = name[:-5]
         if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
@@ -347,32 +371,34 @@ def receive_create(ttl, max_bytes, now=None, files=1):
         record.update(extra)
         return record
 
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
-        record = fresh(slot, secret, files=files)
-        try:
-            receive_store_new(record)
-        except FileExistsError:
-            continue
-        created = [slot]
-        try:
-            for index in range(1, files):
-                child, child_secret = receive_child(secret, index)
-                receive_store_new(fresh(child, child_secret, link=slot))
-                created.append(child)
-        except Exception:
-            # Nobody holds the token yet, so no slot lock is needed.
-            for name in created:
-                receive_remove_locked(name)
-            raise
-        return slot, slot + "." + secret, record
-    raise RuntimeError("could not allocate an upload slot")
+    with receive_links_lock():
+        for _attempt in range(32):
+            slot = secrets.token_urlsafe(12)
+            # A leading "-" is URL-safe but argparse reads it as an option in
+            # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+            # as ordinary positional arguments without requiring a hidden `--`.
+            if not slot[0].isalnum():
+                continue
+            secret = secrets.token_urlsafe(32)
+            record = fresh(slot, secret, files=files)
+            try:
+                receive_store_new(record)
+            except FileExistsError:
+                continue
+            created = [slot]
+            try:
+                for index in range(1, files):
+                    child, child_secret = receive_child(secret, index)
+                    receive_store_new(fresh(child, child_secret, link=slot))
+                    created.append(child)
+            except Exception:
+                # Nobody holds the token yet, so no slot lock is needed.
+                for name in created:
+                    receive_remove_locked(name)
+                raise
+            return slot, slot + "." + secret, record
+        # Every attempt collided with an existing slot.
+        raise RuntimeError("could not allocate an upload slot")
 
 
 def receive_prune(now=None):

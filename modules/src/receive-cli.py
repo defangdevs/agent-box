@@ -119,14 +119,23 @@ def cmd_list(_args):
 
 
 def cmd_revoke(args):
-    record = receive_read(args.slot)
-    if record is None:
-        raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
     # A link's first slot also revokes the slots minted with it, so one
-    # command ends the whole multi-file capability.
-    slots = receive_link_slots(args.slot)
-    for slot in slots:
-        receive_mark_revoked(slot)
+    # command ends the whole multi-file capability. Discovery and marking
+    # share a lock with link creation, so no half-written link is missed,
+    # and an unreadable state directory stops here before any record is
+    # touched. The children are found by their link field, which lets a
+    # retry finish a revoke whose first record was already pruned.
+    try:
+        with receive_links_lock():
+            slots = receive_link_slots(args.slot)
+            if not slots:
+                raise SystemExit(
+                    "agent-box-receive: no such slot: %s" % args.slot)
+            for slot in slots:
+                receive_mark_revoked(slot)
+    except OSError as exc:
+        raise SystemExit(
+            "agent-box-receive: cannot revoke %s: %s" % (args.slot, exc))
     for slot in slots:
         try:
             with receive_slot_lock(slot, blocking=False):

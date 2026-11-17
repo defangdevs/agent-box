@@ -8577,14 +8577,16 @@ not grant access to the terminal or any existing files.</p>
     if (extra) Object.assign(headers, extra);
     const response = await fetch(l.resource, {method: 'HEAD', headers,
                                               cache: 'no-store'});
-    if (response.status === 404) return {state: 'free'};
-    if (response.status === 403) return {state: 'absent'};
-    if (response.status === 422) return {state: 'dead'};
-    if (response.status === 412) return {state: 'changed'};
+    // Only the link's first slot says how many files it was minted for.
+    const files = Number(response.headers.get('Agent-Box-Link-Files')) || 0;
+    if (response.status === 404) return {state: 'free', files};
+    if (response.status === 403) return {state: 'absent', files};
+    if (response.status === 422) return {state: 'dead', files};
+    if (response.status === 412) return {state: 'changed', files};
     if (!response.ok) return fail(response);
     const complete = response.headers.get('Upload-Complete') === '?1';
     return {
-      state: 'bound', complete,
+      state: 'bound', complete, files,
       offset: Number(response.headers.get('Upload-Offset')),
       content: complete
         ? (response.headers.get('ETag') || '').replace(/^"|"$/g, '')
@@ -8592,17 +8594,19 @@ not grant access to the terminal or any existing files.</p>
     };
   };
   const survey = async () => {
-    const slots = [];
-    for (let index = 0; index < MAX_FILES; index++) {
+    const first = await lane(0);
+    const head = await probe(first);
+    if (head.state === 'absent') {
+      throw new Error('This upload link is invalid, expired, or revoked.');
+    }
+    const slots = [Object.assign({lane: first}, head)];
+    // A link minted before multi-file support reports no count: one file.
+    // A slot revoked on its own is skipped, not taken for the end.
+    const count = Math.min(head.files || 1, MAX_FILES);
+    for (let index = 1; index < count; index++) {
       const l = await lane(index);
       const info = await probe(l);
-      if (info.state === 'absent') {
-        if (index === 0) {
-          throw new Error('This upload link is invalid, expired, or revoked.');
-        }
-        break;
-      }
-      slots.push(Object.assign({lane: l}, info));
+      if (info.state !== 'absent') slots.push(Object.assign({lane: l}, info));
     }
     return slots;
   };
@@ -8629,7 +8633,17 @@ not grant access to the terminal or any existing files.</p>
         }
         return;
       }
-      offset = target.offset;
+      // An unfinished slot may have moved since it was cached, for example
+      // after an earlier file with the same bytes ran out of retries.
+      const fresh = await probe(target.lane);
+      if (fresh.state !== 'bound' || fresh.content !== content) {
+        throw new Error('This link is already bound to a different file.');
+      }
+      if (fresh.complete) {
+        target.complete = true;
+        return;
+      }
+      offset = fresh.offset;
     } else {
       target = slots.find(s => s.state === 'free');
       if (!target) {
@@ -8638,7 +8652,21 @@ not grant access to the terminal or any existing files.</p>
           : 'This link accepts at most ' + slots.length +
             ' files and all of them are in use.');
       }
-      offset = await create(target.lane, file, metadata(file, content));
+      try {
+        offset = await create(target.lane, file, metadata(file, content));
+      } catch (error) {
+        // The server may have stored the file even though the answer never
+        // arrived. Ask, so a later file does not pick the same slot again.
+        let now;
+        try { now = await probe(target.lane); } catch (_) { throw error; }
+        if (now.state === 'bound' || now.state === 'dead') {
+          Object.assign(target, now);
+        }
+        if (now.state !== 'bound' || now.content !== content) throw error;
+        // Created after all: carry on with the bytes it holds.
+        if (now.complete) return;
+        offset = now.offset;
+      }
       target.state = 'bound';
       target.content = content;
       target.complete = false;
@@ -9007,6 +9035,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if send_body:
             self.wfile.write(data)
 
+    @staticmethod
+    def _receive_link_headers(record):
+        """Tell the page how many slots the link was minted with.
+
+        Only a link's first record carries the count. A link minted before
+        multi-file support has none, and the page reads that as one file.
+        """
+        files = record.get("files")
+        if isinstance(files, int) and files > 0:
+            return {"Agent-Box-Link-Files": files}
+        return {}
+
     def _receive_headers(self, record, offset):
         headers = {
             "Tus-Resumable": "1.0.0",
@@ -9031,6 +9071,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The partial upload changes after each PATCH, so its target
             # identity is resume metadata rather than an HTTP entity tag.
             headers["Upload-Content"] = record["content"]
+        headers.update(self._receive_link_headers(record))
         return headers
 
     def _receive_create(self, slot):
@@ -9161,11 +9202,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if record is None:
                     return
                 if record["status"] == "waiting":
-                    self._receive_error(404, "No file has been started for this link.")
+                    self._receive_error(
+                        404, "No file has been started for this link.",
+                        self._receive_link_headers(record))
                     return
                 if record["status"] == "failed":
                     self._receive_error(
-                        422, "Uploaded bytes did not match the selected file.")
+                        422, "Uploaded bytes did not match the selected file.",
+                        self._receive_link_headers(record))
                     return
                 offset = receive_offset(record)
                 if offset is None:
