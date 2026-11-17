@@ -375,6 +375,27 @@ class Watches(unittest.TestCase):
                 env=env, capture_output=True, text=True, check=True).stdout
             self.assertEqual(json.loads(got), [self_claimed, True], (event, got))
 
+    def test_seed_reads_self_env_without_sed_on_path(self):
+        # The receiver's PATH has jq and coreutils but no sed. The seed must
+        # still learn the box's login from self.env, or it silently drops the
+        # direct-echo exclude. A failing sed shim stands in for its absence.
+        shim = self.root / 'shim'
+        shim.mkdir()
+        (shim / 'sed').write_text('#!/bin/sh\nexit 127\n')
+        (shim / 'sed').chmod(0o700)
+        (self.state / 'self.env').write_text('LOCAL_WEBHOOK_SELF=Box-Bot\n')
+        env = dict(self.env, PATH=str(shim) + os.pathsep + self.env['PATH'],
+                   LOCAL_WEBHOOK_SPAWN_SOURCE='github',
+                   LOCAL_WEBHOOK_SPAWN_KEY='owner/repo',
+                   LOCAL_WEBHOOK_SPAWN_EVENT='issue_comment',
+                   LOCAL_WEBHOOK_SPAWN_META=json.dumps({'number': 7}))
+        subprocess.run([str(self.spawn)], env=env, input='[UNTRUSTED] event\n',
+                       capture_output=True, text=True, timeout=30)
+        seeded = list(self.state.glob('filter.*-hook-owner-repo-*.json'))
+        self.assertEqual(len(seeded), 1, seeded)
+        entry = json.loads(seeded[0].read_text())['topics'][0]
+        self.assertIn('box-bot', json.dumps(entry.get('exclude')))
+
 
 if __name__ == '__main__':
     unittest.main()
