@@ -231,6 +231,31 @@ finally:
 check("a stat that fails (EIO) keeps the existing pin",
       {v[2] for v in keep.pinned.values()} == {bin_a} and len(lc_io.maps) == 1)
 
+order = []
+orig_shield, orig_reply = rh.shield_from_shutdown, rh.reply
+rh.shield_from_shutdown = lambda: order.append("shield")
+rh.reply = lambda c, t: (order.append(t.strip().decode()), orig_reply(c, t))[1]
+scenario(128, me, [b"REBOOT\n"])
+rh.shield_from_shutdown, rh.reply = orig_shield, orig_reply
+check("SIGTERM is ignored before OK is sent",
+      order.index("shield") < order.index("OK"))
+
+errs = []
+rh.mapped_files(["10", "99"], proc, errors=errs)
+check("an exited process is not a discovery error", not errs)
+os.chmod(os.path.join(proc, "10", "maps"), 0)
+if os.getuid() != 0:
+    rh.mapped_files(["10"], proc, errors=errs)
+    check("an unreadable maps file is a discovery error", len(errs) == 1)
+os.chmod(os.path.join(proc, "10", "maps"), 0o644)
+lc_inc = FakeLibc()
+inc = rh.Pinner(lc_inc, owner=me)
+inc.refresh({bin_a})
+inc.refresh(set(), complete=False)
+check("an incomplete discovery unpins nothing", len(lc_inc.maps) == 1)
+inc.refresh(set())
+check("a complete discovery still unpins", not lc_inc.maps)
+
 if failures:
     print("%d failure(s)" % len(failures))
     sys.exit(1)

@@ -167,8 +167,9 @@ def serve(sock, allowed_uid, trigger_fd, mask_fd, sleep=time.sleep,
                 reply(conn, b"ERR sysrq-disabled\n")
                 continue
             started = True
+            # Before the reply: nothing may stop an accepted request.
+            shield_from_shutdown()
             reply(conn, b"OK\n")
-        shield_from_shutdown()
         try:
             run_sequence(trigger_fd, sleep, delays)
         except OSError as exc:
@@ -178,8 +179,10 @@ def serve(sock, allowed_uid, trigger_fd, mask_fd, sleep=time.sleep,
             return
 
 
-def unit_pids(units, proc="/proc"):
-    """PIDs whose cgroup v2 path ends in one of `units`."""
+def unit_pids(units, proc="/proc", errors=None):
+    """PIDs whose cgroup v2 path ends in one of `units`. A read that fails
+    for a reason other than the process having exited is appended to
+    `errors`: the answer is then incomplete."""
     pids = []
     for name in os.listdir(proc):
         if not name.isdigit():
@@ -187,7 +190,8 @@ def unit_pids(units, proc="/proc"):
         try:
             with open(os.path.join(proc, name, "cgroup")) as f:
                 lines = f.read().splitlines()
-        except OSError:
+        except OSError as exc:
+            note_error(exc, errors)
             continue
         for line in lines:
             if line.startswith("0::") and line.rsplit("/", 1)[-1] in units:
@@ -196,14 +200,22 @@ def unit_pids(units, proc="/proc"):
     return pids
 
 
-def mapped_files(pids, proc="/proc"):
-    """Paths of the files these processes have mapped."""
+def note_error(exc, errors):
+    if errors is not None and not isinstance(
+            exc, (FileNotFoundError, ProcessLookupError)):
+        errors.append(exc)
+
+
+def mapped_files(pids, proc="/proc", errors=None):
+    """Paths of the files these processes have mapped (see unit_pids for
+    `errors`)."""
     paths = set()
     for pid in pids:
         try:
             with open(os.path.join(proc, pid, "maps")) as f:
                 lines = f.read().splitlines()
-        except OSError:
+        except OSError as exc:
+            note_error(exc, errors)
             continue
         for line in lines:
             fields = line.split(None, 5)
@@ -234,7 +246,9 @@ class Pinner:
     def total(self):
         return sum(size for _, size, _ in self.pinned.values())
 
-    def refresh(self, paths):
+    def refresh(self, paths, complete=True):
+        """Reconcile with `paths`. With complete=False (discovery could not
+        read everything) nothing is unpinned: absence proves nothing."""
         wanted = {}
         unknown = set()
         for path in sorted(paths):
@@ -250,7 +264,7 @@ class Pinner:
             if pinnable(st, self.owner):
                 wanted.setdefault((st.st_dev, st.st_ino), (path, st.st_size))
         for key in [k for k, v in self.pinned.items()
-                    if k not in wanted and v[2] not in unknown]:
+                    if complete and k not in wanted and v[2] not in unknown]:
             addr, size, _ = self.pinned.pop(key)
             self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
         skipped = 0
@@ -297,7 +311,10 @@ def run_pinner(units):
     last = None
     while True:
         try:
-            skipped = pinner.refresh(mapped_files(unit_pids(units)))
+            errors = []
+            pids = unit_pids(units, errors=errors)
+            paths = mapped_files(pids, errors=errors)
+            skipped = pinner.refresh(paths, complete=not errors)
             now = (len(pinner.pinned), pinner.total() >> 20, skipped)
             if now != last:
                 sys.stderr.write("agent-box-reboot-helper: pinned %d files "
