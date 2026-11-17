@@ -39,6 +39,14 @@ UPLOADS = None
 daemon = None
 
 
+def load_source(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def setUpModule():
     global WORK, STATE, UPLOADS, daemon
     WORK = tempfile.mkdtemp(prefix="agent-box-receive-")
@@ -57,11 +65,7 @@ def setUpModule():
         "AGENT_BOX_UPLOADS_DIR": UPLOADS,
     })
     try:
-        loader = importlib.machinery.SourceFileLoader(
-            "agent_box_receive_under_test", str(DAEMON))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        daemon = importlib.util.module_from_spec(spec)
-        loader.exec_module(daemon)
+        daemon = load_source("agent_box_receive_under_test", DAEMON)
     finally:
         os.environ.clear()
         os.environ.update(saved)
@@ -551,112 +555,74 @@ class ReceiveHTTPTest(unittest.TestCase):
 
 
 class ReceiveCLITest(unittest.TestCase):
-    def test_cli_prints_secret_only_in_fragment_and_can_revoke(self):
-        assembled = os.path.join(WORK, "agent-box-receive.py")
-        with open(assembled, "w") as output:
+    def setUp(self):
+        self.assembled = os.path.join(WORK, "agent-box-receive.py")
+        with open(self.assembled, "w") as output:
             subprocess.run([
                 sys.executable, str(REPO / "bin" / "assemble-module.py"),
                 "--resolve", str(REPO / "modules" / "src" / "receive-cli.py"),
             ], check=True, stdout=output)
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-               "HOME": WORK,
-               "AGENT_BOX_URL": "https://box.example/alice/",
-               "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
-               "AGENT_BOX_UPLOADS_DIR": UPLOADS}
-        made = subprocess.run(
-            [sys.executable, assembled, "--ttl", "1h", "--max-size", "500M"],
-            check=True, text=True, capture_output=True, env=env)
-        url = made.stdout.strip()
+        self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": WORK,
+                    "AGENT_BOX_URL": "https://box.example/alice/",
+                    "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
+                    "AGENT_BOX_UPLOADS_DIR": UPLOADS}
+        shutil.rmtree(STATE, ignore_errors=True)
+
+    def run_cli(self, *args, check=True):
+        return subprocess.run(
+            [sys.executable, self.assembled, *args], check=check, text=True,
+            capture_output=True, env=self.env)
+
+    def json_names(self):
+        return [n for n in os.listdir(STATE) if n.endswith(".json")]
+
+    def test_cli_prints_secret_only_in_fragment_and_can_revoke(self):
+        url = self.run_cli("--ttl", "1h", "--max-size", "500M").stdout.strip()
         self.assertRegex(
             url, r"^https://box\.example/alice/receive/[A-Za-z0-9_-]+/#"
                  r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
         slot = url.split("/receive/", 1)[1].split("/", 1)[0]
-        listed = subprocess.run(
-            [sys.executable, assembled, "list"], check=True, text=True,
-            capture_output=True, env=env)
-        self.assertIn(slot, listed.stdout)
-        subprocess.run([sys.executable, assembled, "revoke", slot],
-                       check=True, text=True, capture_output=True, env=env)
+        self.assertIn(slot, self.run_cli("list").stdout)
+        self.run_cli("revoke", slot)
         self.assertFalse(os.path.exists(os.path.join(STATE, slot + ".json")))
 
     def test_multi_file_link_lists_and_revokes_as_one(self):
-        assembled = os.path.join(WORK, "agent-box-receive.py")
-        with open(assembled, "w") as output:
-            subprocess.run([
-                sys.executable, str(REPO / "bin" / "assemble-module.py"),
-                "--resolve", str(REPO / "modules" / "src" / "receive-cli.py"),
-            ], check=True, stdout=output)
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-               "HOME": WORK,
-               "AGENT_BOX_URL": "https://box.example/alice/",
-               "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
-               "AGENT_BOX_UPLOADS_DIR": UPLOADS}
-        shutil.rmtree(STATE, ignore_errors=True)
-
-        def run(*args, check=True):
-            return subprocess.run(
-                [sys.executable, assembled, *args], check=check, text=True,
-                capture_output=True, env=env)
-        made = run("--files", "4", "--json")
-        info = json.loads(made.stdout)
+        info = json.loads(self.run_cli("--files", "4", "--json").stdout)
         self.assertEqual(info["files"], 4)
         slot = info["slot"]
-        names = sorted(n for n in os.listdir(STATE) if n.endswith(".json"))
-        self.assertEqual(len(names), 4)
-        listed = run("list").stdout.splitlines()
+        self.assertEqual(len(self.json_names()), 4)
+        listed = self.run_cli("list").stdout.splitlines()
         self.assertEqual(listed[0].split("\t")[-1], "LINK")
         self.assertEqual(
             sorted(line.split("\t")[-1] for line in listed[1:]),
             sorted([slot] * 3 + ["-"]))
-        run("revoke", slot)
-        self.assertEqual(
-            [n for n in os.listdir(STATE) if n.endswith(".json")], [])
+        self.run_cli("revoke", slot)
+        self.assertEqual(self.json_names(), [])
         for bad in ("0", "101"):
-            refused = run("--files", bad, check=False)
+            refused = self.run_cli("--files", bad, check=False)
             self.assertNotEqual(refused.returncode, 0)
-        default = json.loads(run("--json").stdout)
-        self.assertEqual(default["files"], 10)
-
-    def revoke_env(self):
-        assembled = os.path.join(WORK, "agent-box-receive.py")
-        with open(assembled, "w") as output:
-            subprocess.run([
-                sys.executable, str(REPO / "bin" / "assemble-module.py"),
-                "--resolve", str(REPO / "modules" / "src" / "receive-cli.py"),
-            ], check=True, stdout=output)
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-               "HOME": WORK,
-               "AGENT_BOX_URL": "https://box.example/alice/",
-               "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
-               "AGENT_BOX_UPLOADS_DIR": UPLOADS}
-        shutil.rmtree(STATE, ignore_errors=True)
-
-        def run(*args):
-            return subprocess.run(
-                [sys.executable, assembled, *args], text=True,
-                capture_output=True, env=env)
-        return run
+        self.assertEqual(
+            json.loads(self.run_cli("--json").stdout)["files"], 10)
 
     def test_revoke_finishes_after_the_first_record_was_pruned(self):
-        run = self.revoke_env()
-        slot = json.loads(run("--files", "3", "--json").stdout)["slot"]
+        slot = json.loads(
+            self.run_cli("--files", "3", "--json").stdout)["slot"]
         # Marking the primary and then failing on a child leaves the
         # primary revoked, and pruning removes its record.
         daemon.receive_mark_revoked(slot)
         self.assertEqual(daemon.receive_prune(), 1)
-        self.assertEqual(
-            len([n for n in os.listdir(STATE) if n.endswith(".json")]), 2)
-        done = run("revoke", slot)
+        self.assertEqual(len(self.json_names()), 2)
+        done = self.run_cli("revoke", slot, check=False)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(
-            [n for n in os.listdir(STATE) if n.endswith(".json")], [])
-        gone = run("revoke", slot)
+        self.assertEqual(self.json_names(), [])
+        gone = self.run_cli("revoke", slot, check=False)
         self.assertNotEqual(gone.returncode, 0)
         self.assertIn("no such slot", gone.stderr)
 
     def test_revoke_refuses_when_the_link_cannot_be_enumerated(self):
-        run = self.revoke_env()
-        slot = json.loads(run("--files", "3", "--json").stdout)["slot"]
+        slot = json.loads(
+            self.run_cli("--files", "3", "--json").stdout)["slot"]
         # Load the assembled CLI itself so its revoke runs in this process,
         # where listing the state directory can be made to fail.
         saved = dict(os.environ)
@@ -664,12 +630,8 @@ class ReceiveCLITest(unittest.TestCase):
                            "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
                            "AGENT_BOX_UPLOADS_DIR": UPLOADS})
         try:
-            loader = importlib.machinery.SourceFileLoader(
-                "agent_box_receive_cli_under_test",
-                os.path.join(WORK, "agent-box-receive.py"))
-            spec = importlib.util.spec_from_loader(loader.name, loader)
-            cli = importlib.util.module_from_spec(spec)
-            loader.exec_module(cli)
+            cli = load_source(
+                "agent_box_receive_cli_under_test", self.assembled)
         finally:
             os.environ.clear()
             os.environ.update(saved)
@@ -684,10 +646,10 @@ class ReceiveCLITest(unittest.TestCase):
                 cli.cmd_revoke(mock.Mock(slot=slot))
         self.assertIn("cannot revoke", str(caught.exception))
         # Nothing was marked or removed, so the same command can run again.
-        names = os.listdir(STATE)
-        self.assertEqual(len([n for n in names if n.endswith(".json")]), 3)
-        self.assertEqual([n for n in names if n.endswith(".revoked")], [])
-        self.assertEqual(run("revoke", slot).returncode, 0)
+        self.assertEqual(len(self.json_names()), 3)
+        self.assertEqual(
+            [n for n in os.listdir(STATE) if n.endswith(".revoked")], [])
+        self.assertEqual(self.run_cli("revoke", slot).returncode, 0)
 
 
 if __name__ == "__main__":
