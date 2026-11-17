@@ -5495,6 +5495,7 @@ RESTART_PATTERNS = [
     "agent-box-settings@*.service",
     "agent-box-webhook@*.socket",
     "agent-box-webhook@*.service",
+    REBOOT_HELPER_UNIT,
     "caddy.service",
 ]
 SESSION_PATTERN = "agent-box@*.service"
