@@ -335,5 +335,67 @@ class Watches(unittest.TestCase):
                               (self.root / 'receiver.log').read_text())
 
 
+    def test_seeded_hook_claim_keeps_ci_the_box_triggered(self):
+        # PR #1041: a hook session pushed a fix, and the red run on that push
+        # reached a fresh session instead of it. GitHub names the pusher as a
+        # CI run's sender, and the seed muted "@self" outright, so the owner
+        # neither received its own CI nor claimed it. The seed must drop only
+        # the box's DIRECT echoes (its comments, pushes), never its CI.
+        sha = 'a' * 40
+        cases = [({'sha': sha, 'branch': 'fix'}, 'check_run', {
+                      'action': 'completed', 'check_run': {
+                          'conclusion': 'failure', 'head_sha': sha,
+                          'check_suite': {'head_branch': 'fix'}}}, True),
+                 ({'number': 7}, 'issue_comment', {
+                      'action': 'created', 'issue': {'number': 7}}, False)]
+        for meta, event, payload, self_claimed in cases:
+            env = dict(self.env, LOCAL_WEBHOOK_SELF='Box-Bot',
+                       LOCAL_WEBHOOK_SPAWN_SOURCE='github',
+                       LOCAL_WEBHOOK_SPAWN_KEY='owner/repo',
+                       LOCAL_WEBHOOK_SPAWN_EVENT=event,
+                       LOCAL_WEBHOOK_SPAWN_META=json.dumps(meta))
+            for f in self.state.glob('filter.*-hook-*.json'):
+                f.unlink()
+            # The launch itself fails (AGENT_BOX_SESSION_BIN=false); the seed
+            # is written before it, and the seed is what is under test.
+            subprocess.run([str(self.spawn)], env=env, input='[UNTRUSTED] event\n',
+                           capture_output=True, text=True, timeout=30)
+            seeded = list(self.state.glob('filter.*-hook-owner-repo-*.json'))
+            self.assertEqual(len(seeded), 1, seeded)
+            entry = json.loads(seeded[0].read_text())['topics'][0]
+            self.assertNotIn('ignoreSenders', entry)
+            probe = ('import importlib.machinery as m, json, sys\n'
+                     'w = m.SourceFileLoader("w", sys.argv[1]).load_module()\n'
+                     'print(json.dumps([w.filter_claims(sys.argv[2], "github", "owner/repo",'
+                     ' s, sys.argv[3], dict(json.loads(sys.argv[4]), sender={"login": s}))'
+                     ' for s in ("box-bot", "human")]))\n')
+            got = subprocess.run(
+                [sys.executable, '-c', probe, str(WEBHOOK), str(seeded[0]), event,
+                 json.dumps(payload)],
+                env=env, capture_output=True, text=True, check=True).stdout
+            self.assertEqual(json.loads(got), [self_claimed, True], (event, got))
+
+    def test_seed_reads_self_env_without_sed_on_path(self):
+        # The receiver's PATH has jq and coreutils but no sed. The seed must
+        # still learn the box's login from self.env, or it silently drops the
+        # direct-echo exclude. A failing sed shim stands in for its absence.
+        shim = self.root / 'shim'
+        shim.mkdir()
+        (shim / 'sed').write_text('#!/bin/sh\nexit 127\n')
+        (shim / 'sed').chmod(0o700)
+        (self.state / 'self.env').write_text('LOCAL_WEBHOOK_SELF=Box-Bot\n')
+        env = dict(self.env, PATH=str(shim) + os.pathsep + self.env['PATH'],
+                   LOCAL_WEBHOOK_SPAWN_SOURCE='github',
+                   LOCAL_WEBHOOK_SPAWN_KEY='owner/repo',
+                   LOCAL_WEBHOOK_SPAWN_EVENT='issue_comment',
+                   LOCAL_WEBHOOK_SPAWN_META=json.dumps({'number': 7}))
+        subprocess.run([str(self.spawn)], env=env, input='[UNTRUSTED] event\n',
+                       capture_output=True, text=True, timeout=30)
+        seeded = list(self.state.glob('filter.*-hook-owner-repo-*.json'))
+        self.assertEqual(len(seeded), 1, seeded)
+        entry = json.loads(seeded[0].read_text())['topics'][0]
+        self.assertIn('box-bot', json.dumps(entry.get('exclude')))
+
+
 if __name__ == '__main__':
     unittest.main()
