@@ -35,6 +35,7 @@ import json
 import os
 import pathlib
 import re
+import sys
 import tempfile
 import threading
 import unittest
@@ -334,6 +335,7 @@ class ConnectionLogoutTest(unittest.TestCase):
             "github": ["auth", "logout", "--hostname", "github.com"],
             "defang": ["logout", "--non-interactive"],
             "whatsapp": ["unlink"],
+            "tailscale": ["disconnect"],
         })
 
     def test_logout_uses_native_command_without_environment_override(self):
@@ -695,6 +697,88 @@ class ReloginRestartTest(unittest.TestCase):
         self.assertIn("var manuallyOpenFolds = new WeakSet();", self.daemon.SCRIPT)
         self.assertIn("manuallyOpenFolds.has(node)", self.daemon.SCRIPT)
         self.assertIn("manuallyOpenFolds.add(fold)", self.daemon.SCRIPT)
+
+
+class TailscaleConnectTest(unittest.TestCase):
+    def setUp(self):
+        self.daemon = load_daemon()
+
+    def test_card_is_the_box_owners_only(self):
+        self.daemon.TAILSCALE_UNIT = ""
+        ids = [f["id"] for f in self.daemon.connect_flows()]
+        self.assertNotIn("tailscale", ids)
+        self.daemon.TAILSCALE_UNIT = "agent-box-tailscale.service"
+        # Any executable: the Nix build sandbox has no /bin/true.
+        self.daemon.CONNECT_BINS["tailscale"] = sys.executable
+        ids = [f["id"] for f in self.daemon.connect_flows()]
+        self.assertIn("tailscale", ids)
+
+    def test_status_parser(self):
+        class Proc:
+            returncode = 0
+            stdout = '{"enabled": true, "backendState": "NeedsLogin"}'
+
+        self.assertEqual((False, "starting the tailnet connection"),
+                         self.daemon.parse_tailscale_status(Proc()))
+        Proc.stdout = '{"enabled": true, "backendState": "Running", "dnsName": "box.tail.test"}'
+        self.assertEqual((True, "box.tail.test"),
+                         self.daemon.parse_tailscale_status(Proc()))
+        Proc.stdout = '{"enabled": false, "backendState": ""}'
+        self.assertEqual((False, ""), self.daemon.parse_tailscale_status(Proc()))
+
+    def test_sign_in_link_only_to_the_configured_server(self):
+        flow = {"id": "tailscale", "hosts": ("tailscale.com",)}
+        text = "To authenticate, visit:\n\n\thttps://login.tailscale.com/a/abc123\n"
+        self.daemon.tailscale_login_host = lambda: ""
+        hosts = self.daemon.connect_hosts(flow)
+        self.assertEqual("https://login.tailscale.com/a/abc123",
+                         self.daemon.connect_trusted_url(text, hosts))
+        # With a Headscale server configured, only its host is a link.
+        self.daemon.tailscale_login_host = lambda: "hs.example"
+        hosts = self.daemon.connect_hosts(flow)
+        self.assertIsNone(self.daemon.connect_trusted_url(text, hosts))
+        self.assertEqual("https://hs.example/register/abc",
+                         self.daemon.connect_trusted_url(
+                             "visit https://hs.example/register/abc", hosts))
+
+    def test_idle_card_offers_the_connect_form(self):
+        page = self.daemon.render_connect_card(base_state(
+            id="tailscale", label="Tailscale", state="idle", needs_code=False))
+        self.assertIn('name="login_server"', page)
+        self.assertIn('name="auth_key"', page)
+        self.assertIn('type="password" name="auth_key"', page)
+        self.assertIn(">Not connected<", page)
+
+    def test_connected_card_links_the_tailnet_name(self):
+        page = self.daemon.render_connect_card(base_state(
+            id="tailscale", label="Tailscale", state="connected",
+            detail="box.tail.test", removable=True, needs_code=False))
+        self.assertIn('href="https://box.tail.test/', page)
+        self.assertIn(">Disconnect<", page)
+        page = self.daemon.render_connect_card(base_state(
+            id="tailscale", label="Tailscale", state="connected",
+            detail='x"><script>', removable=True, needs_code=False))
+        self.assertNotIn("<script>", page)
+
+    def test_configure_passes_the_key_on_stdin_only(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen["argv"], seen["input"] = argv, kwargs.get("input")
+
+            class Done:
+                returncode = 0
+                stderr = ""
+            return Done()
+
+        with mock.patch.object(self.daemon.subprocess, "run", fake_run):
+            refused = self.daemon.tailscale_configure(
+                {"bin": "/x/agent-box-tailscale"}, " https://hs.example ",
+                " tskey-auth-secret ")
+        self.assertIsNone(refused)
+        self.assertNotIn("tskey-auth-secret", " ".join(seen["argv"]))
+        self.assertEqual("tskey-auth-secret", seen["input"])
+        self.assertIn("https://hs.example", seen["argv"])
 
 if __name__ == "__main__":
     unittest.main()

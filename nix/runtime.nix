@@ -357,6 +357,14 @@ let
     (pkgs.writers.writePython3Bin "agent-box-slack" {
       flakeIgnore = [ "E501" "E302" "E305" ];
     } (readSrc "slack-cli.py"))
+    # The Tailscale card's CLI. The client's store path is embedded without a
+    # dependency, so the profile does not carry tailscale; the root unit
+    # fetches exactly this path when the box owner first connects.
+    (pkgs.writers.writePython3Bin "agent-box-tailscale" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (lib.replaceStrings [ "@TAILSCALE_PKG@" ]
+        [ (builtins.unsafeDiscardStringContext "${pkgs.tailscale}") ]
+        (readSrc "tailscale-cli.py")))
     (payload "agent-box-session-bare" "session-cli.sh")
     # Agent profiles (issue #321): the worker `--profile` selects. Bare, so
     # `agentbox apply` can pin the env store and the harness list into the

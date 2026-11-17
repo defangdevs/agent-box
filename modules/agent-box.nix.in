@@ -229,6 +229,10 @@ let
     install -m444 ${pkgs.writeText "agent-box-harness-upgrade@.service" ''
       @@include:src/units/agent-box-harness-upgrade@.service@@
     ''} $out/etc/systemd/system/agent-box-harness-upgrade@.service
+  '' + lib.optionalString tailscaleEnabled ''
+    install -m444 ${pkgs.writeText "agent-box-tailscale.service" ''
+      @@include:src/units/agent-box-tailscale.service@@
+    ''} $out/etc/systemd/system/agent-box-tailscale.service
   '' + lib.optionalString cfg.containers.enable ''
     install -m444 ${pkgs.writeText "agent-box-docker@.service" ''
       @@include:src/units/agent-box-docker@.service@@
@@ -728,6 +732,25 @@ let
   # - and grant /run/wrappers + disable NoNewPrivileges - for a rule that
   # was never actually rendered (CodeRabbit, PR #655).
   rebootGranted = cfg.web.enable && cfg.web.rebootButton && rootUser != null;
+  # The settings page's Tailscale card (src/tailscale-cli.py): one tailnet
+  # node per box, controlled by the box owner (the root web user) alone.
+  tailscaleEnabled = cfg.web.enable && rootUser != null;
+  tailscaleMarker =
+    "${config.users.users.${rootUser}.home}/.local/state/agent-box-tailscale/enabled";
+  # The owner may start and stop exactly that unit, and nothing else: the
+  # same narrow polkit shape as the Caddy reload grant above. Connect writes
+  # the marker the unit's condition reads, then starts it; Disconnect
+  # removes the marker and stops it.
+  tailscalePolkitRule = ''
+    polkit.addRule(function(action, subject) {
+      if (action.id == "org.freedesktop.systemd1.manage-units" &&
+          action.lookup("unit") == "agent-box-tailscale.service" &&
+          (action.lookup("verb") == "start" || action.lookup("verb") == "stop") &&
+          subject.user == ${builtins.toJSON rootUser}) {
+        return polkit.Result.YES;
+      }
+    });
+  '';
   # Whether this box grants an agent user ANY sudo, which is a different
   # question from whether effectiveSudoAllowlist is non-empty: the
   # containers arm grants each user `systemctl restart/stop` on its OWN
@@ -926,7 +949,7 @@ let
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli transcribeCli
+    ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli tailscaleCli uploadCli receiveCli transcribeCli
          harnessCli secretCli secretsMcpBin secretCandidatesReport ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -1064,6 +1087,17 @@ let
   # local-slack (issue #864): the supervisor runs its daemon while both Slack
   # tokens are in the env store. The CLI fetches the one pinned slack.py and
   # supplies the receiver socket path, which only this box knows.
+  # The box's Tailscale connection (settings page, box owner only). The
+  # client's store path is embedded WITHOUT a dependency on it, so the system
+  # closure does not carry tailscale: the unit fetches exactly this path from
+  # the binary cache when the owner first connects.
+  tailscaleCli = pkgs.writers.writePython3Bin "agent-box-tailscale" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } (lib.replaceStrings [ "@TAILSCALE_PKG@" ]
+      [ (builtins.unsafeDiscardStringContext "${pkgs.tailscale}") ] ''
+@@include:src/tailscale-cli.py@@
+  '');
+
   slackCli = pkgs.writers.writePython3Bin "agent-box-slack" {
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
@@ -1351,6 +1385,7 @@ GH_BIN = "${pkgs.gh}/bin/gh"
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
+    "agent-box-tailscale" = "${tailscaleCli}/bin/agent-box-tailscale";
     "agent-box-slack" = "${slackCli}/bin/agent-box-slack";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
@@ -1859,6 +1894,7 @@ GH_BIN = "${pkgs.gh}/bin/gh"
       "github=${pkgs.gh}/bin/gh"
       "defang=${defangCliBinDir}/defang"
       "whatsapp=${whatsappCli}/bin/agent-box-whatsapp"
+      "tailscale=${tailscaleCli}/bin/agent-box-tailscale"
     ]
   );
 
@@ -3870,6 +3906,27 @@ in
     # systemd-oomd overlaps earlyoom (two daemons racing to kill under
     # pressure); keep exactly one, explicitly.
     systemd.oomd.enable = lib.mkDefault false;
+  }) (lib.mkIf tailscaleEnabled {
+    # The box's tailnet node (src/units/agent-box-tailscale.service, installed
+    # by agentBoxUnitsPackage above). This drop-in is the backend half: the
+    # CLI's store path, the owner, and the owner's marker. The native renderer
+    # writes the same keys. Wanted at boot, but the condition keeps it off
+    # until the owner connects, and off again after Disconnect.
+    systemd.services."agent-box-tailscale" = {
+      overrideStrategy = "asDropin";
+      unitConfig.ConditionPathExists = tailscaleMarker;
+      environment = {
+        AGENT_BOX_TAILSCALE_OWNER = rootUser;
+        AGENT_BOX_TAILSCALE_MARKER = tailscaleMarker;
+      };
+      serviceConfig = {
+        ExecStartPre = "${tailscaleCli}/bin/agent-box-tailscale install-client";
+        ExecStart = "${tailscaleCli}/bin/agent-box-tailscale daemon";
+        ExecStartPost = "${tailscaleCli}/bin/agent-box-tailscale set-operator";
+        ExecStopPost = "${tailscaleCli}/bin/agent-box-tailscale stopped";
+      };
+    };
+    systemd.targets.multi-user.wants = [ "agent-box-tailscale.service" ];
   }) (lib.mkIf cfg.containers.enable {
     # Rootless containers for the agent users (issue 600).
     #
@@ -4376,21 +4433,30 @@ in
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
           caddyReloadCmd
-          (if webDomainIsPrivateIpv4 then "internal_ca"
-           else if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
           (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "")
           portalHint ] ''
         @@include:src/caddyfile-header.caddy@@
       ''
+      # The routes are a snippet so the public vhost and the loopback tailnet
+      # listener in caddyfile-vhost.caddy serve the same pages from one copy.
+      # A snippet must be defined before it is imported.
+      + "(agent_box_routes) {\n"
       + lib.concatMapStringsSep "\n"
           (name: indent "  " (webhookCaddyBlock name + portalCaddyBlock name
                               + terminalCaddyBlock name)) terminalUsers
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
-      + "}\n\n"
+      + "}\n"
+      + lib.replaceStrings [ "@DOMAIN@" "@TLS_POLICY@" ]
+        [ cfg.web.domain
+          (if webDomainIsPrivateIpv4 then "internal_ca"
+           else if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only") ] ''
+        @@include:src/caddyfile-vhost.caddy@@
+      ''
+      + "\n"
       + lib.concatMapStrings (alias:
         lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" "@WEBHOOK_ROUTES@" ]
           [ alias cfg.web.domain
@@ -4615,7 +4681,8 @@ in
       # daemon-reload all keep the platform defaults.
       security.polkit = {
         enable = true;
-        extraConfig = caddyReloadPolkitRule;
+        extraConfig = caddyReloadPolkitRule
+          + lib.optionalString tailscaleEnabled tailscalePolkitRule;
       };
 
 
@@ -4929,6 +4996,11 @@ in
             # here, unlike AGENT_BOX_UPDATE_CMD, which triggers the run.
             AGENT_BOX_UPDATE_UNIT = "agent-box-update.service";
             AGENT_BOX_SYSTEMCTL = "/run/current-system/sw/bin/systemctl";
+          }
+          // lib.optionalAttrs (tailscaleEnabled && name == rootUser) {
+            # The Tailscale card. Root user only, matching the polkit grant:
+            # the daemon hides the card without it.
+            AGENT_BOX_TAILSCALE_UNIT = "agent-box-tailscale.service";
           }
           // lib.optionalAttrs (rebootButton && name == rootUser) {
             # The Danger zone's "Reboot box" (web.rebootButton). Set for

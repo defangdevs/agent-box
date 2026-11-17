@@ -1,0 +1,11 @@
+
+# The box's own vhost: every route in agent_box_routes, under its name. The
+# routes are a snippet so a second site can serve the same pages under
+# another name: agent-box-tailscale writes one for the box's tailnet name
+# into the owner's ~/sites (imported below), which is what lets a box with
+# no inbound port open still be used.
+@DOMAIN@ {
+  import agent_box_site
+  import @TLS_POLICY@
+  import agent_box_routes
+}

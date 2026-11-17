@@ -3052,6 +3052,26 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # The Tailscale card's CLI against fake tailscale/systemctl: key
+          # handling, the Caddy site it writes, and what Disconnect erases.
+          tailscale-cli =
+            pkgs.runCommand "agent-box-tailscale-cli"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                cli = ./modules/src/tailscale-cli.py;
+                tests = ./tests/test-tailscale-cli.py;
+              } ''
+              install -d repo/modules/src repo/tests
+              cp "$cli" repo/modules/src/tailscale-cli.py
+              cp "$tests" repo/tests/test-tailscale-cli.py
+              python3 repo/tests/test-tailscale-cli.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           whatsapp-session =
             pkgs.runCommand "agent-box-whatsapp-session"
               {

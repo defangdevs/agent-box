@@ -281,6 +281,29 @@ read-content ID`; private content normally expires 24 hours after acceptance,
 independently of queue consumption. Do not execute or automatically extract
 attachments. `agent-box-webhook status` reports pending and retained content.
 
+## Tailscale connection
+
+The box owner's settings page has a Tailscale card under Connections. Connect
+joins this BOX to a tailnet as one node named after the box: Tailscale's own
+service, or a self-hosted Headscale server given as the login server. An
+optional auth key joins without a sign-in link. The node is the root unit
+`agent-box-tailscale.service` in kernel mode; only the owner can start or stop
+it, through the card or `agent-box-tailscale connect` / `disconnect`.
+`agent-box-tailscale status` prints its state as JSON.
+
+Once joined, Caddy also serves the box's own pages at
+`https://<node name>/<user>/`, behind the same login, so the box stays usable
+with no inbound port open. A `ts.net` name gets a trusted certificate when
+HTTPS is turned on for the tailnet; any other name uses Caddy's local CA, which
+a browser asks to accept once. The site is the owner's
+`~/sites/agent-box-tailnet.caddy`, written by Connect and removed by
+Disconnect; do not edit it.
+
+A service bound to 127.0.0.1 stays private. A service bound to 0.0.0.0 is
+reachable from every tailnet device the tailnet's access rules allow, as it
+is from the internet when a port is open. Tailscale SSH, exit nodes and subnet
+routes stay off.
+
 ## Personal WhatsApp connection
 
 The settings page's Connections section can link this user's WhatsApp as a

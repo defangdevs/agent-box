@@ -132,6 +132,10 @@ CLAUDE_SETTINGS = "/etc/agent-box/claude-hook-settings.json"
 # have to name the same file.
 CADDYFILE = "/etc/agent-box/Caddyfile"
 CADDY_RELOAD_POLICY = "/etc/polkit-1/rules.d/50-agent-box-caddy-reload.rules"
+# The box's tailnet node (src/units/agent-box-tailscale.service), controlled
+# by the box owner through the settings page's Tailscale card.
+TAILSCALE_UNIT = "agent-box-tailscale.service"
+TAILSCALE_POLICY = "/etc/polkit-1/rules.d/50-agent-box-tailscale.rules"
 SUDOERS_DIR = "/etc/sudoers.d"
 # Memory protection (issue #62, #394 gap 9). Names match the module's
 # pieces, prefixed because these are OUR units on a distro that may have
@@ -1462,6 +1466,7 @@ class Renderer:
             self.caddy(t)
             self.caddy_reload_policy(t)
             self.fail2ban(t)
+            self.tailscale(t)
         else:
             self.web_off(t)
         if self.spec.reboot_button and self.spec.root_user is not None:
@@ -2160,7 +2165,13 @@ class Renderer:
         # The %i templates for the two web families, installed byte-for-byte
         # from the profile (shared_units) — so the profile's own copy is the
         # witness that they are still ours.
-        self.gone_shared_units(t, ("agent-web-terminal@", "agent-box-settings@"))
+        self.gone_shared_units(t, ("agent-web-terminal@", "agent-box-settings@",
+                                   TAILSCALE_UNIT))
+        if self.same_text(self.p("/etc/systemd/system", TAILSCALE_UNIT),
+                          (self.share / "units" / TAILSCALE_UNIT).read_text()
+                          if (self.share / "units" / TAILSCALE_UNIT).is_file()
+                          else None):
+            t.disable.append(TAILSCALE_UNIT)
         for u in self.spec.users:
             for name in (f"agent-web-terminal-{u.name}.env",
                          f"agent-box-settings-{u.name}.env"):
@@ -2174,7 +2185,8 @@ class Renderer:
         # removed on the byte-identical witness instead.
         t.gone(self.p(WEB_USERS_FILE), self.web_users_text())
         for path, (text, _mode) in self.would_have_written(
-                self.caddy, self.caddy_reload_policy, self.fail2ban).items():
+                self.caddy, self.caddy_reload_policy, self.fail2ban,
+                self.tailscale).items():
             t.gone(path, text)
         # NOT removed: /etc/agent-box/<user>.hash and the cookie secrets
         # under /var/lib/agent-box-web. They are credentials this renderer
@@ -2743,6 +2755,8 @@ class Renderer:
                 continue
             if unit.name.startswith(SECRET_BROKER_UNIT_PREFIX) and \
                     not self.spec.secrets_enable:
+                continue
+            if unit.name == TAILSCALE_UNIT and not self.spec.web_enable:
                 continue
             t.file(self.p("/etc/systemd/system", unit.name),
                    unit.read_text(), 0o444)
@@ -3436,7 +3450,8 @@ class Renderer:
                        'Environment="AGENT_BOX_CONNECT_BINS=' + " ".join(
                            [f"{a}={self.bin}/{a}" for a in self.spec.agents]
                            + [f"github={self.bin}/gh",
-                              f"whatsapp={self.bin}/agent-box-whatsapp"]) + '"',
+                              f"whatsapp={self.bin}/agent-box-whatsapp",
+                              f"tailscale={self.bin}/agent-box-tailscale"]) + '"',
                        # The Defang card (issue #461). defang is not in
                        # nixpkgs, so AGENT_BOX_NIXPKGS below cannot reach
                        # it and the card used to be dropped here entirely —
@@ -3458,7 +3473,7 @@ class Renderer:
                        f'Environment="AGENT_BOX_UPDATE_CMD=/usr/bin/sudo -n '
                        f'{UPDATE_TRIGGER}"',
                        f'Environment="AGENT_BOX_UPDATE_UNIT={UPDATE_UNIT}"',
-                   ] + self.reboot_env(u) + ([
+                   ] + self.reboot_env(u) + self.tailscale_env(u) + ([
                        # The webhook panel (issue #227) shells out to the
                        # SAME script and interpreter the receiver runs, so
                        # the panel cannot drift from the semantics the
@@ -3640,6 +3655,16 @@ class Renderer:
                     .replace("@UPDATE_SECTION@", update_section)
                     .replace("@CONTAINERS_SECTION@", containers_section)
                     .replace("@HOST_SECTION@", host_section))
+
+    def tailscale_env(self, u):
+        """AGENT_BOX_TAILSCALE_UNIT, for the root user's settings daemon only.
+
+        The Tailscale card is the box owner's alone, matching the polkit
+        grant in tailscale(); another user's daemon hides it.
+        """
+        if not (self.spec.web_enable and u is self.spec.root_user):
+            return []
+        return [f'Environment="AGENT_BOX_TAILSCALE_UNIT={TAILSCALE_UNIT}"']
 
     def reboot_env(self, u):
         """AGENT_BOX_REBOOT_CMD, for the root user's settings daemon only.
@@ -4094,20 +4119,20 @@ class Renderer:
             text = text.replace("@DOMAIN@", self.spec.domain)
             if alias is not None:
                 text = text.replace("@ALIAS@", alias)
-            if "@TLS_POLICY@" in text:
-                try:
-                    ip = ipaddress.ip_address(self.spec.domain)
-                except ValueError:
-                    ip = None
-                ipv4 = isinstance(ip, ipaddress.IPv4Address)
-                policy = ("internal_ca" if ipv4 and private_ipv4(ip)
-                          else "acme_ip_shortlived" if ipv4
-                          else "acme_alpn_only")
-                text = text.replace("@TLS_POLICY@", policy)
-                text = text.replace(
-                    "@DEFAULT_SNI@",
-                    f"  default_sni {self.spec.domain}"
-                    if isinstance(ip, ipaddress.IPv4Address) else "")
+            try:
+                ip = ipaddress.ip_address(self.spec.domain)
+            except ValueError:
+                ip = None
+            ipv4 = isinstance(ip, ipaddress.IPv4Address)
+            # The header carries @DEFAULT_SNI@ and the vhost fragment
+            # @TLS_POLICY@, so each is bound wherever it appears.
+            policy = ("internal_ca" if ipv4 and private_ipv4(ip)
+                      else "acme_ip_shortlived" if ipv4
+                      else "acme_alpn_only")
+            text = text.replace("@TLS_POLICY@", policy)
+            text = text.replace(
+                "@DEFAULT_SNI@",
+                f"  default_sni {self.spec.domain}" if ipv4 else "")
             text = text.replace("@MANAGED_BY@", "agentbox apply")
             text = text.replace("@APPLY_CMD@", "agentbox apply")
             text = text.replace("@RELOAD_CMD@", CADDY_RELOAD_CMD)
@@ -4146,7 +4171,11 @@ class Renderer:
             # remains literal, matching Nix's non-recursive replaceStrings.
             return text.replace("@PORTAL_HINT@", self.portal_hint())
 
-        parts = [bind("header")]
+        # The routes are a snippet so the public
+        # vhost and the loopback tailnet listener in caddyfile-vhost.caddy
+        # serve the same pages from one copy. A snippet must be defined
+        # before it is imported, so the vhost fragment comes after it.
+        parts = [bind("header"), "(agent_box_routes) {\n"]
         for u in self.spec.users:
             if self.spec.webhook_enable:
                 parts.append(bind("webhook", u))
@@ -4157,6 +4186,7 @@ class Renderer:
             parts.append(bind("terminal", u))
         parts.append(bind("root", root_user))
         parts.append("}\n")
+        parts.append(bind("vhost"))
         routes = "".join(
             "".join(f"  {line}\n" if line else "\n"
                     for line in bind("webhook", u).splitlines())
@@ -4279,6 +4309,50 @@ class Renderer:
                "    return polkit.Result.YES;\n"
                "  }\n"
                "});\n")
+
+    def tailscale(self, t):
+        """The box's tailnet node, for the settings page's Tailscale card.
+
+        The shared unit carries everything but the backend's paths; this
+        drop-in adds them, as the module's systemd.services drop-in does: the
+        CLI, the box owner, and the owner's marker. The unit is enabled for
+        boot, and the condition keeps it off until the owner connects (so it
+        is advisory in verify, like the docker units). The polkit rule lets
+        the owner alone start and stop exactly this unit.
+        """
+        owner = self.spec.root_user
+        marker = (f"{owner.home}/.local/state/agent-box-tailscale/enabled")
+        cli = f"{self.bin}/agent-box-tailscale"
+        t.dir(self.p("/etc/systemd/system", f"{TAILSCALE_UNIT}.d"), 0o755)
+        t.file(self.p("/etc/systemd/system", f"{TAILSCALE_UNIT}.d",
+                      "10-host.conf"),
+               GENERATED_HEADER + "\n".join([
+                   "[Unit]",
+                   f"ConditionPathExists={marker}",
+                   "",
+                   "[Service]",
+                   f"Environment=AGENT_BOX_TAILSCALE_OWNER={owner.name}",
+                   f"Environment=AGENT_BOX_TAILSCALE_MARKER={marker}",
+                   f"ExecStartPre={cli} install-client",
+                   f"ExecStart={cli} daemon",
+                   f"ExecStartPost={cli} set-operator",
+                   f"ExecStopPost={cli} stopped",
+                   "",
+               ]), 0o444)
+        t.dir(self.p("/etc/polkit-1/rules.d"), 0o755)
+        t.file(self.p(TAILSCALE_POLICY),
+               "// Generated by `agentbox apply` - do not edit.\n"
+               "polkit.addRule(function(action, subject) {\n"
+               "  if (action.id == "
+               "\"org.freedesktop.systemd1.manage-units\" &&\n"
+               f"      action.lookup(\"unit\") == \"{TAILSCALE_UNIT}\" &&\n"
+               "      (action.lookup(\"verb\") == \"start\" || "
+               "action.lookup(\"verb\") == \"stop\") &&\n"
+               f"      subject.user == {json.dumps(owner.name)}) {{\n"
+               "    return polkit.Result.YES;\n"
+               "  }\n"
+               "});\n")
+        t.units.append(TAILSCALE_UNIT)
 
 
 # --------------------------------------------------------------------------
@@ -4938,6 +5012,10 @@ def advisory_units(spec, notes):
                 f"{DOCKER_UNIT_PREFIX}<user>.service`")
         advisory |= {f"{DOCKER_UNIT_PREFIX}{u.name}.service"
                      for u in spec.users}
+    if spec.web_enable:
+        # Enabled for boot, but its condition (the owner's marker) keeps it
+        # inactive until the owner connects from the settings page.
+        advisory.add(TAILSCALE_UNIT)
     return advisory
 
 

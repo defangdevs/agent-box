@@ -1,0 +1,35 @@
+[Unit]
+Description=Tailscale for this box (agent-box, started from the settings page)
+# One tailnet node per BOX, run by root in kernel (TUN) mode. Not a
+# user-space daemon in the agent unit: in user-space mode tailscaled forwards
+# every tailnet TCP connection it does not serve to 127.0.0.1 on the same
+# port, so every loopback-only service on the box would be open to the
+# tailnet, and --shields-up also blocks the front door. A TUN keeps the usual
+# semantics: a service bound to 127.0.0.1 stays private.
+#
+# Each backend adds a drop-in with the Exec lines (the absolute path of
+# agent-box-tailscale), the box owner's name, and
+#   ConditionPathExists=<owner home>/.local/state/agent-box-tailscale/enabled
+# The owner's Connect writes that marker and starts this unit through a
+# polkit grant; Disconnect removes it and stops the unit. So the unit comes
+# back at boot only while the box is connected, and a box nobody connected
+# never fetches the client at all.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Caddy asks tailscaled for the *.ts.net certificate of the tailnet site
+# agent-box-tailscale writes (Tailscale's own Caddy integration).
+Environment=TS_PERMIT_CERT_UID=caddy
+StateDirectory=agent-box-tailscale
+StateDirectoryMode=0700
+# The default socket path, so the plain `tailscale` CLI finds it.
+RuntimeDirectory=tailscale
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5s
+# The first start fetches the client from the binary cache.
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

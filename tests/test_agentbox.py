@@ -2693,6 +2693,11 @@ class RenderTest(unittest.TestCase):
                 out / "etc/systemd/system/agent-box-reboot-helper.service",
                 out / "etc/agent-box/Caddyfile",
                 out / mod.CADDY_RELOAD_POLICY.lstrip("/"),
+                # The Tailscale card's unit, its drop-in and polkit grant.
+                out / "etc/systemd/system" / mod.TAILSCALE_UNIT,
+                out / "etc/systemd/system" / (mod.TAILSCALE_UNIT + ".d")
+                / "10-host.conf",
+                out / mod.TAILSCALE_POLICY.lstrip("/"),
                 out / "etc/agent-box/web-users",
                 out / "etc/agent-box/fail2ban/jail.conf",
                 out / "etc/agent-box/fail2ban/fail2ban.conf",
@@ -2738,6 +2743,7 @@ class RenderTest(unittest.TestCase):
             self.assertEqual(["agent-box-fail2ban.service",
                               "caddy.service",
                               "agent-web-auth-secrets.service",
+                              mod.TAILSCALE_UNIT,
                               "agent-box-reboot-helper.service"],
                              tree.disable)
             # The password and cookie secrets are deliberately NOT removed:
@@ -2982,6 +2988,7 @@ class RenderTest(unittest.TestCase):
         want = {a: f"@PROFILE@/bin/{a}" for a in agents}
         want["github"] = "@PROFILE@/bin/gh"
         want["whatsapp"] = "@PROFILE@/bin/agent-box-whatsapp"
+        want["tailscale"] = "@PROFILE@/bin/agent-box-tailscale"
         self.assertEqual(want, cards)
 
     def test_ttyd_override_keeps_every_flag_the_template_sets(self):

@@ -3448,12 +3448,29 @@ def parse_whatsapp_status(proc):
     return (False, "")
 
 
+def parse_tailscale_status(proc):
+    if proc.returncode != 0:
+        return (False, "")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict):
+        return (False, "")
+    if data.get("backendState") == "Running":
+        return (True, str(data.get("dnsName") or "connected"))
+    if data.get("enabled") is True:
+        return (False, "starting the tailnet connection")
+    return (False, "")
+
+
 CONNECT_PARSERS = {
     "claude": parse_claude_status,
     "codex": parse_codex_status,
     "gh": parse_gh_status,
     "defang": parse_defang_status,
     "whatsapp": parse_whatsapp_status,
+    "tailscale": parse_tailscale_status,
 }
 
 # One row per flow, in render order. `start` and `status` are argv tails
@@ -3589,7 +3606,34 @@ CONNECT_DEFS = [
         "prompt_re": None,
         "destructive": False,
     },
+    {
+        # One tailnet node per box, for the box owner only: the daemon shows
+        # this card only where AGENT_BOX_TAILSCALE_UNIT is set (see
+        # connect_flows). Its sign-in host is Tailscale's, or the configured
+        # Headscale server's (connect_hosts).
+        "id": "tailscale",
+        "binary": "agent-box-tailscale",
+        "attr": None,
+        "label": "Tailscale",
+        "note": "Reach this box over your tailnet, with no inbound port open. "
+                "Works with Tailscale or a self-hosted Headscale server. "
+                "Services bound only to 127.0.0.1 stay private.",
+        "start": ["connect"],
+        "status": ["status"],
+        "logout": ["disconnect"],
+        "remove": (),
+        "parse": "tailscale",
+        "hosts": ("tailscale.com",),
+        "needs_code": False,
+        "show_code": False,
+        "unset": (),
+        "shadow": (),
+        "prompt_re": None,
+        "destructive": False,
+    },
 ]
+# Set for the box owner's daemon only (the polkit grant is theirs alone).
+TAILSCALE_UNIT = os.environ.get("AGENT_BOX_TAILSCALE_UNIT", "")
 
 _connect_status_cache = {}
 # The Defang CLI's structured workspace list, populated beside its status
@@ -3630,6 +3674,8 @@ def connect_flows():
     """
     flows = []
     for spec in CONNECT_DEFS:
+        if spec["id"] == "tailscale" and not TAILSCALE_UNIT:
+            continue
         flow = dict(spec)
         # Where this card would fetch the CLI from, if it is missing: a
         # nixpkgs attribute, or a pinned expression file for a CLI nixpkgs
@@ -3719,6 +3765,30 @@ def connect_run(flow, args, timeout=15, unset=()):
         )
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def tailscale_configure(flow, server, key):
+    """Hand the card's two optional fields to the CLI; an error or None.
+
+    The key goes over stdin, never a command line, and the CLI deletes its
+    copy once the node has joined.
+    """
+    if not flow["bin"]:
+        return "The Tailscale helper is not installed on this box."
+    if len(server) > 300 or len(key) > 300:
+        return "That login server or auth key is too long."
+    try:
+        proc = subprocess.run(
+            [flow["bin"], "configure", "--login-server", server.strip(),
+             "--auth-key-stdin"],
+            input=key.strip(), capture_output=True, text=True, timeout=15,
+            check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "Could not save the Tailscale settings."
+    if proc.returncode != 0:
+        message = (proc.stderr or "").strip().replace("agent-box-tailscale: ", "")
+        return message[:200] or "Could not save the Tailscale settings."
+    return None
 
 
 def whatsapp_profile(value=None):
@@ -3941,6 +4011,14 @@ def connect_confirmed_disconnected(flow, proc):
             return False
         return (proc.returncode == 0 and isinstance(data, dict)
                 and data.get("paired") is False)
+    if flow["id"] == "tailscale":
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except ValueError:
+            return False
+        return (proc.returncode == 0 and isinstance(data, dict)
+                and data.get("enabled") is False
+                and data.get("backendState") != "Running")
     return False
 
 
@@ -4134,6 +4212,30 @@ def connect_age(flow_id):
         return max(0.0, time.time() - int(proc.stdout.strip()))
     except ValueError:
         return None
+
+
+def tailscale_login_host():
+    """The configured Headscale server's host, or "" for Tailscale's own.
+
+    Read from the CLI's private config, which only `configure` writes and
+    which accepts nothing but an https origin.
+    """
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".local", "state",
+                               "agent-box-tailscale", "config.json")) as handle:
+            server = json.load(handle).get("loginServer", "")
+        return (urllib.parse.urlsplit(server).hostname or "").lower() \
+            if isinstance(server, str) and server.startswith("https://") else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def connect_hosts(flow):
+    """The hosts this flow may send the user to."""
+    if flow["id"] == "tailscale":
+        host = tailscale_login_host()
+        return (host,) if host else flow["hosts"]
+    return flow["hosts"]
 
 
 def connect_trusted_url(text, hosts):
@@ -4910,7 +5012,7 @@ def connect_state(flow, keys=None, tmux_state=None):
         else:
             if flow["prompt_re"] is not None:
                 connect_answer_prompt(flow, text)
-            url = connect_trusted_url(text, flow["hosts"])
+            url = connect_trusted_url(text, connect_hosts(flow))
             code = connect_user_code(text, flow_id) if flow["show_code"] else None
             state = "waiting" if url or code else "starting"
     elif os.path.exists(connect_done_path(flow_id)):
@@ -4987,7 +5089,8 @@ def connect_state(flow, keys=None, tmux_state=None):
         # WhatsApp remains removable while its stored device is linked but
         # the bridge is still reconnecting. Other providers expose removal
         # once their own status command reports the connection live.
-        "removable": connected or (flow_id == "whatsapp" and bool(detail)),
+        "removable": connected or (flow_id in ("whatsapp", "tailscale")
+                                   and bool(detail)),
     }
 
 
@@ -10158,6 +10261,11 @@ def render_connect_card(state):
             pill = ("live", "Connected")
         elif state["state"] in ("idle", "failed"):
             pill = ("stopped", "Not linked" if not state["detail"] else "Connecting")
+    if flow_id == "tailscale":
+        if state["state"] == "connected":
+            pill = ("live", "Connected")
+        elif state["state"] in ("idle", "failed"):
+            pill = ("stopped", "Not connected" if not state["detail"] else "Connecting")
     if not state["installed"] and state["state"] in ("idle", "checking",
                                                      "failed"):
         # "Not signed in" would be a half-truth for a CLI that is not even
@@ -10205,8 +10313,10 @@ def render_connect_card(state):
         # destructive flow's confirmation on the strength of a guess, so
         # that guard stays armed until the probe actually clears it.
         label, confirm = "Sign in", (state["state"] == "checking" and state["destructive"])
-    if flow_id == "whatsapp":
-        label = None  # The pairing form needs a phone field inside the card.
+    if flow_id in ("whatsapp", "tailscale"):
+        # The pairing form needs a phone field inside the card; Tailscale's
+        # needs its optional login server and auth key.
+        label = None
     action = ""
     if label:
         guard = ""
@@ -10220,10 +10330,15 @@ def render_connect_card(state):
         )
     logout = ""
     if state.get("removable"):
-        logout_label = "Unlink" if flow_id == "whatsapp" else "Sign out"
+        logout_label = {"whatsapp": "Unlink",
+                        "tailscale": "Disconnect"}.get(flow_id, "Sign out")
         if flow_id == "whatsapp":
             question = ("Unlink WhatsApp from this box? This stops the bridge and "
                         "deletes its linked-device keys, queued messages and routing state.")
+        elif flow_id == "tailscale":
+            question = ("Disconnect this box from the tailnet? This logs the node out "
+                        "and erases its state. If no public port is open, the box is "
+                        "then unreachable until it is connected again.")
         else:
             question = ("Sign out of %s on this box? This removes its stored sign-in "
                         "and matching API keys. Running sessions may need a restart."
@@ -10277,6 +10392,45 @@ def render_connect_card(state):
     )
 
 
+def render_tailscale_step(state):
+    """Connect form, or where the connected box is on the tailnet."""
+    base = html.escape(BASE)
+    if state["state"] == "connected":
+        name = state["detail"] or ""
+        user = pwd.getpwuid(os.getuid()).pw_name
+        url = "https://%s/%s/" % (name, user)
+        link = (f'<a href="{html.escape(url, quote=True)}" target="_blank" '
+                f'rel="noopener noreferrer"><code>{html.escape(url)}</code></a>'
+                if re.fullmatch(r"[a-z0-9.-]{1,253}", name) else "")
+        error = (f'<p class="note conn-error">{html.escape(state["error"])}</p>'
+                 if state["error"] else "")
+        return (
+            '<div class="conn-step">' + error + '<p class="note">This box is on the '
+            f'tailnet at {link}. Devices on the tailnet reach it there, behind '
+            'the same login as this page. A name outside <code>ts.net</code> '
+            "uses Caddy's local certificate, so a browser asks once to accept "
+            'it.</p></div>')
+    error = ""
+    if state["state"] == "failed" and state["error"]:
+        error = f'<p class="note conn-error">{html.escape(state["error"])}</p>'
+    return (
+        f'<div class="conn-step">{error}<form method="post" action="{base}/connect/start" '
+        'class="row conn-form">'
+        '<input type="hidden" name="flow" value="tailscale">'
+        '<label class="field conn-field"><span class="note">Login server '
+        '(optional)</span><input type="url" name="login_server" '
+        'autocomplete="off" placeholder="https://headscale.example.com" '
+        'aria-label="Headscale login server"></label>'
+        '<label class="field conn-field"><span class="note">Auth key '
+        '(optional)</span><input type="password" name="auth_key" '
+        'autocomplete="off" aria-label="Tailscale auth key"></label>'
+        '<button type="submit" class="btn">Connect</button></form>'
+        '<p class="note">Leave the login server empty for Tailscale. Without an '
+        'auth key, the next step gives a sign-in link. The node is one per box '
+        'and is named after the box.</p></div>'
+    )
+
+
 def render_connect_step(state):
     """The wizard body: what the user has to do right now."""
     base = html.escape(BASE)
@@ -10286,6 +10440,8 @@ def render_connect_step(state):
         f'<input type="hidden" name="flow" value="{flow_id}">'
         f'<button type="submit" class="btn small">Cancel</button></form>'
     )
+    if flow_id == "tailscale" and state["state"] in ("idle", "failed", "connected"):
+        return render_tailscale_step(state)
     if flow_id == "whatsapp":
         if state["state"] == "waiting" and state["code"]:
             code = state["code"]
@@ -14044,6 +14200,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._redirect("ok=whatsapp_profile_saved")
                 return
             if action == "start":
+                if flow["id"] == "tailscale":
+                    refused = tailscale_configure(
+                        flow, form.get("login_server", [""])[0],
+                        form.get("auth_key", [""])[0])
+                    if refused:
+                        self._send_html(render_page(refused, kind="error"), status=400)
+                        return
                 if flow["id"] == "whatsapp":
                     raw_phone = form.get("phone", [""])[0].strip()
                     raw_country = form.get("phone_country", [""])[0].strip()
