@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noai,noimageai">
-  <meta name="description" content="Interactive C4 architecture explorer for agent-box, local-webhook, and the personal WhatsApp bridge.">
+  <meta name="description" content="Interactive C4 architecture explorer for agent-box and local-channels: webhooks, Slack, mail, WhatsApp, and the root helpers.">
   <meta name="theme-color" content="#07111f">
   <title>agent-box + local-channels &mdash; C4 architecture</title>
   <link rel="icon" href="../potato.svg">
@@ -338,7 +338,7 @@
       <nav class="nav-stack">
         <button class="nav-button active" data-view="context"><span class="nav-number">01</span><span class="nav-copy"><strong>System context</strong><span>Who uses what</span></span></button>
         <button class="nav-button" data-view="containers"><span class="nav-number">02</span><span class="nav-copy"><strong>Containers</strong><span>Runtime building blocks</span></span></button>
-        <button class="nav-button" data-view="flow"><span class="nav-number">&rarr;</span><span class="nav-copy"><strong>Webhook trace</strong><span>Signed event to agent</span></span></button>
+        <button class="nav-button" data-view="flow"><span class="nav-number">&rarr;</span><span class="nav-copy"><strong>Event trace</strong><span>Webhook, Slack, mail to agent</span></span></button>
         <button class="nav-button" data-view="whatsapp"><span class="nav-number">WA</span><span class="nav-copy"><strong>WhatsApp trace</strong><span>Self-chat to agent</span></span></button>
       </nav>
       <div class="rule"></div>
@@ -391,7 +391,7 @@
         <p class="inspector-summary" id="detail-summary">Choose any element to isolate its relationships and see why it exists.</p>
       </div>
       <div class="inspector-scroll" id="detail-body">
-        <section class="detail-section"><h3>Reading the map</h3><p>Use the four views on the left. Filter by harness, expose trust boundaries, or follow either inbound delivery path end to end.</p></section>
+        <section class="detail-section"><h3>Reading the map</h3><p>Use the four views on the left. Filter by harness, expose trust boundaries, or follow the event or WhatsApp delivery path end to end.</p></section>
         <section class="detail-section"><h3>Core rule</h3><p>A Linux user is the trust boundary. A session is a unit of concurrent work and deliberately is not an isolation boundary.</p></section>
       </div>
     </aside>
@@ -403,147 +403,203 @@
 
       const views = {
         context: {
-          title: 'System context', meta: 'People, entry points, and trust boundaries', size: [1100, 760],
+          title: 'System context', meta: 'People, entry points, and trust boundaries', size: [1180, 900],
           boundaries: [
-            { x: 280, y: 58, w: 520, h: 646, label: 'AGENT-BOX HOST \u00b7 OPERATOR-CONTROLLED SANDBOX' },
-            { x: 323, y: 150, w: 430, h: 462, label: 'LINUX USER \u00b7 TRUST BOUNDARY' }
+            { x: 280, y: 40, w: 590, h: 820, label: 'AGENT-BOX HOST · OPERATOR-CONTROLLED SANDBOX' },
+            { x: 310, y: 150, w: 530, h: 480, label: 'LINUX USER · TRUST BOUNDARY' }
           ],
           nodes: [
-            { id: 'operator', x: 35, y: 93, w: 190, h: 106, type: 'Person', title: 'Operator', desc: ['Uses browser workspace', 'and settings UI'], kind: 'person', tech: ['Browser'] },
-            { id: 'whatsapp', x: 35, y: 307, w: 190, h: 106, type: 'External system', title: 'WhatsApp', desc: ['Linked-device transport', 'for the owner self-chat'], kind: 'external', tech: ['E2EE', 'Linked device'] },
-            { id: 'sender', x: 35, y: 529, w: 190, h: 106, type: 'External system', title: 'Event sender', desc: ['GitHub, Linear, Stripe,', 'or a local sensor'], kind: 'external', tech: ['HTTPS', 'HMAC-SHA256'] },
-            { id: 'agentbox', x: 349, y: 203, w: 378, h: 120, type: 'Software system', title: 'agent-box', desc: ['Runs durable coding-agent conversations', 'inside hardened, unprivileged user accounts'], kind: 'platform', tech: ['Nix / NixOS', 'systemd', 'tmux'] },
-            { id: 'channels', x: 349, y: 426, w: 378, h: 120, type: 'Software system', title: 'local-channels', desc: ['Connects personal chat and signed events', 'to selected or newly spawned sessions'], kind: 'channel', tech: ['Node.js', 'Python 3', 'Unix sockets'] },
-            { id: 'model', x: 851, y: 127, w: 210, h: 106, type: 'External system', title: 'Model provider', desc: ['Claude or OpenAI', 'agent service'], kind: 'external', tech: ['HTTPS'] },
-            { id: 'github', x: 851, y: 461, w: 210, h: 106, type: 'External system', title: 'Code + CI systems', desc: ['Repositories, checks,', 'reviews, and issues'], kind: 'external', tech: ['Git', 'APIs'] }
+            { id: 'operator', x: 35, y: 70, w: 200, h: 106, type: 'Person', title: 'Operator', desc: ['Uses browser workspace', 'and settings UI'], kind: 'person', tech: ['Browser'] },
+            { id: 'whatsapp', x: 35, y: 230, w: 200, h: 106, type: 'External system', title: 'WhatsApp', desc: ['Linked-device transport', 'for the owner self-chat'], kind: 'external', tech: ['E2EE', 'Linked device'] },
+            { id: 'sender', x: 35, y: 390, w: 200, h: 106, type: 'External system', title: 'Webhook sender', desc: ['GitHub, Linear, Stripe,', 'or a local sensor'], kind: 'external', tech: ['HTTPS', 'HMAC-SHA256'] },
+            { id: 'slack', x: 35, y: 550, w: 200, h: 106, type: 'External system', title: 'Slack workspace', desc: ['Channel messages, threads,', 'files and voice notes'], kind: 'external', tech: ['Socket Mode'] },
+            { id: 'mail', x: 35, y: 710, w: 200, h: 106, type: 'External system', title: 'Mail sender', desc: ['Mail to a registered', 'purpose address'], kind: 'external', tech: ['SMTP', 'SPF / DKIM'] },
+            { id: 'agentbox', x: 340, y: 195, w: 470, h: 120, type: 'Software system', title: 'agent-box', desc: ['Runs durable coding-agent conversations', 'inside hardened, unprivileged user accounts'], kind: 'platform', tech: ['Nix / NixOS', 'systemd', 'tmux'] },
+            { id: 'channels', x: 340, y: 450, w: 250, h: 130, type: 'Software system', title: 'local-channels', desc: ['Connects chat, mail and', 'signed events to sessions'], kind: 'channel', tech: ['Node.js', 'Python 3', 'Unix sockets'] },
+            { id: 'rootsvc', x: 600, y: 700, w: 230, h: 120, type: 'Privileged services', title: 'Root custodians', desc: ['Update, mail intake,', 'secrets, reboot helper'], kind: 'platform', tech: ['root', 'SO_PEERCRED'] },
+            { id: 'model', x: 940, y: 70, w: 210, h: 106, type: 'External system', title: 'Model provider', desc: ['Claude or OpenAI', 'agent service'], kind: 'external', tech: ['HTTPS'] },
+            { id: 'github', x: 940, y: 270, w: 210, h: 106, type: 'External system', title: 'Code + CI systems', desc: ['Repositories, checks,', 'reviews, and issues'], kind: 'external', tech: ['Git', 'APIs'] },
+            { id: 'buzz', x: 940, y: 470, w: 210, h: 106, type: 'External system', title: 'Buzz', desc: ['Remote ACP client that', 'drives one fixed profile'], kind: 'external', tech: ['ACP', 'SSH'] },
+            { id: 'portal', x: 940, y: 670, w: 210, h: 106, type: 'External system (optional)', title: 'Sign-in portal', desc: ['Hands a signed session', 'to the box front door'], kind: 'external', tech: ['JWT', 'JWKS'] }
           ],
           rels: [
             { from: 'operator', to: 'agentbox', label: 'controls sessions and configuration' },
             { from: 'whatsapp', to: 'channels', label: 'delivers owner messages and media', async: true },
             { from: 'sender', to: 'channels', label: 'posts signed events', async: true },
-            { from: 'channels', to: 'agentbox', label: 'selects, activates, queues, or dispatches work', async: true },
+            { from: 'slack', to: 'channels', label: 'streams messages to the Slack daemon', async: true },
+            { from: 'mail', to: 'rootsvc', label: 'delivers mail on TCP 25', async: true },
+            { from: 'rootsvc', to: 'channels', label: 'emits authenticated mail as bus events', async: true },
+            { from: 'channels', to: 'agentbox', label: 'routes, activates, queues, or dispatches work', async: true },
+            { from: 'agentbox', to: 'rootsvc', label: 'narrow sudo and peer-checked sockets' },
             { from: 'agentbox', to: 'model', label: 'runs harness against' },
-            { from: 'agentbox', to: 'github', label: 'reads and changes code' }
+            { from: 'agentbox', to: 'github', label: 'reads and changes code; reacts and replies' },
+            { from: 'buzz', to: 'agentbox', label: 'ACP over an SSH forced command' },
+            { from: 'portal', to: 'agentbox', label: 'signed session handover' }
           ]
         },
         containers: {
-          title: 'Container view', meta: 'Processes and private state inside one agent-box user', size: [1400, 900],
+          title: 'Container view', meta: 'Processes and private state inside one agent-box user', size: [1560, 1240],
           boundaries: [
-            { x: 210, y: 24, w: 1070, h: 824, label: 'AGENT-BOX HOST' },
-            { x: 275, y: 165, w: 960, h: 600, label: 'LINUX USER \u00b7 TRUST BOUNDARY (SHARED HOME + TMUX)' }
+            { x: 220, y: 15, w: 1170, h: 1210, label: 'AGENT-BOX HOST' },
+            { x: 470, y: 170, w: 870, h: 880, label: 'LINUX USER · TRUST BOUNDARY (SHARED HOME + TMUX)' }
           ],
           nodes: [
-            { id: 'browser', x: 10, y: 166, w: 190, h: 98, type: 'Person / browser', title: 'Web workspace', desc: ['Terminal + settings'], kind: 'person', tech: ['HTTPS'] },
-            { id: 'sender2', x: 10, y: 390, w: 190, h: 98, type: 'External system', title: 'Webhook sender', desc: ['Signed JSON events'], kind: 'external', tech: ['HMAC-SHA256'] },
-            { id: 'whatsapp2', x: 10, y: 650, w: 190, h: 98, type: 'External system', title: 'WhatsApp service', desc: ['Owner self-chat', 'linked-device stream'], kind: 'external', tech: ['E2EE'] },
-            { id: 'caddy', x: 225, y: 60, w: 210, h: 92, type: 'Container', title: 'Caddy', desc: ['TLS + basic auth', 'reverse proxy'], kind: 'platform', tech: ['Caddy'] },
-            { id: 'settings', x: 315, y: 212, w: 220, h: 105, type: 'Container', title: 'Settings daemon', desc: ['Sessions, secrets,', 'pairing + box operations'], kind: 'platform', tech: ['Python', 'HTTP'] },
-            { id: 'supervisor', x: 315, y: 402, w: 220, h: 105, type: 'Container', title: 'Session supervisor', desc: ['Owns agent lifecycles', 'and the WhatsApp bridge'], kind: 'platform', tech: ['Shell', 'tmux'] },
-            { id: 'wa-state', x: 315, y: 610, w: 220, h: 105, type: 'Data store', title: 'WhatsApp state', desc: ['Device keys, target, queue,', 'inbox + outbox files'], kind: 'channel', tech: ['Private files', '0600'] },
-            { id: 'receiver', x: 600, y: 212, w: 230, h: 105, type: 'Container', title: 'Webhook receiver', desc: ['Verifies once, normalizes,', 'fans out envelopes'], kind: 'channel', tech: ['webhook.py', 'socket activation'] },
-            { id: 'state', x: 600, y: 402, w: 230, h: 105, type: 'Data store', title: 'Webhook state', desc: ['Sources, secrets, filters,', 'peer sockets + leases'], kind: 'channel', tech: ['JSON', 'Unix sockets'] },
-            { id: 'bridge', x: 600, y: 610, w: 230, h: 105, type: 'Container', title: 'WhatsApp bridge', desc: ['Authorizes self-chat, routes,', 'and retries messages + media'], kind: 'channel', tech: ['Node.js', 'local-whatsapp'] },
-            { id: 'claude', x: 920, y: 200, w: 190, h: 112, type: 'Container', title: 'Claude session', desc: ['Channel plugins receive', 'events and WhatsApp'], kind: 'platform', harness: 'claude', tech: ['Claude Code', 'MCP stdio'] },
-            { id: 'codex', x: 920, y: 410, w: 190, h: 112, type: 'Container', title: 'Codex session', desc: ['Detached peers queue', 'into exact task threads'], kind: 'platform', harness: 'codex', tech: ['Codex', 'codex queue'] },
-            { id: 'hook', x: 920, y: 640, w: 190, h: 98, type: 'Container', title: 'Hook session', desc: ['Ephemeral agent for', 'standing-watch matches'], kind: 'platform', tech: ['agent-box-session'] },
-            { id: 'providers', x: 1290, y: 330, w: 100, h: 170, type: 'External', title: 'APIs', desc: ['Models', 'Git', 'SaaS'], kind: 'external', tech: ['HTTPS'] }
+            { id: 'browser', x: 10, y: 40, w: 190, h: 98, type: 'Person / browser', title: 'Web workspace', desc: ['Terminal, settings,', 'uploads + downloads'], kind: 'person', tech: ['HTTPS'] },
+            { id: 'sender2', x: 10, y: 200, w: 190, h: 98, type: 'External system', title: 'Webhook sender', desc: ['Signed JSON events'], kind: 'external', tech: ['HMAC-SHA256'] },
+            { id: 'whatsapp2', x: 10, y: 560, w: 190, h: 98, type: 'External system', title: 'WhatsApp service', desc: ['Owner self-chat', 'linked-device stream'], kind: 'external', tech: ['E2EE'] },
+            { id: 'slack2', x: 10, y: 740, w: 190, h: 98, type: 'External system', title: 'Slack', desc: ['Workspace events', 'and file API'], kind: 'external', tech: ['Socket Mode'] },
+            { id: 'buzz2', x: 10, y: 920, w: 190, h: 98, type: 'External system', title: 'Buzz', desc: ['Remote ACP client'], kind: 'external', tech: ['SSH'] },
+            { id: 'mail2', x: 10, y: 1090, w: 190, h: 98, type: 'External system', title: 'Mail sender', desc: ['Mail to a purpose', 'address'], kind: 'external', tech: ['SMTP'] },
+            { id: 'caddy', x: 500, y: 40, w: 510, h: 92, type: 'Container', title: 'Caddy', desc: ['TLS, basic auth or portal session, reverse proxy'], kind: 'platform', tech: ['Caddy', 'forward_auth'] },
+            { id: 'reboot', x: 235, y: 380, w: 210, h: 105, type: 'Root service', title: 'Reboot helper', desc: ['sysrq reboot that needs', 'nothing from the disk'], kind: 'platform', tech: ['root', 'mlock'] },
+            { id: 'settings', x: 500, y: 200, w: 220, h: 105, type: 'Container', title: 'Settings daemon', desc: ['Sessions, profiles, secrets,', 'connections + resources'], kind: 'platform', tech: ['Python', 'SSE'] },
+            { id: 'supervisor', x: 500, y: 380, w: 220, h: 105, type: 'Container', title: 'Session supervisor', desc: ['Lifecycles, capacity,', 'hibernation + bridges'], kind: 'platform', tech: ['Shell', 'tmux'] },
+            { id: 'bridge', x: 500, y: 560, w: 220, h: 105, type: 'Container', title: 'WhatsApp bridge', desc: ['Authorizes self-chat,', 'acks, retries + media'], kind: 'channel', tech: ['Node.js', 'local-whatsapp'] },
+            { id: 'slackd', x: 500, y: 740, w: 220, h: 105, type: 'Container', title: 'Slack daemon', desc: ['Socket Mode client;', 'emits signed bus events'], kind: 'channel', tech: ['local-slack'] },
+            { id: 'acp', x: 500, y: 920, w: 220, h: 105, type: 'Container', title: 'ACP endpoint', desc: ['One pinned profile and', 'one fixed working dir'], kind: 'platform', tech: ['agent-box-acp'] },
+            { id: 'receiver', x: 780, y: 200, w: 230, h: 105, type: 'Container', title: 'Webhook receiver', desc: ['Verifies once, normalizes,', 'fans out, acks pickup'], kind: 'channel', tech: ['webhook.py', 'socket activation'] },
+            { id: 'state', x: 780, y: 380, w: 230, h: 105, type: 'Data store', title: 'Webhook state', desc: ['Sources, filters, claims,', 'peer sockets + content'], kind: 'channel', tech: ['JSON', 'Unix sockets'] },
+            { id: 'router', x: 780, y: 560, w: 230, h: 105, type: 'Container', title: 'Thread router', desc: ['New topic or follow-up', 'for each self-chat message'], kind: 'channel', tech: ['local-router', 'small model'] },
+            { id: 'wa-state', x: 780, y: 740, w: 230, h: 105, type: 'Data store', title: 'WhatsApp state', desc: ['Device keys, target, routes,', 'inbox + outbox files'], kind: 'channel', tech: ['Private files', '0600'] },
+            { id: 'claude', x: 1080, y: 200, w: 220, h: 112, type: 'Container', title: 'Claude session', desc: ['Channel plugins receive', 'events and WhatsApp'], kind: 'platform', harness: 'claude', tech: ['Claude Code', 'MCP stdio'] },
+            { id: 'codex', x: 1080, y: 380, w: 220, h: 112, type: 'Container', title: 'Codex session', desc: ['Detached peers queue', 'into exact task threads'], kind: 'platform', harness: 'codex', tech: ['Codex', 'codex queue'] },
+            { id: 'daemons', x: 1080, y: 560, w: 220, h: 105, type: 'Container', title: 'Remote Control daemons', desc: ['One row serves many', 'app-created conversations'], kind: 'platform', tech: ['claude rc', 'codex app-server'] },
+            { id: 'hook', x: 1080, y: 740, w: 220, h: 105, type: 'Container', title: 'Hook session', desc: ['Ephemeral agent for', 'standing-watch matches'], kind: 'platform', tech: ['agent-box-session'] },
+            { id: 'smtpd', x: 500, y: 1090, w: 220, h: 105, type: 'Root service', title: 'Mail intake', desc: ['SPF / DKIM gate, then', 'delivers as the user'], kind: 'channel', tech: ['OpenSMTPD', 'agent-box-email'] },
+            { id: 'broker', x: 780, y: 1090, w: 230, h: 105, type: 'Root service', title: 'Secret broker', desc: ['Holds values; runs jobs', 'with them as the user'], kind: 'platform', tech: ['root', 'SO_PEERCRED'] },
+            { id: 'providers', x: 1420, y: 380, w: 120, h: 300, type: 'External', title: 'APIs', desc: ['Models', 'Git', 'SaaS'], kind: 'external', tech: ['HTTPS'] }
           ],
           rels: [
             { from: 'browser', to: 'caddy', label: 'HTTPS' },
             { from: 'caddy', to: 'settings', label: 'settings routes' },
-            { from: 'settings', to: 'supervisor', label: 'create / stop / restart' },
-            { from: 'settings', to: 'bridge', label: 'pair / unlink / choose profile' },
             { from: 'sender2', to: 'caddy', label: 'POST /<user>/webhook/<source>', async: true },
             { from: 'caddy', to: 'receiver', label: 'Unix socket' },
+            { from: 'settings', to: 'supervisor', label: 'create / stop / restart' },
+            { from: 'settings', to: 'bridge', label: 'pair / unlink / choose profile' },
+            { from: 'settings', to: 'reboot', label: 'fallback reboot socket' },
+            { from: 'settings', to: 'broker', label: 'store / rotate (never read back)' },
             { from: 'receiver', to: 'state', label: 'reads sources; broadcasts envelopes' },
             { from: 'state', to: 'claude', label: 'per-session filter + peer socket', async: true },
             { from: 'state', to: 'codex', label: 'per-session filter + detached peer', async: true },
-            { from: 'receiver', to: 'hook', label: 'spawn command on watch match', async: true },
-            { from: 'supervisor', to: 'claude', label: 'starts and respawns' },
-            { from: 'supervisor', to: 'codex', label: 'starts and respawns' },
+            { from: 'receiver', to: 'hook', label: 'spawn on watch match (capacity gate)', async: true },
+            { from: 'supervisor', to: 'claude', label: 'starts, respawns, hibernates' },
+            { from: 'supervisor', to: 'codex', label: 'starts, respawns, hibernates' },
             { from: 'supervisor', to: 'bridge', label: 'supervises outside session slots' },
+            { from: 'supervisor', to: 'slackd', label: 'runs while Slack tokens exist' },
             { from: 'whatsapp2', to: 'bridge', label: 'linked-device messages and media', async: true },
-            { from: 'bridge', to: 'wa-state', label: 'persists keys, routing, queues, and files' },
-            { from: 'bridge', to: 'claude', label: 'selected channel + local attachments', async: true },
+            { from: 'bridge', to: 'router', label: 'which session gets this message?' },
+            { from: 'router', to: 'supervisor', label: 'new topic: start a wa-* session' },
+            { from: 'router', to: 'state', label: 'follow-up: inbox:<name> event', async: true },
+            { from: 'bridge', to: 'wa-state', label: 'persists keys, routes, queues, files' },
+            { from: 'bridge', to: 'claude', label: 'pinned channel + local attachments', async: true },
             { from: 'bridge', to: 'codex', label: 'registered thread + codex queue', async: true },
+            { from: 'slack2', to: 'slackd', label: 'Socket Mode (outbound WSS)', async: true },
+            { from: 'slackd', to: 'receiver', label: 'signed slack:<team>/<channel> event', async: true },
+            { from: 'mail2', to: 'smtpd', label: 'SMTP :25, STARTTLS', async: true },
+            { from: 'smtpd', to: 'receiver', label: 'email:<address> event', async: true },
+            { from: 'buzz2', to: 'acp', label: 'SSH forced command' },
+            { from: 'claude', to: 'broker', label: 'exec_with_secrets', async: true },
             { from: 'claude', to: 'providers', label: 'acts through tools' },
             { from: 'codex', to: 'providers', label: 'acts through tools' },
-            { from: 'hook', to: 'providers', label: 'triages / fixes / reports' }
+            { from: 'daemons', to: 'providers', label: 'serves app conversations' },
+            { from: 'hook', to: 'providers', label: 'triages / fixes / replies' },
+            { from: 'acp', to: 'providers', label: 'adapter + native harness' }
           ]
         },
         flow: {
-          title: 'Webhook trace', meta: 'A verified event from sender to the right agent session', size: [1240, 720],
+          title: 'Event trace', meta: 'A verified event from sender to the right agent session', size: [1240, 720],
           boundaries: [
-            { x: 210, y: 100, w: 1010, h: 520, label: 'AGENT-BOX HOST' },
-            { x: 520, y: 330, w: 665, h: 238, label: 'LINUX USER \u00b7 ROUTING + SESSIONS' }
+            { x: 210, y: 40, w: 1010, h: 640, label: 'AGENT-BOX HOST' },
+            { x: 520, y: 330, w: 665, h: 238, label: 'LINUX USER · ROUTING + SESSIONS' }
           ],
           nodes: [
-            { id: 'f-sender', x: 18, y: 260, w: 175, h: 98, type: '1 \u00b7 Sender', title: 'Signed event', desc: ['GitHub or another', 'HMAC sender'], kind: 'external', tech: ['HTTPS'] },
-            { id: 'f-caddy', x: 235, y: 260, w: 175, h: 98, type: '2 \u00b7 Edge', title: 'Caddy', desc: ['Terminates TLS', 'routes by source'], kind: 'platform', tech: ['Reverse proxy'] },
-            { id: 'f-receiver', x: 452, y: 260, w: 205, h: 98, type: '3 \u00b7 Trust gate', title: 'Receiver', desc: ['Verifies HMAC once', 'normalizes envelope'], kind: 'channel', tech: ['Fail closed'] },
-            { id: 'f-fanout', x: 700, y: 260, w: 185, h: 98, type: '4 \u00b7 Bus', title: 'IPC fan-out', desc: ['One NDJSON line to', 'every peer socket'], kind: 'channel', tech: ['Unix sockets'] },
-            { id: 'f-filter', x: 925, y: 260, w: 190, h: 98, type: '5 \u00b7 Routing', title: 'Session filter', desc: ['Topic + payload rules', 'TTL + sender mute'], kind: 'channel', tech: ['filter.<session>.json'] },
-            { id: 'f-claude', x: 680, y: 446, w: 190, h: 98, type: '6A \u00b7 Delivery', title: 'Claude channel', desc: ['JSON-RPC notification', 'on plugin stdio'], kind: 'platform', harness: 'claude', tech: ['MCP'] },
-            { id: 'f-codex', x: 920, y: 446, w: 190, h: 98, type: '6B \u00b7 Delivery', title: 'Codex queue', desc: ['Detached peer queues', 'next turn message'], kind: 'platform', harness: 'codex', tech: ['codex queue'] },
-            { id: 'f-hook', x: 925, y: 78, w: 190, h: 98, type: '6C \u00b7 Dispatch', title: 'Fresh hook session', desc: ['Standing watch spawns', 'bounded ephemeral work'], kind: 'platform', tech: ['EX_TEMPFAIL retry'] }
+            { id: 'f-sender', x: 18, y: 260, w: 175, h: 98, type: '1 · Sender', title: 'Signed event', desc: ['GitHub or another', 'HMAC sender'], kind: 'external', tech: ['HTTPS'] },
+            { id: 'f-caddy', x: 235, y: 260, w: 175, h: 98, type: '2 · Edge', title: 'Caddy', desc: ['Terminates TLS', 'routes by source'], kind: 'platform', tech: ['Reverse proxy'] },
+            { id: 'f-local', x: 235, y: 470, w: 205, h: 98, type: '2′ · Local publishers', title: 'Slack, mail, router', desc: ['Sign and emit to the', 'same user socket'], kind: 'channel', tech: ['webhook.py emit'] },
+            { id: 'f-receiver', x: 452, y: 260, w: 205, h: 98, type: '3 · Trust gate', title: 'Receiver', desc: ['Verifies HMAC once', 'normalizes envelope'], kind: 'channel', tech: ['Fail closed'] },
+            { id: 'f-fanout', x: 700, y: 260, w: 185, h: 98, type: '4 · Bus', title: 'IPC fan-out', desc: ['One NDJSON line to', 'every peer socket'], kind: 'channel', tech: ['Unix sockets'] },
+            { id: 'f-filter', x: 925, y: 260, w: 190, h: 98, type: '5 · Routing', title: 'Session filter', desc: ['Topic, claims, events', 'policy, TTL, mutes'], kind: 'channel', tech: ['filter.<session>.json'] },
+            { id: 'f-claude', x: 680, y: 446, w: 190, h: 98, type: '6A · Delivery', title: 'Claude channel', desc: ['JSON-RPC notification', 'on plugin stdio'], kind: 'platform', harness: 'claude', tech: ['MCP'] },
+            { id: 'f-codex', x: 920, y: 446, w: 190, h: 98, type: '6B · Delivery', title: 'Codex queue', desc: ['Shared peer daemon', 'queues next turn'], kind: 'platform', harness: 'codex', tech: ['codex queue'] },
+            { id: 'f-hook', x: 925, y: 78, w: 190, h: 98, type: '6C · Dispatch', title: 'Fresh hook session', desc: ['Standing watch spawns', 'bounded ephemeral work'], kind: 'platform', tech: ['capacity gate'] },
+            { id: 'f-ack', x: 640, y: 78, w: 200, h: 98, type: '7 · Acknowledge', title: 'Pickup reaction', desc: ['eyes on GitHub once', 'a session accepts'], kind: 'channel', tech: ['webhook-ack'] }
           ],
           rels: [
-            { from: 'f-sender', to: 'f-caddy', label: '1 \u00b7 POST raw JSON', async: true },
-            { from: 'f-caddy', to: 'f-receiver', label: '2 \u00b7 forward request' },
-            { from: 'f-receiver', to: 'f-fanout', label: '3 \u00b7 verified envelope', async: true },
-            { from: 'f-fanout', to: 'f-filter', label: '4 \u00b7 broadcast', async: true },
-            { from: 'f-filter', to: 'f-claude', label: '5A \u00b7 matching live session', async: true },
-            { from: 'f-filter', to: 'f-codex', label: '5B \u00b7 matching live session', async: true },
-            { from: 'f-filter', to: 'f-hook', label: '5C \u00b7 matching standing watch', async: true }
+            { from: 'f-sender', to: 'f-caddy', label: '1 · POST raw JSON', async: true },
+            { from: 'f-caddy', to: 'f-receiver', label: '2 · forward request' },
+            { from: 'f-local', to: 'f-receiver', label: '2′ · signed local POST', async: true },
+            { from: 'f-receiver', to: 'f-fanout', label: '3 · verified envelope', async: true },
+            { from: 'f-fanout', to: 'f-filter', label: '4 · broadcast', async: true },
+            { from: 'f-filter', to: 'f-claude', label: '5A · matching live session', async: true },
+            { from: 'f-filter', to: 'f-codex', label: '5B · matching live session', async: true },
+            { from: 'f-filter', to: 'f-hook', label: '5C · matching standing watch', async: true },
+            { from: 'f-hook', to: 'f-ack', label: '6 · accepted', async: true }
           ]
         },
         whatsapp: {
           title: 'WhatsApp trace', meta: 'An owner self-chat message to one exact agent conversation', size: [1420, 780],
           boundaries: [
             { x: 400, y: 82, w: 985, h: 614, label: 'AGENT-BOX HOST' },
-            { x: 430, y: 122, w: 925, h: 535, label: 'LINUX USER \u00b7 PRIVATE STATE + SESSION ROUTING' }
+            { x: 430, y: 122, w: 925, h: 535, label: 'LINUX USER · PRIVATE STATE + SESSION ROUTING' }
           ],
           nodes: [
-            { id: 'w-owner', x: 12, y: 248, w: 170, h: 98, type: '1 \u00b7 Person', title: 'Linked owner', desc: ['Message Yourself', 'with the user prefix'], kind: 'person', tech: ['WhatsApp app'] },
-            { id: 'w-service', x: 215, y: 248, w: 170, h: 98, type: '2 \u00b7 External', title: 'WhatsApp', desc: ['End-to-end encrypted', 'linked-device transport'], kind: 'external', tech: ['E2EE'] },
-            { id: 'w-bridge', x: 450, y: 248, w: 195, h: 98, type: '3 \u00b7 Channel', title: 'Bridge', desc: ['Checks self-chat + prefix', 'receives text and media'], kind: 'channel', tech: ['local-whatsapp'] },
-            { id: 'w-state', x: 690, y: 248, w: 195, h: 98, type: '4 \u00b7 Private state', title: 'Inbox + queue', desc: ['Persists target, messages,', 'keys and attachments'], kind: 'channel', tech: ['0600 files'] },
-            { id: 'w-route', x: 930, y: 248, w: 195, h: 98, type: '5 \u00b7 Routing', title: 'Target selection', desc: ['Exact selected session', 'or profile-based new one'], kind: 'channel', tech: ['session name'] },
-            { id: 'w-activate', x: 1170, y: 248, w: 195, h: 98, type: '6 \u00b7 Admission', title: 'Activate runtime', desc: ['Wake exact cold target', 'through shared capacity'], kind: 'platform', tech: ['session CLI'] },
-            { id: 'w-claude', x: 930, y: 488, w: 195, h: 98, type: '7A \u00b7 Delivery', title: 'Claude channel', desc: ['Plugin receives prompt', 'and local file paths'], kind: 'platform', harness: 'claude', tech: ['MCP stdio'] },
-            { id: 'w-codex', x: 1170, y: 488, w: 195, h: 98, type: '7B \u00b7 Delivery', title: 'Codex queue', desc: ['Stable session maps to', 'native thread UUID'], kind: 'platform', harness: 'codex', tech: ['codex queue'] }
+            { id: 'w-owner', x: 12, y: 248, w: 170, h: 98, type: '1 · Person', title: 'Linked owner', desc: ['Message Yourself', 'with the user prefix'], kind: 'person', tech: ['WhatsApp app'] },
+            { id: 'w-service', x: 215, y: 248, w: 170, h: 98, type: '2 · External', title: 'WhatsApp', desc: ['End-to-end encrypted', 'linked-device transport'], kind: 'external', tech: ['E2EE'] },
+            { id: 'w-bridge', x: 450, y: 248, w: 195, h: 98, type: '3 · Channel', title: 'Bridge', desc: ['Checks self-chat + prefix', 'receives text and media'], kind: 'channel', tech: ['local-whatsapp'] },
+            { id: 'w-state', x: 690, y: 248, w: 195, h: 98, type: '4 · Private state', title: 'Inbox + queue', desc: ['Persists target, messages,', 'keys and attachments'], kind: 'channel', tech: ['0600 files'] },
+            { id: 'w-route', x: 930, y: 248, w: 195, h: 98, type: '5 · Routing', title: 'Router or pin', desc: ['/target pin, else a small', 'model picks the thread'], kind: 'channel', tech: ['local-router'] },
+            { id: 'w-activate', x: 1170, y: 248, w: 195, h: 98, type: '6 · Admission', title: 'Activate runtime', desc: ['Wake exact cold target', 'through shared capacity'], kind: 'platform', tech: ['session CLI'] },
+            { id: 'w-new', x: 690, y: 488, w: 195, h: 98, type: '6′ · New topic', title: 'New wa-* session', desc: ['Kickoff prompt is the', 'message; chosen profile'], kind: 'platform', tech: ['agent-box-session'] },
+            { id: 'w-claude', x: 930, y: 488, w: 195, h: 98, type: '7A · Delivery', title: 'Claude channel', desc: ['Pinned plugin or owner', 'inbox:<name> event'], kind: 'platform', harness: 'claude', tech: ['MCP stdio'] },
+            { id: 'w-codex', x: 1170, y: 488, w: 195, h: 98, type: '7B · Delivery', title: 'Codex queue', desc: ['Stable session maps to', 'native thread UUID'], kind: 'platform', harness: 'codex', tech: ['codex queue'] }
           ],
           rels: [
-            { from: 'w-owner', to: 'w-service', label: '1 \u00b7 send text or media', async: true },
-            { from: 'w-service', to: 'w-bridge', label: '2 \u00b7 linked-device stream', async: true },
-            { from: 'w-bridge', to: 'w-state', label: '3 \u00b7 authorize and persist', async: true },
-            { from: 'w-state', to: 'w-route', label: '4 \u00b7 pending delivery', async: true },
-            { from: 'w-route', to: 'w-activate', label: '5 \u00b7 select / start / resume' },
-            { from: 'w-activate', to: 'w-claude', label: '6A \u00b7 exact Claude target', async: true },
-            { from: 'w-activate', to: 'w-codex', label: '6B \u00b7 exact Codex target', async: true }
+            { from: 'w-owner', to: 'w-service', label: '1 · send text or media', async: true },
+            { from: 'w-service', to: 'w-bridge', label: '2 · linked-device stream', async: true },
+            { from: 'w-bridge', to: 'w-state', label: '3 · authorize and persist', async: true },
+            { from: 'w-state', to: 'w-route', label: '4 · pending delivery', async: true },
+            { from: 'w-route', to: 'w-new', label: '5′ · new topic' },
+            { from: 'w-route', to: 'w-activate', label: '5 · follow-up or pinned target' },
+            { from: 'w-activate', to: 'w-claude', label: '6A · exact Claude target', async: true },
+            { from: 'w-activate', to: 'w-codex', label: '6B · exact Codex target', async: true }
           ]
         }
       };
 
       const details = {
-        operator: { summary: 'The human who opens the browser workspace and controls a declared trust domain.', responsibilities: ['Starts, stops, and names sessions', 'Manages secrets, WhatsApp pairing, and webhook wiring', 'Chooses when a separate Linux user is required'], tech: ['Browser', 'Caddy-authenticated UI'] },
+        slack: { summary: 'A Slack workspace whose app tokens are in the user\'s env store.', responsibilities: ['Delivers channel and thread messages over Socket Mode, so the box needs no public Slack URL', 'Serves thread files (images, PDF, text, audio) to the agent on request', 'Receives thread replies, uploads and allowlisted DMs under write rules'], tech: ['Slack Socket Mode', 'Web API'] },
+        mail: { summary: 'Any mail server sending to an address the user registered with a purpose and a worker profile.', responsibilities: ['Must pass SPF or DKIM for the exact From domain', 'Reaches only explicitly registered addresses; there is no catch-all', 'Supplies untrusted content and attachments'], tech: ['SMTP', 'STARTTLS', 'SPF', 'DKIM'] },
+        rootsvc: { summary: 'The few root-owned services an agent user may reach, each through a narrow, peer-checked door.', responsibilities: ['Update: fast-forwards the root-owned source tree and swaps the Nix profile', 'Mail intake: authenticates SMTP and delivers as the recipient user', 'Secret broker: keeps values out of the agent user\'s reach', 'Reboot helper: reboots through sysrq when the disk is gone'], tech: ['systemd', 'sudo allowlist', 'SO_PEERCRED'] },
+        buzz: { summary: 'A remote ACP client (Buzz) that drives one Agentbox profile on the box over SSH.', responsibilities: ['Owns channel/thread routing and ACP session reuse', 'Connects with a dedicated key whose forced command fixes the profile and directory', 'Gets trusted native-agent execution as that Linux user'], tech: ['ACP', 'OpenSSH forced command'] },
+        portal: { summary: 'An optional external portal that signs the operator in and hands a session to the box.', responsibilities: ['Issues a handover token with the configured iss', 'Publishes signing keys that the box caches with a bound', 'Is the return target of the 401 page'], tech: ['JWT', 'JWKS', 'web.portalIssuer'] },
+        reboot: { summary: 'A root daemon that can reboot the box when the disk is gone and sudo cannot run.', responsibilities: ['Holds /proc/sysrq-trigger open and writes only s, u, b', 'Accepts only the exact REBOOT request from the root terminal user\'s uid', 'Pins Caddy and the settings daemon in RAM so the button still loads'], tech: ['Python', 'mlockall', 'SO_PEERCRED'] },
+        slackd: { summary: 'The per-user Slack daemon that turns Socket Mode events into signed bus events.', responsibilities: ['Runs only while SLACK_APP_TOKEN and SLACK_BOT_TOKEN are set', 'Emits slack:<TEAM>/<CHANNEL> topics to the user ingress socket', 'Fetches allowlisted files and posts replies, uploads and DMs'], tech: ['local-slack', 'slack.py'] },
+        acp: { summary: 'The ACP stdio endpoint that Buzz reaches through an SSH forced command.', responsibilities: ['Pins one profile and one remote working directory', 'Rewrites session cwd and path anchors to that directory', 'Refuses MCP server definitions unless explicitly allowed', 'Ends the adapter process group on EOF or disconnect'], tech: ['agent-box-acp', 'codex-acp', 'claude-agent-acp'] },
+        router: { summary: 'Chooses the session for each WhatsApp self-chat message, since a self-chat has no threads.', responsibilities: ['Asks a small model whether the message continues a routed session or starts a new topic', 'New topic: starts a wa-* session whose kickoff prompt is the message', 'Follow-up: wakes the session and posts an owner-trusted inbox:<name> event', 'Never picks a session that the router did not start'], tech: ['local-router', 'Claude Haiku first', 'AGENT_BOX_ROUTER_*'] },
+        daemons: { summary: 'Persistent Remote Control hosts that serve several conversations created from the Claude or Codex apps.', responsibilities: ['Use one agent-box row and one slot for many app conversations', 'Have no kickoff prompt, webhook or WhatsApp target of their own', 'Are restarted when a stale harness build is detected'], tech: ['claude remote-control', 'codex app-server'] },
+        smtpd: { summary: 'Optional inbound mail: OpenSMTPD with an authentication filter, then per-user delivery to the bus.', responsibilities: ['Rejects unknown or disabled addresses before accepting a message', 'Requires SPF or DKIM to pass for the From domain; defers on temporary errors', 'Delivers as the recipient user with webhook.py emit; keeps content 24 hours'], tech: ['OpenSMTPD', 'agent-box-email', 'dkimpy'] },
+        broker: { summary: 'A socket-activated root custodian, one per agent user, for secrets the agent must use but not read (optional).', responsibilities: ['Checks every caller by SO_PEERCRED uid', 'Has no operation that returns a value to the caller', 'Runs exec jobs with the values in a worker that already runs as the user', 'Keeps per-profile scopes'], tech: ['secret-broker.py', 'secrets-mcp', 'socket activation'] },
+        'f-local': { summary: 'Step 2′: on-box publishers sign their events and post them to the same per-user ingress socket.', responsibilities: ['Slack daemon emits slack:<team>/<channel>', 'Mail intake emits email:<address> as the recipient user', 'WhatsApp router emits owner-trusted inbox:<name> follow-ups'], tech: ['webhook.py emit', 'Unix socket'] },
+        'f-ack': { summary: 'Step 7: when a claimed session accepts a comment or a watch spawn succeeds, the box adds an eyes reaction on GitHub.', responsibilities: ['Confirms dispatch, not completion', 'Is skipped for CI events and non-GitHub sources', 'The session still replies on the issue or PR with the outcome'], tech: ['webhook-ack.py', 'GitHub reactions'] },
+        'w-new': { summary: 'Step 6′: a new topic starts a fresh wa-* session with the message as its kickoff prompt.', responsibilities: ['Uses the profile chosen in Connections or by /profile, else the default profile', 'Goes through the shared capacity gate', 'Is remembered so later follow-ups route back to it'], tech: ['agent-box-session', 'router state'] },
+        operator: { summary: 'The human who opens the browser workspace and controls a declared trust domain.', responsibilities: ['Starts, stops, and names sessions and profiles', 'Manages secrets, WhatsApp pairing, mail addresses and webhook rules', 'Chooses when a separate Linux user is required'], tech: ['Browser', 'Caddy-authenticated UI'] },
         whatsapp: { summary: 'The owner\'s personal WhatsApp account, linked to the box as an additional device.', responsibilities: ['Accepts commands from Message Yourself only', 'Carries replies and native outbound images back to the owner', 'Protects chat transport with WhatsApp end-to-end encryption'], tech: ['WhatsApp', 'Linked devices', 'E2EE'] },
-        sender: { summary: 'Any system able to send JSON and sign the raw body with HMAC-SHA256.', responsibilities: ['Chooses the source-specific URL', 'Supplies event, delivery, sender, and routing metadata', 'Treats 200 as accepted, 401 as a failed trust check'], tech: ['GitHub', 'Linear', 'Stripe', 'Local emitters'] },
+        sender: { summary: 'Any system able to send JSON and sign the raw body with HMAC-SHA256 (GitHub, Linear, Stripe, ...).', responsibilities: ['Chooses the source-specific URL', 'Supplies event, delivery, sender, and routing metadata', 'Treats 200 as accepted, 401 as a failed trust check'], tech: ['GitHub', 'Linear', 'Stripe', 'Local emitters'] },
         agentbox: { summary: 'A reproducible multi-user sandbox that keeps autonomous coding-agent conversations reachable.', responsibilities: ['Declares users as security boundaries', 'Runs, parks, and resumes jobs through named sessions', 'Provides browser workspace, settings, lifecycle, and narrow sudo operations'], tech: ['Nix / NixOS', 'systemd', 'tmux', 'Caddy', 'ttyd'] },
-        channels: { summary: 'The channel layer connects personal WhatsApp and signed external events to agent conversations.', responsibilities: ['Runs the personal linked-device bridge', 'Verifies and fans out signed webhook bodies', 'Routes to an exact session or dispatches bounded new work'], tech: ['Node.js', 'Python 3', 'JSON-RPC', 'Unix sockets'] },
+        channels: { summary: 'The channel layer connects WhatsApp, Slack, mail and signed external events to agent conversations.', responsibilities: ['Runs the WhatsApp bridge, the thread router and the Slack daemon', 'Verifies and fans out signed bodies on one per-user bus', 'Routes to an exact session or dispatches bounded new work', 'Acknowledges accepted GitHub work with a reaction'], tech: ['Node.js', 'Python 3', 'JSON-RPC', 'Unix sockets'] },
         model: { summary: 'The external model service used by the selected coding-agent harness.', responsibilities: ['Interprets the task and event data', 'Calls tools exposed by the harness', 'Returns agent output to the persistent session'], tech: ['Claude', 'OpenAI'] },
         github: { summary: 'The external systems the agent reads and changes while doing development work.', responsibilities: ['Hosts code and reviews', 'Emits CI, issue, PR, and comment events', 'Accepts authenticated changes from the agent'], tech: ['GitHub API', 'Git', 'CI'] },
-        browser: { summary: 'The operator-facing workspace for terminals, settings, sessions, secrets, connections, and webhooks.', responsibilities: ['Embeds the terminal', 'Calls settings routes', 'Keeps the operator inside one authenticated origin'], tech: ['HTML', 'ttyd', 'HTTP'] },
-        caddy: { summary: 'The only public web edge on the box.', responsibilities: ['Terminates TLS', 'Authenticates operator-facing routes', 'Routes webhook ingress to a per-user Unix socket'], tech: ['Caddy', 'TLS', 'Unix sockets'] },
-        settings: { summary: 'The per-user control plane for the box.', responsibilities: ['Renders session and connection state', 'Pairs or unlinks the personal WhatsApp device', 'Writes the user-owned environment store and invokes scoped lifecycle operations'], tech: ['Python HTTP server', 'JSON state'] },
-        supervisor: { summary: 'Maintains agent runtimes and the user-owned WhatsApp bridge.', responsibilities: ['Starts the chosen harness or profile', 'Parks eligible runtimes only when capacity is needed', 'Refreshes and supervises the bridge without spending a session slot'], tech: ['Shell', 'tmux', 'systemd'] },
-        receiver: { summary: 'The single ingress owner in agent-box daemon mode.', responsibilities: ['Adopts the systemd-activated socket', 'Verifies the raw request body before parsing', 'Broadcasts a normalized envelope to every live peer'], tech: ['webhook.py', 'Python http.server', 'socket activation'] },
-        state: { summary: 'Shared per-user runtime state for sources, routing, subscriptions, and peers.', responsibilities: ['Keeps source configuration and 0600 secrets', 'Stores one filter per session plus shared standing watches', 'Tracks live peer sockets and spawn leases'], tech: ['sources.json', 'filter.<session>.json', 'instances/*.sock'] },
+        browser: { summary: 'The operator-facing workspace for terminals, settings, sessions, secrets, connections, and webhooks.', responsibilities: ['Embeds the terminal and the session grid', 'Calls settings routes and receives live resource readings over SSE', 'Serves ~/downloads and resumable one-file upload links'], tech: ['HTML', 'ttyd', 'HTTP'] },
+        caddy: { summary: 'The only public web edge on the box.', responsibilities: ['Terminates TLS (internal CA for a private IPv4)', 'Authenticates operator routes by password or portal handover', 'Routes webhook ingress to a per-user Unix socket', 'Imports user ~/sites snippets; strips identifying headers'], tech: ['Caddy', 'TLS', 'Unix sockets'] },
+        settings: { summary: 'The per-user control plane for the box.', responsibilities: ['Renders sessions, profiles, automations and host resources', 'Pairs or unlinks WhatsApp; registers mail addresses', 'Writes the env store and invokes scoped lifecycle operations', 'Falls back to the reboot helper when the normal reboot fails or hangs'], tech: ['Python HTTP server', 'JSON state'] },
+        supervisor: { summary: 'Maintains agent runtimes and the user-owned channel daemons.', responsibilities: ['Starts the chosen harness or profile; gives each session its own TMPDIR', 'Reserves hook capacity; hibernates an idle hook to make room and resumes it exactly', 'Supervises the WhatsApp bridge and Slack daemon without spending a session slot'], tech: ['Shell', 'tmux', 'systemd'] },
+        receiver: { summary: 'The single ingress owner in agent-box daemon mode.', responsibilities: ['Adopts the systemd-activated socket', 'Verifies the raw request body before parsing', 'Broadcasts a normalized envelope to every live peer', 'Retains full untrusted content for 24 hours and adds GitHub pickup reactions'], tech: ['webhook.py', 'Python http.server', 'socket activation'] },
+        state: { summary: 'Shared per-user runtime state for sources, routing, subscriptions, and peers.', responsibilities: ['Keeps source configuration and 0600 secrets', 'Stores one filter per session (claims + events policy) plus named standing watches', 'Tracks live peer sockets, spawn leases and retained content'], tech: ['sources.json', 'filter.<session>.json', 'instances/*.sock'] },
         'wa-state': { summary: 'Private per-user state owned by the linked-device bridge.', responsibilities: ['Stores linked-device credentials, plaintext messages, and the selected target', 'Keeps retryable inbound and outbound delivery state', 'Bounds private inbox attachments and removes them after delivery'], tech: ['~/.local/state/local-whatsapp', '0600 files', 'JSON'] },
-        bridge: { summary: 'The personal WhatsApp transport supervised once per Linux user.', responsibilities: ['Pairs with account-level linked-device access but forwards only Message Yourself', 'Requires the @<user> gate for commands and normal deliveries', 'Selects or creates one target and activates an exact cold session before delivery', 'Queues text and media paths, retries replies, and never exposes a shell command target'], tech: ['local-whatsapp', 'Node.js', 'agent-box-session'] },
-        claude: { summary: 'A Claude Code job that can receive both webhook events and selected WhatsApp deliveries.', responsibilities: ['Reads its own webhook subscription filter', 'Loads the WhatsApp channel only for the selected target', 'Treats external text and attachment metadata as untrusted data'], tech: ['Claude Code', 'MCP', 'Channel plugins'] },
+        bridge: { summary: 'The personal WhatsApp transport supervised once per Linux user.', responsibilities: ['Pairs with account-level linked-device access but forwards only Message Yourself', 'Requires the @<user> gate for commands and normal deliveries', 'Asks the router for a session unless a /target pin is set', 'Sends an eyes reaction when an agent acks pickup', 'Queues text and media paths, retries replies, and never exposes a shell command target'], tech: ['local-whatsapp', 'Node.js', 'agent-box-session'] },
+        claude: { summary: 'A Claude Code job that can receive both webhook events and selected WhatsApp deliveries.', responsibilities: ['Reads its own webhook subscription filter', 'Loads the WhatsApp channel only for the selected target', 'Runs secret-using commands through the broker (exec_with_secrets)', 'Treats external text and attachment metadata as untrusted data'], tech: ['Claude Code', 'MCP', 'Channel plugins'] },
         codex: { summary: 'A Codex job addressed through detached peers and its native thread UUID.', responsibilities: ['Registers the real native thread behind the stable session name', 'Queues webhook or WhatsApp input into that exact task', 'Consumes queued input at a turn boundary or after cold activation'], tech: ['Codex', 'codex queue', 'rollout UUID'] },
-        hook: { summary: 'A fresh, bounded session spawned only when a standing-watch rule matches.', responsibilities: ['Claims the event object or commit it was created for', 'Yields to an interactive session already holding the work', 'Removes itself after completion'], tech: ['agent-box-session', 'spawnConfig', 'lease / cap'] },
+        hook: { summary: 'A fresh, bounded session spawned only when a standing-watch rule matches.', responsibilities: ['Claims the event object or commit it was created for', 'Yields to an interactive session already holding the work', 'Runs the watch\'s own profile; may be hibernated when idle', 'Replies with the outcome, then removes itself'], tech: ['agent-box-session', 'spawnConfig', 'lease / cap'] },
         providers: { summary: 'External model, source-control, CI, and application APIs used while the agent works.', responsibilities: ['Provide model inference', 'Store code and collaboration state', 'Receive tool-driven changes'], tech: ['HTTPS', 'Git', 'MCP'] },
         sender2: { summary: 'An external event producer that can reach the public webhook route.', responsibilities: ['Signs the exact request body', 'Uses the configured source path', 'Retries according to its own delivery policy'], tech: ['HTTPS', 'HMAC-SHA256'] },
         whatsapp2: { summary: 'WhatsApp\'s external service carries the owner self-chat to the linked device on the box.', responsibilities: ['Authenticates the linked device', 'Transports text and media end to end', 'Retains its own primary-account device controls'], tech: ['WhatsApp', 'E2EE', 'Linked devices'] },
@@ -551,17 +607,17 @@
         'f-caddy': { summary: 'Step 2: Caddy terminates TLS and forwards the request to the user-scoped ingress socket.', responsibilities: ['Expose one stable public URL', 'Keep the receiver off the public TCP interface'], tech: ['TLS', 'reverse_proxy'] },
         'f-receiver': { summary: 'Step 3: the receiver selects the source configuration, verifies the signature, and only then parses JSON.', responsibilities: ['Fail closed on unknown source or bad signature', 'Normalize source, event, key, sender, delivery, and payload'], tech: ['constant-time compare', 'sources.json'] },
         'f-fanout': { summary: 'Step 4: one verified envelope is written to every live per-session peer socket.', responsibilities: ['Use newline-delimited JSON', 'Remove stale sockets after failed delivery'], tech: ['AF_UNIX', 'NDJSON'] },
-        'f-filter': { summary: 'Step 5: each peer independently decides whether this verified event belongs to its session.', responsibilities: ['Match source:key topic patterns', 'Apply include / exclude rules and TTL', 'Enforce sender mutes and claim brakes'], tech: ['filter.<session>.json', 'hot reload'] },
+        'f-filter': { summary: 'Step 5: each peer independently decides whether this verified event belongs to its session.', responsibilities: ['Match source:key topic patterns', 'Apply claims, the events policy (actionable, ci-summary, terminal-ci), rules and TTL', 'Enforce sender mutes and claim brakes'], tech: ['filter.<session>.json', 'hot reload'] },
         'f-claude': { summary: 'Step 6A: a matching Claude peer emits an untrusted-marked channel notification on plugin stdio.', responsibilities: ['Summarize known GitHub event types', 'Truncate and mark free text as untrusted'], tech: ['notifications/claude/channel'] },
-        'f-codex': { summary: 'Step 6B: a detached peer queues the same event into the subscribed Codex task.', responsibilities: ['Target the exact remote-controlled task', 'Wake an idle task or wait for the turn boundary'], tech: ['codex queue'] },
-        'f-hook': { summary: 'Step 6C: a standing-watch match asks agent-box to create a fresh ephemeral worker.', responsibilities: ['Respect the shared session admission cap', 'Return EX_TEMPFAIL when the batch must be retried', 'Seed the new session with a narrow event claim'], tech: ['spawn command', 'EX_TEMPFAIL'] },
+        'f-codex': { summary: 'Step 6B: one shared delivery daemon queues the same event into each subscribed Codex task.', responsibilities: ['Target the exact remote-controlled task', 'Wake an idle task or wait for the turn boundary'], tech: ['codex queue'] },
+        'f-hook': { summary: 'Step 6C: a standing-watch match asks agent-box to create a fresh ephemeral worker.', responsibilities: ['Respect the shared hook capacity; hibernate an idle hook to make room', 'Decline with EX_TEMPFAIL so the receiver re-offers the batch for up to an hour', 'Seed the new session with a narrow event claim and the watch\'s profile'], tech: ['spawn command', 'EX_TEMPFAIL'] },
         'w-owner': { summary: 'Step 1: the linked account sends a command or attachment from its Message Yourself chat.', responsibilities: ['Prefix text or captions with @<user>', 'Use /target or /profile to control routing', 'Open a short /attach window before sending captionless media'], tech: ['WhatsApp app', 'Message Yourself'] },
         'w-service': { summary: 'Step 2: WhatsApp transports the self-chat event to the box as a linked device.', responsibilities: ['Authenticate the linked device', 'Protect the network transport with end-to-end encryption'], tech: ['WhatsApp', 'E2EE'] },
         'w-bridge': { summary: 'Step 3: the bridge accepts only the linked owner self-chat and applies the command or attachment gate.', responsibilities: ['Reject other chats and unprefixed input', 'Exclude view-once media', 'Mark message text and attachment metadata as untrusted'], tech: ['local-whatsapp', 'Node.js'] },
         'w-state': { summary: 'Step 4: authorized input enters private, retryable bridge state before agent handoff.', responsibilities: ['Persist linked-device keys and plaintext pending delivery', 'Store inbound attachments as bridge-named 0600 files', 'Cap each attachment and the total inbox'], tech: ['~/.local/state/local-whatsapp', '0600 files'] },
-        'w-route': { summary: 'Step 5: the bridge resolves one stable Agentbox session name.', responsibilities: ['Honor the explicit /target selection', 'Create a clean session from the selected or default profile when automatic', 'Keep a selected unavailable target instead of choosing a replacement'], tech: ['target.json', 'agent-box-session'] },
+        'w-route': { summary: 'Step 5: the bridge resolves one stable Agentbox session name.', responsibilities: ['Honor an explicit /target pin', 'Otherwise ask local-router: follow-up, new topic, or new topic that needs older context', 'Only choose among sessions the router started', 'Keep a pinned unavailable target instead of choosing a replacement'], tech: ['local-router', 'target.json', 'agent-box-session'] },
         'w-activate': { summary: 'Step 6: Agentbox admits the selected runtime and resumes its exact native conversation.', responsibilities: ['Activate a stopped target through the shared capacity gate', 'Resume the recorded Claude transcript or Codex rollout', 'Leave delivery queued when capacity refuses activation'], tech: ['session capacity', 'native resume ID'] },
-        'w-claude': { summary: 'Step 7A: the selected Claude channel receives the prompt and private local attachment paths.', responsibilities: ['Load only for the selected session', 'Reply through the message-specific channel tool', 'Use native image replies when requested'], tech: ['MCP stdio', 'whatsapp_reply_image'] },
+        'w-claude': { summary: 'Step 7A: the Claude session receives the prompt and private local attachment paths.', responsibilities: ['A pinned session loads the channel plugin; a routed follow-up arrives as an owner-trusted inbox event', 'Acknowledge pickup with whatsapp_ack', 'Reply through the message-specific channel tool', 'Use native image replies when requested'], tech: ['MCP stdio', 'whatsapp_reply_image'] },
         'w-codex': { summary: 'Step 7B: the stable session name resolves to the exact Codex task before queueing input.', responsibilities: ['Use the published rollout UUID for TUI sessions', 'Use explicit or subscription registration for Remote Control tasks', 'Reply through the bridge CLI against the originating message'], tech: ['codex queue', 'codex-threads.json'] }
       };
 
@@ -570,7 +626,14 @@
         channels: ['local-channels repository', 'https://github.com/defangdevs/local-channels'],
         receiver: ['local-webhook implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-webhook'],
         bridge: ['local-whatsapp implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-whatsapp'],
-        'w-bridge': ['local-whatsapp implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-whatsapp']
+        'w-bridge': ['local-whatsapp implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-whatsapp'],
+        router: ['local-router implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-router'],
+        'w-route': ['local-router implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-router'],
+        slackd: ['local-slack implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-slack'],
+        reboot: ['PR #1055: reboot helper', 'https://github.com/defangdevs/agent-box/pull/1055'],
+        broker: ['secret-broker.py', 'https://github.com/defangdevs/agent-box/blob/master/modules/src/secret-broker.py'],
+        acp: ['acp-cli.py', 'https://github.com/defangdevs/agent-box/blob/master/modules/src/acp-cli.py'],
+        smtpd: ['email-cli.py', 'https://github.com/defangdevs/agent-box/blob/master/modules/src/email-cli.py']
       };
 
       const svg = document.querySelector('#diagram');
@@ -677,7 +740,7 @@
         document.querySelector('#detail-type').textContent = 'Architecture map';
         document.querySelector('#detail-title').textContent = 'Select a system';
         document.querySelector('#detail-summary').textContent = 'Choose any element to isolate its relationships and see why it exists.';
-        document.querySelector('#detail-body').innerHTML = '<section class="detail-section"><h3>Reading the map</h3><p>Use the four views on the left. Filter by harness, expose trust boundaries, or follow either inbound delivery path end to end.</p></section><section class="detail-section"><h3>Core rule</h3><p>A Linux user is the trust boundary. A session is a unit of concurrent work and deliberately is not an isolation boundary.</p></section>';
+        document.querySelector('#detail-body').innerHTML = '<section class="detail-section"><h3>Reading the map</h3><p>Use the four views on the left. Filter by harness, expose trust boundaries, or follow the event or WhatsApp delivery path end to end.</p></section><section class="detail-section"><h3>Core rule</h3><p>A Linux user is the trust boundary. A session is a unit of concurrent work and deliberately is not an isolation boundary.</p></section>';
       }
 
       function fit() {
