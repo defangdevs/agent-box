@@ -739,6 +739,20 @@ class ProfilePanel(ProfileFixture):
         self.assertEqual(module.probe_codex_catalog(old), ())
         self.assertEqual(module.probe_model_aliases(old, "codex"), ())
 
+    def test_a_failed_codex_catalog_with_no_model_option_is_retryable(self):
+        """Help text without any `--model` option is not a final answer
+        either while the catalog could not be asked."""
+        module = self.daemon()
+        odd = os.path.join(self.tmp.name, "odd-codex-stub")
+        with open(odd, "w") as handle:
+            handle.write("#!/bin/sh\n"
+                         "[ \"$1 $2\" = 'debug models' ] && "
+                         "{ echo 'not json'; exit 0; }\n"
+                         "echo 'usage: codex [--version]'\n")
+        os.chmod(odd, 0o755)
+        self.assertIsNone(module.probe_model_aliases(odd, "codex"))
+        self.assertEqual(module.probe_model_aliases(odd, "claude"), ())
+
     def test_a_codex_catalog_that_failed_is_asked_again(self):
         """A catalog probe that could not answer, with a help page that
         names nothing, must not be cached as an empty list under the

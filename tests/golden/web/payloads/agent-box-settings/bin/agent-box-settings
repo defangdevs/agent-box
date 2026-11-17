@@ -9078,6 +9078,10 @@ def probe_model_aliases(binary, harness=None):
         return None
     opt = _MODEL_OPT_RE.search(text)
     if not opt:
+        if harness == "codex" and catalog is None:
+            # Same rule as below: without a catalog this help is not the
+            # CLI's final word, so keep the empty retryable.
+            return None
         return ()
     rest = text[opt.end():]
     end = _NEXT_OPT_RE.search(rest)
