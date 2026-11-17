@@ -689,6 +689,66 @@ class ProfilePanel(ProfileFixture):
         self.assertNotIn(
             "codex", self.in_fixture(module.render_model_hints, profiles))
 
+    def codex_catalog_stub(self, catalog):
+        """A codex that answers `debug models` with CATALOG and `--help`
+        with CODEX_HELP, as codex-cli 0.165 does."""
+        path = os.path.join(self.tmp.name, "codex-catalog-stub")
+        with open(path, "w") as handle:
+            handle.write(
+                "#!/bin/sh\n"
+                "if [ \"$1 $2\" = 'debug models' ]; then\n"
+                "cat <<'AGENTBOXCATALOG'\n" + catalog
+                + "\nAGENTBOXCATALOG\nexit 0\nfi\n"
+                "cat <<'AGENTBOXHELP'\n" + CODEX_HELP + "AGENTBOXHELP\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def test_codex_models_are_read_off_its_own_catalog(self):
+        """codex's --help names no model, but `codex debug models` prints
+        the catalog its own /model picker reads. The listed slugs are
+        offered in codex's priority order; a hidden entry and a slug no
+        model field could hold are not."""
+        catalog = json.dumps({"models": [
+            {"slug": "gpt-b", "visibility": "list", "priority": 2},
+            {"slug": "internal-review", "visibility": "hide", "priority": 0},
+            {"slug": "gpt-a", "visibility": "list", "priority": 1},
+            {"slug": "bad slug", "visibility": "list", "priority": 3},
+            {"slug": "gpt-c", "visibility": "list"},
+        ]})
+        module = self.daemon(
+            AGENT_BOX_CONNECT_BINS="codex=" + self.codex_catalog_stub(catalog))
+        self.write_profile("fast", 'HARNESS=codex\nMODEL=gpt-old\n')
+        self.assertEqual(
+            self.in_fixture(module.model_hints, "codex",
+                            module.read_profiles()),
+            ("gpt-a", "gpt-b", "gpt-c", "gpt-old"))
+
+    def test_a_codex_without_a_catalog_falls_back_to_its_help(self):
+        """An older codex has no `debug models`; a broken catalog is no
+        better. Either way the help page is still asked, and what it says
+        (nothing, for codex) is the answer."""
+        module = self.daemon()
+        broken = self.codex_catalog_stub("not json")
+        self.assertIsNone(module.probe_codex_catalog(broken))
+        self.assertEqual(module.probe_model_aliases(broken, "codex"), ())
+        old = self.harness_stub("codex", CODEX_HELP)
+        self.assertEqual(module.probe_model_aliases(old, "codex"), ())
+
+    def test_only_codex_is_asked_for_a_catalog(self):
+        """`debug models` is codex's subcommand. Another CLI could read it
+        as a prompt, so a claude probe never sends it."""
+        log = os.path.join(self.tmp.name, "argv.log")
+        path = os.path.join(self.tmp.name, "claude-argv-stub")
+        with open(path, "w") as handle:
+            handle.write("#!/bin/sh\necho \"$*\" >> '%s'\n"
+                         "echo \"  --model <M>  e.g. 'opus'.\"\n" % log)
+        os.chmod(path, 0o755)
+        module = self.daemon()
+        self.assertEqual(module.probe_model_aliases(path, "claude"),
+                         ("opus",))
+        with open(log) as handle:
+            self.assertEqual(handle.read(), "--help\n")
+
     def test_a_model_already_in_use_is_offered_for_its_own_harness(self):
         """The second source, and the only one a harness with a silent
         --help has: what this box's own profiles already name. It is

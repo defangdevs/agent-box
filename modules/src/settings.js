@@ -1614,8 +1614,14 @@
     } catch (err) { return []; }
   }
   function acFrag(input) {
-    return acKind(input) === "model"
-      ? input.value : acSplit(input.value).frag;
+    if (acKind(input) !== "model") { return acSplit(input.value).frag; }
+    // A model field filters only on what was TYPED since it opened. An
+    // existing profile's row opens on its saved model, and filtering by
+    // that showed the one name already in the field - or nothing at all
+    // for a full ID that no alias starts with - so editing a profile never
+    // offered the list that adding one did.
+    var st = input._dir;
+    return st && st.typed ? input.value : "";
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -1630,7 +1636,7 @@
     var ul = acList(input);
     if (ul) { ul.hidden = true; ul.innerHTML = ""; }
     var st = input._dir;
-    if (st) { st.active = -1; }
+    if (st) { st.active = -1; st.typed = false; }
   }
   function acRender(input) {
     var ul = acList(input);
@@ -1727,6 +1733,7 @@
   document.addEventListener("input", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    (input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 })).typed = true;
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
@@ -1739,6 +1746,7 @@
     // such default - it starts empty, or on what the profile already says,
     // and selecting THAT would throw the value away on a stray focus.
     if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    if (input._dir) { input._dir.typed = false; }
     acFetch(input);
   });
   document.addEventListener("focusout", function (e) {

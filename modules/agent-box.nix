@@ -34227,8 +34227,14 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     } catch (err) { return []; }
   }
   function acFrag(input) {
-    return acKind(input) === "model"
-      ? input.value : acSplit(input.value).frag;
+    if (acKind(input) !== "model") { return acSplit(input.value).frag; }
+    // A model field filters only on what was TYPED since it opened. An
+    // existing profile's row opens on its saved model, and filtering by
+    // that showed the one name already in the field - or nothing at all
+    // for a full ID that no alias starts with - so editing a profile never
+    // offered the list that adding one did.
+    var st = input._dir;
+    return st && st.typed ? input.value : "";
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -34243,7 +34249,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var ul = acList(input);
     if (ul) { ul.hidden = true; ul.innerHTML = ""; }
     var st = input._dir;
-    if (st) { st.active = -1; }
+    if (st) { st.active = -1; st.typed = false; }
   }
   function acRender(input) {
     var ul = acList(input);
@@ -34340,6 +34346,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   document.addEventListener("input", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    (input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 })).typed = true;
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
@@ -34352,6 +34359,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     // such default - it starts empty, or on what the profile already says,
     // and selecting THAT would throw the value away on a stray focus.
     if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    if (input._dir) { input._dir.typed = false; }
     acFetch(input);
   });
   document.addEventListener("focusout", function (e) {
@@ -34612,6 +34620,9 @@ _MODEL_HINT_MAX = 12
 # holds spaces, so no match is possible there and the scan resumes at the
 # real opening quote of the example that follows.
 _MODEL_NAME_RE = re.compile(r"'([A-Za-z0-9][A-Za-z0-9._-]{1,63})'")
+# The same charset, for a name that arrives bare (codex's catalog) rather
+# than quoted in prose.
+_MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,63}")
 # harness_model_aliases()' answers, keyed on (binary, stamp) and holding
 # (names, retry_at). retry_at is None for a real answer - it stands until
 # the binary itself changes - and a monotonic deadline for a probe that
@@ -34632,17 +34643,71 @@ def binary_stamp(path):
     return (info.st_mtime_ns, info.st_size)
 
 
-def probe_model_aliases(binary):
+def probe_codex_catalog(binary):
+    """codex's own model catalog, or None when this codex has none to give.
+
+    codex's `--help` names no model, but `codex debug models` prints the
+    catalog its own /model picker reads (codex-cli 0.165 has it; an older
+    one does not, and answers with an error). That is the same "read it off
+    the harness" rule as the help scrape, from a better page: the slugs the
+    harness itself LISTS to its users (visibility "list"), in its own
+    priority order, so a hidden internal entry is never offered.
+
+    Only ever run for codex. The subcommand is codex's; handed to another
+    CLI, `debug models` could just as well be read as a prompt.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "debug", "models"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("profiles: codex model catalog: %s\n" % exc)
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        models = json.loads(proc.stdout).get("models")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(models, list):
+        return None
+    listed = [m for m in models if isinstance(m, dict)
+              and m.get("visibility") == "list"
+              and isinstance(m.get("slug"), str)
+              and _MODEL_SLUG_RE.fullmatch(m["slug"])]
+    listed.sort(key=lambda m: m.get("priority")
+                if isinstance(m.get("priority"), int) else 1 << 30)
+    names = []
+    for model in listed:
+        if model["slug"] not in names:
+            names.append(model["slug"])
+        if len(names) >= _MODEL_HINT_MAX:
+            break
+    return tuple(names)
+
+
+def probe_model_aliases(binary, harness=None):
     """Ask one harness what models it names, or None when it could not be
     asked at all.
 
+    codex first asks its catalog (probe_codex_catalog) and falls back to
+    its help page only when that cannot answer.
+
     The two answers are deliberately different things. () is an ANSWER -
-    the CLI ran and its `--model` puts no name forward, which is codex
-    today. None is a non-answer: the probe timed out, or raced a lazy
-    `nix profile add` still linking the binary, or the CLI printed nothing
+    the CLI ran and its `--model` puts no name forward, which is an old
+    codex without a catalog. None is a non-answer: the probe timed out, or
+    raced a lazy `nix profile add` still linking the binary, or the CLI printed nothing
     whatsoever, and asking again later may well succeed. Only the caller
     can act on that difference, and it does - see the cache above.
     """
+    if harness == "codex":
+        names = probe_codex_catalog(binary)
+        if names:
+            return names
     try:
         proc = subprocess.run(
             [binary, "--help"],
@@ -34675,15 +34740,16 @@ def probe_model_aliases(binary):
     return tuple(names)
 
 
-def harness_model_aliases(binary, stamp):
+def harness_model_aliases(binary, stamp, harness=None):
     """The model names a harness's own `--help` puts forward, as a tuple.
 
     claude names them ("an alias for the latest model (e.g. 'fable',
     'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')").
-    codex documents none - its `--model` says only "Model the agent should
-    use", and its shell completion file-completes the value - so it
-    contributes nothing here rather than us guessing a list on its behalf
-    and shipping it stale.
+    codex's help documents none - its `--model` says only "Model the agent
+    should use" - so codex is asked for its catalog instead (see
+    probe_codex_catalog). A codex too old to have one contributes nothing
+    here rather than us guessing a list on its behalf and shipping it
+    stale.
 
     Empty either way to the caller: the field is free text, so a probe
     that cannot run costs a suggestion and never a save. What the two
@@ -34698,11 +34764,11 @@ def harness_model_aliases(binary, stamp):
     """
     if not binary:
         return ()
-    key = (binary, stamp)
+    key = (binary, stamp, harness)
     hit = _model_alias_cache.get(key)
     if hit is not None and (hit[1] is None or time.monotonic() < hit[1]):
         return hit[0]
-    names = probe_model_aliases(binary)
+    names = probe_model_aliases(binary, harness)
     if len(_model_alias_cache) > 16:
         # Same reasoning as _transcript_cache: the keyspace grows with
         # every binary ever probed, and there is nothing here worth an
@@ -34732,7 +34798,8 @@ def model_hints(harness, profiles):
     binary = flow["bin"] if flow else None
     hints = []
     if binary:
-        for name in harness_model_aliases(binary, binary_stamp(binary)):
+        for name in harness_model_aliases(binary, binary_stamp(binary),
+                                          harness):
             if name not in hints:
                 hints.append(name)
     for name in sorted(profiles):
