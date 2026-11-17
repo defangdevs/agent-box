@@ -216,6 +216,25 @@ before a new named rule. Named watches keep their event rules across
 receiver restarts: the topic-based declared watch policy governs only
 unnamed watches. Profiles still fall back to the box default if unavailable.
 
+Before a watch starts a session it asks `agent-box-watch-route` whether a
+session already works on what the event is about, claimed or not. It looks for
+the PR, issue, branch or commit in the transcripts of your Claude and Codex
+sessions (what was said and which commands ran, not what commands printed), then
+makes one small model call with the event text. If a session you can message
+holds it, the batch goes to that session as a `routed:<name>` event, labelled
+UNTRUSTED like any GitHub event, and no session is started. A woken session
+that was stopped or hibernated gets it the same way. Nothing here needs a claim,
+so an interactive session that never claimed its PR still hears about it.
+
+When the owner cannot be messaged (a Codex thread hosted in a remote-control
+daemon, a Claude app conversation), or only an earlier session touched the
+object, the new worker's prompt lists those transcripts, of any harness, as
+`EARLIER WORK ON THESE EVENTS' OBJECT`. Read the end of the file
+(`tail -c 20000 FILE`) before acting, and do not edit that session's worktree.
+Any failure - no model, no network, a timeout - starts a session exactly as
+before; the router never costs an event. Its model is the WhatsApp router's
+(`AGENT_BOX_ROUTER_BACKEND`, `AGENT_BOX_ROUTER_MODEL`).
+
 A watch tries not to double up on work you own, and how well it manages
 depends on what you told it. local-webhook >= 0.23.0 has no built-in policy left: a subagent watch
 MUST carry `--when`/`--drop` rules or it is refused outright, so

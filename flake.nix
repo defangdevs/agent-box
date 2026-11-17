@@ -2988,6 +2988,47 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # agent-box-watch-route (issue #1056): which session, if any, already
+          # holds a standing watch's event. Hermetic: a fake home with
+          # transcripts of both harnesses, a stub router and stubbed CLI calls.
+          # Weighted at the refusals - every failure must mean "start a
+          # session", and a session no message can reach must never be sent one.
+          watch-route =
+            pkgs.runCommand "agent-box-watch-route"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                cli = ./modules/src/watch-route.py;
+                tests = ./tests/test-watch-route.py;
+              } ''
+              install -d repo/modules/src repo/tests
+              cp "$cli" repo/modules/src/watch-route.py
+              cp "$tests" repo/tests/test-watch-route.py
+              python3 repo/tests/test-watch-route.py > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # What webhook-spawn.sh does with the router's answer: CONTINUE starts
+          # nothing and seeds no claim, NEW_LINKS reaches the prompt, and every
+          # router failure still starts a session (issue #1056).
+          webhook-spawn-route =
+            pkgs.runCommand "agent-box-webhook-spawn-route"
+              {
+                nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.jq pkgs.python3 ];
+                src = ./modules/src;
+                tests = ./tests/test-webhook-spawn-route.sh;
+              } ''
+              bash "$tests" "$src/webhook-spawn.sh" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           whatsapp-cli =
             pkgs.runCommand "agent-box-whatsapp-cli"
               {
