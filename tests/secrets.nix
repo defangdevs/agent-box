@@ -220,7 +220,9 @@
         machine.succeed(f"cp /tmp/K.rec.bak {rec}")
 
     with subtest("env-exec strips protected names, tombstones included"):
-        agent("agent-box-profile set t HARNESS=shell")
+        # Any worker harness: the profile only names the default namespace
+        # (master refuses HARNESS=shell profiles, which are not workers).
+        agent("agent-box-profile set t HARNESS=claude")
         agent("agent-box-profile default t")
         agent("printf %s other | agent-box-secret --profile t set T --stdin")
         agent("agent-box-secret --profile t remove T")
