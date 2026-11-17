@@ -56,6 +56,21 @@ remember_codex_wake() {
   fi
 }
 
+# True when this process runs inside a conversation of a Claude Remote Control
+# daemon session (`agent-box-session add NAME --harness claude --daemon`).
+# LOCAL_WEBHOOK_SESSION is "<user>-<session>" (webhookSessionEnvArgs), and the
+# registry marks the daemon. A Codex caller is never one: Codex delivers through
+# its own peer, not a Claude channel.
+claude_rc_daemon_conversation() {
+  [ -z "${CODEX_THREAD_ID:-}${CODEX_SESSION_ID:-}" ] || return 1
+  _cs="${LOCAL_WEBHOOK_SESSION:-}"
+  _cs="${_cs#"$(id -un)"-}"
+  [ -n "$_cs" ] && [ -r "$SESSIONS" ] || return 1
+  "$JQ" -e --arg s "$_cs" \
+    '.sessions[$s] | (.agent // "claude") == "claude" and (.remoteControlDaemon == true or .remoteControlServer == true)' \
+    "$SESSIONS" >/dev/null 2>&1
+}
+
 forget_codex_wake_if_idle() {
   _wake="$(codex_wake_file)" || return 0
   _filter="$STATE_DIR/filter.${LOCAL_WEBHOOK_SESSION}.json"
@@ -336,6 +351,15 @@ USAGE
 
 ensure_state() { mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; }
 
+# Read-only diagnosis: `status` must leave state untouched, so it never
+# repairs the mode. It only creates a MISSING directory (first run), and a
+# failure to do so is reported and not fatal (issue #1048).
+ensure_state_for_read() {
+  [ -d "$STATE_DIR" ] && return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null && return 0
+  echo "webhook: state directory $STATE_DIR is unavailable (read-only filesystem?); continuing" >&2
+}
+
 valid_source() {
   case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
 }
@@ -382,6 +406,14 @@ source_template() {
       ;;
     email)
       printf '%s' '{"format":"generic","keyPath":"recipient","senderPath":"envelopeSender","retainPayload":true}'
+      ;;
+    inbox)
+      # Owner messages a router hands to the session it chose (agent-box-whatsapp
+      # route): keyed on the session name, so inbox:<name> reaches exactly one
+      # session, and rendered by local-webhook >= 0.39.0 as the owner's request
+      # rather than untrusted data. Only box-local producers that prove the
+      # owner wrote the text may emit here.
+      printf '%s' '{"format":"generic","keyPath":"session","trust":"owner"}'
       ;;
     slack)
       # local-slack emits through `webhook.py emit`, which signs with this
@@ -1149,6 +1181,28 @@ case "$cmd" in
             set -- "$@" --spawn-config "profile=$profile" ;;
         esac
       fi
+      # A Claude Remote Control DAEMON runs each app conversation as a
+      # `claude --print --sdk-url` child with no --channels, so its plugin peer
+      # starts and owns the socket but every delivery goes nowhere. Worse, a
+      # claim from it still brakes the standing watch, so a review on the PR
+      # spawns nobody and reaches nobody (PR #1051's CodeRabbit review). The
+      # guide already says a daemon is no webhook target; refuse here rather
+      # than write a subscription that silently swallows its events.
+      # A daemon started by a supervisor that knows the inbox path carries
+      # LOCAL_WEBHOOK_CLAUDE_DELIVERY=send, and then the plugin delivers
+      # through Claude's cross-session inbox (local-channels#149). Only a
+      # daemon without it (started before that release) is refused.
+      if [ "$deliver_to" = session ] && [ "${LOCAL_WEBHOOK_CLAUDE_DELIVERY:-}" != send ] \
+          && claude_rc_daemon_conversation; then
+        echo "agent-box-webhook: this is a conversation of the Claude Remote" \
+             "Control daemon '${LOCAL_WEBHOOK_SESSION#"$(id -un)"-}', which has no" \
+             "channel to deliver session events into: they would be dropped," \
+             "and a --claim would also stop the standing watch from spawning" \
+             "anyone for them. Restart the daemon after a box update (agent-box-session" \
+             "restart NAME) so it delivers through the Claude inbox, use a standing" \
+             "watch (--deliver-to subagent), or work in an interactive session" >&2
+        exit 2
+      fi
       # The relevance dimension, resolved once: a named policy or the
       # caller's own predicate, never both — they are two spellings of the
       # same thing and a precedence rule between them would be a coin toss.
@@ -1413,7 +1467,7 @@ case "$cmd" in
     # Same status webhook.py prints (its own version is the pin, since this
     # wrapper runs the pinned script), plus the two facts only the box can
     # see: what a NEW session would load, and what the live ones DID load.
-    ensure_state
+    ensure_state_for_read
     out="$("$PY" "$SCRIPT" status "$@")" || exit $?
     pinned="$(printf '%s' "$out" | "$JQ" -r '.version // ""')"
     installed="$(plugin_versions | tr '\n' ' ')"; installed="${installed% }"

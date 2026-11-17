@@ -1757,21 +1757,34 @@ let
     continue to list the now-inactive device until it is also removed from the
     primary phone's Linked devices screen.
 
-    WhatsApp has one destination session at a time. From the phone, send
-    `@agent /sessions` to list Claude and Codex sessions, then `@agent /target NAME`
-    to choose one. `@agent /target auto` clears that choice, so the next message
-    starts a new session with the profile selected in Connections; with no
-    selection, it uses the box's default profile. Send `@agent /profile NAME` to
-    change the profile and make the next message start fresh, or
-    `@agent /profile default` to use the default profile. The CLI equivalents are
-    `agent-box-session whatsapp candidates`, `select NAME`, `activate NAME`,
-    `clear`, and `spawn PROFILE|default`. A stopped session is a cold conversation:
-    the next message asks the shared capacity policy to reactivate that exact
-    session and resume its native harness thread. If no slot is available or that
-    selected session no longer exists, the message remains queued on the same
-    target instead of starting a replacement.
-    Selecting a different target does not require pairing again. Restart a running
-    Claude session after selecting it so it loads the WhatsApp channel.
+    A self-chat has no threads, so a router chooses the session for each
+    message. `agent-box-whatsapp route` asks local-router (a small model through
+    the first signed-in harness, Claude Haiku first) whether the message continues
+    one of the sessions the router started, starts a new topic, or starts a new
+    topic that needs facts from older ones. A new topic starts a new session, with
+    the profile selected in Connections or the box's default profile; its kickoff
+    prompt is the message. A follow-up wakes its session if it is stopped or
+    hibernated, and arrives there as an `[OWNER message via inbox ...]` on the
+    webhook bus: it is the owner's request, not untrusted data. Answer it with the
+    `reply` command it names. The router never chooses a session you started
+    yourself, and the chat shows no route notice unless `LOCAL_WHATSAPP_DEBUG=1`.
+    `AGENT_BOX_ROUTER_BACKEND` (`auto`, `claude`, `codex`, `anthropic`, `openai`,
+    `none`) and `AGENT_BOX_ROUTER_MODEL` in the env store override the model;
+    `AGENT_BOX_WHATSAPP_ROUTER=off` turns routing off.
+
+    To pin one session instead, send `@agent /sessions` to list Claude and Codex
+    sessions, then `@agent /target NAME`. `@agent /target auto` removes the pin
+    and routes again. Send `@agent /profile NAME` to change the profile for new
+    sessions, or `@agent /profile default` to use the default profile. The CLI
+    equivalents are `agent-box-session whatsapp candidates`, `select NAME`,
+    `activate NAME`, `clear`, and `spawn PROFILE|default`; `wake NAME` revives any
+    stopped Claude or Codex session through the same capacity gate. A stopped
+    pinned session is a cold conversation: the next message asks the shared
+    capacity policy to reactivate that exact session and resume its native harness
+    thread. If no slot is available or the pinned session no longer exists, the
+    message remains queued on the same target instead of starting a replacement.
+    Pinning a different target does not require pairing again. Restart a running
+    Claude session after pinning it so it loads the WhatsApp channel.
 
     A normal Codex TUI is registered automatically after its rollout starts, so
     WhatsApp resolves the agent-box session name to the real Codex thread ID. A
@@ -2640,8 +2653,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "7fb5bf1fad5d5f2fc6a1833d88a02264d210a315";
-  sha256 = "sha256-2tmUCZMCWo7VewN0q+PgiPx4eQzoGnufE+zyYDBh5gg=";
+  rev = "c0021f6c491d3710c498a3b8739ecd9d7932fe8d";
+  sha256 = "sha256-2+lTrqU3+ZJSA5+CN9WQ1XbWoRe5tmaTmlVwEDPm6js=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
@@ -5043,6 +5056,396 @@ def main():
 if __name__ == "__main__":
     main()
   '');
+  # Root reboot helper (issue #1054): a reboot that needs nothing from the
+  # disk when the settings page's normal `sudo systemctl reboot` cannot exec.
+  rebootHelperBin = pkgs.writers.writePython3Bin "agent-box-reboot-helper" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+"""agent-box-reboot-helper - a reboot that needs nothing from the disk.
+
+The settings page's "Reboot box" button normally runs `sudo systemctl
+reboot`: two programs, both read from disk at the moment of the request.
+When the disk has gone away (issue #1053) the page still answers - it runs
+from RAM - and the button does nothing, because the `exec` cannot find its
+program. This helper is the last resort for that case.
+
+It is a root daemon that is ALREADY RUNNING when the disk fails. Everything
+it needs is open or loaded before it serves the first request:
+
+  * /proc/sysrq-trigger is open for writing, so a reboot is a `write()` on
+    a descriptor it holds - no path lookup, no exec;
+  * every module it uses is imported at the top, and mlockall() keeps its
+    pages resident, so a stalled disk cannot page the code out;
+  * the listening socket is bound, so no systemd socket activation (which
+    would have to start a process on demand) is involved.
+
+It then drops root. The open descriptor keeps working; what is left is a
+process that can write to one file and nothing else.
+
+Misuse hardening (the point of the design, not an afterthought):
+
+  * Only ONE agent user may connect: the kernel reports the peer's uid
+    (SO_PEERCRED) and anything else is closed unanswered. The socket file
+    is also 0600 and owned by that user.
+  * The request is exactly the seven bytes b"REBOOT\\n". The helper never
+    forwards a client byte anywhere: what it writes to sysrq-trigger comes
+    from the constants below, so no client can select another sysrq key
+    (crash, kill-all, ...). Any other request, longer, shorter, or slow, is
+    refused.
+  * It refuses outright unless the kernel's kernel.sysrq mask allows the
+    reboot function (bit 128, or the value 1).
+  * One request starts the sequence; later ones are answered "BUSY".
+
+The front door has to survive too: the request reaches this helper through
+Caddy and the settings daemon, and a code page of theirs that was never
+loaded since boot is a SIGBUS once the disk is gone (a KVM fault test
+killed Caddy on its first TLS handshake). So a second, root process forked
+before the drop pins every file the AGENT_BOX_REBOOT_PIN_UNITS processes
+have mapped: mmap + mlock, refreshed every PIN_REFRESH_S so an update's new
+store paths are picked up. It takes no client input, pins only root-owned
+files nobody else can write, and stops at PIN_MAX_BYTES.
+
+The sequence is the classic sync (s), remount read-only (u), reboot (b),
+with a pause between each. The kernel runs s and u asynchronously and `b`
+does not wait for them, so the pauses are what give them a chance. They are
+bounded: a dead disk cannot stop the final `b`.
+"""
+import ctypes
+import grp
+import os
+import pwd
+import signal
+import socket
+import stat
+import struct
+import sys
+import time
+
+REQUEST = b"REBOOT\n"
+SYSRQ_TRIGGER = "/proc/sysrq-trigger"
+SYSRQ_MASK = "/proc/sys/kernel/sysrq"
+# Bit 128 of kernel.sysrq allows reboot/poweroff; 1 allows everything.
+SYSRQ_REBOOT_BIT = 128
+# The ONLY bytes ever written to the trigger. Never derived from input.
+SEQUENCE = ((b"s", 3.0), (b"u", 3.0), (b"b", 0.0))
+CLIENT_TIMEOUT_S = 2.0
+NOBODY = 65534
+PIN_REFRESH_S = 60
+# Caddy plus the settings daemon came to 72 MiB in the fault test.
+PIN_MAX_BYTES = 256 << 20
+PROT_READ = 1
+MAP_SHARED = 1
+
+
+def sysrq_allows_reboot(mask_fd):
+    """True when kernel.sysrq lets the `b` function run."""
+    try:
+        raw = os.pread(mask_fd, 32, 0).strip()
+        value = int(raw)
+    except (OSError, ValueError):
+        return False
+    return value == 1 or bool(value & SYSRQ_REBOOT_BIT)
+
+
+def peer_uid(conn):
+    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                            struct.calcsize("3i"))
+    return struct.unpack("3i", creds)[1]
+
+
+def read_request(conn):
+    """Read at most len(REQUEST)+1 bytes before a deadline; the caller
+    compares them with REQUEST. One byte too many is read on purpose so a
+    longer message is a mismatch and not a silently truncated match."""
+    conn.settimeout(CLIENT_TIMEOUT_S)
+    data = b""
+    limit = len(REQUEST) + 1
+    deadline = time.monotonic() + CLIENT_TIMEOUT_S
+    while len(data) < limit and time.monotonic() < deadline:
+        try:
+            chunk = conn.recv(limit - len(data))
+        except OSError:
+            break
+        if not chunk:
+            break
+        data += chunk
+        if data == REQUEST:
+            # Complete request: stop here instead of waiting for EOF. A
+            # trailing byte would not have been read yet, so ask once
+            # more without blocking.
+            conn.settimeout(0.05)
+            try:
+                extra = conn.recv(1)
+            except OSError:
+                extra = b""
+            return data + extra
+    return data
+
+
+def reply(conn, text):
+    try:
+        conn.sendall(text)
+    except OSError:
+        pass
+
+
+def run_sequence(trigger_fd, sleep, delays=True):
+    for key, pause in SEQUENCE:
+        os.write(trigger_fd, key)
+        if pause and delays:
+            sleep(pause)
+
+
+def shield_from_shutdown():
+    """An accepted request must reach its final `b` even if a late normal
+    shutdown sends SIGTERM meanwhile (systemd would still SIGKILL after its
+    stop timeout, far longer than the sequence)."""
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except ValueError:  # not the main thread (tests)
+        pass
+
+
+def serve(sock, allowed_uid, trigger_fd, mask_fd, sleep=time.sleep,
+          delays=True, once=False):
+    started = False
+    while True:
+        conn, _ = sock.accept()
+        with conn:
+            try:
+                uid = peer_uid(conn)
+            except OSError:
+                continue
+            if uid != allowed_uid:
+                # Not answered: a stranger learns nothing, not even that a
+                # reboot helper is here.
+                continue
+            if read_request(conn) != REQUEST:
+                reply(conn, b"ERR request\n")
+                continue
+            if started:
+                reply(conn, b"BUSY\n")
+                continue
+            if not sysrq_allows_reboot(mask_fd):
+                reply(conn, b"ERR sysrq-disabled\n")
+                continue
+            started = True
+            # Before the reply: nothing may stop an accepted request.
+            shield_from_shutdown()
+            reply(conn, b"OK\n")
+        try:
+            run_sequence(trigger_fd, sleep, delays)
+        except OSError as exc:
+            sys.stderr.write("agent-box-reboot-helper: sysrq write: %s\n" % exc)
+            started = False
+        if once:
+            return
+
+
+def unit_pids(units, proc="/proc", errors=None):
+    """PIDs whose cgroup v2 path ends in one of `units`. A read that fails
+    for a reason other than the process having exited is appended to
+    `errors`: the answer is then incomplete."""
+    pids = []
+    for name in os.listdir(proc):
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, name, "cgroup")) as f:
+                lines = f.read().splitlines()
+        except OSError as exc:
+            note_error(exc, errors)
+            continue
+        for line in lines:
+            if line.startswith("0::") and line.rsplit("/", 1)[-1] in units:
+                pids.append(name)
+                break
+    return pids
+
+
+def note_error(exc, errors):
+    if errors is not None and not isinstance(
+            exc, (FileNotFoundError, ProcessLookupError)):
+        errors.append(exc)
+
+
+def mapped_files(pids, proc="/proc", errors=None):
+    """Paths of the files these processes have mapped (see unit_pids for
+    `errors`)."""
+    paths = set()
+    for pid in pids:
+        try:
+            with open(os.path.join(proc, pid, "maps")) as f:
+                lines = f.read().splitlines()
+        except OSError as exc:
+            note_error(exc, errors)
+            continue
+        for line in lines:
+            fields = line.split(None, 5)
+            if len(fields) < 6 or not fields[5].startswith("/"):
+                continue
+            if not fields[5].endswith(" (deleted)"):
+                paths.add(fields[5])
+    return paths
+
+
+def pinnable(st, owner=0):
+    """A regular, non-empty file owned by `owner` that group and others
+    cannot write: a process we pin for cannot grow it into our RAM."""
+    if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+        return False
+    return st.st_uid == owner and not st.st_mode & 0o022
+
+
+class Pinner:
+    """Keeps a set of files mmapped and mlocked; refresh() reconciles."""
+
+    def __init__(self, libc, owner=0, limit=PIN_MAX_BYTES):
+        self.libc = libc
+        self.owner = owner
+        self.limit = limit
+        self.pinned = {}  # (st_dev, st_ino) -> (addr, size, path)
+
+    def total(self):
+        return sum(size for _, size, _ in self.pinned.values())
+
+    def refresh(self, paths, complete=True):
+        """Reconcile with `paths`. With complete=False (discovery could not
+        read everything) nothing is unpinned: absence proves nothing."""
+        wanted = {}
+        unknown = set()
+        for path in sorted(paths):
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # Could not look (a failing disk): not proof the file is
+                # gone, so an existing pin on it must stay.
+                unknown.add(path)
+                continue
+            if pinnable(st, self.owner):
+                wanted.setdefault((st.st_dev, st.st_ino), (path, st.st_size))
+        for key in [k for k, v in self.pinned.items()
+                    if complete and k not in wanted and v[2] not in unknown]:
+            addr, size, _ = self.pinned.pop(key)
+            self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+        skipped = 0
+        for key, (path, size) in wanted.items():
+            if key in self.pinned:
+                continue
+            if self.total() + size > self.limit:
+                skipped += 1
+                continue
+            addr = self.map(path, size)
+            if addr is not None:
+                self.pinned[key] = (addr, size, path)
+        return skipped
+
+    def map(self, path, size):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            return None
+        try:
+            addr = self.libc.mmap(None, size, PROT_READ, MAP_SHARED, fd, 0)
+        finally:
+            os.close(fd)
+        if addr in (None, ctypes.c_void_p(-1).value):
+            return None
+        if self.libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(size)):
+            self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+            return None
+        return addr
+
+
+def load_libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                          ctypes.c_int, ctypes.c_int, ctypes.c_long]
+    return libc
+
+
+def run_pinner(units):
+    """The root child: pin the front door's mapped files, forever."""
+    lock_memory()
+    pinner = Pinner(load_libc())
+    last = None
+    while True:
+        try:
+            errors = []
+            pids = unit_pids(units, errors=errors)
+            paths = mapped_files(pids, errors=errors)
+            skipped = pinner.refresh(paths, complete=not errors)
+            now = (len(pinner.pinned), pinner.total() >> 20, skipped)
+            if now != last:
+                sys.stderr.write("agent-box-reboot-helper: pinned %d files "
+                                 "(%d MiB), %d over the limit\n" % now)
+                last = now
+        except Exception as exc:  # keep pinning through one bad refresh
+            sys.stderr.write("agent-box-reboot-helper: pin: %r\n" % exc)
+        time.sleep(PIN_REFRESH_S)
+
+
+def lock_memory():
+    libc = ctypes.CDLL(None, use_errno=True)
+    # MCL_CURRENT | MCL_FUTURE
+    if libc.mlockall(1 | 2) != 0:
+        sys.stderr.write("agent-box-reboot-helper: mlockall failed: errno %d\n"
+                         % ctypes.get_errno())
+
+
+def drop_privileges():
+    os.setgroups([])
+    os.setgid(NOBODY)
+    os.setuid(NOBODY)
+
+
+def main():
+    user = os.environ.get("AGENT_BOX_REBOOT_USER", "")
+    path = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+    if not user or not path:
+        sys.stderr.write("agent-box-reboot-helper: AGENT_BOX_REBOOT_USER and "
+                         "AGENT_BOX_REBOOT_SOCKET are required\n")
+        return 2
+    entry = pwd.getpwnam(user)
+    # Preload everything a later lookup could need, before the disk can fail.
+    grp.getgrall()
+    trigger_fd = os.open(SYSRQ_TRIGGER, os.O_WRONLY)
+    mask_fd = os.open(SYSRQ_MASK, os.O_RDONLY)
+    if os.path.lexists(path):
+        os.unlink(path)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    os.umask(0o177)
+    sock.bind(path)
+    os.chown(path, entry.pw_uid, -1)
+    os.chmod(path, 0o600)
+    sock.listen(4)
+    units = os.environ.get("AGENT_BOX_REBOOT_PIN_UNITS", "").split()
+    if units:
+        # Auto-reap: a pinner that dies must not leave a zombie, and the
+        # reboot path does not depend on it.
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        if os.fork() == 0:
+            # The child keeps root (reading another user's maps needs it)
+            # and so holds nothing a client can reach.
+            sock.close()
+            os.close(trigger_fd)
+            os.close(mask_fd)
+            run_pinner(set(units))
+            os._exit(1)
+    lock_memory()
+    drop_privileges()
+    sys.stderr.write("agent-box-reboot-helper: ready for uid %d on %s\n"
+                     % (entry.pw_uid, path))
+    serve(sock, entry.pw_uid, trigger_fd, mask_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+  '';
   secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
@@ -6246,6 +6649,9 @@ import time as hibernate_time
 
 
 HIBERNATE_IDLE_S = 30
+# Claude record types that carry or announce input. One of these after the
+# last closed turn means the session is not quiet.
+HIBERNATE_CLAUDE_INPUT_TYPES = ("user", "assistant", "attachment", "queue-operation")
 HIBERNATE_TAIL_LINES = 400
 HIBERNATE_TAIL_BYTES = 2 * 1024 * 1024
 HIBERNATE_CODEX_HEAD_BYTES = 64 * 1024
@@ -6347,15 +6753,28 @@ def _hibernate_transcript_state(path, harness):
     if records is None:
         return None
     if harness == "claude":
-        relevant = [record for record in records
+        relevant = [(index, record) for index, record in enumerate(records)
                     if record.get("type") in ("assistant", "user")
                     and isinstance(record.get("message"), dict)]
         if not relevant:
             return None
-        last = relevant[-1]
+        last_index, last = relevant[-1]
         closed = (last.get("type") == "assistant"
                   and last["message"].get("stop_reason") == "end_turn")
         marker = [last.get("type"), last["message"].get("stop_reason")]
+        # Claude Code also appends records that are not conversation:
+        # last-prompt, cost-state, file-history-snapshot, ai-title and more,
+        # some of them when the process EXITS (2.1.322). Those must not read
+        # as new input, or the check after the kill always fails and every
+        # hibernation is undone and resumed. Input is a user or assistant
+        # record (above), or an attachment or queue record that comes with
+        # one; any of those after the last turn record is a change.
+        if any(record.get("type") in HIBERNATE_CLAUDE_INPUT_TYPES
+               for record in records[last_index + 1:]):
+            return None
+        conversation = hibernate_hashlib.sha256(hibernate_json.dumps(
+            last, sort_keys=True, separators=(",", ":"))
+            .encode("utf-8")).hexdigest()
     elif harness == "codex":
         relevant = [(index, record) for index, record in enumerate(records)
                     if record.get("type") == "event_msg"
@@ -6365,6 +6784,7 @@ def _hibernate_transcript_state(path, harness):
         if not relevant:
             return None
         last_index, last = relevant[-1]
+        conversation = None
         closed = last["payload"].get("type") == "task_complete"
         marker = ["event_msg", last["payload"].get("type")]
         # Codex normally appends thread_settings_applied while sitting at the
@@ -6394,6 +6814,9 @@ def _hibernate_transcript_state(path, harness):
         "size": stat.st_size,
         "mtimeNs": stat.st_mtime_ns,
         "marker": marker,
+        # What the quiet check compares instead of size and mtime, when the
+        # harness writes records after its last turn that are not input.
+        "conversation": conversation,
     }
 
 
@@ -6552,7 +6975,15 @@ def _hibernate_has_watch(name):
     if not isinstance(topics, list):
         return True, path, _hibernate_hash(path)
     enabled = value.get("enabled") is not False
-    return enabled and bool(topics), path, _hibernate_hash(path)
+    # inbox:<name> is the message router's delivery address for this session.
+    # The router wakes the session before every delivery and the bus spools
+    # the message while it starts, so that subscription alone is no reason to
+    # keep the runtime resident. Anything else, or an unreadable entry, is.
+    blocking = [topic for topic in topics
+                if not (isinstance(topic, dict) and isinstance(topic.get("topic"), str)
+                        and topic["topic"].startswith("inbox:")
+                        and topic.get("deliverTo", "session") == "session")]
+    return enabled and bool(blocking), path, _hibernate_hash(path)
 
 
 def _hibernate_has_lease(name):
@@ -6646,7 +7077,10 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
         return None
     now = hibernate_time.time() if now is None else now
     idle_since = transcript_state["mtimeNs"] / 1_000_000_000
-    if now - idle_since < _hibernate_idle_seconds():
+    # A parked re-probe (the quiet checks around the kill) skips the age
+    # test: the selection already proved the idle time, and an exiting
+    # Claude writes its last records just then, which renews the mtime.
+    if not parked and now - idle_since < _hibernate_idle_seconds():
         return None
     evidence = {
         "name": name,
@@ -6665,8 +7099,16 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
     # Narrower than the token: only what native input or routing can change.
     # The token also covers the registry entry and session state file, which
     # hibernate_one itself rewrites while parking.
+    # For Claude, the transcript part is the file identity and the last turn
+    # record, not size and mtime: records that are not input (see
+    # _hibernate_transcript_state) may still arrive, for example on exit.
+    if transcript_state["conversation"] is not None:
+        quiet_transcript = [transcript_state["path"], transcript_state["device"],
+                            transcript_state["inode"], transcript_state["conversation"]]
+    else:
+        quiet_transcript = transcript_state
     quiet = hibernate_hashlib.sha256(hibernate_json.dumps(
-        [evidence["transcript"], evidence["lease"], evidence["watch"],
+        [quiet_transcript, evidence["lease"], evidence["watch"],
          evidence["whatsapp"]], sort_keys=True, separators=(",", ":"))
         .encode("utf-8")).hexdigest()
     return {
@@ -9256,7 +9698,7 @@ usage() {
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session hibernate [--exclude NAME...]"
   echo "       agent-box-session restart NAME | --all"
-  echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | clear"
+  echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | wake NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
   echo "       agent-box-session env ls | set KEY VALUE | set KEY --stdin | rm KEY"
   echo "         (--stdin reads the value from stdin: for a multi-line secret"
@@ -9966,7 +10408,8 @@ case "$cmd" in
                  and ((.value.agent != "claude") or
                       ((.value.remoteControlDaemon != true) and (.value.remoteControlServer != true)))) |
           {name: .key, harness: .value.agent, stopped: (.value.stopped == true),
-           selected: (.value.whatsapp == true)}]' "$REGISTRY_FILE"
+           selected: (.value.whatsapp == true), id: (.value.boxSessionId // null),
+           start: (.value.routeStart // null)}]' "$REGISTRY_FILE"
       else
         echo '[]'
       fi
@@ -10012,7 +10455,11 @@ case "$cmd" in
       registry_unlock
       exit 0
     fi
-    if [ "$name" = activate ]; then
+    # activate wakes the selected WhatsApp target; wake does the same for any
+    # Claude or Codex session (the message router's own sessions, which are
+    # never "selected"), through the same capacity gate.
+    if [ "$name" = activate ] || [ "$name" = wake ]; then
+      wa_verb="$name"
       selected="''${2:-}"
       [ $# -eq 2 ] && valid_name "$selected" || { usage >&2; exit 2; }
       registry_ensure
@@ -10032,7 +10479,7 @@ case "$cmd" in
           echo "WhatsApp cannot target a Claude Remote Control server's app-created conversations" >&2
           exit 2
         fi
-        "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
+        [ "$wa_verb" = wake ] || "$JQ" -e --arg n "$selected" '.sessions[$n].whatsapp == true' \
           "$REGISTRY_FILE" >/dev/null || {
             echo "session '$selected' is not the selected WhatsApp target" >&2
             exit 2
@@ -10142,7 +10589,7 @@ case "$cmd" in
     esac
     harness="$DEFAULT_AGENT"; cwd=""; prompt=""; rprompt=""; has_prompt=0; has_rprompt=0
     profile=""; has_harness=0; ephemeral=0; remote_control=""; remote_control_daemon=false; daemon_option=false; whatsapp=false
-    origin="user"; hook_source=""; hook_repo=""
+    origin="user"; hook_source=""; hook_repo=""; route_start=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --harness) harness="''${2:?--harness needs a value}"; has_harness=1; shift 2 ;;
@@ -10189,6 +10636,16 @@ case "$cmd" in
           esac
           shift 2 ;;
         --hook) hook_source="''${2:?--hook needs SOURCE REPOSITORY}"; hook_repo="''${3?--hook needs SOURCE REPOSITORY}"; shift 3 ;;
+        # The message router's mark of the start that created this session
+        # (agent-box-whatsapp route). Unlike the kickoff prompt, which the
+        # supervisor clears at the first spawn, it stays for the session's
+        # life, so an interrupted route can prove the session is its own.
+        --route-start)
+          case "''${2:?--route-start needs 32 hex characters}" in
+            (*[!0-9a-f]*) echo "agent-box-session: --route-start must be 32 lowercase hex characters" >&2; exit 2 ;;
+          esac
+          [ "''${#2}" -eq 32 ] || { echo "agent-box-session: --route-start must be 32 lowercase hex characters" >&2; exit 2; }
+          route_start="$2"; shift 2 ;;
         --) shift; break ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
       esac
@@ -10405,6 +10862,7 @@ case "$cmd" in
       --argjson rcd "$remote_control_daemon" \
       --argjson whatsapp "$whatsapp" \
       --arg origin "$origin" --arg hsrc "$hook_source" --arg hrepo "$hook_repo" \
+      --arg rstart "$route_start" \
       '(if $whatsapp then .sessions |= with_entries(.value.whatsapp = false) else . end)
        | .sessions[$n] = ({agent: $a, skipPermissions: true, remoteControl: $rc,
                         remoteControlDaemon: $rcd,
@@ -10428,7 +10886,8 @@ case "$cmd" in
                           else {} end)
                        # Added only when set, so every session that is NOT
                        # one-shot keeps the entry shape it has always had.
-                       + (if $eph == "1" then {ephemeral: true} else {} end))' \
+                       + (if $eph == "1" then {ephemeral: true} else {} end)
+                       + (if $rstart != "" then {routeStart: $rstart} else {} end))' \
       --args -- "''${sargs[@]}"
     registry_unlock
 
@@ -10684,11 +11143,14 @@ esac
   } ''
 """Optional per-user WhatsApp linked-device runtime for agent-box."""
 
+import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -10698,13 +11160,16 @@ import time
 from urllib.request import urlopen
 
 
-REV = "cd70050eaca87cd45bf936cd87b0dbd18ab41fd2"
+REV = "a54bb56dba4e6c8aafb57231ba81211eeb1e78ab"
 FILES = {
-    "bridge.mjs": "c76883483a33b5b1e6cf31b8fbb2dede119cd22888b0d239f74f4c39a097d302",
+    "bridge.mjs": "d4f0a60f85bc14e870ba0dd4a8706992550c23f9949d83f926b332e3d9ba98c9",
     "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
-    "package.json": "8dda2da5443512104027d3905e14cf24def81ab240a12d6aea6799fb15dea200",
+    "package.json": "a685e52bfe73a8965869cf1884c98280bca5a9ada31ae2fa1ce8829dc5cb16eb",
     "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
+# local-router's single file, fetched with the bridge at the same REV. The
+# route subcommand loads it from the runtime directory.
+ROUTER_FILE = ("local-router/router.py", "cd0f1a591b8ccd1f0bba29b45098c5c4c3f631ea9b07acab31fb855651298a8d")
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
 STATE = HOME / ".local/state/local-whatsapp"
@@ -10744,6 +11209,9 @@ def runtime_matches():
             return False
         if hashlib.sha256(source.read_bytes()).hexdigest() != expected:
             return False
+    router = RUNTIME / "router.py"
+    if not router.is_file() or hashlib.sha256(router.read_bytes()).hexdigest() != ROUTER_FILE[1]:
+        return False
     return True
 
 
@@ -10774,6 +11242,13 @@ def install():
             if len(content) > 2_000_000 or hashlib.sha256(content).hexdigest() != expected:
                 raise RuntimeError("WhatsApp source integrity check failed for " + name)
             (stage / name).write_bytes(content)
+        path, expected = ROUTER_FILE
+        with urlopen(f"https://raw.githubusercontent.com/defangdevs/local-channels/{REV}/{path}",
+                     timeout=30) as response:
+            content = response.read(2_000_001)
+        if len(content) > 2_000_000 or hashlib.sha256(content).hexdigest() != expected:
+            raise RuntimeError("WhatsApp source integrity check failed for router.py")
+        (stage / "router.py").write_bytes(content)
         print("Installing pinned WhatsApp dependencies.", flush=True)
         env = dict(os.environ)
         env["PATH"] = str(NODE.parent) + os.pathsep + env.get("PATH", "")
@@ -10843,7 +11318,25 @@ def activate():
     if not paired():
         raise RuntimeError("WhatsApp is not linked; pair the device first")
     private_dir(STATE)
-    READY.touch(mode=0o600)
+    # The marker carries a pairing token. serve() hands it to the bridge, the
+    # bridge's route calls inherit it, and a route from an EARLIER pairing
+    # (route calls can outlive their bridge) refuses to write (take_route_lock).
+    if not READY.is_file() or not pairing_token():
+        pending = READY.with_name(READY.name + ".pending")
+        pending.write_text(secrets.token_hex(16))
+        pending.chmod(0o600)
+        pending.replace(READY)
+
+
+def pairing_token():
+    """The pairing token, or "" when the marker has none (older pairings).
+    Only exactly 32 hex characters count, so nothing else in that file can
+    reach the bridge's environment."""
+    try:
+        raw = READY.read_text(encoding="ascii", errors="replace").strip()
+    except OSError:
+        return ""
+    return raw if re.fullmatch(r"[0-9a-f]{32}", raw) else ""
 
 
 def bridge_connected():
@@ -10872,6 +11365,7 @@ def unlink():
         raise RuntimeError("WhatsApp state cannot be a symlink")
     READY.unlink(missing_ok=True)
     if not STATE.exists():
+        forget_route_state()
         return
     # The supervisor reconciles every two seconds. An absent socket before one
     # full tick does not prove a bridge is stopped: it may still be installing
@@ -10882,16 +11376,463 @@ def unlink():
         if time.monotonic() >= deadline:
             raise RuntimeError("WhatsApp bridge did not stop; try unlinking again")
         time.sleep(0.1)
+    forget_route_state()
     shutil.rmtree(STATE)
 
 
+def forget_route_state():
+    """The router's history holds message text too; Unlink forgets it. A
+    route call runs in its own process group and can outlive the bridge, so
+    wait for it under the route lock; a call that gets the lock afterwards
+    sees READY gone and writes nothing (see route())."""
+    root = ROUTE_STATE.parent
+    if not root.is_dir() or root.is_symlink():
+        return
+    with open(root / "lock", "a") as lock:
+        deadline = time.monotonic() + ROUTE_UNLINK_WAIT
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("a message route is still running; try unlinking again")
+                time.sleep(0.2)
+        shutil.rmtree(root)
+
+
 def serve():
-    """Refresh the optional runtime, then replace this process with its bridge."""
+    """Refresh the optional runtime, then replace this process with its bridge.
+
+    Unless AGENT_BOX_WHATSAPP_ROUTER is "off", the bridge hands each message
+    to `agent-box-whatsapp route` (below): a self-chat has no threads, so the
+    router chooses the session. The bridge needs one absolute executable with
+    no arguments, so a two-line wrapper in the private runtime directory
+    supplies the subcommand."""
     if not paired():
         raise RuntimeError("WhatsApp is not linked; pair the device first")
     install()
-    os.execve(str(NODE), [str(NODE), str(RUNTIME / "bridge.mjs"), "serve"],
-              dict(os.environ))
+    env = dict(os.environ)
+    env.pop("LOCAL_WHATSAPP_ROUTE_CMD", None)
+    env["AGENT_BOX_WHATSAPP_PAIRING"] = pairing_token()
+    if os.environ.get("AGENT_BOX_WHATSAPP_ROUTER", "").strip().lower() not in ("off", "0", "false", "no"):
+        wrapper = RUNTIME / "route"
+        self_path = Path(sys.argv[0]).resolve()
+        wrapper.write_text("#!/bin/sh\nexec %s route\n" % shlex_quote(str(self_path)))
+        wrapper.chmod(0o700)
+        env["LOCAL_WHATSAPP_ROUTE_CMD"] = str(wrapper)
+    os.execve(str(NODE), [str(NODE), str(RUNTIME / "bridge.mjs"), "serve"], env)  # NOSONAR - reviewed: env values are validated tokens and box paths
+
+
+def shlex_quote(text):
+    return "'" + text.replace("'", "'\"'\"'") + "'"
+
+
+# ------------------------------------------------------------------ routing
+#
+# POLICY for local-router (the mechanism lives in local-channels). One call
+# per inbound message, from the bridge (see local-whatsapp's
+# LOCAL_WHATSAPP_ROUTE_CMD): JSON request on stdin, {"session": NAME, ...} on
+# stdout. Nothing here is specific to WhatsApp except the channel name in the
+# request; email and Slack can call the same command later.
+#
+# - Candidates are only the sessions the router started itself (recorded in
+#   ROUTE_STATE). A session the user started by hand is never chosen.
+# - CONTINUE: wake the session if it is stopped or hibernated, renew its
+#   inbox:<name> subscription, and emit the message on the bus through the
+#   owner-trusted `inbox` source, keyed on the session name. The spool holds
+#   it while a woken session starts.
+# - NEW / NEW_LINKS: start a session (origin webhook, so it takes a hook slot
+#   and can hibernate like any event-started worker) whose kickoff prompt IS
+#   the message, plus the linked sessions for NEW_LINKS.
+# - Backend: AGENT_BOX_ROUTER_BACKEND (auto by default: the first signed-in
+#   harness, Claude/Haiku first) and AGENT_BOX_ROUTER_MODEL. The probe result
+#   is cached so a message does not pay for a probe call.
+
+ROUTE_STATE = HOME / ".local/state/agent-box/router/state.json"
+ROUTE_BACKEND_CACHE = HOME / ".local/state/agent-box/router/backend.json"
+ROUTE_HISTORY_MAX = 40      # messages kept per session
+ROUTE_SESSIONS_MAX = 40     # sessions remembered
+ROUTE_BACKEND_TTL = 24 * 3600
+ROUTE_NO_BACKEND_TTL = 600
+# Per-call limits for discovery and routing: two probes (40 + 60 s) and one
+# routing call stay inside the bridge's 180 s route deadline.
+PROBE_LIMITS = {"claude": {"timeout": 40}, "codex": {"timeout": 60}}
+ROUTE_DECISIONS_MAX = 300   # message ids remembered for replay
+ROUTE_UNLINK_WAIT = 200     # longer than the bridge's 180 s route deadline
+INBOX_TTL_HOURS = "8"       # local-webhook's longest session TTL; renewed on every delivery
+SESSION_BIN = os.environ.get("AGENT_BOX_SESSION_BIN", "agent-box-session")
+WEBHOOK_BIN = os.environ.get("AGENT_BOX_WEBHOOK_BIN", "agent-box-webhook")
+PROFILE_BIN = os.environ.get("AGENT_BOX_PROFILE_BIN", "agent-box-profile")
+# A session name never starts with "-", so it can never read as an option
+# on the command lines below, whatever a model or the state file says.
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,149}")
+
+
+def checked_name(name):
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise RuntimeError("invalid session name %r" % (name,))
+    return name
+
+
+def run_json(argv, env=None, timeout=60):
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+    if result.returncode != 0:
+        raise RouteError(result.returncode, (result.stderr or result.stdout).strip()[-500:])
+    return json.loads(result.stdout) if result.stdout.strip() else None
+
+
+class RouteError(RuntimeError):
+    def __init__(self, code, detail):
+        super().__init__(detail or "exit %d" % code)
+        self.code = code
+
+
+def load_router():
+    spec = importlib.util.spec_from_file_location("local_router", str(RUNTIME / "router.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def router_backend(router):
+    """The configured backend, or a lazy factory for auto (only called when a
+    model decision is needed)."""
+    name = os.environ.get("AGENT_BOX_ROUTER_BACKEND", "auto").strip().lower() or "auto"
+    model = os.environ.get("AGENT_BOX_ROUTER_MODEL", "").strip()
+    if name == "none":
+        return None
+    if name != "auto":
+        if name not in router.BACKENDS:
+            choices = ", ".join(sorted(router.BACKENDS))
+            raise RuntimeError("AGENT_BOX_ROUTER_BACKEND must be auto, none or one of: " + choices)
+        return router.BACKENDS[name](**({"model": model} if model else {}))
+
+    def make(name):
+        kwargs = dict(PROBE_LIMITS.get(name, {}))
+        if model:
+            kwargs["model"] = model
+        return router.BACKENDS[name](**kwargs)
+
+    def factory():
+        try:
+            cached = json.loads(ROUTE_BACKEND_CACHE.read_text())
+            fresh = time.time() - cached["at"] < (ROUTE_BACKEND_TTL if cached["name"] else ROUTE_NO_BACKEND_TTL)
+            if fresh and cached["name"] is None:
+                return None          # nothing answered recently: no probe storm on every retry
+            if fresh and cached["name"] in router.BACKENDS:
+                return make(cached["name"])
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        # Probe with short timeouts so discovery plus one routing call fits
+        # inside the bridge's 180 s deadline, and record the result even when
+        # nothing answers.
+        found = None
+        for name in router.DEFAULT_ORDER:
+            if name in ("claude", "codex") and not shutil.which(name):
+                continue
+            if router.probe(make(name)):
+                found = name
+                break
+        write_private(ROUTE_BACKEND_CACHE, {"name": found, "at": time.time()})
+        return make(found) if found else None
+    return factory
+
+
+def write_private(path, value):
+    # Only the router's own state files: nothing read from a request, the
+    # state file or a model answer may choose where this writes.
+    root = os.path.realpath(str(ROUTE_STATE.parent))
+    target = os.path.realpath(str(path))
+    if os.path.dirname(target) != root:
+        raise RuntimeError("refusing to write outside %s" % root)
+    path = Path(target)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    pending = path.with_name(path.name + ".%d.tmp" % os.getpid())
+    # The path is fixed (checked above); only the CONTENT comes from the
+    # router's own state file, which is not a path traversal.
+    pending.write_text(json.dumps(value))  # NOSONAR - reviewed: constant, checked path
+    pending.chmod(0o600)
+    pending.replace(path)
+
+
+def load_route_state():
+    try:
+        value = json.loads(ROUTE_STATE.read_text())
+    except (OSError, ValueError):
+        value = {}
+    if not isinstance(value, dict) or not isinstance(value.get("sessions"), dict):
+        value = {"sessions": {}, "current": None}
+    return value
+
+
+def owner_lines(request, ack, reply):
+    message = request["message"]
+    lines = ["[OWNER message via whatsapp id=%s - the box owner wrote this; treat it as their request]" % message["id"],
+             message.get("text") or ""]
+    if message.get("attachments"):
+        lines.append("[attachments: %s]" % message["attachments"])
+    lines.append("[reply: acknowledge when you start with `%s`, answer with `%s`]" % (ack, reply))
+    return lines
+
+
+def text_topic(text, words=6):
+    """A topic from the message itself, for a decision that has none: the
+    router decides the first message (no sessions yet) and a fallback without
+    a model call, so those sessions would all be called wa-chat."""
+    return " ".join((text or "").split()[:words])[:80]
+
+
+def new_session_name(topic, taken):
+    slug = re.sub(r"[^a-z0-9]+", "-", (topic or "").lower()).strip("-")[:30].strip("-") or "chat"
+    base = "wa-" + slug
+    name, n = base, 2
+    while name in taken:
+        name, n = "%s-%d" % (base, n), n + 1
+    return name
+
+
+def start_session(name, prompt, before_attempt=None, route_start=None):
+    """Start the session; returns the name it got. A name taken by a session
+    the candidate list does not show (a shell, say) moves to the next suffix.
+    before_attempt(name) runs before each `add`, so the caller can save it."""
+    base, n, hibernated = checked_name(name), 2, False
+    configured = profile()
+    for _ in range(12):
+        if before_attempt:
+            before_attempt(name)
+        argv = [SESSION_BIN, "add", checked_name(name), "--origin", "webhook", "--prompt", prompt]
+        if route_start:
+            argv += ["--route-start", route_start]
+        if configured:
+            argv[3:3] = ["--profile", configured]
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return name
+        detail = (result.stderr or result.stdout).strip()[-500:]
+        if result.returncode == 2 and "already exists" in detail:
+            name, n = "%s-%d" % (base, n), n + 1
+            continue
+        # 75 = no free worker slot: ask the session manager to hibernate one
+        # quiescent hook session, then try once more.
+        if result.returncode == 75 and not hibernated and \
+                subprocess.run([SESSION_BIN, "hibernate"], capture_output=True, timeout=120).returncode == 0:
+            hibernated = True
+            continue
+        raise RouteError(result.returncode, detail)
+    raise RuntimeError("no free session name near %s" % base)
+
+
+def ensure_inbox_source():
+    sources = HOME / ".local/state/local-webhook/sources.json"
+    try:
+        entry = json.loads(sources.read_text())["sources"]["inbox"]
+        if entry.get("trust") == "owner" and entry.get("keyPath") == "session":
+            return
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    subprocess.run([WEBHOOK_BIN, "setup", "inbox"], capture_output=True, timeout=30, check=True)
+    # setup keeps fields an existing entry already has, so check the result.
+    try:
+        entry = json.loads(sources.read_text())["sources"]["inbox"]
+    except (OSError, ValueError, KeyError, TypeError):
+        entry = None
+    if not isinstance(entry, dict) or entry.get("trust") != "owner" or entry.get("keyPath") != "session":
+        raise RuntimeError("the inbox source in %s must have keyPath \"session\" and trust \"owner\"" % sources)
+
+
+def codex_thread(name):
+    try:
+        thread = json.loads((STATE / "codex-threads.json").read_text())[name]["thread"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return thread if isinstance(thread, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", thread) else None
+
+
+def deliver(name, harness, request, ack, reply):
+    """Wake NAME, renew its inbox subscription, emit the message on the bus."""
+    name = checked_name(name)
+    run_json([SESSION_BIN, "whatsapp", "wake", name], timeout=180)
+    ensure_inbox_source()
+    env = dict(os.environ, LOCAL_WEBHOOK_SESSION="%s-%s" % (os.environ.get("USER") or "", name))
+    env.pop("LOCAL_WEBHOOK_CODEX_THREAD", None)
+    if harness == "codex":
+        thread = codex_thread(name)
+        if thread is None:
+            raise RuntimeError("no registered Codex thread for session %s yet" % name)
+        env["LOCAL_WEBHOOK_CODEX_THREAD"] = thread
+    subprocess.run([WEBHOOK_BIN, "subscribe", "inbox:" + name, "--ttl", INBOX_TTL_HOURS,
+                    "--note", "owner messages the router sends to this session"],
+                   capture_output=True, timeout=60, check=True, env=env)
+    message = request["message"]
+    payload = {"session": name, "text": message.get("text") or "", "channel": request.get("channel") or "",
+               "id": message["id"], "attachments": message.get("attachments") or "",
+               "reply": "acknowledge when you start with `%s`, answer with `%s`" % (ack, reply)}
+    # On stdin, not as an argument: the payload carries the owner's text.
+    # A stable delivery id per message: a replayed route re-emits the same
+    # delivery, which the bus drops as already seen.
+    delivery = "route-" + hashlib.sha256(message["id"].encode()).hexdigest()[:40]
+    subprocess.run([WEBHOOK_BIN, "emit", "inbox", "-", "--event", "message", "--delivery-id", delivery],
+                   input=json.dumps(payload), text=True, capture_output=True, timeout=60, check=True)
+
+
+def route_request(request, router=None):
+    message = request.get("message") if isinstance(request, dict) else None
+    if not isinstance(message, dict) or not isinstance(message.get("id"), str) or \
+            not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", message["id"]):
+        raise RuntimeError("route request needs message.id")
+    ack, reply = str(request.get("ack") or ""), str(request.get("reply") or "")
+    live = {item["name"]: item for item in (run_json([SESSION_BIN, "whatsapp", "candidates"]) or [])
+            if isinstance(item, dict) and NAME_RE.fullmatch(str(item.get("name", "")))}
+    state = load_route_state()
+    known = state["sessions"]
+    decisions = state.setdefault("decisions", {})
+    # Removed, malformed, or REPLACED sessions are forgotten: a session the
+    # user re-creates under a router name has another registry id.
+
+    def gone(n):
+        if n not in live or not NAME_RE.fullmatch(n):
+            return True
+        return bool(known[n].get("id")) and live[n].get("id") != known[n].get("id")
+    for name in [n for n in known if gone(n)]:
+        del known[name]
+
+    def remember(name, topic):
+        """Record that this message went to NAME, and save. Idempotent, so a
+        replay can restore what an interrupted call did not get to write."""
+        entry = known.setdefault(name, {"messages": [], "startedAt": time.time()})
+        if not entry.get("id"):
+            entry["id"] = live.get(name, {}).get("id")
+        msgs = list(entry.get("messages") or [])
+        if not any(m.get("id") == message["id"] and m.get("role") == "user" for m in msgs):
+            msgs.append({"id": message["id"], "role": "user", "text": (message.get("text") or "")[:2000],
+                         "ts": message.get("ts"), "topic": topic or ""})
+        entry["messages"] = msgs[-ROUTE_HISTORY_MAX:]
+        state["current"] = name
+        for old in list(decisions)[:max(0, len(decisions) - ROUTE_DECISIONS_MAX)]:
+            del decisions[old]
+        if len(known) > ROUTE_SESSIONS_MAX:
+            def last(n):
+                ms = known[n].get("messages") or []
+                return (ms[-1].get("ts") or 0) if ms else known[n].get("startedAt", 0)
+            for old in sorted(known, key=last)[:len(known) - ROUTE_SESSIONS_MAX]:
+                del known[old]
+        write_private(ROUTE_STATE, state)
+
+    # A replay (the bridge restarted after this call delivered but before it
+    # recorded the answer) repeats the recorded decision instead of deciding
+    # again, and restores the history the interrupted call did not write.
+    # Its side effects are idempotent: an existing session is not started
+    # again, and the emit carries the same delivery id.
+    done = decisions.get(message["id"])
+    if isinstance(done, dict) and done.get("session") in live:
+        name = done["session"]
+        sid = live[name].get("id")
+        if done.get("id"):
+            # Only into the SAME session, never one re-created under the name.
+            ours = sid == done["id"]
+        else:
+            # An interrupted start: adopt the session only if the registry
+            # recorded this route's nonce for it (add --route-start). A session someone created by
+            # hand under that name cannot, so it is decided again (fail closed).
+            nonce = done.get("nonce") if done.get("action") != "CONTINUE" else None
+            ours = bool(nonce) and live[name].get("start") == nonce
+        if ours:
+            done["id"] = sid
+            if done.get("action") == "CONTINUE":
+                deliver(name, live[name]["harness"], request, ack, reply)
+            remember(name, done.get("topic"))
+            return {"session": name, "action": done.get("action"), "links": done.get("links") or [],
+                    "reason": "replay"}
+    # Answers the channel already sent become the assistant side of history.
+    for item in request.get("recent") or []:
+        if not isinstance(item, dict):
+            continue
+        msgs = (known.get(item.get("session")) or {}).get("messages") or []
+        for i, m in enumerate(msgs):
+            if m.get("id") == item.get("id") and m.get("role") == "user":
+                if not (i + 1 < len(msgs) and msgs[i + 1].get("role") == "assistant"):
+                    msgs.insert(i + 1, {"role": "assistant", "text": str(item.get("reply") or "")[:2000],
+                                        "ts": m.get("ts")})
+                break
+    router = router or load_router()
+    sessions = [{"id": name, "messages": known[name].get("messages") or []} for name in known]
+    current = state.get("current") if state.get("current") in known else None
+    decision = router.route({"text": message.get("text") or "", "ts": message.get("ts")},
+                            sessions, current, backend=router_backend(router))
+    if decision.get("reason") == "fallback" and decision.get("error"):
+        try:
+            ROUTE_BACKEND_CACHE.unlink()
+        except OSError:
+            pass
+    topic = decision.get("topic") or text_topic(message.get("text"))
+    if decision["action"] == "CONTINUE":
+        name = decision["session"]
+        # Recorded BEFORE the delivery, so a crash after it replays, not re-decides.
+        decisions[message["id"]] = {"session": name, "action": "CONTINUE", "links": [],
+                                    "id": live[name].get("id"), "topic": topic}
+        write_private(ROUTE_STATE, state)
+        deliver(name, live[name]["harness"], request, ack, reply)
+    else:
+        name = new_session_name(topic, set(live) | set(known))
+        lines = owner_lines(request, ack, reply)
+        if decision["action"] == "NEW_LINKS" and decision.get("links"):
+            lines.append("Earlier sessions with related context (read their transcripts if you need the details):")
+            for link in decision["links"]:
+                topics = [m.get("topic") for m in known.get(link, {}).get("messages", []) if m.get("topic")]
+                lines.append("- %s: %s" % (link, "; ".join(dict.fromkeys(topics[-3:])) or "no topic labels"))
+        lines.append("(This session was started by the message router for this topic. Later owner messages "
+                     "on the same topic arrive here as OWNER messages via inbox.)")
+        # A durable mark of THIS start: `add --route-start` stores it in the
+        # registry for the session's life, and `whatsapp candidates` reads it
+        # back as "start" (the kickoff prompt is cleared at the first spawn).
+        nonce = secrets.token_hex(16)
+
+        def attempt(candidate):
+            # Saved before EACH start attempt, so an interrupted start under
+            # a suffixed name is found again by a replay.
+            decisions[message["id"]] = {"session": candidate, "action": decision["action"],
+                                        "links": decision.get("links") or [], "id": None, "topic": topic,
+                                        "nonce": nonce}
+            write_private(ROUTE_STATE, state)
+        name = start_session(name, "\n".join(lines), attempt, route_start=nonce)
+        started = (run_json([SESSION_BIN, "whatsapp", "candidates"]) or [])
+        sid = next((i.get("id") for i in started if isinstance(i, dict) and i.get("name") == name), None)
+        live[name] = {"name": name, "id": sid}
+        decisions[message["id"]]["id"] = sid
+    remember(name, topic)
+    return {"session": name, "action": decision["action"], "links": decision.get("links") or [],
+            "reason": decision.get("reason")}
+
+
+def route():
+    request = json.loads(sys.stdin.read(400_000))
+    ROUTE_STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(ROUTE_STATE.with_name("lock"), "a") as lock:
+        take_route_lock(lock)
+        print(json.dumps(route_request(request)))
+
+
+def take_route_lock(lock):
+    """Lock, then prove the lock still means this pairing. Unlink removes
+    the router directory, lock file included; a call that opened the old file
+    before that would otherwise lock a deleted inode with no contention and,
+    after a new pairing, write into the new state. So the file we hold must
+    still be the one at the path, and WhatsApp must still be linked."""
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        current = os.stat(ROUTE_STATE.with_name("lock"))
+    except OSError:
+        current = None
+    held = os.fstat(lock.fileno())
+    if current is None or (current.st_dev, current.st_ino) != (held.st_dev, held.st_ino):
+        raise RuntimeError("WhatsApp was unlinked while this route waited; not routing")
+    if not READY.is_file():
+        raise RuntimeError("WhatsApp is unlinked; not routing")
+    # Bound to the pairing the bridge was started for: a call from before an
+    # Unlink and a new pairing carries the old token, whenever it got here.
+    if os.environ.get("AGENT_BOX_WHATSAPP_PAIRING") != pairing_token():
+        raise RuntimeError("this route belongs to an earlier WhatsApp pairing; not routing")
 
 
 def pair():
@@ -10912,14 +11853,14 @@ def main():
         print(json.dumps({"profile": profile(sys.argv[2])}))
         return
     if len(sys.argv) != 2 or sys.argv[1] not in (
-            "install", "pair", "activate", "serve", "status", "profile", "unlink"):
+            "install", "pair", "activate", "serve", "status", "profile", "unlink", "route"):
         raise RuntimeError(
-            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile|unlink [NAME|default]")
+            "usage: agent-box-whatsapp install|pair|activate|serve|status|profile|unlink|route [NAME|default]")
     if sys.argv[1] == "profile":
         print(json.dumps({"profile": profile()}))
         return
     {"install": install, "pair": pair, "activate": activate,
-     "serve": serve, "status": status, "unlink": unlink}[sys.argv[1]]()
+     "serve": serve, "status": status, "unlink": unlink, "route": route}[sys.argv[1]]()
 
 
 if __name__ == "__main__":
@@ -12284,6 +13225,21 @@ _hc_main "$@"
       fi
     }
 
+    # True when this process runs inside a conversation of a Claude Remote Control
+    # daemon session (`agent-box-session add NAME --harness claude --daemon`).
+    # LOCAL_WEBHOOK_SESSION is "<user>-<session>" (webhookSessionEnvArgs), and the
+    # registry marks the daemon. A Codex caller is never one: Codex delivers through
+    # its own peer, not a Claude channel.
+    claude_rc_daemon_conversation() {
+      [ -z "''${CODEX_THREAD_ID:-}''${CODEX_SESSION_ID:-}" ] || return 1
+      _cs="''${LOCAL_WEBHOOK_SESSION:-}"
+      _cs="''${_cs#"$(id -un)"-}"
+      [ -n "$_cs" ] && [ -r "$SESSIONS" ] || return 1
+      "$JQ" -e --arg s "$_cs" \
+        '.sessions[$s] | (.agent // "claude") == "claude" and (.remoteControlDaemon == true or .remoteControlServer == true)' \
+        "$SESSIONS" >/dev/null 2>&1
+    }
+
     forget_codex_wake_if_idle() {
       _wake="$(codex_wake_file)" || return 0
       _filter="$STATE_DIR/filter.''${LOCAL_WEBHOOK_SESSION}.json"
@@ -12564,6 +13520,15 @@ _hc_main "$@"
 
     ensure_state() { mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR"; }
 
+    # Read-only diagnosis: `status` must leave state untouched, so it never
+    # repairs the mode. It only creates a MISSING directory (first run), and a
+    # failure to do so is reported and not fatal (issue #1048).
+    ensure_state_for_read() {
+      [ -d "$STATE_DIR" ] && return 0
+      mkdir -p "$STATE_DIR" 2>/dev/null && return 0
+      echo "webhook: state directory $STATE_DIR is unavailable (read-only filesystem?); continuing" >&2
+    }
+
     valid_source() {
       case "$1" in (*[!A-Za-z0-9_-]*|"") return 1 ;; esac
     }
@@ -12610,6 +13575,14 @@ _hc_main "$@"
           ;;
         email)
           printf '%s' '{"format":"generic","keyPath":"recipient","senderPath":"envelopeSender","retainPayload":true}'
+          ;;
+        inbox)
+          # Owner messages a router hands to the session it chose (agent-box-whatsapp
+          # route): keyed on the session name, so inbox:<name> reaches exactly one
+          # session, and rendered by local-webhook >= 0.39.0 as the owner's request
+          # rather than untrusted data. Only box-local producers that prove the
+          # owner wrote the text may emit here.
+          printf '%s' '{"format":"generic","keyPath":"session","trust":"owner"}'
           ;;
         slack)
           # local-slack emits through `webhook.py emit`, which signs with this
@@ -13377,6 +14350,28 @@ _hc_main "$@"
                 set -- "$@" --spawn-config "profile=$profile" ;;
             esac
           fi
+          # A Claude Remote Control DAEMON runs each app conversation as a
+          # `claude --print --sdk-url` child with no --channels, so its plugin peer
+          # starts and owns the socket but every delivery goes nowhere. Worse, a
+          # claim from it still brakes the standing watch, so a review on the PR
+          # spawns nobody and reaches nobody (PR #1051's CodeRabbit review). The
+          # guide already says a daemon is no webhook target; refuse here rather
+          # than write a subscription that silently swallows its events.
+          # A daemon started by a supervisor that knows the inbox path carries
+          # LOCAL_WEBHOOK_CLAUDE_DELIVERY=send, and then the plugin delivers
+          # through Claude's cross-session inbox (local-channels#149). Only a
+          # daemon without it (started before that release) is refused.
+          if [ "$deliver_to" = session ] && [ "''${LOCAL_WEBHOOK_CLAUDE_DELIVERY:-}" != send ] \
+              && claude_rc_daemon_conversation; then
+            echo "agent-box-webhook: this is a conversation of the Claude Remote" \
+                 "Control daemon ''\'''${LOCAL_WEBHOOK_SESSION#"$(id -un)"-}', which has no" \
+                 "channel to deliver session events into: they would be dropped," \
+                 "and a --claim would also stop the standing watch from spawning" \
+                 "anyone for them. Restart the daemon after a box update (agent-box-session" \
+                 "restart NAME) so it delivers through the Claude inbox, use a standing" \
+                 "watch (--deliver-to subagent), or work in an interactive session" >&2
+            exit 2
+          fi
           # The relevance dimension, resolved once: a named policy or the
           # caller's own predicate, never both — they are two spellings of the
           # same thing and a precedence rule between them would be a coin toss.
@@ -13641,7 +14636,7 @@ _hc_main "$@"
         # Same status webhook.py prints (its own version is the pin, since this
         # wrapper runs the pinned script), plus the two facts only the box can
         # see: what a NEW session would load, and what the live ones DID load.
-        ensure_state
+        ensure_state_for_read
         out="$("$PY" "$SCRIPT" status "$@")" || exit $?
         pinned="$(printf '%s' "$out" | "$JQ" -r '.version // ""')"
         installed="$(plugin_versions | tr '\n' ' ')"; installed="''${installed% }"
@@ -17414,9 +18409,25 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
   include="$(claim_include)" || include=""
   note="$(claim_note "$LOCAL_WEBHOOK_SPAWN_KEY")" || note=""
   [ -n "$note" ] || note="seeded at spawn: this session was started for an event on $own"
+  # Mute this box's own DIRECT echoes (its comments, pushes, PR edits), never
+  # the CI those pushes trigger. This used to be ignoreSenders ["@self"], but
+  # since local-webhook 0.23.0 that is a pure sender mute, and GitHub stamps a
+  # CI run with whoever pushed. So a hook session that pushed a fix lost its own
+  # CI: no delivery, and no claim, so the standing watch spawned a stranger
+  # for the red run instead (PR #1041). The list matches local-webhook's
+  # DEFAULT_DIRECT_GITHUB_ECHO_EVENTS, the exclude it seeds for a fresh
+  # session subscription. A re-subscribe keeps it, as it kept ignoreSenders.
+  self_login="''${LOCAL_WEBHOOK_SELF:-}"
+  if [ -z "$self_login" ] && [ -r "$LOCAL_WEBHOOK_STATE_DIR/self.env" ]; then
+    # Builtins only: the receiver's PATH carries jq and coreutils, not sed.
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in (LOCAL_WEBHOOK_SELF=*) self_login="''${line#LOCAL_WEBHOOK_SELF=}" ;; esac
+    done < "$LOCAL_WEBHOOK_STATE_DIR/self.env"
+  fi
+  self_login="$(printf '%s' "$self_login" | tr -cd 'A-Za-z0-9._-' | tr 'A-Z' 'a-z')"
   if "$JQ" -n --arg topic "$own" --arg ts "$ts" --arg note "$note" \
-      --argjson include "''${include:-null}" \
-      '{"//": "Seeded by agent-box-webhook-spawn for a dispatched hook-* session, so the dispatch brake can see which OBJECT this session owns (agent-box#251). Same schema as any session filter; webhook_subscribe rewrites it.", enabled: true, ttlHours: 2, topics: [{topic: $topic, note: $note, ignoreSenders: ["@self"], renewOnEvent: true, subscribedAt: $ts, lastActivityAt: $ts} + (if $include == null then {} else {include: $include} end)]}' \
+      --argjson include "''${include:-null}" --arg self "$self_login" \
+      '{"//": "Seeded by agent-box-webhook-spawn for a dispatched hook-* session, so the dispatch brake can see which OBJECT this session owns (agent-box#251). Same schema as any session filter; webhook_subscribe rewrites it.", enabled: true, ttlHours: 2, topics: [{topic: $topic, note: $note, renewOnEvent: true, subscribedAt: $ts, lastActivityAt: $ts} + (if $include == null then {} else {include: $include} end) + (if $self == "" or ($topic | startswith("github:") | not) then {} else {exclude: {all: [{path: "_senderLower", in: [$self]}, {path: "event", in: ["commit_comment", "create", "discussion", "discussion_comment", "issue_comment", "issues", "pull_request", "pull_request_review", "pull_request_review_comment", "pull_request_review_thread", "push", "release"]}]}} end)]}' \
       > "$ff.$$" && mv -f "$ff.$$" "$ff"; then
     seeded="$own"
   else
@@ -21419,6 +22430,11 @@ esac
       codex_sync_last=$_now
       _target="$($JQ -r '.session // empty' \
         "$HOME/.local/state/local-whatsapp/target.json" 2>/dev/null)" || _target=""
+      # Sessions the message router started are never the selected target, but
+      # it delivers to them too and needs their thread (agent-box-whatsapp route).
+      _routed="$($JQ -c '[.sessions // {} | keys[]]' \
+        "$HOME/.local/state/agent-box/router/state.json" 2>/dev/null)" || _routed='[]'
+      [ -n "$_routed" ] || _routed='[]'
       while IFS=$'\t' read -r _name _rc _profile; do
         case "$_name" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
         [ "$_profile" != "." ] || _profile=""
@@ -21442,11 +22458,12 @@ esac
           codex_publish_thread "$_name" "$_thread"
           record_native_session "$_name" "$_thread"
         fi
-      done < <($JQ -r --arg target "$_target" '
+      done < <($JQ -r --arg target "$_target" --argjson routed "$_routed" '
         .sessions | to_entries[]
         | select((.value.agent // "") == "codex"
             and .value.stopped != true
-            and (.value.whatsapp == true or .key == $target))
+            and (.value.whatsapp == true or .key == $target
+                 or (.key as $k | $routed | index($k)) != null))
         | [.key,
            (if (.value.remoteControlDaemon == true
                  or .value.remoteControl == true)
@@ -22065,6 +23082,14 @@ esac
       whargs=""
       if [ -n "''${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
         whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$WEBHOOK_STATE_DIR -e LOCAL_WEBHOOK_PORT=0"
+        # A Claude Remote Control daemon cannot pass --channels to the
+        # conversations it starts, so channel notifications from local-webhook are
+        # dropped there. This tells the plugin in each conversation to deliver
+        # through Claude's cross-session inbox instead (local-channels#149). Only
+        # here: a session that has the channel would get every event twice.
+        if [ "$agent" = claude ] && [ "$rcdaemon" = true ]; then
+          whargs="$whargs -e LOCAL_WEBHOOK_CLAUDE_DELIVERY=send"
+        fi
       fi
       # AGENT_BOX_SESSION_ID rides the same session environment: it is the
       # launch id the SessionStart hook keys its live-id record by (the
@@ -22198,17 +23223,29 @@ esac
       codex_cli="$(agent_bin codex stable 2>/dev/null)" || codex_cli=""
       # Diagnostic receipts are opt-in from the env store; this unit does not load
       # the store itself, so read the one setting the bridge honours.
-      wa_debug=""
+      # The message router's switches come from the store the same way, so
+      # saving AGENT_BOX_WHATSAPP_ROUTER=off or a router backend/model takes
+      # effect at the next bridge start. Empty keeps the bridge's default.
+      wa_debug=""; wa_router=""; wa_backend=""; wa_model=""
       envstore="''${AGENT_BOX_ENVSTORE_BIN:-}"
       if [ -x "$envstore" ]; then
-        wa_debug="$("$envstore" json 2>/dev/null \
-          | "$JQ" -r '.LOCAL_WHATSAPP_DEBUG // empty' 2>/dev/null)" || wa_debug=""
+        wa_env="$("$envstore" json 2>/dev/null)" || wa_env=""
+        if [ -n "$wa_env" ]; then
+          wa_debug="$("$JQ" -r '.LOCAL_WHATSAPP_DEBUG // empty' <<<"$wa_env" 2>/dev/null)" || wa_debug=""
+          wa_router="$("$JQ" -r '.AGENT_BOX_WHATSAPP_ROUTER // empty' <<<"$wa_env" 2>/dev/null)" || wa_router=""
+          wa_backend="$("$JQ" -r '.AGENT_BOX_ROUTER_BACKEND // empty' <<<"$wa_env" 2>/dev/null)" || wa_backend=""
+          wa_model="$("$JQ" -r '.AGENT_BOX_ROUTER_MODEL // empty' <<<"$wa_env" 2>/dev/null)" || wa_model=""
+        fi
       fi
       if [ -n "$codex_cli" ]; then
         LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
+          AGENT_BOX_WHATSAPP_ROUTER="$wa_router" AGENT_BOX_ROUTER_BACKEND="$wa_backend" \
+          AGENT_BOX_ROUTER_MODEL="$wa_model" \
           LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$whatsapp" serve &
       else
         LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
+          AGENT_BOX_WHATSAPP_ROUTER="$wa_router" AGENT_BOX_ROUTER_BACKEND="$wa_backend" \
+          AGENT_BOX_ROUTER_MODEL="$wa_model" \
           "$whatsapp" serve &
       fi
       whatsapp_pid=$!
@@ -22414,6 +23451,11 @@ esac
       done < <(printf '%s\n' "$_arch")
     }
 
+    # The tick's pause is a builtin `read -t` on a pipe nobody writes, not
+    # `sleep`: with the disk gone every exec dies at once (SIGBUS), and a
+    # failed `sleep 2` turned this loop into a fork storm (PR #1055).
+    exec {TICK_FD}<> <(:)
+
     # Reconcile forever; systemd stop tears the whole tree down (ExecStop
     # kill-server + cgroup kill), Restart=always revives a crashed loop.
     # Sessions flagged stopped (a clean agent exit, or agent-box-session
@@ -22446,7 +23488,7 @@ esac
       sync_codex_threads
       supervise_whatsapp
       supervise_slack
-      sleep 2
+      read -rt 2 -u "$TICK_FD" || :
     done
   '';
 
@@ -22983,7 +24025,10 @@ in
         description = ''
           Public IPv4 address or DNS name for the browser terminal. An IPv4
           address uses a Let's Encrypt shortlived certificate; a DNS name uses
-          the normal ACME profile. Caddy renews certificates in its persistent
+          the normal ACME profile. A private IPv4 address (RFC 1918,
+          100.64.0.0/10 as handed out by Tailscale/Headscale, loopback,
+          link-local) cannot get a public certificate, so it uses Caddy's
+          internal CA instead. Caddy renews certificates in its persistent
           /var/lib/caddy state directory.
         '';
       };
@@ -25346,6 +26391,13 @@ SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
 # reboots (see the box's apt policy). Without this the box has no way to
 # finish those updates at all — nobody inside it can reboot.
 REBOOT_CMD = os.environ.get("AGENT_BOX_REBOOT_CMD", "")
+# Socket of the root reboot helper (modules/src/reboot-helper.py), the
+# fallback when REBOOT_CMD cannot run because the disk is gone (issue 1054).
+# Empty on a box without the helper.
+REBOOT_SOCKET = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+# How long the normal reboot command gets before the helper is tried. A
+# failed disk may HANG the exec instead of failing it.
+REBOOT_CMD_TIMEOUT_S = 15
 # The distro's own "a reboot would apply something" marker: Debian and
 # Ubuntu's update machinery creates it, and the .pkgs file beside it
 # lists what asked. Both are world-readable, so the card reports WHY a
@@ -29830,19 +30882,63 @@ def update_box():
         sys.stderr.write("update_box: %s\n" % exc)
 
 
+def reboot_via_helper():
+    """Ask the root reboot helper to sysrq-reboot. True when it accepted.
+
+    Sends the one fixed request the helper understands. Nothing here reads
+    the disk: the socket module is already imported and the helper is
+    already running.
+    """
+    if not REBOOT_SOCKET:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(REBOOT_SOCKET)
+            conn.sendall(b"REBOOT\n")
+            answer = conn.recv(64).strip()
+    except OSError as exc:
+        sys.stderr.write("reboot_box: helper: %s\n" % exc)
+        return False
+    sys.stderr.write("reboot_box: helper answered %r\n" % answer[:32])
+    return answer in (b"OK", b"BUSY")
+
+
+def _run_reboot_cmd(result):
+    try:
+        proc = subprocess.run(REBOOT_CMD.split(), check=False,
+                              capture_output=True)
+        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
+        result.append(proc.returncode)
+    except OSError as exc:
+        sys.stderr.write("reboot_box: %s\n" % exc)
+
+
 def reboot_box():
-    """Trigger the reboot through the allowlisted sudo command.
+    """Trigger the reboot through the allowlisted sudo command, and when
+    that cannot run (no disk to exec sudo from), through the root helper.
+
+    The normal command runs in a worker thread and this function waits for
+    it with a deadline. subprocess's own timeout is not enough: on a dying
+    disk the fork/exec itself, or the wait after a kill, can block, and the
+    helper would never be asked.
 
     The caller sends its HTTP response BEFORE calling this (see the
     /reboot route): --no-block returns immediately, but systemd starts
     stopping units at once, and this daemon is one of them — a response
     written afterwards can lose the race with its own socket going away.
     """
-    try:
-        proc = subprocess.run(REBOOT_CMD.split(), check=False, capture_output=True)
-        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
-    except OSError as exc:
-        sys.stderr.write("reboot_box: %s\n" % exc)
+    result = []
+    worker = threading.Thread(target=_run_reboot_cmd, args=(result,),
+                              daemon=True)
+    worker.start()
+    worker.join(REBOOT_CMD_TIMEOUT_S)
+    if result and result[0] == 0:
+        return
+    if worker.is_alive():
+        sys.stderr.write("reboot_box: trigger did not finish in %ds\n"
+                         % REBOOT_CMD_TIMEOUT_S)
+    reboot_via_helper()
 
 
 def reboot_pending():
@@ -30659,6 +31755,8 @@ STYLE = """<style>
   .msg[data-kind="error"] { border: 1px solid rgba(248,81,73,.4); background: #2b1315;
                              color: #f85149; }
   .msg-text { flex: 1; }
+  .msg-restart { font-size: 14px; border-width: 2px; }
+  .msg-restart a { color: inherit; font-weight: 600; text-decoration: underline; }
   /* Dismiss (x), issue #246. A link, so it also works without JS (see
      render_msg); styled as a quiet button that only lights up on hover,
      like the tab's own close control. color: inherit rides on the
@@ -31200,7 +32298,7 @@ CONNECT_SECTION_TPL = """<section>
 # layout does not navigate, since a navigation would tear down every
 # attached terminal on the page.
 HOME_BODY = """<body class="ws" data-view="{view}">
-<div id="msg-slot">{message}</div>
+<div id="restart-banner">{restart_banner}</div><div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}"
      data-sess-base="{action_base}">
   {tabs}
@@ -31240,7 +32338,7 @@ BODY = """<main>
   </a>
   <a class="back" href="{term_home}">&larr; workspace</a>
   <h1><span class="mark">{mark}</span>Settings</h1>
-  <div id="msg-slot">{message}</div>
+  <div id="restart-banner">{restart_banner}</div><div id="msg-slot">{message}</div>
   <section aria-labelledby="resource-usage" data-resources-url="{base}/resources">
     <h2 id="resource-usage">Resource usage<a class="heading-anchor" href="#resource-usage" aria-label="Copy link to Resource usage" title="Copy link to Resource usage"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     <p class="note">Box CPU, memory and disk; hook session slots. Manual sessions bypass the limit. Refreshes every 5 seconds.</p>
@@ -31765,8 +32863,8 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       fetch(here + window.location.search, { headers: sectionHeaders(sections) }),
       here);
   }
-  var SESSION_REGIONS = ["msg-slot", "sessions-list", "tab-bar"];
-  var CONNECT_REGIONS = ["msg-slot", "connect-list"];
+  var SESSION_REGIONS = ["msg-slot", "restart-banner", "sessions-list", "tab-bar"];
+  var CONNECT_REGIONS = ["msg-slot", "restart-banner", "connect-list"];
   // Re-fetch the current page and patch the live session list/tabs, so
   // the visible list tracks a restart even when nothing was "starting"
   // at submit time (which is what otherwise gates schedulePoll).
@@ -31774,7 +32872,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     return fetchPage(SESSION_REGIONS)
       .then(function (t) {
         if (t === null) { return; }
-        applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+        applyRefreshDoc(parseHTML(t), ["restart-banner", "sessions-list", "tab-bar"]);
         wsSync();
       })
       .catch(function () {});
@@ -31974,7 +33072,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       fetchPage(SESSION_REGIONS)
         .then(function (t) {
           if (t === null) { return; }
-          applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"]);
+          applyRefreshDoc(parseHTML(t), ["restart-banner", "sessions-list", "tab-bar"]);
           wsSync();
           schedulePoll();
         });
@@ -32026,7 +33124,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       // banner slot with the card state so that result appears where every
       // other transient action message lives (issue #835).
       .then(function (t) {
-        if (t) { applyRefreshDoc(parseHTML(t), ["connect-list"]); }
+        if (t) { applyRefreshDoc(parseHTML(t), ["restart-banner", "connect-list"]); }
         connectRetries = 0;
         return true;
       }, function () { return false; })
@@ -32947,10 +34045,10 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     // Signing out deletes a provider's keys (GH_TOKEN) and starting WhatsApp
     // stores its phone number, so a card's own form keeps the secrets too.
     if (f.closest("#connect-list")) {
-      return ["msg-slot", "connect-list", "secrets-list"];
+      return ["msg-slot", "restart-banner", "connect-list", "secrets-list"];
     }
     if (f.closest("#secret-editor, #secrets-list")) {
-      return ["msg-slot", "secrets-list", "connect-list"];
+      return ["msg-slot", "restart-banner", "secrets-list", "connect-list"];
     }
     return null;
   }
@@ -33015,7 +34113,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
       // could not offer the profile the operator had just made.
       var doc = parseHTML(t);
       applyDoc(doc, sections ||
-        ["msg-slot", "secrets-list", "sessions-list", "profiles-list",
+        ["msg-slot", "restart-banner", "secrets-list", "sessions-list", "profiles-list",
          "profile-picker", "webhook-endpoint", "webhooks-list",
          "connect-list", "tab-bar"]);
       var ed = f.closest(".editor");
@@ -34459,6 +35557,31 @@ def render_reboot_line():
             + " &mdash; restart agent-box to finish installing the update.")
 
 
+def render_restart_banner(settings_href):
+    """A persistent red banner while the distro says a restart is waiting.
+
+    The reason used to live only in the Maintenance card at the bottom of
+    Settings, which nobody opens (issue #1044). Unlike the action banner
+    it has no dismiss: it clears itself when the marker file goes away,
+    which is the only thing that should clear it.
+    """
+    pending, packages = reboot_pending()
+    if not pending:
+        return ""
+    reason = ""
+    if packages:
+        reason = " (" + html.escape(", ".join(packages)) + ")"
+    return (
+        '<div class="msg msg-restart" data-kind="error" role="alert">'
+        '<span class="msg-text"><strong>A restart is required</strong>'
+        + reason + ' to finish installing an update. '
+        + (f'<a href="{html.escape(settings_href, quote=True)}">'
+           'Open Settings &rarr; Maintenance to restart agent-box</a>.'
+           if REBOOT_CMD else
+           'Ask the administrator of this box to restart it.')
+        + '</span></div>')
+
+
 def render_update_line():
     """Running rev plus a progressively enhanced GitHub update status.
 
@@ -34665,9 +35788,11 @@ def render_connect_step(state):
             user = html.escape(pwd.getpwuid(os.getuid()).pw_name)
             return (
                 '<div class="conn-step"><p class="note">The linked device is '
-                f'connected. Send <code>@{user} /sessions</code> from Message Yourself '
-                f'to choose its one recipient, or <code>@{user} /target auto</code> to '
-                'start a new one automatically.</p>'
+                f'connected. Start each Message Yourself message with <code>@{user} </code>; '
+                'it goes to the session the router chooses, and a new topic starts a new '
+                'session. Send '
+                f'<code>@{user} /target NAME</code> to pin one session, or '
+                f'<code>@{user} /target auto</code> to route again.</p>'
                 f'<form method="post" action="{base}/connect/configure" class="row conn-form">'
                 f'<input type="hidden" name="flow" value="{flow_id}">'
                 f'{render_whatsapp_profile_field()}'
@@ -35142,7 +36267,8 @@ def render_head(title):
 # the no-JS form flow and every other client see no difference.
 SECTIONS_HEADER = "X-Agent-Box-Sections"
 PAGE_SECTIONS = frozenset((
-    "msg-slot", "secrets-list", "sessions-list", "profile-picker",
+    "msg-slot", "restart-banner", "secrets-list", "sessions-list",
+    "profile-picker",
     "profiles-list", "webhook-endpoint", "webhooks-list", "connect-list",
 ))
 _request_local = threading.local()
@@ -35184,6 +36310,7 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False,
             not message or prefer_connect_feedback):
         message = take_connect_feedback(connect_feedback)
         kind = "ok"
+    restart_html = render_restart_banner(BASE + "/#maintenance")
     msg_html = render_msg(message, BASE + "/", kind)
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
@@ -35239,6 +36366,7 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False,
             webhooks_section=webhooks_section,
             connect_section=connect_section,
             message=msg_html,
+            restart_banner=restart_html,
             password_section=(
                 PASSWORD_SECTION.format(base=html.escape(BASE))
                 if PASSWORD_CMD else ""
@@ -35299,6 +36427,7 @@ def render_home(message="", selected=None, kind="ok", view="tabs"):
     died = {n for n, v in entries.items() if crashed_status(v) is not None}
     # Dismissing keeps the selected tab and the layout it was dismissed in
     # (SESSION_RE names are URL-safe, so nothing here is escaped away).
+    restart_html = render_restart_banner(BASE + "/#maintenance")
     msg_html = render_msg(message, view_href(selected, view), kind)
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
@@ -35313,6 +36442,7 @@ def render_home(message="", selected=None, kind="ok", view="tabs"):
             panes=render_panes(names, live, stopped, died, selected, view),
             new_session_fields=render_new_session_fields(),
             message=msg_html,
+            restart_banner=restart_html,
             icon_info=ICON_INFO,
             icon_gear=ICON_GEAR,
         )
@@ -39289,6 +40419,21 @@ if __name__ == "__main__":
       ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
       isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
       webDomainIsIpv4 = isIpv4 cfg.web.domain;
+      # Mirrors private_ipv4 in bin/agentbox octet for octet (see there):
+      # RFC 1918, 100.64.0.0/10 (Tailscale/Headscale), loopback, link-local.
+      # No public CA issues for these, so the box uses Caddy's internal CA.
+      privateIpv4 = value:
+        let
+          o = map lib.toIntBase10 (lib.splitString "." value);
+          a = builtins.elemAt o 0;
+          b = builtins.elemAt o 1;
+        in
+        a == 10 || a == 127
+        || (a == 100 && b >= 64 && b < 128)
+        || (a == 169 && b == 254)
+        || (a == 172 && b >= 16 && b < 32)
+        || (a == 192 && b == 168);
+      webDomainIsPrivateIpv4 = webDomainIsIpv4 && privateIpv4 cfg.web.domain;
       # Preserve a configured destination; only an unset one uses the
       # issuer's origin. Neither HTML nor Caddy may interpret URL syntax.
       portalHint =
@@ -39734,7 +40879,8 @@ if __name__ == "__main__":
       lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
           caddyReloadCmd
-          (if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
+          (if webDomainIsPrivateIpv4 then "internal_ca"
+           else if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
           (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "")
           portalHint ] ''
         # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
@@ -39809,6 +40955,17 @@ if __name__ == "__main__":
               disable_http_challenge
             }
           }
+        }
+
+        # A private IPv4 domain (RFC 1918, the 100.64.0.0/10 shared range Tailscale
+        # and Headscale hand out, loopback, link-local) is one no public CA can
+        # validate, and Caddy rejects an explicit ACME policy for it outright
+        # ("hostname appears in more than one automation policy"), so the box would
+        # fail `caddy validate` and every update would roll back. Such a box is
+        # reached over a private network, so Caddy's own local CA is the cert it can
+        # actually have; clients trust it once, as with any internal CA.
+        (internal_ca) {
+          tls internal
         }
 
         # Preserve HTTP-to-HTTPS redirects for every hostname, including imported
@@ -40100,7 +41257,7 @@ if __name__ == "__main__":
     {
       assertions = [
         {
-          assertion = !webDomainIsIpv4 || lib.versionAtLeast pkgs.caddy.version "2.11.4";
+          assertion = !webDomainIsIpv4 || webDomainIsPrivateIpv4 || lib.versionAtLeast pkgs.caddy.version "2.11.4";
           message = "services.agent-box.web.domain is an IPv4 address, which requires Caddy 2.11.4 or newer for ACME IP certificates.";
         }
         {
@@ -40351,6 +41508,35 @@ if __name__ == "__main__":
           Restart = lib.mkForce "always";
         };
       }
+      // lib.optionalAttrs rebootButton {
+        # Issue #1054: a reboot that needs nothing from the disk. Runs from
+        # boot so its code and /proc/sysrq-trigger are already in RAM and
+        # open when a failing disk makes `sudo systemctl reboot` unable to
+        # exec. See src/reboot-helper.py for the request protocol.
+        agent-box-reboot-helper = {
+          description = "agent-box: disk-independent reboot helper";
+          wantedBy = [ "multi-user.target" ];
+          # The settings daemon is socket-activated; one never started
+          # cannot start once the disk is gone, so bring it up at boot.
+          wants = [ "agent-box-settings@${rootUser}.service" ];
+          environment = {
+            AGENT_BOX_REBOOT_USER = rootUser;
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
+            # The front door the button's request crosses; the helper keeps
+            # their mapped files in RAM so a dead disk cannot SIGBUS them.
+            AGENT_BOX_REBOOT_PIN_UNITS = "caddy.service agent-box-settings@${rootUser}.service";
+          };
+          serviceConfig = {
+            ExecStart = "${rebootHelperBin}/bin/agent-box-reboot-helper";
+            RuntimeDirectory = "agent-box-reboot";
+            RuntimeDirectoryMode = "0755";
+            Restart = "always";
+            RestartSec = "5s";
+            LimitMEMLOCK = "infinity";
+            OOMScoreAdjust = -900;
+          };
+        };
+      }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
         # The attach script (src/attach.sh) resolves tmux, jq and head
@@ -40464,6 +41650,8 @@ if __name__ == "__main__":
             # the daemon hides the card and 404s the route without it, so
             # another user's page cannot even ask.
             AGENT_BOX_REBOOT_CMD = "/run/wrappers/bin/sudo -n ${rebootCmd}";
+            # Fallback when that cannot exec (issue #1054).
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
           })
           // {
             # mkForce for the reason spelled out on the "agent-box@" unit:

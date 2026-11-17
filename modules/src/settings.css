@@ -254,6 +254,8 @@ form.inline { display: inline; }
 .msg[data-kind="error"] { border: 1px solid rgba(248,81,73,.4); background: #2b1315;
                            color: #f85149; }
 .msg-text { flex: 1; }
+.msg-restart { font-size: 14px; border-width: 2px; }
+.msg-restart a { color: inherit; font-weight: 600; text-decoration: underline; }
 /* Dismiss (x), issue #246. A link, so it also works without JS (see
    render_msg); styled as a quiet button that only lights up on hover,
    like the tab's own close control. color: inherit rides on the

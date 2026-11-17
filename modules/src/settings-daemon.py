@@ -219,6 +219,13 @@ SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
 # reboots (see the box's apt policy). Without this the box has no way to
 # finish those updates at all — nobody inside it can reboot.
 REBOOT_CMD = os.environ.get("AGENT_BOX_REBOOT_CMD", "")
+# Socket of the root reboot helper (modules/src/reboot-helper.py), the
+# fallback when REBOOT_CMD cannot run because the disk is gone (issue 1054).
+# Empty on a box without the helper.
+REBOOT_SOCKET = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+# How long the normal reboot command gets before the helper is tried. A
+# failed disk may HANG the exec instead of failing it.
+REBOOT_CMD_TIMEOUT_S = 15
 # The distro's own "a reboot would apply something" marker: Debian and
 # Ubuntu's update machinery creates it, and the .pkgs file beside it
 # lists what asked. Both are world-readable, so the card reports WHY a
@@ -4308,19 +4315,63 @@ def update_box():
         sys.stderr.write("update_box: %s\n" % exc)
 
 
+def reboot_via_helper():
+    """Ask the root reboot helper to sysrq-reboot. True when it accepted.
+
+    Sends the one fixed request the helper understands. Nothing here reads
+    the disk: the socket module is already imported and the helper is
+    already running.
+    """
+    if not REBOOT_SOCKET:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(REBOOT_SOCKET)
+            conn.sendall(b"REBOOT\n")
+            answer = conn.recv(64).strip()
+    except OSError as exc:
+        sys.stderr.write("reboot_box: helper: %s\n" % exc)
+        return False
+    sys.stderr.write("reboot_box: helper answered %r\n" % answer[:32])
+    return answer in (b"OK", b"BUSY")
+
+
+def _run_reboot_cmd(result):
+    try:
+        proc = subprocess.run(REBOOT_CMD.split(), check=False,
+                              capture_output=True)
+        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
+        result.append(proc.returncode)
+    except OSError as exc:
+        sys.stderr.write("reboot_box: %s\n" % exc)
+
+
 def reboot_box():
-    """Trigger the reboot through the allowlisted sudo command.
+    """Trigger the reboot through the allowlisted sudo command, and when
+    that cannot run (no disk to exec sudo from), through the root helper.
+
+    The normal command runs in a worker thread and this function waits for
+    it with a deadline. subprocess's own timeout is not enough: on a dying
+    disk the fork/exec itself, or the wait after a kill, can block, and the
+    helper would never be asked.
 
     The caller sends its HTTP response BEFORE calling this (see the
     /reboot route): --no-block returns immediately, but systemd starts
     stopping units at once, and this daemon is one of them — a response
     written afterwards can lose the race with its own socket going away.
     """
-    try:
-        proc = subprocess.run(REBOOT_CMD.split(), check=False, capture_output=True)
-        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
-    except OSError as exc:
-        sys.stderr.write("reboot_box: %s\n" % exc)
+    result = []
+    worker = threading.Thread(target=_run_reboot_cmd, args=(result,),
+                              daemon=True)
+    worker.start()
+    worker.join(REBOOT_CMD_TIMEOUT_S)
+    if result and result[0] == 0:
+        return
+    if worker.is_alive():
+        sys.stderr.write("reboot_box: trigger did not finish in %ds\n"
+                         % REBOOT_CMD_TIMEOUT_S)
+    reboot_via_helper()
 
 
 def reboot_pending():
@@ -5060,7 +5111,7 @@ CONNECT_SECTION_TPL = """<section>
 # layout does not navigate, since a navigation would tear down every
 # attached terminal on the page.
 HOME_BODY = """<body class="ws" data-view="{view}">
-<div id="msg-slot">{message}</div>
+<div id="restart-banner">{restart_banner}</div><div id="msg-slot">{message}</div>
 <nav class="tabs" id="tab-bar" aria-label="Sessions" data-term-base="{term_base}"
      data-sess-base="{action_base}">
   {tabs}
@@ -5100,7 +5151,7 @@ BODY = """<main>
   </a>
   <a class="back" href="{term_home}">&larr; workspace</a>
   <h1><span class="mark">{mark}</span>Settings</h1>
-  <div id="msg-slot">{message}</div>
+  <div id="restart-banner">{restart_banner}</div><div id="msg-slot">{message}</div>
   <section aria-labelledby="resource-usage" data-resources-url="{base}/resources">
     <h2 id="resource-usage">Resource usage<a class="heading-anchor" href="#resource-usage" aria-label="Copy link to Resource usage" title="Copy link to Resource usage"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M7.775 3.275a3.25 3.25 0 0 1 4.596 0l.354.354a3.25 3.25 0 0 1 0 4.596l-2.25 2.25a3.25 3.25 0 0 1-4.596 0 .75.75 0 0 1 1.06-1.06 1.75 1.75 0 0 0 2.475 0l2.25-2.25a1.75 1.75 0 0 0 0-2.475l-.354-.354a1.75 1.75 0 0 0-2.475 0L7.7 5.47a.75.75 0 1 1-1.06-1.06Zm.45 9.45a3.25 3.25 0 0 1-4.596 0l-.354-.354a3.25 3.25 0 0 1 0-4.596l2.25-2.25a3.25 3.25 0 0 1 4.596 0 .75.75 0 0 1-1.06 1.06 1.75 1.75 0 0 0-2.475 0l-2.25 2.25a1.75 1.75 0 0 0 0 2.475l.354.354a1.75 1.75 0 0 0 2.475 0L8.3 10.53a.75.75 0 1 1 1.06 1.06Z"/></svg></a></h2>
     <p class="note">Box CPU, memory and disk; hook session slots. Manual sessions bypass the limit. Refreshes every 5 seconds.</p>
@@ -6525,6 +6576,31 @@ def render_reboot_line():
             + " &mdash; restart agent-box to finish installing the update.")
 
 
+def render_restart_banner(settings_href):
+    """A persistent red banner while the distro says a restart is waiting.
+
+    The reason used to live only in the Maintenance card at the bottom of
+    Settings, which nobody opens (issue #1044). Unlike the action banner
+    it has no dismiss: it clears itself when the marker file goes away,
+    which is the only thing that should clear it.
+    """
+    pending, packages = reboot_pending()
+    if not pending:
+        return ""
+    reason = ""
+    if packages:
+        reason = " (" + html.escape(", ".join(packages)) + ")"
+    return (
+        '<div class="msg msg-restart" data-kind="error" role="alert">'
+        '<span class="msg-text"><strong>A restart is required</strong>'
+        + reason + ' to finish installing an update. '
+        + (f'<a href="{html.escape(settings_href, quote=True)}">'
+           'Open Settings &rarr; Maintenance to restart agent-box</a>.'
+           if REBOOT_CMD else
+           'Ask the administrator of this box to restart it.')
+        + '</span></div>')
+
+
 def render_update_line():
     """Running rev plus a progressively enhanced GitHub update status.
 
@@ -6731,9 +6807,11 @@ def render_connect_step(state):
             user = html.escape(pwd.getpwuid(os.getuid()).pw_name)
             return (
                 '<div class="conn-step"><p class="note">The linked device is '
-                f'connected. Send <code>@{user} /sessions</code> from Message Yourself '
-                f'to choose its one recipient, or <code>@{user} /target auto</code> to '
-                'start a new one automatically.</p>'
+                f'connected. Start each Message Yourself message with <code>@{user} </code>; '
+                'it goes to the session the router chooses, and a new topic starts a new '
+                'session. Send '
+                f'<code>@{user} /target NAME</code> to pin one session, or '
+                f'<code>@{user} /target auto</code> to route again.</p>'
                 f'<form method="post" action="{base}/connect/configure" class="row conn-form">'
                 f'<input type="hidden" name="flow" value="{flow_id}">'
                 f'{render_whatsapp_profile_field()}'
@@ -7208,7 +7286,8 @@ def render_head(title):
 # the no-JS form flow and every other client see no difference.
 SECTIONS_HEADER = "X-Agent-Box-Sections"
 PAGE_SECTIONS = frozenset((
-    "msg-slot", "secrets-list", "sessions-list", "profile-picker",
+    "msg-slot", "restart-banner", "secrets-list", "sessions-list",
+    "profile-picker",
     "profiles-list", "webhook-endpoint", "webhooks-list", "connect-list",
 ))
 _request_local = threading.local()
@@ -7250,6 +7329,7 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False,
             not message or prefer_connect_feedback):
         message = take_connect_feedback(connect_feedback)
         kind = "ok"
+    restart_html = render_restart_banner(BASE + "/#maintenance")
     msg_html = render_msg(message, BASE + "/", kind)
     # One pass over the subscription state per render, feeding both
     # panels: it forks the pinned CLI once per session, so the Sessions
@@ -7305,6 +7385,7 @@ def render_page(message="", kind="ok", prefer_connect_feedback=False,
             webhooks_section=webhooks_section,
             connect_section=connect_section,
             message=msg_html,
+            restart_banner=restart_html,
             password_section=(
                 PASSWORD_SECTION.format(base=html.escape(BASE))
                 if PASSWORD_CMD else ""
@@ -7365,6 +7446,7 @@ def render_home(message="", selected=None, kind="ok", view="tabs"):
     died = {n for n, v in entries.items() if crashed_status(v) is not None}
     # Dismissing keeps the selected tab and the layout it was dismissed in
     # (SESSION_RE names are URL-safe, so nothing here is escaped away).
+    restart_html = render_restart_banner(BASE + "/#maintenance")
     msg_html = render_msg(message, view_href(selected, view), kind)
     return (
         render_head("Agent Box &mdash; " + html.escape(USER))
@@ -7379,6 +7461,7 @@ def render_home(message="", selected=None, kind="ok", view="tabs"):
             panes=render_panes(names, live, stopped, died, selected, view),
             new_session_fields=render_new_session_fields(),
             message=msg_html,
+            restart_banner=restart_html,
             icon_info=ICON_INFO,
             icon_gear=ICON_GEAR,
         )

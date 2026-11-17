@@ -681,12 +681,12 @@ class ReloginRestartTest(unittest.TestCase):
 
     def test_connection_poll_morphs_page_feedback_with_the_card(self):
         self.assertIn(
-            'applyRefreshDoc(parseHTML(t), ["connect-list"])',
+            'applyRefreshDoc(parseHTML(t), ["restart-banner", "connect-list"])',
             self.daemon.SCRIPT,
         )
         self.assertEqual(
             self.daemon.SCRIPT.count(
-                'applyRefreshDoc(parseHTML(t), ["sessions-list", "tab-bar"])'),
+                'applyRefreshDoc(parseHTML(t), ["restart-banner", "sessions-list", "tab-bar"])'),
             2,
         )
         self.assertIn('doc.querySelector("#msg-slot .msg")', self.daemon.SCRIPT)

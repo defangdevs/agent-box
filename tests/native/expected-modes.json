@@ -58,6 +58,8 @@
   "etc/systemd/system/agent-box-nixpkgs-cache.service": "0o644",
   "etc/systemd/system/agent-box-nixpkgs-cache.service.d/05-tls.conf": "0o644",
   "etc/systemd/system/agent-box-nixpkgs-cache.timer": "0o644",
+  "etc/systemd/system/agent-box-reboot-helper.service": "0o644",
+  "etc/systemd/system/agent-box-reboot-helper.service.d/05-tls.conf": "0o644",
   "etc/systemd/system/agent-box-secret-broker@.service": "0o444",
   "etc/systemd/system/agent-box-secret-broker@.service.d/05-tls.conf": "0o644",
   "etc/systemd/system/agent-box-secret-broker@.socket": "0o444",

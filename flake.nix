@@ -2995,6 +2995,23 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               cp log "$out"
             '';
 
+          # Issue #1054: the disk-independent reboot helper. Real serve()
+          # loop on a unix socket; the sysrq files are plain files.
+          reboot-helper =
+            pkgs.runCommand "agent-box-reboot-helper-test"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                helper = ./modules/src/reboot-helper.py;
+                tests = ./tests/test-reboot-helper.py;
+              } ''
+              python3 "$tests" "$helper" > log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
           whatsapp-cli =
             pkgs.runCommand "agent-box-whatsapp-cli"
               {
@@ -3040,10 +3057,12 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
               {
                 nativeBuildInputs = [ pkgs.python3 pkgs.bash pkgs.jq pkgs.util-linux ];
                 cli = ./tests/golden/vm/payloads/agent-box-session/bin/agent-box-session;
+                router = ./modules/src/whatsapp-cli.py;
                 tests = ./tests/test-whatsapp-session.py;
               } ''
-              install -d repo/tests/golden/vm/payloads/agent-box-session/bin repo/tests
+              install -d repo/tests/golden/vm/payloads/agent-box-session/bin repo/tests repo/modules/src
               cp "$cli" repo/tests/golden/vm/payloads/agent-box-session/bin/agent-box-session
+              cp "$router" repo/modules/src/whatsapp-cli.py
               cp "$tests" repo/tests/test-whatsapp-session.py
               python3 repo/tests/test-whatsapp-session.py > log 2>&1 || {
                 cat log

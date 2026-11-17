@@ -525,6 +525,13 @@ let
 
 @@include:src/secret-broker.py@@
   '');
+  # Root reboot helper (issue #1054): a reboot that needs nothing from the
+  # disk when the settings page's normal `sudo systemctl reboot` cannot exec.
+  rebootHelperBin = pkgs.writers.writePython3Bin "agent-box-reboot-helper" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/reboot-helper.py@@
+  '';
   secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
@@ -2380,7 +2387,10 @@ in
         description = ''
           Public IPv4 address or DNS name for the browser terminal. An IPv4
           address uses a Let's Encrypt shortlived certificate; a DNS name uses
-          the normal ACME profile. Caddy renews certificates in its persistent
+          the normal ACME profile. A private IPv4 address (RFC 1918,
+          100.64.0.0/10 as handed out by Tailscale/Headscale, loopback,
+          link-local) cannot get a public certificate, so it uses Caddy's
+          internal CA instead. Caddy renews certificates in its persistent
           /var/lib/caddy state directory.
         '';
       };
@@ -4238,6 +4248,21 @@ in
       ipv4Octet = "(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
       isIpv4 = value: builtins.match "${ipv4Octet}(\\.${ipv4Octet}){3}" value != null;
       webDomainIsIpv4 = isIpv4 cfg.web.domain;
+      # Mirrors private_ipv4 in bin/agentbox octet for octet (see there):
+      # RFC 1918, 100.64.0.0/10 (Tailscale/Headscale), loopback, link-local.
+      # No public CA issues for these, so the box uses Caddy's internal CA.
+      privateIpv4 = value:
+        let
+          o = map lib.toIntBase10 (lib.splitString "." value);
+          a = builtins.elemAt o 0;
+          b = builtins.elemAt o 1;
+        in
+        a == 10 || a == 127
+        || (a == 100 && b >= 64 && b < 128)
+        || (a == 169 && b == 254)
+        || (a == 172 && b >= 16 && b < 32)
+        || (a == 192 && b == 168);
+      webDomainIsPrivateIpv4 = webDomainIsIpv4 && privateIpv4 cfg.web.domain;
       # Preserve a configured destination; only an unset one uses the
       # issuer's origin. Neither HTML nor Caddy may interpret URL syntax.
       portalHint =
@@ -4350,7 +4375,8 @@ in
       lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
           caddyReloadCmd
-          (if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
+          (if webDomainIsPrivateIpv4 then "internal_ca"
+           else if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
           (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "")
           portalHint ] ''
         @@include:src/caddyfile-header.caddy@@
@@ -4513,7 +4539,7 @@ in
     {
       assertions = [
         {
-          assertion = !webDomainIsIpv4 || lib.versionAtLeast pkgs.caddy.version "2.11.4";
+          assertion = !webDomainIsIpv4 || webDomainIsPrivateIpv4 || lib.versionAtLeast pkgs.caddy.version "2.11.4";
           message = "services.agent-box.web.domain is an IPv4 address, which requires Caddy 2.11.4 or newer for ACME IP certificates.";
         }
         {
@@ -4764,6 +4790,35 @@ in
           Restart = lib.mkForce "always";
         };
       }
+      // lib.optionalAttrs rebootButton {
+        # Issue #1054: a reboot that needs nothing from the disk. Runs from
+        # boot so its code and /proc/sysrq-trigger are already in RAM and
+        # open when a failing disk makes `sudo systemctl reboot` unable to
+        # exec. See src/reboot-helper.py for the request protocol.
+        agent-box-reboot-helper = {
+          description = "agent-box: disk-independent reboot helper";
+          wantedBy = [ "multi-user.target" ];
+          # The settings daemon is socket-activated; one never started
+          # cannot start once the disk is gone, so bring it up at boot.
+          wants = [ "agent-box-settings@${rootUser}.service" ];
+          environment = {
+            AGENT_BOX_REBOOT_USER = rootUser;
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
+            # The front door the button's request crosses; the helper keeps
+            # their mapped files in RAM so a dead disk cannot SIGBUS them.
+            AGENT_BOX_REBOOT_PIN_UNITS = "caddy.service agent-box-settings@${rootUser}.service";
+          };
+          serviceConfig = {
+            ExecStart = "${rebootHelperBin}/bin/agent-box-reboot-helper";
+            RuntimeDirectory = "agent-box-reboot";
+            RuntimeDirectoryMode = "0755";
+            Restart = "always";
+            RestartSec = "5s";
+            LimitMEMLOCK = "infinity";
+            OOMScoreAdjust = -900;
+          };
+        };
+      }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
         # The attach script (src/attach.sh) resolves tmux, jq and head
@@ -4877,6 +4932,8 @@ in
             # the daemon hides the card and 404s the route without it, so
             # another user's page cannot even ask.
             AGENT_BOX_REBOOT_CMD = "/run/wrappers/bin/sudo -n ${rebootCmd}";
+            # Fallback when that cannot exec (issue #1054).
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
           })
           // {
             # mkForce for the reason spelled out on the "agent-box@" unit:

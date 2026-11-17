@@ -20,6 +20,7 @@ import ast
 import contextlib
 import importlib.util
 import io
+import ipaddress
 import json
 import os
 import re
@@ -233,6 +234,22 @@ def tree_modes(root):
 
 
 class RenderTest(unittest.TestCase):
+    def test_reboot_helper_pin_units_survive_word_splitting(self):
+        # PR #1055 KVM test: an unquoted Environment= value is split at
+        # spaces by systemd, and the helper then saw only caddy.service.
+        import shlex
+        text = (FIXTURE / "etc/systemd/system/agent-box-reboot-helper.service"
+                ).read_text()
+        env = {}
+        for line in text.splitlines():
+            if line.startswith("Environment="):
+                for word in shlex.split(line[len("Environment="):]):
+                    key, _, value = word.partition("=")
+                    env[key] = value
+        self.assertEqual(env.get("AGENT_BOX_REBOOT_PIN_UNITS", "").split(),
+                         ["caddy.service", "agent-box-settings@agent.service"])
+        self.assertIn("Wants=agent-box-settings@agent.service", text)
+
     def test_tls_policy_reaches_socket_and_timer_services_and_keeps_ownership(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = render(tmp, CONFIG_JSON)
@@ -251,6 +268,33 @@ class RenderTest(unittest.TestCase):
             # Byte-for-byte unit copies remain recognizable by feature-off cleanup.
             shared = (out / "etc/systemd/system/agent-box-settings@.service").read_text()
             self.assertEqual(shared, (SRC / "units/agent-box-settings@.service").read_text())
+
+    def test_private_ip_uses_internal_ca(self):
+        # A Tailscale/Headscale or LAN address cannot get a public cert, and
+        # Caddy rejects an ACME policy for it, so it must use `tls internal`
+        # while keeping default_sni (clients connecting by IP send no SNI).
+        mod = load_agentbox()
+        for addr, private in [("100.64.0.13", True), ("100.127.255.1", True),
+                              ("10.0.0.5", True), ("172.16.0.1", True),
+                              ("172.31.255.1", True), ("192.168.1.10", True),
+                              ("127.0.0.1", True), ("169.254.1.1", True),
+                              ("100.63.255.255", False), ("100.128.0.1", False),
+                              ("172.15.0.1", False), ("172.32.0.1", False),
+                              ("203.0.113.7", False), ("8.8.8.8", False)]:
+            self.assertEqual(
+                mod.private_ipv4(ipaddress.ip_address(addr)), private, addr)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "config.json"
+            cfg.write_text(json.dumps({
+                "domain": "100.64.0.13",
+                "web": {"enable": True},
+                "users": {"agent": {"root": True}},
+            }))
+            caddyfile = (render(tmp, cfg) / "etc/agent-box/Caddyfile").read_text()
+            self.assertIn("default_sni 100.64.0.13", caddyfile)
+            site = caddyfile.split("\n100.64.0.13 {", 1)[1].split("\n}", 1)[0]
+            self.assertIn("import internal_ca", site)
+            self.assertNotIn("import acme_", site)
 
     def test_ip_certificate_and_optional_dns_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2644,6 +2688,9 @@ class RenderTest(unittest.TestCase):
                 out / "etc/systemd/system/agent-box-fail2ban.service",
                 out / "etc/systemd/system/agent-web-terminal@.service",
                 out / "etc/systemd/system/agent-box-settings@.service",
+                # Issue #1054: the reboot helper exists only with the
+                # Reboot button, which needs the settings page.
+                out / "etc/systemd/system/agent-box-reboot-helper.service",
                 out / "etc/agent-box/Caddyfile",
                 out / mod.CADDY_RELOAD_POLICY.lstrip("/"),
                 out / "etc/agent-box/web-users",
@@ -2690,7 +2737,8 @@ class RenderTest(unittest.TestCase):
             # Requires= last.
             self.assertEqual(["agent-box-fail2ban.service",
                               "caddy.service",
-                              "agent-web-auth-secrets.service"],
+                              "agent-web-auth-secrets.service",
+                              "agent-box-reboot-helper.service"],
                              tree.disable)
             # The password and cookie secrets are deliberately NOT removed:
             # turning the terminal off must not throw away the credential
@@ -3914,6 +3962,8 @@ class SelfUpdateLogicTest(unittest.TestCase):
             "agent-box-webhook@*.socket": ["agent-box-webhook@agent.socket"],
             # Deliberately stopped by the operator: not listed, not restarted.
             "agent-box-webhook@*.service": [],
+            "agent-box-reboot-helper.service": [
+                "agent-box-reboot-helper.service"],
             "caddy.service": ["caddy.service"],
             "agent-box@*.service": ["agent-box@agent.service",
                                     "agent-box@robot.service"],
@@ -3926,6 +3976,7 @@ class SelfUpdateLogicTest(unittest.TestCase):
                      "agent-web-terminal@agent.service",
                      "agent-box-settings@agent.socket",
                      "agent-box-webhook@agent.socket",
+                     "agent-box-reboot-helper.service",
                      "caddy.service"):
             self.assertIn(unit, restarted)
         # Sessions last: the agent that asked for the update is in one.
@@ -4205,6 +4256,25 @@ class ApplyActivationTest(unittest.TestCase):
         rc, out, err = self.apply()
         self.assertEqual(rc, 0, err)
         self.assertNotIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
+
+    def test_changed_reboot_helper_unit_restarts_an_active_helper(self):
+        # Issue #1054 review: the helper authorizes one uid read from its
+        # unit's environment at start, and `enable --now` leaves an active
+        # unit alone, so a changed root user needs an explicit restart.
+        unit = self.mod.REBOOT_HELPER_UNIT
+        path = "/etc/systemd/system/" + unit
+        self.extra_files[path] = "[Service]\n"
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: (
+            [unit] if pattern == unit else [])
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn(["systemctl", "restart", unit], self.calls)
+        self.calls.clear()
+        self.mod.write_if_changed = lambda *args: False
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(["systemctl", "restart", unit], self.calls)
 
     def test_a_failed_settings_environment_refresh_fails_apply(self):
         path = "/etc/agent-box/units/agent-box-settings-agent.env"

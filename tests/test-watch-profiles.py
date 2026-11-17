@@ -48,7 +48,7 @@ class Watches(unittest.TestCase):
                         AGENT_BOX_WEBHOOK_STATE_DIR=str(self.state),
                         AGENT_BOX_WEBHOOK_PYTHON=sys.executable,
                         AGENT_BOX_PROFILES_DIR=str(self.profiles))
-        for key in ('CODEX_THREAD_ID', 'LOCAL_WEBHOOK_SPAWN_CONFIG',
+        for key in ('CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'LOCAL_WEBHOOK_SPAWN_CONFIG',
                     'AGENT_BOX_HOOK_PROFILE', 'LOCAL_WEBHOOK_SELF'):
             self.env.pop(key, None)
         src = REPO / 'modules/src'
@@ -333,6 +333,105 @@ class Watches(unittest.TestCase):
         log.flush()
         self.assertCountEqual(launches, ['triage', 'debugger'],
                               (self.root / 'receiver.log').read_text())
+
+
+    def test_seeded_hook_claim_keeps_ci_the_box_triggered(self):
+        # PR #1041: a hook session pushed a fix, and the red run on that push
+        # reached a fresh session instead of it. GitHub names the pusher as a
+        # CI run's sender, and the seed muted "@self" outright, so the owner
+        # neither received its own CI nor claimed it. The seed must drop only
+        # the box's DIRECT echoes (its comments, pushes), never its CI.
+        sha = 'a' * 40
+        cases = [({'sha': sha, 'branch': 'fix'}, 'check_run', {
+                      'action': 'completed', 'check_run': {
+                          'conclusion': 'failure', 'head_sha': sha,
+                          'check_suite': {'head_branch': 'fix'}}}, True),
+                 ({'number': 7}, 'issue_comment', {
+                      'action': 'created', 'issue': {'number': 7}}, False)]
+        for meta, event, payload, self_claimed in cases:
+            env = dict(self.env, LOCAL_WEBHOOK_SELF='Box-Bot',
+                       LOCAL_WEBHOOK_SPAWN_SOURCE='github',
+                       LOCAL_WEBHOOK_SPAWN_KEY='owner/repo',
+                       LOCAL_WEBHOOK_SPAWN_EVENT=event,
+                       LOCAL_WEBHOOK_SPAWN_META=json.dumps(meta))
+            for f in self.state.glob('filter.*-hook-*.json'):
+                f.unlink()
+            # The launch itself fails (AGENT_BOX_SESSION_BIN=false); the seed
+            # is written before it, and the seed is what is under test.
+            subprocess.run([str(self.spawn)], env=env, input='[UNTRUSTED] event\n',
+                           capture_output=True, text=True, timeout=30)
+            seeded = list(self.state.glob('filter.*-hook-owner-repo-*.json'))
+            self.assertEqual(len(seeded), 1, seeded)
+            entry = json.loads(seeded[0].read_text())['topics'][0]
+            self.assertNotIn('ignoreSenders', entry)
+            probe = ('import importlib.machinery as m, json, sys\n'
+                     'w = m.SourceFileLoader("w", sys.argv[1]).load_module()\n'
+                     'print(json.dumps([w.filter_claims(sys.argv[2], "github", "owner/repo",'
+                     ' s, sys.argv[3], dict(json.loads(sys.argv[4]), sender={"login": s}))'
+                     ' for s in ("box-bot", "human")]))\n')
+            got = subprocess.run(
+                [sys.executable, '-c', probe, str(WEBHOOK), str(seeded[0]), event,
+                 json.dumps(payload)],
+                env=env, capture_output=True, text=True, check=True).stdout
+            self.assertEqual(json.loads(got), [self_claimed, True], (event, got))
+
+    def test_seed_reads_self_env_without_sed_on_path(self):
+        # The receiver's PATH has jq and coreutils but no sed. The seed must
+        # still learn the box's login from self.env, or it silently drops the
+        # direct-echo exclude. A failing sed shim stands in for its absence.
+        shim = self.root / 'shim'
+        shim.mkdir()
+        (shim / 'sed').write_text('#!/bin/sh\nexit 127\n')
+        (shim / 'sed').chmod(0o700)
+        (self.state / 'self.env').write_text('LOCAL_WEBHOOK_SELF=Box-Bot\n')
+        env = dict(self.env, PATH=str(shim) + os.pathsep + self.env['PATH'],
+                   LOCAL_WEBHOOK_SPAWN_SOURCE='github',
+                   LOCAL_WEBHOOK_SPAWN_KEY='owner/repo',
+                   LOCAL_WEBHOOK_SPAWN_EVENT='issue_comment',
+                   LOCAL_WEBHOOK_SPAWN_META=json.dumps({'number': 7}))
+        subprocess.run([str(self.spawn)], env=env, input='[UNTRUSTED] event\n',
+                       capture_output=True, text=True, timeout=30)
+        seeded = list(self.state.glob('filter.*-hook-owner-repo-*.json'))
+        self.assertEqual(len(seeded), 1, seeded)
+        entry = json.loads(seeded[0].read_text())['topics'][0]
+        self.assertIn('box-bot', json.dumps(entry.get('exclude')))
+
+    def test_claude_daemon_conversation_cannot_take_session_events(self):
+        # A Claude Remote Control daemon conversation has no channel: its
+        # session subscription would drop every event, and its claim would
+        # still brake the standing watch (PR #1051's review reached nobody).
+        sessions = self.root / '.config/agent-box/sessions.json'
+        sessions.write_text(json.dumps({'sessions': {
+            'rc': {'agent': 'claude', 'remoteControlDaemon': True},
+            'old': {'agent': 'claude', 'remoteControlServer': True},
+            'tui': {'agent': 'claude', 'remoteControlDaemon': False}}}))
+        user = subprocess.run(['id', '-un'], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        args = ['subscribe', 'owner/repo', '--note', 'n', '--claim', '7',
+                '--events', 'actionable']
+        def run(session, *extra, delivery=None):
+            env = dict(self.env, LOCAL_WEBHOOK_SESSION=user + '-' + session)
+            env.pop('LOCAL_WEBHOOK_CLAUDE_DELIVERY', None)
+            if delivery:
+                env['LOCAL_WEBHOOK_CLAUDE_DELIVERY'] = delivery
+            return subprocess.run(['bash', str(REPO / 'modules/src/webhook-cli.sh'),
+                                   *extra], env=env, capture_output=True,
+                                  text=True, timeout=15)
+        p = run('rc', *args)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn('Remote Control daemon', p.stderr)
+        self.assertFalse((self.state / ('filter.%s-rc.json' % user)).exists())
+        p = run('old', *args)
+        self.assertEqual(p.returncode, 2, p.stderr)
+        # A daemon the supervisor started with inbox delivery
+        # (local-channels#149) can take session events.
+        p = run('rc', *args, delivery='send')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        p = run('tui', *args)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        p = run('rc', 'subscribe', 'owner/repo', '--deliver-to', 'subagent',
+                '--note', 'n', '--when', '{"path":"action","in":["opened"]}')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
 
 
 if __name__ == '__main__':
