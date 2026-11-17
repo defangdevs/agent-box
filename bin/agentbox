@@ -412,7 +412,14 @@ def parse_flake_url(url):
         return None, rev
     if not url or not url.startswith("github:"):
         return None, None
-    parts = url[len("github:"):].split("/")
+    # A locked manifest `url` carries a query after the rev
+    # (`github:owner/repo/<rev>?narHash=sha256-...`), which is what nix
+    # writes for every `nix profile install` of a pinned github: flake.
+    # Matching with the query still attached found no rev at all, so the
+    # settings page showed forty zeroes and `agentbox update` refused the
+    # box as "not locked to a commit". Drop it before splitting, so it can
+    # land in neither the rev nor (on an unlocked url) the repo name.
+    parts = url[len("github:"):].split("?", 1)[0].split("/")
     if len(parts) < 2 or not parts[0] or not parts[1]:
         return None, None
     repo = f"{parts[0]}/{parts[1]}"
