@@ -1880,9 +1880,20 @@ EOF
     # sibling session, so refuse it. This is friction, not a boundary: the
     # session's user can read the source secret (issue #1062).
     if [ "$cmd" = emit ] && [ -n "${AGENT_BOX_SESSION_ID:-}" ] && [ -f "$SOURCES" ]; then
-      trust="$("$JQ" -r --arg s "${1:-}" '.sources[$s].trust // empty' "$SOURCES" 2>/dev/null || true)"
+      # Match webhook.py run_emit: --event and --delivery-id take a value;
+      # the first other word is SOURCE.
+      src=""; skip=0
+      for a in "$@"; do
+        if [ "$skip" = 1 ]; then skip=0; continue; fi
+        case "$a" in
+          --event|--delivery-id) skip=1 ;;
+          --*) ;;
+          *) src="$a"; break ;;
+        esac
+      done
+      trust="$("$JQ" -r --arg s "$src" '.sources[$s].trust // empty' "$SOURCES" 2>/dev/null || true)"
       if [ "$trust" = owner ]; then
-        echo "agent-box-webhook: refusing to emit on owner-trusted source '$1' from an agent session." >&2
+        echo "agent-box-webhook: refusing to emit on owner-trusted source '$src' from an agent session." >&2
         echo "  Its deliveries read as the box owner's own request; only box daemons that" >&2
         echo "  prove the owner wrote the text emit there (agent-box-whatsapp route)." >&2
         exit 2

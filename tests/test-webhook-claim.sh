@@ -955,6 +955,12 @@ emit_case() {  # NAME WANT_STATUS SESSION_ID SOURCE
 emit_case "a session's emit on the owner-trusted inbox is refused" 2 sess-1 inbox
 grep -q "owner-trusted source 'inbox'" "$work/err" \
   && ok "the refusal names the source" || no "the refusal names the source" "$(cat "$work/err")"
+# Options before SOURCE must not hide it from the guard.
+for pre in "--event message" "--delivery-id d1" "--event message --delivery-id d1"; do
+  # shellcheck disable=SC2086
+  out=$(AGENT_BOX_SESSION_ID=sess-1 bash "$SCRIPT" emit $pre inbox - 2>"$work/err" </dev/null); st=$?
+  if [ "$st" -eq 2 ]; then ok "emit $pre inbox is refused"; else no "emit $pre inbox is refused" "exit $st, stdout: $out"; fi
+done
 emit_case "a session's emit on an ordinary source passes" 0 sess-1 slack
 emit_case "the router outside a session still emits on inbox" 0 "" inbox
 emit_case "an unknown source is left to webhook.py" 0 sess-1 nosuch
