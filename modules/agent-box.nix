@@ -5039,6 +5039,209 @@ def main():
 if __name__ == "__main__":
     main()
   '');
+  # Root reboot helper (issue #1054): a reboot that needs nothing from the
+  # disk when the settings page's normal `sudo systemctl reboot` cannot exec.
+  rebootHelperBin = pkgs.writers.writePython3Bin "agent-box-reboot-helper" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+"""agent-box-reboot-helper - a reboot that needs nothing from the disk.
+
+The settings page's "Reboot box" button normally runs `sudo systemctl
+reboot`: two programs, both read from disk at the moment of the request.
+When the disk has gone away (issue #1053) the page still answers - it runs
+from RAM - and the button does nothing, because the `exec` cannot find its
+program. This helper is the last resort for that case.
+
+It is a root daemon that is ALREADY RUNNING when the disk fails. Everything
+it needs is open or loaded before it serves the first request:
+
+  * /proc/sysrq-trigger is open for writing, so a reboot is a `write()` on
+    a descriptor it holds - no path lookup, no exec;
+  * every module it uses is imported at the top, and mlockall() keeps its
+    pages resident, so a stalled disk cannot page the code out;
+  * the listening socket is bound, so no systemd socket activation (which
+    would have to start a process on demand) is involved.
+
+It then drops root. The open descriptor keeps working; what is left is a
+process that can write to one file and nothing else.
+
+Misuse hardening (the point of the design, not an afterthought):
+
+  * Only ONE agent user may connect: the kernel reports the peer's uid
+    (SO_PEERCRED) and anything else is closed unanswered. The socket file
+    is also 0600 and owned by that user.
+  * The request is exactly the seven bytes b"REBOOT\\n". The helper never
+    forwards a client byte anywhere: what it writes to sysrq-trigger comes
+    from the constants below, so no client can select another sysrq key
+    (crash, kill-all, ...). Any other request, longer, shorter, or slow, is
+    refused.
+  * It refuses outright unless the kernel's kernel.sysrq mask allows the
+    reboot function (bit 128, or the value 1).
+  * One request starts the sequence; later ones are answered "BUSY".
+
+The sequence is the classic sync (s), remount read-only (u), reboot (b),
+with a pause between each. The kernel runs s and u asynchronously and `b`
+does not wait for them, so the pauses are what give them a chance. They are
+bounded: a dead disk cannot stop the final `b`.
+"""
+import grp
+import os
+import pwd
+import socket
+import struct
+import sys
+import time
+
+REQUEST = b"REBOOT\n"
+SYSRQ_TRIGGER = "/proc/sysrq-trigger"
+SYSRQ_MASK = "/proc/sys/kernel/sysrq"
+# Bit 128 of kernel.sysrq allows reboot/poweroff; 1 allows everything.
+SYSRQ_REBOOT_BIT = 128
+# The ONLY bytes ever written to the trigger. Never derived from input.
+SEQUENCE = ((b"s", 3.0), (b"u", 3.0), (b"b", 0.0))
+CLIENT_TIMEOUT_S = 2.0
+NOBODY = 65534
+
+
+def sysrq_allows_reboot(mask_fd):
+    """True when kernel.sysrq lets the `b` function run."""
+    try:
+        raw = os.pread(mask_fd, 32, 0).strip()
+        value = int(raw)
+    except (OSError, ValueError):
+        return False
+    return value == 1 or bool(value & SYSRQ_REBOOT_BIT)
+
+
+def peer_uid(conn):
+    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                            struct.calcsize("3i"))
+    return struct.unpack("3i", creds)[1]
+
+
+def read_request(conn):
+    """Read at most len(REQUEST)+1 bytes before a deadline; the caller
+    compares them with REQUEST. One byte too many is read on purpose so a
+    longer message is a mismatch and not a silently truncated match."""
+    conn.settimeout(CLIENT_TIMEOUT_S)
+    data = b""
+    limit = len(REQUEST) + 1
+    deadline = time.monotonic() + CLIENT_TIMEOUT_S
+    while len(data) < limit and time.monotonic() < deadline:
+        try:
+            chunk = conn.recv(limit - len(data))
+        except OSError:
+            break
+        if not chunk:
+            break
+        data += chunk
+        if data == REQUEST:
+            # Complete request: stop here instead of waiting for EOF. A
+            # trailing byte would not have been read yet, so ask once
+            # more without blocking.
+            conn.settimeout(0.05)
+            try:
+                extra = conn.recv(1)
+            except OSError:
+                extra = b""
+            return data + extra
+    return data
+
+
+def reply(conn, text):
+    try:
+        conn.sendall(text)
+    except OSError:
+        pass
+
+
+def run_sequence(trigger_fd, sleep, delays=True):
+    for key, pause in SEQUENCE:
+        os.write(trigger_fd, key)
+        if pause and delays:
+            sleep(pause)
+
+
+def serve(sock, allowed_uid, trigger_fd, mask_fd, sleep=time.sleep,
+          delays=True, once=False):
+    started = False
+    while True:
+        conn, _ = sock.accept()
+        with conn:
+            try:
+                uid = peer_uid(conn)
+            except OSError:
+                continue
+            if uid != allowed_uid:
+                # Not answered: a stranger learns nothing, not even that a
+                # reboot helper is here.
+                continue
+            if read_request(conn) != REQUEST:
+                reply(conn, b"ERR request\n")
+                continue
+            if started:
+                reply(conn, b"BUSY\n")
+                continue
+            if not sysrq_allows_reboot(mask_fd):
+                reply(conn, b"ERR sysrq-disabled\n")
+                continue
+            started = True
+            reply(conn, b"OK\n")
+        try:
+            run_sequence(trigger_fd, sleep, delays)
+        except OSError as exc:
+            sys.stderr.write("agent-box-reboot-helper: sysrq write: %s\n" % exc)
+            started = False
+        if once:
+            return
+
+
+def lock_memory():
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    # MCL_CURRENT | MCL_FUTURE
+    if libc.mlockall(1 | 2) != 0:
+        sys.stderr.write("agent-box-reboot-helper: mlockall failed: errno %d\n"
+                         % ctypes.get_errno())
+
+
+def drop_privileges():
+    os.setgroups([])
+    os.setgid(NOBODY)
+    os.setuid(NOBODY)
+
+
+def main():
+    user = os.environ.get("AGENT_BOX_REBOOT_USER", "")
+    path = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+    if not user or not path:
+        sys.stderr.write("agent-box-reboot-helper: AGENT_BOX_REBOOT_USER and "
+                         "AGENT_BOX_REBOOT_SOCKET are required\n")
+        return 2
+    entry = pwd.getpwnam(user)
+    # Preload everything a later lookup could need, before the disk can fail.
+    grp.getgrall()
+    trigger_fd = os.open(SYSRQ_TRIGGER, os.O_WRONLY)
+    mask_fd = os.open(SYSRQ_MASK, os.O_RDONLY)
+    if os.path.lexists(path):
+        os.unlink(path)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    os.umask(0o177)
+    sock.bind(path)
+    os.chown(path, entry.pw_uid, -1)
+    os.chmod(path, 0o600)
+    sock.listen(4)
+    lock_memory()
+    drop_privileges()
+    sys.stderr.write("agent-box-reboot-helper: ready for uid %d on %s\n"
+                     % (entry.pw_uid, path))
+    serve(sock, entry.pw_uid, trigger_fd, mask_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+  '';
   secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
@@ -25928,6 +26131,13 @@ SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
 # reboots (see the box's apt policy). Without this the box has no way to
 # finish those updates at all — nobody inside it can reboot.
 REBOOT_CMD = os.environ.get("AGENT_BOX_REBOOT_CMD", "")
+# Socket of the root reboot helper (modules/src/reboot-helper.py), the
+# fallback when REBOOT_CMD cannot run because the disk is gone (issue 1054).
+# Empty on a box without the helper.
+REBOOT_SOCKET = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+# How long the normal reboot command gets before the helper is tried. A
+# failed disk may HANG the exec instead of failing it.
+REBOOT_CMD_TIMEOUT_S = 15
 # The distro's own "a reboot would apply something" marker: Debian and
 # Ubuntu's update machinery creates it, and the .pkgs file beside it
 # lists what asked. Both are world-readable, so the card reports WHY a
@@ -30412,8 +30622,31 @@ def update_box():
         sys.stderr.write("update_box: %s\n" % exc)
 
 
+def reboot_via_helper():
+    """Ask the root reboot helper to sysrq-reboot. True when it accepted.
+
+    Sends the one fixed request the helper understands. Nothing here reads
+    the disk: the socket module is already imported and the helper is
+    already running.
+    """
+    if not REBOOT_SOCKET:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(REBOOT_SOCKET)
+            conn.sendall(b"REBOOT\n")
+            answer = conn.recv(64).strip()
+    except OSError as exc:
+        sys.stderr.write("reboot_box: helper: %s\n" % exc)
+        return False
+    sys.stderr.write("reboot_box: helper answered %r\n" % answer[:32])
+    return answer in (b"OK", b"BUSY")
+
+
 def reboot_box():
-    """Trigger the reboot through the allowlisted sudo command.
+    """Trigger the reboot through the allowlisted sudo command, and when
+    that cannot run (no disk to exec sudo from), through the root helper.
 
     The caller sends its HTTP response BEFORE calling this (see the
     /reboot route): --no-block returns immediately, but systemd starts
@@ -30421,10 +30654,15 @@ def reboot_box():
     written afterwards can lose the race with its own socket going away.
     """
     try:
-        proc = subprocess.run(REBOOT_CMD.split(), check=False, capture_output=True)
+        proc = subprocess.run(REBOOT_CMD.split(), check=False,
+                              capture_output=True,
+                              timeout=REBOOT_CMD_TIMEOUT_S)
         sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
-    except OSError as exc:
+        if proc.returncode == 0:
+            return
+    except (OSError, subprocess.SubprocessError) as exc:
         sys.stderr.write("reboot_box: %s\n" % exc)
+    reboot_via_helper()
 
 
 def reboot_pending():
@@ -40994,6 +41232,29 @@ if __name__ == "__main__":
           Restart = lib.mkForce "always";
         };
       }
+      // lib.optionalAttrs rebootButton {
+        # Issue #1054: a reboot that needs nothing from the disk. Runs from
+        # boot so its code and /proc/sysrq-trigger are already in RAM and
+        # open when a failing disk makes `sudo systemctl reboot` unable to
+        # exec. See src/reboot-helper.py for the request protocol.
+        agent-box-reboot-helper = {
+          description = "agent-box: disk-independent reboot helper";
+          wantedBy = [ "multi-user.target" ];
+          environment = {
+            AGENT_BOX_REBOOT_USER = rootUser;
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
+          };
+          serviceConfig = {
+            ExecStart = "${rebootHelperBin}/bin/agent-box-reboot-helper";
+            RuntimeDirectory = "agent-box-reboot";
+            RuntimeDirectoryMode = "0755";
+            Restart = "always";
+            RestartSec = "5s";
+            LimitMEMLOCK = "infinity";
+            OOMScoreAdjust = -900;
+          };
+        };
+      }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
         # The attach script (src/attach.sh) resolves tmux, jq and head
@@ -41107,6 +41368,8 @@ if __name__ == "__main__":
             # the daemon hides the card and 404s the route without it, so
             # another user's page cannot even ask.
             AGENT_BOX_REBOOT_CMD = "/run/wrappers/bin/sudo -n ${rebootCmd}";
+            # Fallback when that cannot exec (issue #1054).
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
           })
           // {
             # mkForce for the reason spelled out on the "agent-box@" unit:

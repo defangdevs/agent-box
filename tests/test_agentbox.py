@@ -2672,6 +2672,9 @@ class RenderTest(unittest.TestCase):
                 out / "etc/systemd/system/agent-box-fail2ban.service",
                 out / "etc/systemd/system/agent-web-terminal@.service",
                 out / "etc/systemd/system/agent-box-settings@.service",
+                # Issue #1054: the reboot helper exists only with the
+                # Reboot button, which needs the settings page.
+                out / "etc/systemd/system/agent-box-reboot-helper.service",
                 out / "etc/agent-box/Caddyfile",
                 out / mod.CADDY_RELOAD_POLICY.lstrip("/"),
                 out / "etc/agent-box/web-users",
@@ -2718,7 +2721,8 @@ class RenderTest(unittest.TestCase):
             # Requires= last.
             self.assertEqual(["agent-box-fail2ban.service",
                               "caddy.service",
-                              "agent-web-auth-secrets.service"],
+                              "agent-web-auth-secrets.service",
+                              "agent-box-reboot-helper.service"],
                              tree.disable)
             # The password and cookie secrets are deliberately NOT removed:
             # turning the terminal off must not throw away the credential
