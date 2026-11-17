@@ -95,6 +95,7 @@ import fcntl
 import functools
 import glob
 import hashlib
+import hmac
 import html
 import http.server
 import json
@@ -8520,7 +8521,7 @@ RECEIVE_FILE_RE = re.compile(
 RECEIVE_PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Send a file to __USER__</title>
+<title>Send files to __USER__</title>
 <style nonce="__NONCE__">
 :root{color-scheme:light dark}body{margin:0;background:#0d1117;color:#e6edf3;
 font:15px/1.5 system-ui,sans-serif}.card{max-width:38rem;margin:8vh auto;
@@ -8535,14 +8536,18 @@ border-color:#58a6ff;background:#1f6feb26}.drop:focus-within{outline:2px solid
 #file{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;
 clip-path:inset(50%);white-space:nowrap;border:0}
 progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
+#queue{list-style:none;margin:0;padding:0}#queue li{padding:.25rem 0;
+border-top:1px solid #30363d;overflow-wrap:anywhere;color:#8b949e}
+#queue li.done{color:#3fb950}#queue li.error{color:#f85149}
 </style></head><body data-slot="__SLOT__"><main class="card">
-<h1>Send one file to __USER__</h1>
-<p>This private link accepts one resumable upload. It does not grant access
-to the terminal or any existing files.</p>
-<label id="drop" class="drop" for="file"><strong id="prompt">Drop a file here</strong>
-<span>or tap to choose one</span><input id="file" type="file"></label>
+<h1>Send files to __USER__</h1>
+<p>This private link accepts a limited number of resumable uploads. It does
+not grant access to the terminal or any existing files.</p>
+<label id="drop" class="drop" for="file"><strong id="prompt">Drop files here</strong>
+<span>or tap to choose them</span><input id="file" type="file" multiple></label>
 <progress id="progress" aria-label="Upload progress" value="0" max="1"></progress>
 <p id="status" role="status"></p>
+<ul id="queue" aria-label="Files"></ul>
 </main><script nonce="__NONCE__">
 (() => {
   'use strict';
@@ -8553,39 +8558,81 @@ to the terminal or any existing files.</p>
   const prompt = document.getElementById('prompt');
   const progress = document.getElementById('progress');
   const status = document.getElementById('status');
+  const queue = document.getElementById('queue');
+  const MAX_FILES = __MAX_FILES__;
   let uploading = false;
-  const collection = location.pathname.replace(/\/?$/, '/') + 'files';
-  const resource = collection + '/upload';
+  // /<user>/receive/<slot>/ -> /<user>/receive/
+  const base = location.pathname.replace(/[^/]+\/?$/, '');
   const validToken = token.startsWith(slot + '.') &&
     /^[A-Za-z0-9_.-]+$/.test(token);
-  const auth = () => ({'Authorization': 'Bearer ' + token,
-                       'Tus-Resumable': '1.0.0'});
+  const master = token.slice(slot.length + 1);
+  const encoder = new TextEncoder();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const hex = bytes => Array.from(bytes, byte =>
+    byte.toString(16).padStart(2, '0')).join('');
   const b64 = value => {
-    const bytes = new TextEncoder().encode(value);
+    const bytes = encoder.encode(value);
     let binary = '';
     for (const byte of bytes) binary += String.fromCharCode(byte);
     return btoa(binary);
   };
+  // One link carries up to MAX_FILES slots, each bound to one file. Slot 0
+  // is the link itself; the rest are HMAC-SHA256 of its secret, the same
+  // derivation agent-box-receive uses when it mints them.
+  const derive = async (label, index, size) => {
+    const key = await crypto.subtle.importKey(
+      'raw', encoder.encode(master), {name: 'HMAC', hash: 'SHA-256'},
+      false, ['sign']);
+    const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(
+      'agent-box-receive-v1\n' + label + '\n' + index));
+    return hex(new Uint8Array(mac)).slice(0, size);
+  };
+  const lanes = [];
+  const lane = async index => {
+    if (!lanes[index]) {
+      let id = slot;
+      let bearer = token;
+      if (index > 0) {
+        id = await derive('slot', index, 24);
+        bearer = id + '.' + await derive('secret', index, 64);
+      }
+      const collection = base + id + '/files';
+      lanes[index] = {collection, resource: collection + '/upload',
+                      bearer};
+    }
+    return lanes[index];
+  };
+  const auth = l => ({'Authorization': 'Bearer ' + l.bearer,
+                      'Tus-Resumable': '1.0.0'});
   const metadata = (file, content) => 'filename ' + b64(file.name) +
     ',fingerprint ' + b64(file.name + '\n' + file.size + '\n' +
                           file.lastModified) + ',content ' + b64(content);
   const contentEtag = content => '"' + content + '"';
-  const hex = bytes => Array.from(bytes, byte =>
-    byte.toString(16).padStart(2, '0')).join('');
-  const contentId = async file => {
+  // One bar for the whole batch: bytes of finished files plus the bytes of
+  // the file in flight, over the total size of every selected file.
+  const tally = {done: 0, total: 0};
+  const bar = offset => {
+    progress.max = Math.max(tally.total, 1);
+    progress.value = Math.min(tally.done + offset, progress.max);
+    return Math.floor(100 * progress.value / progress.max);
+  };
+  const show = (text, offset) => {
+    const percent = bar(offset);
+    status.textContent = text + ' ' + percent + '%';
+  };
+  const contentId = async (file, label) => {
     const leaves = [];
     let checked = 0;
-    show('Checking ' + file.name + '...', 0, file.size);
+    show('Checking ' + label + '...', 0);
     while (checked < file.size) {
       const end = Math.min(checked + __HASH_CHUNK__, file.size);
       const block = await file.slice(checked, end).arrayBuffer();
       leaves.push(new Uint8Array(
         await crypto.subtle.digest('SHA-256', block)));
       checked = end;
-      show('Checking ' + file.name + '...', checked, file.size);
+      show('Checking ' + label + '...', 0);
     }
-    const prefix = new TextEncoder().encode(
+    const prefix = encoder.encode(
       'agent-box-content-v1\n' + file.size + '\n');
     const tree = new Uint8Array(prefix.length + leaves.length * 32);
     tree.set(prefix);
@@ -8598,102 +8645,233 @@ to the terminal or any existing files.</p>
     try { detail = (await response.text()).trim(); } catch (_) {}
     throw new Error(detail || ('Upload request failed (' + response.status + ')'));
   };
-  const head = async (file, content) => {
-    const response = await fetch(resource, {method: 'HEAD', headers: auth(),
-                                            cache: 'no-store'});
-    if (response.status === 404) return null;
+  // What one slot holds: nothing yet (free), a file (bound), a transfer that
+  // failed its content check (dead), or no such slot (absent).
+  const probe = async (l, extra) => {
+    const headers = auth(l);
+    if (extra) Object.assign(headers, extra);
+    const response = await fetch(l.resource, {method: 'HEAD', headers,
+                                              cache: 'no-store'});
+    // Only the link's first slot says how many files it was minted for.
+    const files = Number(response.headers.get('Agent-Box-Link-Files')) || 0;
+    if (response.status === 404) return {state: 'free', files};
+    if (response.status === 403) return {state: 'absent', files};
+    if (response.status === 422) return {state: 'dead', files};
+    if (response.status === 412) return {state: 'changed', files};
     if (!response.ok) return fail(response);
-    if (Number(response.headers.get('Upload-Length')) !== file.size) {
-      throw new Error('This link is already bound to a different file.');
-    }
-    if (response.headers.get('Upload-Complete') === '?1') {
-      const headers = auth();
-      headers['If-Match'] = contentEtag(content);
-      const verified = await fetch(resource, {
-        method: 'HEAD', headers, cache: 'no-store'
-      });
-      if (verified.status === 412) {
-        throw new Error('This link is already bound to a different file.');
-      }
-      if (!verified.ok) return fail(verified);
-      return Number(verified.headers.get('Upload-Offset'));
-    }
-    if (response.headers.get('Upload-Content') !== content) {
-      throw new Error('This link is already bound to a different file.');
-    }
-    return Number(response.headers.get('Upload-Offset'));
+    const complete = response.headers.get('Upload-Complete') === '?1';
+    return {
+      state: 'bound', complete, files,
+      offset: Number(response.headers.get('Upload-Offset')),
+      content: complete
+        ? (response.headers.get('ETag') || '').replace(/^"|"$/g, '')
+        : response.headers.get('Upload-Content'),
+    };
   };
-  const create = async (file, details) => {
-    const headers = auth();
+  const survey = async () => {
+    const first = await lane(0);
+    const head = await probe(first);
+    if (head.state === 'absent') {
+      throw new Error('This upload link is invalid, expired, or revoked.');
+    }
+    const slots = [Object.assign({lane: first}, head)];
+    // A link minted before multi-file support reports no count: one file.
+    // A slot revoked on its own is skipped, not taken for the end.
+    const count = Math.min(head.files || 1, MAX_FILES);
+    for (let index = 1; index < count; index++) {
+      const l = await lane(index);
+      const info = await probe(l);
+      if (info.state !== 'absent') slots.push(Object.assign({lane: l}, info));
+    }
+    return slots;
+  };
+  const create = async (l, file, details) => {
+    const headers = auth(l);
     headers['Upload-Length'] = String(file.size);
     headers['Upload-Metadata'] = details;
-    const response = await fetch(collection, {method: 'POST', headers});
+    const response = await fetch(l.collection, {method: 'POST', headers});
     if (!response.ok) return fail(response);
     return Number(response.headers.get('Upload-Offset') || '0');
   };
-  const show = (text, offset, size) => {
-    status.textContent = text;
-    progress.max = Math.max(size, 1);
-    progress.value = offset;
-  };
-  async function upload(file) {
-    const content = await contentId(file);
-    const details = metadata(file, content);
-    let offset = await head(file, content);
-    if (offset === null) offset = await create(file, details);
-    show('Uploading ' + file.name + '...', offset, file.size);
+  async function send(file, slots, caption) {
+    const content = await contentId(file, caption);
+    let target = slots.find(s => s.state === 'bound' && s.content === content);
+    let offset;
+    if (target) {
+      if (target.complete) {
+        // Trust the bytes, not the metadata: the server confirms the
+        // completed file's content before this one is skipped.
+        const verified = await probe(
+          target.lane, {'If-Match': contentEtag(content)});
+        if (verified.state !== 'bound') {
+          throw new Error('This link is already bound to a different file.');
+        }
+        return;
+      }
+      // An unfinished slot may have moved since it was cached, for example
+      // after an earlier file with the same bytes ran out of retries.
+      const fresh = await probe(target.lane);
+      if (fresh.state !== 'bound' || fresh.content !== content) {
+        throw new Error('This link is already bound to a different file.');
+      }
+      if (fresh.complete) {
+        target.complete = true;
+        return;
+      }
+      offset = fresh.offset;
+    } else {
+      target = slots.find(s => s.state === 'free');
+      if (!target) {
+        throw new Error(slots.length === 1
+          ? 'This link is already bound to a different file.'
+          : 'This link accepts at most ' + slots.length +
+            ' files and all of them are in use.');
+      }
+      try {
+        offset = await create(target.lane, file, metadata(file, content));
+      } catch (error) {
+        // The server may have stored the file even though the answer never
+        // arrived. Ask, so a later file does not pick the same slot again.
+        let now;
+        try { now = await probe(target.lane); } catch (_) { throw error; }
+        if (now.state === 'bound' || now.state === 'dead') {
+          Object.assign(target, now);
+        }
+        if (now.state !== 'bound' || now.content !== content) throw error;
+        // Created after all: carry on with the bytes it holds.
+        if (now.complete) return;
+        offset = now.offset;
+      }
+      target.state = 'bound';
+      target.content = content;
+      target.complete = false;
+    }
+    const l = target.lane;
+    show('Uploading ' + caption + '...', offset);
     let failures = 0;
     while (offset < file.size) {
       const end = Math.min(offset + __CHUNK__, file.size);
-      const headers = auth();
+      const headers = auth(l);
       headers['Upload-Offset'] = String(offset);
       headers['Content-Type'] = 'application/offset+octet-stream';
       try {
-        const response = await fetch(resource, {
+        const response = await fetch(l.resource, {
           method: 'PATCH', headers, body: file.slice(offset, end)
         });
         if (!response.ok) await fail(response);
         offset = Number(response.headers.get('Upload-Offset'));
         failures = 0;
-        show('Uploading ' + file.name + '...', offset, file.size);
+        show('Uploading ' + caption + '...', offset);
       } catch (error) {
         if (++failures > 6) throw error;
-        show('Connection interrupted; resuming...', offset, file.size);
+        show('Connection interrupted; resuming...', offset);
         await sleep(Math.min(1000 * (2 ** failures), 15000));
-        const resumed = await head(file, content);
-        if (resumed === null) throw error;
+        const resumed = await probe(l);
+        if (resumed.state !== 'bound' || resumed.content !== content) {
+          throw error;
+        }
         // A timed-out or cut-off chunk can still persist bytes. Count only
         // failures that made no progress, so a slow link is not abandoned.
-        if (resumed > offset) failures = 0;
-        offset = resumed;
+        if (resumed.offset > offset) failures = 0;
+        offset = resumed.offset;
       }
     }
-    show('Upload complete. You may close this page.', offset, file.size);
+    target.complete = true;
   }
+  const row = file => {
+    const item = document.createElement('li');
+    item.textContent = file.name + ' - waiting';
+    queue.appendChild(item);
+    return item;
+  };
+  const mark = (item, file, text, kind) => {
+    item.textContent = file.name + ' - ' + text;
+    item.className = kind || '';
+  };
+  const upload = async (files, note) => {
+    uploading = true;
+    input.disabled = true;
+    drop.classList.add('disabled');
+    prompt.textContent = files.length === 1 ? files[0].name
+                                            : files.length + ' files';
+    queue.textContent = '';
+    tally.done = 0;
+    tally.total = files.reduce((sum, file) => sum + file.size, 0);
+    bar(0);
+    const rows = files.map(row);
+    let done = 0;
+    let lastError = '';
+    try {
+      const slots = await survey();
+      for (let n = 0; n < files.length; n++) {
+        const file = files[n];
+        const caption = files.length === 1 ? file.name
+          : file.name + ' (' + (n + 1) + ' of ' + files.length + ')';
+        try {
+          await send(file, slots, caption);
+          done++;
+          tally.done += file.size;
+          bar(0);
+          mark(rows[n], file, 'done', 'done');
+        } catch (error) {
+          lastError = error.message;
+          mark(rows[n], file, error.message, 'error');
+        }
+      }
+      if (done === files.length) {
+        status.textContent = files.length === 1
+          ? 'Upload complete. You may close this page.'
+          : 'Uploaded ' + done + ' of ' + files.length +
+            ' files. You may close this page.';
+        progress.max = Math.max(tally.total, 1);
+        progress.value = progress.max;
+      } else {
+        status.textContent = files.length === 1 ? lastError
+          : 'Uploaded ' + done + ' of ' + files.length + ' files.';
+      }
+    } catch (error) {
+      status.textContent = error.message;
+    }
+    if (note) status.textContent += ' ' + note;
+    uploading = false;
+    input.disabled = false;
+    input.value = '';
+    drop.classList.remove('disabled');
+  };
   if (!validToken) {
     status.textContent = 'This upload link is incomplete.';
   } else {
-    const selectFile = async files => {
+    // A drop hands over every dragged item, folders included, and there is
+    // no accept filter as in the file dialog. Folders are skipped here.
+    const dropped = transfer => {
+      const files = [];
+      let folders = 0;
+      const items = Array.from(transfer.items || []);
+      if (items.length) {
+        for (const item of items) {
+          if (item.kind !== 'file') continue;
+          const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+          if (entry && entry.isDirectory) { folders++; continue; }
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      } else {
+        files.push(...transfer.files);
+      }
+      return {files, folders};
+    };
+    const selectFiles = (files, folders) => {
       if (uploading) return;
-      if (files.length !== 1) {
+      const note = folders
+        ? 'Skipped ' + folders + (folders === 1 ? ' folder' : ' folders') +
+          '; choose files only.' : '';
+      if (!files.length) {
         input.value = '';
-        prompt.textContent = 'Drop a file here';
-        status.textContent = 'Choose exactly one file.';
+        prompt.textContent = 'Drop files here';
+        status.textContent = note || 'Choose at least one file.';
         return;
       }
-      const file = files[0];
-      prompt.textContent = file.name;
-      uploading = true;
-      input.disabled = true;
-      drop.classList.add('disabled');
-      try { await upload(file); }
-      catch (error) {
-        uploading = false;
-        input.disabled = false;
-        input.value = '';
-        drop.classList.remove('disabled');
-        status.textContent = error.message;
-      }
+      upload(files, note);
     };
     const stopDrag = event => {
       event.preventDefault();
@@ -8716,9 +8894,11 @@ to the terminal or any existing files.</p>
     drop.addEventListener('drop', event => {
       stopDrag(event);
       drop.classList.remove('dragging');
-      selectFile(event.dataTransfer.files);
+      const result = dropped(event.dataTransfer);
+      selectFiles(result.files, result.folders);
     });
-    input.addEventListener('change', () => selectFile(input.files));
+    input.addEventListener('change', () => selectFiles(
+      Array.from(input.files), 0));
   }
 })();
 </script></body></html>'''
@@ -8729,7 +8909,8 @@ def receive_page(slot, nonce):
             .replace("__SLOT__", slot)
             .replace("__NONCE__", nonce)
             .replace("__CHUNK__", str(RECEIVE_CHUNK_MAX))
-            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK)))
+            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK))
+            .replace("__MAX_FILES__", str(RECEIVE_MAX_FILES)))
 
 
 def receive_metadata(raw):
@@ -8929,6 +9110,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if send_body:
             self.wfile.write(data)
 
+    @staticmethod
+    def _receive_link_headers(record):
+        """Tell the page how many slots the link was minted with.
+
+        Only a link's first record carries the count. A link minted before
+        multi-file support has none, and the page reads that as one file.
+        """
+        files = record.get("files")
+        if isinstance(files, int) and files > 0:
+            return {"Agent-Box-Link-Files": files}
+        return {}
+
     def _receive_headers(self, record, offset):
         headers = {
             "Tus-Resumable": "1.0.0",
@@ -8953,6 +9146,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The partial upload changes after each PATCH, so its target
             # identity is resume metadata rather than an HTTP entity tag.
             headers["Upload-Content"] = record["content"]
+        headers.update(self._receive_link_headers(record))
         return headers
 
     def _receive_create(self, slot):
@@ -9083,11 +9277,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if record is None:
                     return
                 if record["status"] == "waiting":
-                    self._receive_error(404, "No file has been started for this link.")
+                    self._receive_error(
+                        404, "No file has been started for this link.",
+                        self._receive_link_headers(record))
                     return
                 if record["status"] == "failed":
                     self._receive_error(
-                        422, "Uploaded bytes did not match the selected file.")
+                        422, "Uploaded bytes did not match the selected file.",
+                        self._receive_link_headers(record))
                     return
                 offset = receive_offset(record)
                 if offset is None:

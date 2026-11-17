@@ -39,6 +39,14 @@ UPLOADS = None
 daemon = None
 
 
+def load_source(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
 def setUpModule():
     global WORK, STATE, UPLOADS, daemon
     WORK = tempfile.mkdtemp(prefix="agent-box-receive-")
@@ -57,11 +65,7 @@ def setUpModule():
         "AGENT_BOX_UPLOADS_DIR": UPLOADS,
     })
     try:
-        loader = importlib.machinery.SourceFileLoader(
-            "agent_box_receive_under_test", str(DAEMON))
-        spec = importlib.util.spec_from_loader(loader.name, loader)
-        daemon = importlib.util.module_from_spec(spec)
-        loader.exec_module(daemon)
+        daemon = load_source("agent_box_receive_under_test", DAEMON)
     finally:
         os.environ.clear()
         os.environ.update(saved)
@@ -152,9 +156,9 @@ class ReceiveHTTPTest(unittest.TestCase):
         status, headers, body = self.request("GET", self.page)
         self.assertEqual(status, 200)
         self.assertNotIn(self.token.encode(), body)
-        self.assertIn(b"one resumable upload", body)
-        self.assertIn(b"Drop a file here", body)
-        self.assertIn(b"event.dataTransfer.files", body)
+        self.assertIn(b"resumable uploads", body)
+        self.assertIn(b"Drop files here", body)
+        self.assertIn(b"dropped(event.dataTransfer)", body)
         self.assertEqual(headers["Referrer-Policy"], "no-referrer")
         self.assertIn("frame-ancestors 'none'",
                       headers["Content-Security-Policy"])
@@ -309,6 +313,106 @@ class ReceiveHTTPTest(unittest.TestCase):
         self.assertEqual(status, 409)
         self.assertEqual(headers["Location"], self.resource)
 
+    def test_one_link_carries_several_independent_file_slots(self):
+        slot, token, _record = daemon.receive_create(3600, 64 << 20, files=3)
+        secret = token.split(".", 1)[1]
+        lanes = [(slot, token)]
+        for index in (1, 2):
+            child, child_secret = daemon.receive_child(secret, index)
+            self.assertRegex(child, r"^[0-9a-f]{24}$")
+            lanes.append((child, child + "." + child_secret))
+        self.assertEqual(len({name for name, _ in lanes}), 3)
+        for number, (name, bearer) in enumerate(lanes):
+            headers = {"Authorization": "Bearer " + bearer,
+                       "Tus-Resumable": "1.0.0",
+                       "Upload-Length": "3",
+                       "Upload-Metadata": metadata(
+                           "f%d.bin" % number, 3, content=b"abc")}
+            path = "/alice/receive/%s/files" % name
+            self.assertEqual(
+                self.request("POST", path, headers=headers)[0], 201)
+            headers = {"Authorization": "Bearer " + bearer,
+                       "Tus-Resumable": "1.0.0", "Upload-Offset": "0",
+                       "Content-Type": "application/offset+octet-stream"}
+            self.assertEqual(self.request(
+                "PATCH", path + "/upload", body=b"abc",
+                headers=headers)[0], 204)
+        self.assertEqual(len(list(pathlib.Path(UPLOADS).glob("f*.bin"))), 3)
+        # A slot's token opens that slot and no other.
+        cross = {"Authorization": "Bearer " + lanes[1][1],
+                 "Tus-Resumable": "1.0.0"}
+        self.assertEqual(self.request(
+            "HEAD", "/alice/receive/%s/files/upload" % slot,
+            headers=cross)[0], 403)
+
+    def test_single_file_link_has_no_derived_slots(self):
+        secret = self.token.split(".", 1)[1]
+        child, child_secret = daemon.receive_child(secret, 1)
+        headers = {"Authorization": "Bearer %s.%s" % (child, child_secret),
+                   "Tus-Resumable": "1.0.0"}
+        status = self.request(
+            "HEAD", "/alice/receive/%s/files/upload" % child,
+            headers=headers)[0]
+        self.assertEqual(status, 403)
+        self.assertNotIn("link", self.record)
+
+    def test_first_slot_reports_how_many_files_the_link_holds(self):
+        slot, token, _record = daemon.receive_create(3600, 64 << 20, files=3)
+        headers = {"Authorization": "Bearer " + token,
+                   "Tus-Resumable": "1.0.0"}
+        path = "/alice/receive/%s/files/upload" % slot
+        status, reply, _body = self.request("HEAD", path, headers=headers)
+        self.assertEqual(status, 404)
+        self.assertEqual(reply["Agent-Box-Link-Files"], "3")
+        # The count follows the slot through every later state.
+        create = dict(headers, **{
+            "Upload-Length": "3",
+            "Upload-Metadata": metadata("n.bin", 3, content=b"abc")})
+        self.assertEqual(self.request(
+            "POST", "/alice/receive/%s/files" % slot, headers=create)[0], 201)
+        status, reply, _body = self.request("HEAD", path, headers=headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(reply["Agent-Box-Link-Files"], "3")
+        # A child, and a link minted before multi-file support, name none.
+        child, child_secret = daemon.receive_child(token.split(".", 1)[1], 1)
+        status, reply, _body = self.request(
+            "HEAD", "/alice/receive/%s/files/upload" % child,
+            headers={"Authorization": "Bearer %s.%s" % (child, child_secret),
+                     "Tus-Resumable": "1.0.0"})
+        self.assertEqual(status, 404)
+        self.assertNotIn("Agent-Box-Link-Files", reply)
+        legacy = daemon.receive_read(self.slot)
+        legacy.pop("files", None)
+        daemon.receive_write(legacy)
+        status, reply, _body = self.request("HEAD", self.resource,
+                                            headers=self.auth())
+        self.assertEqual(status, 404)
+        self.assertNotIn("Agent-Box-Link-Files", reply)
+
+    def test_link_creation_holds_the_lock_revocation_needs(self):
+        seen = []
+        original = daemon.receive_store_new
+
+        def watching(record):
+            fd = os.open(os.path.join(STATE, ".links.lock"), os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    seen.append(False)
+                except BlockingIOError:
+                    seen.append(True)
+            finally:
+                os.close(fd)
+            return original(record)
+        with mock.patch.object(daemon, "receive_store_new", watching):
+            daemon.receive_create(3600, 1024, files=3)
+        self.assertEqual(seen, [True, True, True])
+
+    def test_file_count_is_bounded(self):
+        for files in (0, daemon.RECEIVE_MAX_FILES + 1):
+            with self.assertRaises(ValueError):
+                daemon.receive_create(3600, 1024, files=files)
+
     def test_size_limit_is_enforced_before_a_partial_is_created(self):
         record = daemon.receive_read(self.slot)
         record["max_bytes"] = 4
@@ -451,33 +555,101 @@ class ReceiveHTTPTest(unittest.TestCase):
 
 
 class ReceiveCLITest(unittest.TestCase):
-    def test_cli_prints_secret_only_in_fragment_and_can_revoke(self):
-        assembled = os.path.join(WORK, "agent-box-receive.py")
-        with open(assembled, "w") as output:
+    def setUp(self):
+        self.assembled = os.path.join(WORK, "agent-box-receive.py")
+        with open(self.assembled, "w") as output:
             subprocess.run([
                 sys.executable, str(REPO / "bin" / "assemble-module.py"),
                 "--resolve", str(REPO / "modules" / "src" / "receive-cli.py"),
             ], check=True, stdout=output)
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-               "HOME": WORK,
-               "AGENT_BOX_URL": "https://box.example/alice/",
-               "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
-               "AGENT_BOX_UPLOADS_DIR": UPLOADS}
-        made = subprocess.run(
-            [sys.executable, assembled, "--ttl", "1h", "--max-size", "500M"],
-            check=True, text=True, capture_output=True, env=env)
-        url = made.stdout.strip()
+        self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": WORK,
+                    "AGENT_BOX_URL": "https://box.example/alice/",
+                    "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
+                    "AGENT_BOX_UPLOADS_DIR": UPLOADS}
+        shutil.rmtree(STATE, ignore_errors=True)
+
+    def run_cli(self, *args, check=True):
+        return subprocess.run(
+            [sys.executable, self.assembled, *args], check=check, text=True,
+            capture_output=True, env=self.env)
+
+    def json_names(self):
+        return [n for n in os.listdir(STATE) if n.endswith(".json")]
+
+    def test_cli_prints_secret_only_in_fragment_and_can_revoke(self):
+        url = self.run_cli("--ttl", "1h", "--max-size", "500M").stdout.strip()
         self.assertRegex(
             url, r"^https://box\.example/alice/receive/[A-Za-z0-9_-]+/#"
                  r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$")
         slot = url.split("/receive/", 1)[1].split("/", 1)[0]
-        listed = subprocess.run(
-            [sys.executable, assembled, "list"], check=True, text=True,
-            capture_output=True, env=env)
-        self.assertIn(slot, listed.stdout)
-        subprocess.run([sys.executable, assembled, "revoke", slot],
-                       check=True, text=True, capture_output=True, env=env)
+        self.assertIn(slot, self.run_cli("list").stdout)
+        self.run_cli("revoke", slot)
         self.assertFalse(os.path.exists(os.path.join(STATE, slot + ".json")))
+
+    def test_multi_file_link_lists_and_revokes_as_one(self):
+        info = json.loads(self.run_cli("--files", "4", "--json").stdout)
+        self.assertEqual(info["files"], 4)
+        slot = info["slot"]
+        self.assertEqual(len(self.json_names()), 4)
+        listed = self.run_cli("list").stdout.splitlines()
+        self.assertEqual(listed[0].split("\t")[-1], "LINK")
+        self.assertEqual(
+            sorted(line.split("\t")[-1] for line in listed[1:]),
+            sorted([slot] * 3 + ["-"]))
+        self.run_cli("revoke", slot)
+        self.assertEqual(self.json_names(), [])
+        for bad in ("0", "101"):
+            refused = self.run_cli("--files", bad, check=False)
+            self.assertNotEqual(refused.returncode, 0)
+        self.assertEqual(
+            json.loads(self.run_cli("--json").stdout)["files"], 10)
+
+    def test_revoke_finishes_after_the_first_record_was_pruned(self):
+        slot = json.loads(
+            self.run_cli("--files", "3", "--json").stdout)["slot"]
+        # Marking the primary and then failing on a child leaves the
+        # primary revoked, and pruning removes its record.
+        daemon.receive_mark_revoked(slot)
+        self.assertEqual(daemon.receive_prune(), 1)
+        self.assertEqual(len(self.json_names()), 2)
+        done = self.run_cli("revoke", slot, check=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.json_names(), [])
+        gone = self.run_cli("revoke", slot, check=False)
+        self.assertNotEqual(gone.returncode, 0)
+        self.assertIn("no such slot", gone.stderr)
+
+    def test_revoke_refuses_when_the_link_cannot_be_enumerated(self):
+        slot = json.loads(
+            self.run_cli("--files", "3", "--json").stdout)["slot"]
+        # Load the assembled CLI itself so its revoke runs in this process,
+        # where listing the state directory can be made to fail.
+        saved = dict(os.environ)
+        os.environ.update({"HOME": WORK,
+                           "AGENT_BOX_RECEIVE_STATE_DIR": STATE,
+                           "AGENT_BOX_UPLOADS_DIR": UPLOADS})
+        try:
+            cli = load_source(
+                "agent_box_receive_cli_under_test", self.assembled)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        real_listdir = os.listdir
+
+        def failing(path="."):
+            if os.fspath(path) == STATE:
+                raise PermissionError(13, "Permission denied", STATE)
+            return real_listdir(path)
+        with mock.patch.object(cli.os, "listdir", failing):
+            with self.assertRaises(SystemExit) as caught:
+                cli.cmd_revoke(mock.Mock(slot=slot))
+        self.assertIn("cannot revoke", str(caught.exception))
+        # Nothing was marked or removed, so the same command can run again.
+        self.assertEqual(len(self.json_names()), 3)
+        self.assertEqual(
+            [n for n in os.listdir(STATE) if n.endswith(".revoked")], [])
+        self.assertEqual(self.run_cli("revoke", slot).returncode, 0)
 
 
 if __name__ == "__main__":
