@@ -314,10 +314,15 @@ a browser asks to accept once. The site is the owner's
 `~/sites/agent-box-tailnet.caddy`, written by Connect and removed by
 Disconnect; do not edit it.
 
-A service bound to 127.0.0.1 stays private. A service bound to 0.0.0.0 is
-reachable from every tailnet device the tailnet's access rules allow, as it
-is from the internet when a port is open. Tailscale SSH, exit nodes and subnet
-routes stay off.
+A service bound to 127.0.0.1 stays private. The box's own firewall governs
+the tailnet interface like any other, so a service bound to 0.0.0.0 is
+reachable from the tailnet only on a port that firewall opens, as from the
+internet. Tailscale SSH, exit nodes and subnet routes stay off.
+
+Disconnect logs the node out and erases it on the box, but the tailnet keeps
+listing it until someone removes it in the admin console (or with `headscale
+nodes delete`). Until then, the next Connect joins as `<box>-1`, so the URL
+changes; the card shows the new one.
 
 ## Personal WhatsApp connection
 

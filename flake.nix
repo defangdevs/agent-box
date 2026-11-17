@@ -36,7 +36,7 @@
         };
         host = {
           jobs = 1;
-          checks = [ "ipv4-tcp-mitigation" "containers" "secrets" "memory-protection" "ttyd-isolation" "web-surface" "email" ];
+          checks = [ "ipv4-tcp-mitigation" "containers" "secrets" "memory-protection" "ttyd-isolation" "web-surface" "email" "tailscale" ];
         };
       };
 
@@ -63,6 +63,15 @@
 
           connect = pkgs.testers.runNixOSTest
             (import ./tests/connect.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (PR #1069): the settings page's Tailscale
+          # card for real - a root kernel-mode tailscaled the owner starts
+          # through polkit, joined to a Headscale guest, the box's pages
+          # served under its tailnet name to a second tailnet node, a
+          # loopback-only port that stays private, Disconnect erasing the
+          # node, and the unit returning after a reboot.
+          tailscale = pkgs.testers.runNixOSTest
+            (import ./tests/tailscale.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue 62): protectMemory defaults — zram
           # swap active, agent unit's OOMScoreAdjust applied, and earlyoom

@@ -104,7 +104,7 @@ https:// {
 }
 
 # Site-level behavior shared by every listener that serves the box's own
-# pages: the public vhost and the loopback tailnet listener (see
+# pages: the public vhost and the tailnet site agent-box-tailscale writes (see
 # caddyfile-vhost.caddy). The routes themselves are the agent_box_routes
 # snippet the renderer writes after this fragment.
 (agent_box_site) {

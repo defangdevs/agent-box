@@ -265,9 +265,13 @@ def connect():
     proc = systemctl("start", UNIT)
     if proc.returncode != 0:
         raise RuntimeError("Could not start %s: %s" % (UNIT, (proc.stderr or "").strip()))
+    # --netfilter-mode=off: by default tailscaled puts `-i tailscale0 -j
+    # ACCEPT` ahead of the host firewall, so every port the firewall closes
+    # to the internet (a dev server on 0.0.0.0) would be open to the tailnet.
+    # Off, the box's own firewall decides for tailscale0 as for any interface.
     args = ["up", "--reset", "--operator=" + user_name(), "--hostname", node_name(),
             "--ssh=false", "--accept-dns=false", "--accept-routes=false",
-            "--timeout", UP_TIMEOUT]
+            "--netfilter-mode=off", "--timeout", UP_TIMEOUT]
     server = login_server()
     if server:
         args += ["--login-server", server]

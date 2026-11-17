@@ -1747,10 +1747,15 @@ let
     `~/sites/agent-box-tailnet.caddy`, written by Connect and removed by
     Disconnect; do not edit it.
 
-    A service bound to 127.0.0.1 stays private. A service bound to 0.0.0.0 is
-    reachable from every tailnet device the tailnet's access rules allow, as it
-    is from the internet when a port is open. Tailscale SSH, exit nodes and subnet
-    routes stay off.
+    A service bound to 127.0.0.1 stays private. The box's own firewall governs
+    the tailnet interface like any other, so a service bound to 0.0.0.0 is
+    reachable from the tailnet only on a port that firewall opens, as from the
+    internet. Tailscale SSH, exit nodes and subnet routes stay off.
+
+    Disconnect logs the node out and erases it on the box, but the tailnet keeps
+    listing it until someone removes it in the admin console (or with `headscale
+    nodes delete`). Until then, the next Connect joins as `<box>-1`, so the URL
+    changes; the card shows the new one.
 
     ## Personal WhatsApp connection
 
@@ -12321,9 +12326,13 @@ def connect():
     proc = systemctl("start", UNIT)
     if proc.returncode != 0:
         raise RuntimeError("Could not start %s: %s" % (UNIT, (proc.stderr or "").strip()))
+    # --netfilter-mode=off: by default tailscaled puts `-i tailscale0 -j
+    # ACCEPT` ahead of the host firewall, so every port the firewall closes
+    # to the internet (a dev server on 0.0.0.0) would be open to the tailnet.
+    # Off, the box's own firewall decides for tailscale0 as for any interface.
     args = ["up", "--reset", "--operator=" + user_name(), "--hostname", node_name(),
             "--ssh=false", "--accept-dns=false", "--accept-routes=false",
-            "--timeout", UP_TIMEOUT]
+            "--netfilter-mode=off", "--timeout", UP_TIMEOUT]
     server = login_server()
     if server:
         args += ["--login-server", server]
@@ -42256,7 +42265,7 @@ if __name__ == "__main__":
         }
 
         # Site-level behavior shared by every listener that serves the box's own
-        # pages: the public vhost and the loopback tailnet listener (see
+        # pages: the public vhost and the tailnet site agent-box-tailscale writes (see
         # caddyfile-vhost.caddy). The routes themselves are the agent_box_routes
         # snippet the renderer writes after this fragment.
         (agent_box_site) {

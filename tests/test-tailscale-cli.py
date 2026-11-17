@@ -131,7 +131,8 @@ class TailscaleCli(unittest.TestCase):
         up = [json.loads(c[len("tailscale "):]) for c in calls
               if c.startswith("tailscale ") and '"up"' in c][0]
         for flag in ("--reset", "--operator=owner", "--ssh=false",
-                     "--accept-routes=false", "--accept-dns=false"):
+                     "--accept-routes=false", "--accept-dns=false",
+                     "--netfilter-mode=off"):
             self.assertIn(flag, up)
         self.assertEqual(up[up.index("--login-server") + 1], "https://hs.example")
         self.assertIn("key hskey-auth-12345678", calls)
