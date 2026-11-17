@@ -17975,7 +17975,10 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
   # session subscription. A re-subscribe keeps it, as it kept ignoreSenders.
   self_login="''${LOCAL_WEBHOOK_SELF:-}"
   if [ -z "$self_login" ] && [ -r "$LOCAL_WEBHOOK_STATE_DIR/self.env" ]; then
-    self_login="$(sed -n 's/^LOCAL_WEBHOOK_SELF=//p' "$LOCAL_WEBHOOK_STATE_DIR/self.env" | tail -n 1)"
+    # Builtins only: the receiver's PATH carries jq and coreutils, not sed.
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in (LOCAL_WEBHOOK_SELF=*) self_login="''${line#LOCAL_WEBHOOK_SELF=}" ;; esac
+    done < "$LOCAL_WEBHOOK_STATE_DIR/self.env"
   fi
   self_login="$(printf '%s' "$self_login" | tr -cd 'A-Za-z0-9._-' | tr 'A-Z' 'a-z')"
   if "$JQ" -n --arg topic "$own" --arg ts "$ts" --arg note "$note" \
