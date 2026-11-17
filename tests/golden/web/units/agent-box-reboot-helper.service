@@ -2,6 +2,7 @@
 Description=agent-box: disk-independent reboot helper
 
 [Service]
+Environment="AGENT_BOX_REBOOT_PIN_UNITS=caddy.service agent-box-settings@agent.service"
 Environment="AGENT_BOX_REBOOT_SOCKET=/run/agent-box-reboot/reboot.sock"
 Environment="AGENT_BOX_REBOOT_USER=agent"
 Environment="CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"

@@ -119,6 +119,98 @@ r, wrote, _ = scenario(128, me, [b"junk", b"REBOOT\n"])
 check("a refused request does not block a later valid one",
       r[1] == b"OK\n" and wrote == b"sub")
 
+# --- the front-door pinner -------------------------------------------------
+
+proc = tempfile.mkdtemp()
+files = tempfile.mkdtemp()
+
+
+def fake_proc(pid, cgroup, maps):
+    os.makedirs(os.path.join(proc, pid))
+    open(os.path.join(proc, pid, "cgroup"), "w").write(cgroup)
+    open(os.path.join(proc, pid, "maps"), "w").write(maps)
+
+
+def mkfile(name, size, mode=0o644):
+    p = os.path.join(files, name)
+    open(p, "wb").write(b"x" * size)
+    os.chmod(p, mode)
+    return p
+
+
+bin_a = mkfile("caddy", 4096)
+lib_a = mkfile("libc.so", 1024)
+writable = mkfile("writable.so", 1024, 0o666)
+empty = mkfile("empty", 0)
+fake_proc("10", "0::/system.slice/caddy.service\n",
+          "0-1 r-xp 0 08:01 5 %s\n0-1 r--p 0 08:01 6 %s\n"
+          "0-1 rw-p 0 00:00 0 [heap]\n0-1 rw-p 0 00:00 0\n"
+          "0-1 r--p 0 08:01 7 %s (deleted)\n" % (bin_a, lib_a, lib_a))
+fake_proc("11", "0::/system.slice/system-agent\\x2dbox\\x2dsettings.slice/"
+          "agent-box-settings@root.service\n", "0-1 r--p 0 08:01 8 %s\n" % writable)
+fake_proc("12", "0::/user.slice/user-1000.slice/session-1.scope\n",
+          "0-1 r--p 0 08:01 9 %s\n" % empty)
+fake_proc("13", "0::/system.slice/not-caddy.service.d\n", "")
+os.makedirs(os.path.join(proc, "self"))
+
+units = {"caddy.service", "agent-box-settings@root.service"}
+check("unit_pids matches the unit's own cgroup leaf only",
+      sorted(rh.unit_pids(units, proc)) == ["10", "11"])
+check("mapped_files keeps file paths, drops anon/heap/deleted",
+      rh.mapped_files(["10"], proc) == {bin_a, lib_a})
+
+
+class FakeLibc:
+    def __init__(self, fail_mlock=False):
+        self.next = 0x1000
+        self.maps = {}
+        self.fail_mlock = fail_mlock
+
+    def mmap(self, _addr, size, prot, flags, fd, off):
+        assert prot == rh.PROT_READ and flags == rh.MAP_SHARED and off == 0
+        addr = self.next
+        self.next += 0x100000
+        self.maps[addr] = size
+        return addr
+
+    def mlock(self, addr, size):
+        return -1 if self.fail_mlock else 0
+
+    def munmap(self, addr, size):
+        del self.maps[addr.value]
+        return 0
+
+
+me = os.getuid()
+lc = FakeLibc()
+pin = rh.Pinner(lc, owner=me, limit=1 << 20)
+pin.refresh({bin_a, lib_a, writable, empty, "/nonexistent"})
+pinned = {v[2] for v in pin.pinned.values()}
+check("pins own regular files", pinned == {bin_a, lib_a})
+check("refuses a group/other-writable file", writable not in pinned)
+check("refuses an empty file", empty not in pinned)
+check("total counts pinned bytes", pin.total() == 4096 + 1024)
+pin.refresh({bin_a, lib_a})
+check("refresh is idempotent", len(lc.maps) == 2)
+pin.refresh({lib_a})
+check("a file no longer mapped is unpinned",
+      {v[2] for v in pin.pinned.values()} == {lib_a} and len(lc.maps) == 1)
+
+other = rh.Pinner(FakeLibc(), owner=me + 1)
+other.refresh({bin_a})
+check("a file owned by someone else is refused", not other.pinned)
+
+small = rh.Pinner(FakeLibc(), owner=me, limit=2048)
+skipped = small.refresh({bin_a, lib_a})
+check("the byte limit skips what does not fit",
+      skipped == 1 and small.total() == 1024)
+
+lc_fail = FakeLibc(fail_mlock=True)
+nolock = rh.Pinner(lc_fail, owner=me)
+nolock.refresh({bin_a})
+check("a failed mlock is unmapped and not recorded",
+      not nolock.pinned and not lc_fail.maps)
+
 if failures:
     print("%d failure(s)" % len(failures))
     sys.exit(1)

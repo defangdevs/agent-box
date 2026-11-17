@@ -4798,6 +4798,9 @@ in
           environment = {
             AGENT_BOX_REBOOT_USER = rootUser;
             AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
+            # The front door the button's request crosses; the helper keeps
+            # their mapped files in RAM so a dead disk cannot SIGBUS them.
+            AGENT_BOX_REBOOT_PIN_UNITS = "caddy.service agent-box-settings@${rootUser}.service";
           };
           serviceConfig = {
             ExecStart = "${rebootHelperBin}/bin/agent-box-reboot-helper";

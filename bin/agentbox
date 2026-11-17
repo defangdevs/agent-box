@@ -2091,6 +2091,8 @@ class Renderer:
                    "Type=simple",
                    f"Environment=AGENT_BOX_REBOOT_USER={self.spec.root_user.name}",
                    f"Environment=AGENT_BOX_REBOOT_SOCKET={REBOOT_HELPER_SOCKET}",
+                   "Environment=AGENT_BOX_REBOOT_PIN_UNITS=caddy.service "
+                   f"agent-box-settings@{self.spec.root_user.name}.service",
                    f"ExecStart={self.bin}/agent-box-reboot-helper",
                    "RuntimeDirectory=agent-box-reboot",
                    "RuntimeDirectoryMode=0755",

@@ -34,15 +34,27 @@ Misuse hardening (the point of the design, not an afterthought):
     reboot function (bit 128, or the value 1).
   * One request starts the sequence; later ones are answered "BUSY".
 
+The front door has to survive too: the request reaches this helper through
+Caddy and the settings daemon, and a code page of theirs that was never
+loaded since boot is a SIGBUS once the disk is gone (a KVM fault test
+killed Caddy on its first TLS handshake). So a second, root process forked
+before the drop pins every file the AGENT_BOX_REBOOT_PIN_UNITS processes
+have mapped: mmap + mlock, refreshed every PIN_REFRESH_S so an update's new
+store paths are picked up. It takes no client input, pins only root-owned
+files nobody else can write, and stops at PIN_MAX_BYTES.
+
 The sequence is the classic sync (s), remount read-only (u), reboot (b),
 with a pause between each. The kernel runs s and u asynchronously and `b`
 does not wait for them, so the pauses are what give them a chance. They are
 bounded: a dead disk cannot stop the final `b`.
 """
+import ctypes
 import grp
 import os
 import pwd
+import signal
 import socket
+import stat
 import struct
 import sys
 import time
@@ -56,6 +68,11 @@ SYSRQ_REBOOT_BIT = 128
 SEQUENCE = ((b"s", 3.0), (b"u", 3.0), (b"b", 0.0))
 CLIENT_TIMEOUT_S = 2.0
 NOBODY = 65534
+PIN_REFRESH_S = 60
+# Caddy plus the settings daemon came to 72 MiB in the fault test.
+PIN_MAX_BYTES = 256 << 20
+PROT_READ = 1
+MAP_SHARED = 1
 
 
 def sysrq_allows_reboot(mask_fd):
@@ -151,8 +168,130 @@ def serve(sock, allowed_uid, trigger_fd, mask_fd, sleep=time.sleep,
             return
 
 
+def unit_pids(units, proc="/proc"):
+    """PIDs whose cgroup v2 path ends in one of `units`."""
+    pids = []
+    for name in os.listdir(proc):
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, name, "cgroup")) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if line.startswith("0::") and line.rsplit("/", 1)[-1] in units:
+                pids.append(name)
+                break
+    return pids
+
+
+def mapped_files(pids, proc="/proc"):
+    """Paths of the files these processes have mapped."""
+    paths = set()
+    for pid in pids:
+        try:
+            with open(os.path.join(proc, pid, "maps")) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            fields = line.split(None, 5)
+            if len(fields) < 6 or not fields[5].startswith("/"):
+                continue
+            if not fields[5].endswith(" (deleted)"):
+                paths.add(fields[5])
+    return paths
+
+
+def pinnable(st, owner=0):
+    """A regular, non-empty file owned by `owner` that group and others
+    cannot write: a process we pin for cannot grow it into our RAM."""
+    if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+        return False
+    return st.st_uid == owner and not st.st_mode & 0o022
+
+
+class Pinner:
+    """Keeps a set of files mmapped and mlocked; refresh() reconciles."""
+
+    def __init__(self, libc, owner=0, limit=PIN_MAX_BYTES):
+        self.libc = libc
+        self.owner = owner
+        self.limit = limit
+        self.pinned = {}  # (st_dev, st_ino) -> (addr, size, path)
+
+    def total(self):
+        return sum(size for _, size, _ in self.pinned.values())
+
+    def refresh(self, paths):
+        wanted = {}
+        for path in sorted(paths):
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if pinnable(st, self.owner):
+                wanted.setdefault((st.st_dev, st.st_ino), (path, st.st_size))
+        for key in [k for k in self.pinned if k not in wanted]:
+            addr, size, _ = self.pinned.pop(key)
+            self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+        skipped = 0
+        for key, (path, size) in wanted.items():
+            if key in self.pinned:
+                continue
+            if self.total() + size > self.limit:
+                skipped += 1
+                continue
+            addr = self.map(path, size)
+            if addr is not None:
+                self.pinned[key] = (addr, size, path)
+        return skipped
+
+    def map(self, path, size):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            return None
+        try:
+            addr = self.libc.mmap(None, size, PROT_READ, MAP_SHARED, fd, 0)
+        finally:
+            os.close(fd)
+        if addr in (None, ctypes.c_void_p(-1).value):
+            return None
+        if self.libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(size)):
+            self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+            return None
+        return addr
+
+
+def load_libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                          ctypes.c_int, ctypes.c_int, ctypes.c_long]
+    return libc
+
+
+def run_pinner(units):
+    """The root child: pin the front door's mapped files, forever."""
+    lock_memory()
+    pinner = Pinner(load_libc())
+    last = None
+    while True:
+        try:
+            skipped = pinner.refresh(mapped_files(unit_pids(units)))
+            now = (len(pinner.pinned), pinner.total() >> 20, skipped)
+            if now != last:
+                sys.stderr.write("agent-box-reboot-helper: pinned %d files "
+                                 "(%d MiB), %d over the limit\n" % now)
+                last = now
+        except Exception as exc:  # keep pinning through one bad refresh
+            sys.stderr.write("agent-box-reboot-helper: pin: %r\n" % exc)
+        time.sleep(PIN_REFRESH_S)
+
+
 def lock_memory():
-    import ctypes
     libc = ctypes.CDLL(None, use_errno=True)
     # MCL_CURRENT | MCL_FUTURE
     if libc.mlockall(1 | 2) != 0:
@@ -186,6 +325,19 @@ def main():
     os.chown(path, entry.pw_uid, -1)
     os.chmod(path, 0o600)
     sock.listen(4)
+    units = os.environ.get("AGENT_BOX_REBOOT_PIN_UNITS", "").split()
+    if units:
+        # Auto-reap: a pinner that dies must not leave a zombie, and the
+        # reboot path does not depend on it.
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        if os.fork() == 0:
+            # The child keeps root (reading another user's maps needs it)
+            # and so holds nothing a client can reach.
+            sock.close()
+            os.close(trigger_fd)
+            os.close(mask_fd)
+            run_pinner(set(units))
+            os._exit(1)
     lock_memory()
     drop_privileges()
     sys.stderr.write("agent-box-reboot-helper: ready for uid %d on %s\n"
