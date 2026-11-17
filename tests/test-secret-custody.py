@@ -719,6 +719,43 @@ class Bounds(unittest.TestCase):
         # An existing namespace stays reachable at the cap.
         ns["Store"](root, "p0", "agent", os.getuid(), key).close()
 
+    def test_retry_after_failed_parent_sync_still_syncs(self):
+        """A parent fsync that fails after mkdir leaves the directories in
+        place; the retry finds them existing and must sync the parents
+        anyway, or a later write is acknowledged without durable entries."""
+        root = os.path.join(self.tmp, "u", "store")
+        key = b"\x00" * 32
+        real_fsync = os.fsync
+        synced = []
+
+        def path_of(fd):
+            return os.readlink(f"/proc/self/fd/{fd}")
+
+        def failing(fd):
+            if path_of(fd) == root:
+                raise OSError(5, "injected fsync failure")
+            real_fsync(fd)
+
+        def recording(fd):
+            synced.append(path_of(fd))
+            real_fsync(fd)
+
+        os.fsync = failing
+        try:
+            with self.assertRaises(OSError):
+                ns["Store"](root, "p", "agent", os.getuid(), key)
+        finally:
+            os.fsync = real_fsync
+        self.assertTrue(os.path.isdir(os.path.join(root, "p")),
+                        "the failed attempt was expected to leave the namespace")
+        os.fsync = recording
+        try:
+            ns["Store"](root, "p", "agent", os.getuid(), key).close()
+        finally:
+            os.fsync = real_fsync
+        self.assertIn(root, synced, "retry did not sync the namespace's parent")
+        self.assertIn(os.path.dirname(root), synced, "retry did not sync the root's parent")
+
     def test_retained_job_results_are_bounded(self):
         class Launcher:
             def start(self, job, *args):
