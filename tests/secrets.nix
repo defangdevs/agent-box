@@ -161,27 +161,36 @@
         assert "no such secret" in out or "error" in out, out
 
     with subtest("cancel and timeout reap the whole control group"):
+        # The job sleeps for an odd duration and is found by its exact
+        # command line: a bare `pgrep -u agent -x sleep` also matches the
+        # box's own agent-owned loops (supervisor, attach), which keep a
+        # short `sleep` alive almost all the time, so "no sleep left"
+        # raced them and timed out.
+        JOB_SLEEP = "sleep 3017"
+        JOB_PGREP = f"pgrep -u agent -xf '{JOB_SLEEP}'"
+        JOB_CMD = "'" + SYSPATH + f"{JOB_SLEEP} & {JOB_SLEEP}'"
+
         def leftovers():
             units = machine.succeed(
                 "systemctl list-units --all --plain --no-legend 'agent-box-secret-job-*' || true").strip()
-            procs = machine.execute("pgrep -u agent -x sleep")[1].strip()
+            procs = machine.execute(JOB_PGREP)[1].strip()
             return units, procs
 
         # cancel: a shell that backgrounds a second sleep, so killing only
         # the leader would leave an orphan behind.
         status, out = as_user("agent",
-            "agent-box-secret --profile t exec --command '" + SYSPATH + "sleep 300 & sleep 300'")
+            "agent-box-secret --profile t exec --command " + JOB_CMD)
         job = out.strip().splitlines()[-1]
-        machine.wait_until_succeeds("pgrep -u agent -x sleep >/dev/null", timeout=20)
+        machine.wait_until_succeeds(JOB_PGREP + " >/dev/null", timeout=20)
         agent(f"agent-box-secret --profile t cancel {job}")
-        machine.wait_until_succeeds("! pgrep -u agent -x sleep", timeout=20)
+        machine.wait_until_succeeds("! " + JOB_PGREP, timeout=20)
         units, procs = leftovers()
         assert not units and not procs, f"cancel left units={units!r} procs={procs!r}"
 
         # timeout: same shape, reaped by the deadline instead of the caller.
-        _, reply = run_job("--timeout-ms 2000 --command '" + SYSPATH + "sleep 300 & sleep 300'", wait=30)
+        _, reply = run_job("--timeout-ms 2000 --command " + JOB_CMD, wait=30)
         assert reply["state"] == "timeout", reply
-        machine.wait_until_succeeds("! pgrep -u agent -x sleep", timeout=20)
+        machine.wait_until_succeeds("! " + JOB_PGREP, timeout=20)
         units, procs = leftovers()
         assert not units and not procs, f"timeout left units={units!r} procs={procs!r}"
 
