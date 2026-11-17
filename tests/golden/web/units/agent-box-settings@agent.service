@@ -10,6 +10,7 @@ Environment="AGENT_BOX_NIXPKGS=https://channels.nixos.org/nixos-unstable/nixexpr
 Environment="AGENT_BOX_NIX_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nix-2.34.8/bin/nix"
 Environment="AGENT_BOX_PROFILE_BIN=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-profile/bin/agent-box-profile"
 Environment="AGENT_BOX_REBOOT_CMD=/run/wrappers/bin/sudo -n /run/current-system/sw/bin/systemctl reboot --no-block"
+Environment="AGENT_BOX_REBOOT_SOCKET=/run/agent-box-reboot/reboot.sock"
 Environment="AGENT_BOX_REPO=defangdevs/agent-box"
 Environment="AGENT_BOX_REV=0000000000000000000000000000000000000000"
 Environment="AGENT_BOX_SYSTEMCTL=/run/current-system/sw/bin/systemctl"

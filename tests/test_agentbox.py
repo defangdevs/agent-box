@@ -234,6 +234,22 @@ def tree_modes(root):
 
 
 class RenderTest(unittest.TestCase):
+    def test_reboot_helper_pin_units_survive_word_splitting(self):
+        # PR #1055 KVM test: an unquoted Environment= value is split at
+        # spaces by systemd, and the helper then saw only caddy.service.
+        import shlex
+        text = (FIXTURE / "etc/systemd/system/agent-box-reboot-helper.service"
+                ).read_text()
+        env = {}
+        for line in text.splitlines():
+            if line.startswith("Environment="):
+                for word in shlex.split(line[len("Environment="):]):
+                    key, _, value = word.partition("=")
+                    env[key] = value
+        self.assertEqual(env.get("AGENT_BOX_REBOOT_PIN_UNITS", "").split(),
+                         ["caddy.service", "agent-box-settings@agent.service"])
+        self.assertIn("Wants=agent-box-settings@agent.service", text)
+
     def test_tls_policy_reaches_socket_and_timer_services_and_keeps_ownership(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = render(tmp, CONFIG_JSON)
@@ -2672,6 +2688,9 @@ class RenderTest(unittest.TestCase):
                 out / "etc/systemd/system/agent-box-fail2ban.service",
                 out / "etc/systemd/system/agent-web-terminal@.service",
                 out / "etc/systemd/system/agent-box-settings@.service",
+                # Issue #1054: the reboot helper exists only with the
+                # Reboot button, which needs the settings page.
+                out / "etc/systemd/system/agent-box-reboot-helper.service",
                 out / "etc/agent-box/Caddyfile",
                 out / mod.CADDY_RELOAD_POLICY.lstrip("/"),
                 out / "etc/agent-box/web-users",
@@ -2718,7 +2737,8 @@ class RenderTest(unittest.TestCase):
             # Requires= last.
             self.assertEqual(["agent-box-fail2ban.service",
                               "caddy.service",
-                              "agent-web-auth-secrets.service"],
+                              "agent-web-auth-secrets.service",
+                              "agent-box-reboot-helper.service"],
                              tree.disable)
             # The password and cookie secrets are deliberately NOT removed:
             # turning the terminal off must not throw away the credential
@@ -4233,6 +4253,25 @@ class ApplyActivationTest(unittest.TestCase):
         rc, out, err = self.apply()
         self.assertEqual(rc, 0, err)
         self.assertNotIn(["systemctl", "restart", "agent-box-settings@agent.service"], self.calls)
+
+    def test_changed_reboot_helper_unit_restarts_an_active_helper(self):
+        # Issue #1054 review: the helper authorizes one uid read from its
+        # unit's environment at start, and `enable --now` leaves an active
+        # unit alone, so a changed root user needs an explicit restart.
+        unit = self.mod.REBOOT_HELPER_UNIT
+        path = "/etc/systemd/system/" + unit
+        self.extra_files[path] = "[Service]\n"
+        self.mod.write_if_changed = lambda p, *args: p == path
+        self.mod.active_units = lambda pattern: (
+            [unit] if pattern == unit else [])
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertIn(["systemctl", "restart", unit], self.calls)
+        self.calls.clear()
+        self.mod.write_if_changed = lambda *args: False
+        rc, out, err = self.apply()
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(["systemctl", "restart", unit], self.calls)
 
     def test_a_failed_settings_environment_refresh_fails_apply(self):
         path = "/etc/agent-box/units/agent-box-settings-agent.env"

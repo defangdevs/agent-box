@@ -717,6 +717,13 @@ SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
 # reboots (see the box's apt policy). Without this the box has no way to
 # finish those updates at all — nobody inside it can reboot.
 REBOOT_CMD = os.environ.get("AGENT_BOX_REBOOT_CMD", "")
+# Socket of the root reboot helper (modules/src/reboot-helper.py), the
+# fallback when REBOOT_CMD cannot run because the disk is gone (issue 1054).
+# Empty on a box without the helper.
+REBOOT_SOCKET = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+# How long the normal reboot command gets before the helper is tried. A
+# failed disk may HANG the exec instead of failing it.
+REBOOT_CMD_TIMEOUT_S = 15
 # The distro's own "a reboot would apply something" marker: Debian and
 # Ubuntu's update machinery creates it, and the .pkgs file beside it
 # lists what asked. Both are world-readable, so the card reports WHY a
@@ -5201,19 +5208,63 @@ def update_box():
         sys.stderr.write("update_box: %s\n" % exc)
 
 
+def reboot_via_helper():
+    """Ask the root reboot helper to sysrq-reboot. True when it accepted.
+
+    Sends the one fixed request the helper understands. Nothing here reads
+    the disk: the socket module is already imported and the helper is
+    already running.
+    """
+    if not REBOOT_SOCKET:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(REBOOT_SOCKET)
+            conn.sendall(b"REBOOT\n")
+            answer = conn.recv(64).strip()
+    except OSError as exc:
+        sys.stderr.write("reboot_box: helper: %s\n" % exc)
+        return False
+    sys.stderr.write("reboot_box: helper answered %r\n" % answer[:32])
+    return answer in (b"OK", b"BUSY")
+
+
+def _run_reboot_cmd(result):
+    try:
+        proc = subprocess.run(REBOOT_CMD.split(), check=False,
+                              capture_output=True)
+        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
+        result.append(proc.returncode)
+    except OSError as exc:
+        sys.stderr.write("reboot_box: %s\n" % exc)
+
+
 def reboot_box():
-    """Trigger the reboot through the allowlisted sudo command.
+    """Trigger the reboot through the allowlisted sudo command, and when
+    that cannot run (no disk to exec sudo from), through the root helper.
+
+    The normal command runs in a worker thread and this function waits for
+    it with a deadline. subprocess's own timeout is not enough: on a dying
+    disk the fork/exec itself, or the wait after a kill, can block, and the
+    helper would never be asked.
 
     The caller sends its HTTP response BEFORE calling this (see the
     /reboot route): --no-block returns immediately, but systemd starts
     stopping units at once, and this daemon is one of them — a response
     written afterwards can lose the race with its own socket going away.
     """
-    try:
-        proc = subprocess.run(REBOOT_CMD.split(), check=False, capture_output=True)
-        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
-    except OSError as exc:
-        sys.stderr.write("reboot_box: %s\n" % exc)
+    result = []
+    worker = threading.Thread(target=_run_reboot_cmd, args=(result,),
+                              daemon=True)
+    worker.start()
+    worker.join(REBOOT_CMD_TIMEOUT_S)
+    if result and result[0] == 0:
+        return
+    if worker.is_alive():
+        sys.stderr.write("reboot_box: trigger did not finish in %ds\n"
+                         % REBOOT_CMD_TIMEOUT_S)
+    reboot_via_helper()
 
 
 def reboot_pending():

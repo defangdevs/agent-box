@@ -512,6 +512,13 @@ let
 
 @@include:src/secret-broker.py@@
   '');
+  # Root reboot helper (issue #1054): a reboot that needs nothing from the
+  # disk when the settings page's normal `sudo systemctl reboot` cannot exec.
+  rebootHelperBin = pkgs.writers.writePython3Bin "agent-box-reboot-helper" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/reboot-helper.py@@
+  '';
   secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
@@ -4780,6 +4787,35 @@ in
           Restart = lib.mkForce "always";
         };
       }
+      // lib.optionalAttrs rebootButton {
+        # Issue #1054: a reboot that needs nothing from the disk. Runs from
+        # boot so its code and /proc/sysrq-trigger are already in RAM and
+        # open when a failing disk makes `sudo systemctl reboot` unable to
+        # exec. See src/reboot-helper.py for the request protocol.
+        agent-box-reboot-helper = {
+          description = "agent-box: disk-independent reboot helper";
+          wantedBy = [ "multi-user.target" ];
+          # The settings daemon is socket-activated; one never started
+          # cannot start once the disk is gone, so bring it up at boot.
+          wants = [ "agent-box-settings@${rootUser}.service" ];
+          environment = {
+            AGENT_BOX_REBOOT_USER = rootUser;
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
+            # The front door the button's request crosses; the helper keeps
+            # their mapped files in RAM so a dead disk cannot SIGBUS them.
+            AGENT_BOX_REBOOT_PIN_UNITS = "caddy.service agent-box-settings@${rootUser}.service";
+          };
+          serviceConfig = {
+            ExecStart = "${rebootHelperBin}/bin/agent-box-reboot-helper";
+            RuntimeDirectory = "agent-box-reboot";
+            RuntimeDirectoryMode = "0755";
+            Restart = "always";
+            RestartSec = "5s";
+            LimitMEMLOCK = "infinity";
+            OOMScoreAdjust = -900;
+          };
+        };
+      }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
         # The attach script (src/attach.sh) resolves tmux, jq and head
@@ -4893,6 +4929,8 @@ in
             # the daemon hides the card and 404s the route without it, so
             # another user's page cannot even ask.
             AGENT_BOX_REBOOT_CMD = "/run/wrappers/bin/sudo -n ${rebootCmd}";
+            # Fallback when that cannot exec (issue #1054).
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
           })
           // {
             # mkForce for the reason spelled out on the "agent-box@" unit:

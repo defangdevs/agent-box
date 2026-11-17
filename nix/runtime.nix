@@ -393,6 +393,11 @@ let
       libraries = [ pkgs.python3Packages.cryptography ];
       flakeIgnore = [ "E402" "F811" "E501" "E302" "E305" "W503" "W504" ];
     } (secretProtocolLib + "\n\n" + secretJobsLib + "\n\n" + readSrc "secret-broker.py"))
+    # Root reboot helper (issue #1054), started at boot by a unit the
+    # renderer writes when the settings page has a Reboot button.
+    (pkgs.writers.writePython3Bin "agent-box-reboot-helper" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "reboot-helper.py"))
     (pkgs.writers.writePython3Bin "agent-box-secret-worker" {
       flakeIgnore = [ "E501" "E302" "E305" ];
     } (readSrc "secret-worker.py"))

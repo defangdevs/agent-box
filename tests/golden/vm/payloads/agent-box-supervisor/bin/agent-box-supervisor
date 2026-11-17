@@ -3364,6 +3364,11 @@ park_archived_rc() {
   done < <(printf '%s\n' "$_arch")
 }
 
+# The tick's pause is a builtin `read -t` on a pipe nobody writes, not
+# `sleep`: with the disk gone every exec dies at once (SIGBUS), and a
+# failed `sleep 2` turned this loop into a fork storm (PR #1055).
+exec {TICK_FD}<> <(:)
+
 # Reconcile forever; systemd stop tears the whole tree down (ExecStop
 # kill-server + cgroup kill), Restart=always revives a crashed loop.
 # Sessions flagged stopped (a clean agent exit, or agent-box-session
@@ -3396,6 +3401,6 @@ while true; do
   sync_codex_threads
   supervise_whatsapp
   supervise_slack
-  sleep 2
+  read -rt 2 -u "$TICK_FD" || :
 done
 
