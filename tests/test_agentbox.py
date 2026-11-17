@@ -3962,6 +3962,8 @@ class SelfUpdateLogicTest(unittest.TestCase):
             "agent-box-webhook@*.socket": ["agent-box-webhook@agent.socket"],
             # Deliberately stopped by the operator: not listed, not restarted.
             "agent-box-webhook@*.service": [],
+            "agent-box-reboot-helper.service": [
+                "agent-box-reboot-helper.service"],
             "caddy.service": ["caddy.service"],
             "agent-box@*.service": ["agent-box@agent.service",
                                     "agent-box@robot.service"],
@@ -3974,6 +3976,7 @@ class SelfUpdateLogicTest(unittest.TestCase):
                      "agent-web-terminal@agent.service",
                      "agent-box-settings@agent.socket",
                      "agent-box-webhook@agent.socket",
+                     "agent-box-reboot-helper.service",
                      "caddy.service"):
             self.assertIn(unit, restarted)
         # Sessions last: the agent that asked for the update is in one.
