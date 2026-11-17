@@ -1740,6 +1740,12 @@
   document.addEventListener("focusin", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    // A close still pending from a previous visit would fire into this
+    // one and wipe its typed state, so refocusing cancels it.
+    if (input._dir && input._dir.closeTimer) {
+      window.clearTimeout(input._dir.closeTimer);
+      input._dir.closeTimer = null;
+    }
     // The directory field starts on the untouched default "~": select it
     // so the first keystroke replaces it instead of appending, which is
     // what produced an invalid "~docu" (issue #308). A model field has no
@@ -1753,7 +1759,12 @@
     var input = e.target;
     if (!acKind(input)) { return; }
     // Delay so a mousedown-selected item still registers its click.
-    window.setTimeout(function () { acClose(input); }, 150);
+    var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+    if (st.closeTimer) { window.clearTimeout(st.closeTimer); }
+    st.closeTimer = window.setTimeout(function () {
+      st.closeTimer = null;
+      acClose(input);
+    }, 150);
   });
   document.addEventListener("keydown", function (e) {
     var input = e.target;

@@ -694,14 +694,16 @@ class ProfilePanel(ProfileFixture):
         with CODEX_HELP, as codex-cli 0.165 does."""
         path = os.path.join(self.tmp.name, "codex-catalog-stub")
         with open(path, "w") as handle:
-            handle.write(
-                "#!/bin/sh\n"
+            handle.write(self.codex_catalog_text(catalog))
+        os.chmod(path, 0o755)
+        return path
+
+    def codex_catalog_text(self, catalog):
+        return ("#!/bin/sh\n"
                 "if [ \"$1 $2\" = 'debug models' ]; then\n"
                 "cat <<'AGENTBOXCATALOG'\n" + catalog
                 + "\nAGENTBOXCATALOG\nexit 0\nfi\n"
                 "cat <<'AGENTBOXHELP'\n" + CODEX_HELP + "AGENTBOXHELP\n")
-        os.chmod(path, 0o755)
-        return path
 
     def test_codex_models_are_read_off_its_own_catalog(self):
         """codex's --help names no model, but `codex debug models` prints
@@ -728,11 +730,39 @@ class ProfilePanel(ProfileFixture):
         better. Either way the help page is still asked, and what it says
         (nothing, for codex) is the answer."""
         module = self.daemon()
-        broken = self.codex_catalog_stub("not json")
-        self.assertIsNone(module.probe_codex_catalog(broken))
-        self.assertEqual(module.probe_model_aliases(broken, "codex"), ())
-        old = self.harness_stub("codex", CODEX_HELP)
+        old = os.path.join(self.tmp.name, "old-codex-stub")
+        with open(old, "w") as handle:
+            handle.write("#!/bin/sh\n[ \"$1\" = debug ] && exit 2\n"
+                         "cat <<'AGENTBOXHELP'\n" + CODEX_HELP
+                         + "AGENTBOXHELP\n")
+        os.chmod(old, 0o755)
+        self.assertEqual(module.probe_codex_catalog(old), ())
         self.assertEqual(module.probe_model_aliases(old, "codex"), ())
+
+    def test_a_codex_catalog_that_failed_is_asked_again(self):
+        """A catalog probe that could not answer, with a help page that
+        names nothing, must not be cached as an empty list under the
+        binary's unchanged stamp: it is retried after the retry window,
+        while an old codex's definitive "no catalog" is kept."""
+        module = self.daemon()
+        flaky = self.codex_catalog_stub("not json")
+        self.assertIsNone(module.probe_codex_catalog(flaky))
+        self.assertIsNone(module.probe_model_aliases(flaky, "codex"))
+        stamp = module.binary_stamp(flaky)
+        self.assertEqual(
+            module.harness_model_aliases(flaky, stamp, "codex"), ())
+        with open(flaky, "w") as handle:
+            handle.write(self.codex_catalog_text(
+                json.dumps({"models": [
+                    {"slug": "gpt-a", "visibility": "list", "priority": 1}
+                ]})))
+        os.utime(flaky, ns=(stamp[0], stamp[0]))
+        self.assertEqual(
+            module.harness_model_aliases(flaky, stamp, "codex"), ())
+        module._MODEL_ALIAS_RETRY = 0.0
+        module._model_alias_cache.clear()
+        self.assertEqual(
+            module.harness_model_aliases(flaky, stamp, "codex"), ("gpt-a",))
 
     def test_only_codex_is_asked_for_a_catalog(self):
         """`debug models` is codex's subcommand. Another CLI could read it

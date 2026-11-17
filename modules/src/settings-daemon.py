@@ -5662,7 +5662,13 @@ def binary_stamp(path):
 
 
 def probe_codex_catalog(binary):
-    """codex's own model catalog, or None when this codex has none to give.
+    """codex's own model catalog as a tuple of names.
+
+    () is an ANSWER: this codex ran and has no `debug models` (a non-zero
+    exit), which will not change until the binary does. None is a
+    NON-answer - a timeout, a spawn failure or output that is not the
+    catalog - which probe_model_aliases() must not let the help fallback
+    turn into a cached empty list.
 
     codex's `--help` names no model, but `codex debug models` prints the
     catalog its own /model picker reads (codex-cli 0.165 has it; an older
@@ -5686,7 +5692,7 @@ def probe_codex_catalog(binary):
         sys.stderr.write("profiles: codex model catalog: %s\n" % exc)
         return None
     if proc.returncode != 0:
-        return None
+        return ()
     try:
         models = json.loads(proc.stdout).get("models")
     except (ValueError, AttributeError):
@@ -5722,10 +5728,11 @@ def probe_model_aliases(binary, harness=None):
     whatsoever, and asking again later may well succeed. Only the caller
     can act on that difference, and it does - see the cache above.
     """
+    catalog = None
     if harness == "codex":
-        names = probe_codex_catalog(binary)
-        if names:
-            return names
+        catalog = probe_codex_catalog(binary)
+        if catalog:
+            return catalog
     try:
         proc = subprocess.run(
             [binary, "--help"],
@@ -5755,6 +5762,11 @@ def probe_model_aliases(binary, harness=None):
             names.append(name)
         if len(names) >= _MODEL_HINT_MAX:
             break
+    if harness == "codex" and catalog is None and not names:
+        # The catalog could not be asked and the help names nothing, which
+        # is what codex's help always says: that empty is the help's
+        # answer, not the catalog's, so keep it retryable.
+        return None
     return tuple(names)
 
 
