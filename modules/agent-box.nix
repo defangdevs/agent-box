@@ -41413,6 +41413,9 @@ if __name__ == "__main__":
         agent-box-reboot-helper = {
           description = "agent-box: disk-independent reboot helper";
           wantedBy = [ "multi-user.target" ];
+          # The settings daemon is socket-activated; one never started
+          # cannot start once the disk is gone, so bring it up at boot.
+          wants = [ "agent-box-settings@${rootUser}.service" ];
           environment = {
             AGENT_BOX_REBOOT_USER = rootUser;
             AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";

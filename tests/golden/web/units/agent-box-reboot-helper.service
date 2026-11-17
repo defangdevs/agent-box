@@ -1,5 +1,6 @@
 [Unit]
 Description=agent-box: disk-independent reboot helper
+Wants=agent-box-settings@agent.service
 
 [Service]
 Environment="AGENT_BOX_REBOOT_PIN_UNITS=caddy.service agent-box-settings@agent.service"

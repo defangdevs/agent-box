@@ -234,6 +234,22 @@ def tree_modes(root):
 
 
 class RenderTest(unittest.TestCase):
+    def test_reboot_helper_pin_units_survive_word_splitting(self):
+        # PR #1055 KVM test: an unquoted Environment= value is split at
+        # spaces by systemd, and the helper then saw only caddy.service.
+        import shlex
+        text = (FIXTURE / "etc/systemd/system/agent-box-reboot-helper.service"
+                ).read_text()
+        env = {}
+        for line in text.splitlines():
+            if line.startswith("Environment="):
+                for word in shlex.split(line[len("Environment="):]):
+                    key, _, value = word.partition("=")
+                    env[key] = value
+        self.assertEqual(env.get("AGENT_BOX_REBOOT_PIN_UNITS", "").split(),
+                         ["caddy.service", "agent-box-settings@agent.service"])
+        self.assertIn("Wants=agent-box-settings@agent.service", text)
+
     def test_tls_policy_reaches_socket_and_timer_services_and_keeps_ownership(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = render(tmp, CONFIG_JSON)
