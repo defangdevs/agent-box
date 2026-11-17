@@ -13219,7 +13219,7 @@ _hc_main "$@"
       _cs="''${_cs#"$(id -un)"-}"
       [ -n "$_cs" ] && [ -r "$SESSIONS" ] || return 1
       "$JQ" -e --arg s "$_cs" \
-        '.sessions[$s] | (.agent // "claude") == "claude" and .remoteControlDaemon == true' \
+        '.sessions[$s] | (.agent // "claude") == "claude" and (.remoteControlDaemon == true or .remoteControlServer == true)' \
         "$SESSIONS" >/dev/null 2>&1
     }
 

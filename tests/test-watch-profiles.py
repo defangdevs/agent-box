@@ -48,7 +48,7 @@ class Watches(unittest.TestCase):
                         AGENT_BOX_WEBHOOK_STATE_DIR=str(self.state),
                         AGENT_BOX_WEBHOOK_PYTHON=sys.executable,
                         AGENT_BOX_PROFILES_DIR=str(self.profiles))
-        for key in ('CODEX_THREAD_ID', 'LOCAL_WEBHOOK_SPAWN_CONFIG',
+        for key in ('CODEX_THREAD_ID', 'CODEX_SESSION_ID', 'LOCAL_WEBHOOK_SPAWN_CONFIG',
                     'AGENT_BOX_HOOK_PROFILE', 'LOCAL_WEBHOOK_SELF'):
             self.env.pop(key, None)
         src = REPO / 'modules/src'
@@ -403,6 +403,7 @@ class Watches(unittest.TestCase):
         sessions = self.root / '.config/agent-box/sessions.json'
         sessions.write_text(json.dumps({'sessions': {
             'rc': {'agent': 'claude', 'remoteControlDaemon': True},
+            'old': {'agent': 'claude', 'remoteControlServer': True},
             'tui': {'agent': 'claude', 'remoteControlDaemon': False}}}))
         user = subprocess.run(['id', '-un'], capture_output=True, text=True,
                               check=True).stdout.strip()
@@ -417,6 +418,8 @@ class Watches(unittest.TestCase):
         self.assertEqual(p.returncode, 2, p.stderr)
         self.assertIn('Remote Control daemon', p.stderr)
         self.assertFalse((self.state / ('filter.%s-rc.json' % user)).exists())
+        p = run('old', *args)
+        self.assertEqual(p.returncode, 2, p.stderr)
         p = run('tui', *args)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         p = run('rc', 'subscribe', 'owner/repo', '--deliver-to', 'subagent',
