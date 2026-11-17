@@ -120,7 +120,12 @@ class Broker:
         self._stores = {}
         self._stores_lock = threading.Lock()
 
-    def _store(self, profile):
+    def _store(self, profile, create):
+        """The cached Store for this profile. With create=False (every op
+        but `set`) a namespace that does not exist yet is NOT made: the
+        answer is None, so a `list` or `exec` naming an invented profile
+        costs nothing on disk and no slot of SECRET_MAX_NAMESPACES_PER_USER.
+        """
         # Already validated by validate_request (every request names a
         # concrete profile - see resolve_profile's docstring): "profile" is
         # the namespace, with no further resolution needed here.
@@ -128,6 +133,8 @@ class Broker:
         with self._stores_lock:
             store = self._stores.pop(namespace, None)
             if store is None:
+                if not create and not Store.exists(self.store_root, namespace):
+                    return None
                 store = Store(self.store_root, namespace, self.user, self.uid, self.root_key)
             self._stores[namespace] = store  # re-insert: most-recently-used
             while len(self._stores) > self.MAX_OPEN_STORES:
@@ -139,16 +146,27 @@ class Broker:
 
     def handle(self, req):
         op = validate_request(req)
-        store = self._store(req.get("profile"))
+        profile = req.get("profile")
+        # status/cancel only need the job manager, which keys jobs by the
+        # profile name; they never touch the store.
+        if op == "status":
+            return {"ok": True, **self.job_manager.status(profile, req["jobId"])}
+        if op == "cancel":
+            return {"ok": True, **self.job_manager.cancel(profile, req["jobId"])}
+        store = self._store(profile, create=(op == "set"))
         if op in ("list", "set", "remove"):
+            if store is None:
+                if op == "list":
+                    return {"ok": True, "secrets": []}
+                raise SecretError("no such secret")
             return handle_request(store, req)
         if op == "exec":
-            job_id = self.job_manager.start(store.namespace, req, store.get)
+            # A missing namespace resolves no name, so _dispatch reports
+            # "no such secret: NAME" for each; with no secretNames the job
+            # simply runs.
+            resolve = store.get if store is not None else (lambda name: None)
+            job_id = self.job_manager.start(profile, req, resolve)
             return {"ok": True, "jobId": job_id}
-        if op == "status":
-            return {"ok": True, **self.job_manager.status(store.namespace, req["jobId"])}
-        if op == "cancel":
-            return {"ok": True, **self.job_manager.cancel(store.namespace, req["jobId"])}
         raise SecretError("unsupported operation")
 
 

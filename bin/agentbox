@@ -2202,6 +2202,19 @@ class Renderer:
         feature - turning the daemon off must not make its data
         disappear, let alone print it anywhere.
         """
+        # Disable (and stop) every instance explicitly, BEFORE the
+        # templates go: the stop sweep in cmd_apply finds instances with
+        # `list-unit-files`, which no longer lists one whose template was
+        # just removed, so a running broker would otherwise keep custody
+        # of its secrets after the opt-out. Only while the template is
+        # still installed - the transition - so a box that never ran the
+        # broker does not print a disable line on every apply.
+        if any(self.p("/etc/systemd/system",
+                      f"{SECRET_BROKER_UNIT_PREFIX}.{kind}").exists()
+               for kind in ("service", "socket")):
+            for u in self.spec.users:
+                t.disable.append(f"{SECRET_BROKER_UNIT_PREFIX}{u.name}.socket")
+                t.disable.append(f"{SECRET_BROKER_UNIT_PREFIX}{u.name}.service")
         self.gone_shared_units(t, (SECRET_BROKER_UNIT_PREFIX,))
         for u in self.spec.users:
             t.gone(self.p("/etc/systemd/system",

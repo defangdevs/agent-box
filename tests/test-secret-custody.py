@@ -660,6 +660,29 @@ class Custody(unittest.TestCase):
         last = ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [], "cwd": tmp, "profile": "testprofile"})
         self.assertTrue(last["ok"], last)
 
+    def test_read_only_ops_do_not_create_a_namespace(self):
+        ghost = os.path.join(self.broker.root, "ghost")
+        resp = self.broker.ask({"op": "list", "profile": "ghost"})
+        self.assertEqual(resp, {"ok": True, "secrets": []})
+        resp = self.broker.ask({"op": "remove", "name": "K", "profile": "ghost"})
+        self.assertFalse(resp["ok"], resp)
+        # exec without secrets still runs; with one, it is "no such secret".
+        resp = self.broker.ask({"op": "exec", "argv": ["echo", "hi"], "secretNames": [],
+                                "cwd": self.tmp, "profile": "ghost"})
+        self.assertTrue(resp["ok"], resp)
+        done = self.broker.wait_job(resp["jobId"], profile="ghost")
+        self.assertEqual(done["state"], "done", done)
+        resp = self.broker.ask({"op": "exec", "argv": ["true"], "secretNames": ["K"],
+                                "cwd": self.tmp, "profile": "ghost"})
+        done = self.broker.wait_job(resp["jobId"], profile="ghost")
+        self.assertEqual(done["state"], "error", done)
+        self.assertIn("no such secret", done["stderr"])
+        self.assertFalse(os.path.exists(ghost), "a read-only op created a namespace")
+        # set is what creates it.
+        resp = self.broker.ask({"op": "set", "name": "K", "value": "v", "profile": "ghost"})
+        self.assertTrue(resp["ok"], resp)
+        self.assertTrue(os.path.isdir(ghost))
+
     def test_exec_concurrency_cap_per_user(self):
         jobs = []
         for _ in range(ns["SECRET_MAX_JOBS_PER_USER"]):
