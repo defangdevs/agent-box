@@ -229,7 +229,10 @@
         agent("mkdir -p ~/.config/agent-box && "
               "printf 'K=legacy-plain\\nT=legacy-tomb\\nKEEP=ok\\n' >> ~/.config/agent-box/env")
         exec_bin = machine.succeed(
-            "nix-store -qR /run/current-system | grep 'agent-box-env-exec$' | head -1").strip()
+            # The closure also holds a DIRECTORY ending in this name (a
+            # payload wrapper), so take the first executable regular file.
+            "for p in $(nix-store -qR /run/current-system | grep 'agent-box-env-exec$'); do "
+            "if [ -f \"$p\" ] && [ -x \"$p\" ]; then echo \"$p\"; break; fi; done").strip()
         assert exec_bin, "no agent-box-env-exec in the system closure"
         out = agent(f"{exec_bin} env")
         names = [line.split("=", 1)[0] for line in out.splitlines() if "=" in line]
