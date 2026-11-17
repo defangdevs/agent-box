@@ -959,7 +959,11 @@ grep -q "owner-trusted source 'inbox'" "$work/err" \
 for pre in "--event message" "--delivery-id d1" "--event message --delivery-id d1"; do
   # shellcheck disable=SC2086
   out=$(AGENT_BOX_SESSION_ID=sess-1 bash "$SCRIPT" emit $pre inbox - 2>"$work/err" </dev/null); st=$?
-  if [ "$st" -eq 2 ]; then ok "emit $pre inbox is refused"; else no "emit $pre inbox is refused" "exit $st, stdout: $out"; fi
+  if [ "$st" -eq 2 ] && grep -q "owner-trusted source 'inbox'" "$work/err"; then
+    ok "emit $pre inbox is refused and names inbox"
+  else
+    no "emit $pre inbox is refused and names inbox" "exit $st, stdout: $out, stderr: $(cat "$work/err")"
+  fi
 done
 emit_case "a session's emit on an ordinary source passes" 0 sess-1 slack
 emit_case "the router outside a session still emits on inbox" 0 "" inbox
