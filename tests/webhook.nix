@@ -408,6 +408,10 @@
             " kill-server"
         )
         machine.wait_until_succeeds("! pgrep -u agent -x 'tmux: server'", timeout=30)
+        # Pane wrapper and plugin sync can outlive the server (#950).
+        machine.wait_until_succeeds(
+            "! pgrep -u agent -f 'env-exec|claude plugin'", timeout=60
+        )
 
     machine.succeed("systemctl stop agent-box@agent.service")
     quiesce_sessions()
