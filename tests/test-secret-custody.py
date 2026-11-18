@@ -1264,6 +1264,23 @@ class BrowserJobs(unittest.TestCase):
         self.assertEqual(self.page_eval("document.getElementById('pw').value"), CANARY)
         self.assertEqual(self.page_eval("document.getElementById('user').value"), "")
 
+    def test_fill_rechecks_the_node_after_synchronous_focus_handlers(self):
+        """focus() runs page focus handlers synchronously; one that makes the
+        field read-only must stop the write (CodeRabbit on PR 1076)."""
+        self.page_eval(
+            "(() => { const pw = document.getElementById('pw');"
+            " pw.readOnly = false; pw.value = '';"
+            " pw.addEventListener('focus', () => { pw.readOnly = true; }, {once: true});"
+            " document.getElementById('user').focus(); })()")
+        self.addCleanup(self.page_eval, "document.getElementById('pw').readOnly = false")
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#pw"})
+        self.assertEqual(status["state"], "error", status)
+        self.assertIn("not editable", status["stderr"])
+        self.assertNotIn(CANARY, json.dumps(status))
+        self.assertEqual(self.page_eval("document.getElementById('pw').value"), "")
+
     def test_fill_refuses_a_non_input(self):
         self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
                          "origins": [self.origin], "fillOnly": True})

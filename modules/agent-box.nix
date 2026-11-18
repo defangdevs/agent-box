@@ -6348,15 +6348,22 @@ def _host_matches(cookie_domain, origins):
 
 
 # Runs as `this` = the resolved input. Refuses unless the node is still in
-# the main document of the checked origin and takes focus; then sets the
-# value through the element's own prototype setter (what a framework's
-# value tracking sees, as typing would) and fires input and change.
+# the main document of the checked origin, editable, and takes focus; then
+# sets the value through the element's own prototype setter (what a
+# framework's value tracking sees, as typing would) and fires input and
+# change. focus() runs the page's focus handlers synchronously, and they can
+# detach the node or make it read-only, so every check runs again AFTER it.
 FILL_FUNCTION = (
     "function (origin, value) {"
-    " if (window.top !== window || self.origin !== origin) return 'origin';"
-    " if (!this.isConnected || this.ownerDocument !== document) return 'detached';"
-    " if (this.disabled || this.readOnly) return 'not editable';"
+    " var el = this;"
+    " function check() {"
+    "  if (window.top !== window || self.origin !== origin) return 'origin';"
+    "  if (!el.isConnected || el.ownerDocument !== document) return 'detached';"
+    "  if (el.disabled || el.readOnly) return 'not editable';"
+    "  return null; }"
+    " var refused = check(); if (refused) return refused;"
     " this.focus();"
+    " refused = check(); if (refused) return refused;"
     " if (document.activeElement !== this) return 'no focus';"
     " var proto = this instanceof HTMLTextAreaElement"
     "   ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
