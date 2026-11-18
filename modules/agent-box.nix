@@ -1358,10 +1358,12 @@ let
       `git worktree add ~/worktrees/NAME --detach ${"$"}{AGENT_BOX_CHECKOUT_REV}`
       from the checkout and work there. Never commit in the shared tree.
 
-      Changing this box means the same round trip as changing any other
-      repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
-      remote if you have one, and open a PR. Editing THIS tree changes
-      nothing about what the box runs - the box rebuilds from root's own
+      When asked to contribute a change to this box, use the same round trip
+      as any other repo: edit, `nix run .#assemble`, run the checks, push to
+      the `fork` remote if you have one, and open a PR. For an unsolicited
+      platform bug, follow "This platform has its own upstream repo" instead.
+      Editing THIS tree changes nothing about what the box runs - the box
+      rebuilds from root's own
       checkout (see Updating above), which only ever fast-forwards along the
       repo the deployment points at. So a commit reaches this machine once it
       is merged there and the update above runs; a commit that only exists
@@ -1980,9 +1982,11 @@ let
     guide - is github.com/defangdevs/agent-box, the repo this deployment is
     built from. A bug in that platform is not the same as a bug in the user's
     project: if you hit one, first work around it so your own running session
-    is unblocked, then file an issue (or a PR, if you already have the fix)
-    upstream so every other deployment gets it too. Search for an existing
-    issue before opening one, and don't wait for permission to file it.
+    is unblocked, then report it in an upstream issue so it can be fixed for
+    every deployment. Prefer an issue even if you have a fix; include the
+    diagnosis and fix in the report when useful. Search for an existing issue
+    before opening one, and don't wait for permission to file it. If the user
+    asks you to contribute a PR, follow that request.
   '';
   # The canonical guide is published READ-ONLY under /etc (see
   # environment.etc below) rather than seeded into $HOME. environment.etc
