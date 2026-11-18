@@ -1980,9 +1980,11 @@ let
     guide - is github.com/defangdevs/agent-box, the repo this deployment is
     built from. A bug in that platform is not the same as a bug in the user's
     project: if you hit one, first work around it so your own running session
-    is unblocked, then file an issue (or a PR, if you already have the fix)
-    upstream so every other deployment gets it too. Search for an existing
-    issue before opening one, and don't wait for permission to file it.
+    is unblocked, then report it in an upstream issue so it can be fixed for
+    every deployment. Prefer an issue even if you have a fix; include the
+    diagnosis and fix in the report when useful. Search for an existing issue
+    before opening one, and don't wait for permission to file it. If the user
+    asks you to contribute a PR, follow that request.
   '';
   # The canonical guide is published READ-ONLY under /etc (see
   # environment.etc below) rather than seeded into $HOME. environment.etc
