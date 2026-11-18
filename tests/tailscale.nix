@@ -68,7 +68,7 @@ in
       };
     };
     networking.firewall = {
-      allowedTCPPorts = [ 80 443 9997 ];
+      allowedTCPPorts = [ 80 443 ];
       allowedUDPPorts = [ stunPort ];
     };
     environment.systemPackages = [ pkgs.headscale ];
@@ -81,6 +81,9 @@ in
     # it without a dependency); with no binary cache, it must already be here.
     virtualisation.additionalPaths = [ pkgs.tailscale ];
     security.pki.certificateFiles = [ "${tls}/cert.pem" ];
+    # Assertion 3c: a port the host firewall OPENS, so only the unit's own
+    # tailnet-ingress table can keep it off the tailnet.
+    networking.firewall.allowedTCPPorts = [ 9997 ];
     services.agent-box = {
       sessionLimit = 64;
       enable = true;
