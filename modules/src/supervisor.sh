@@ -432,6 +432,19 @@ seed_claude_state() {
        | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
     sync_webhook_plugin
   fi
+  # Secret broker (issue #922): the unit exports AGENT_BOX_SECRET_SOCKET
+  # only when the broker is on, so it doubles as the enable flag, exactly as
+  # AGENT_BOX_WEBHOOK_REPO does above. Register the stdio adapter at user
+  # scope so exec_with_secrets is a native tool with no `claude mcp add`.
+  # The bare command name resolves through PATH at connect time, so the
+  # entry survives an update that moves the store path. A plain merge: a
+  # hand-edited entry of the same name is replaced, any other server stays.
+  if [ -n "${AGENT_BOX_SECRET_SOCKET:-}" ]; then
+    seed_json_settled "$HOME"/.claude.json \
+      '.mcpServers = ((.mcpServers // {})
+         + {"agent-box-secrets": {type: "stdio", command: "agent-box-secrets-mcp",
+            args: [], env: {}}})'
+  fi
   if [ "${3:-false}" = true ]; then
     seed_json "$HOME"/.claude/settings.json \
       --arg repo "$WHATSAPP_PLUGIN_REPO" \
