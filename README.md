@@ -560,7 +560,15 @@ sessions started with that profile, applied at each spawn on top of
 `agent-box-session env`. That env is convenience, not a boundary: sessions of
 one user are not isolated, so a sibling session reads it out of
 `/proc/<pid>/environ` — a token in a profile is a token every session of that
-user has. Arguments are resolved when the session is created, so an edited
+user has.
+
+That env is also how a profile picks the **credential** its harness runs with:
+set `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` or `OPENAI_API_KEY`, or give
+it its own login directory with `CLAUDE_CONFIG_DIR` or `CODEX_HOME`. The
+profile's value beats the box-wide one, so two profiles on one harness can run
+as two different accounts. This scopes which account a session spends. It does
+not isolate it from its siblings (see the next paragraph and the wiki).
+Arguments are resolved when the session is created, so an edited
 profile changes what starts *next*, never a running session.
 
 A standing webhook watch can hand its work to a profile instead of the box
