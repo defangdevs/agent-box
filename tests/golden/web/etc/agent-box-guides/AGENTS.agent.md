@@ -742,7 +742,7 @@ the work is free. So a dispatched session is told, and gets the facts to act
 on it: its prompt carries what `agent-box-session peers` reported at spawn -
 every other live session, where it works, what it claims - and it re-runs that
 command rather than trusting the snapshot. If one of those sessions has the
-object, hand it what the event said and `agent-box-session rm` yourself; that
+object, hand it what the event said and `agent-box-session finish NAME` yourself; that
 is the whole job done, because the event reached somebody with the context. If
 nobody has it, the work is yours - investigate, report, push to a branch you
 created, and leave anything irreversible on work you did not start (merging a
@@ -753,8 +753,13 @@ A hook session is spawned `--ephemeral`, so it delists ITSELF: whatever parks
 it - the agent quitting, or `agent-box-session stop` - the supervisor drops the
 entry on its next tick, and the transcript stays on disk. Hibernation keeps
 the entry and native conversation mapping for exact resumption. Its prompt still asks
-it to `agent-box-session rm NAME` when done, which is the same end reached
-sooner. What is NOT reaped is a hook session that CRASHED: a non-zero exit is
+it to run `agent-box-session finish NAME` when done, which is the same end
+reached sooner. `finish` is not `rm`: it returns at once and the removal waits
+for the session's last turn to close with nothing queued behind it, because a
+delivery that lands just before a self-`rm` sits unread in the harness's queue
+and dies with the pane. New input after `finish` cancels the removal; the
+session reads it and runs `finish` again. (`rm` still delists at once, for a
+person.) What is NOT reaped is a hook session that CRASHED: a non-zero exit is
 never parked, so it stays listed and attachable for you to read - `rm` it once
 you have. That cleanup is load-bearing: one RAM-sized limit (about one session
 per GiB by default, overridable with `sessionLimit`) bounds hook sessions

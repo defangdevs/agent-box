@@ -624,3 +624,61 @@ def archived_sessions(sessions):
             # Unreadable evidence for one session must not block the others.
             continue
     return sorted(archived)
+
+
+def finish_state(name, entry, since):
+    """Whether a session that asked to finish may be removed now.
+
+    `agent-box-session finish` cannot simply delist its own caller: a webhook
+    delivery that lands between the agent's last look and the delist sits in
+    the harness's input queue, unread, and dies with the pane (PR 1076: five
+    CodeRabbit comments arrived 0.1 s before the session removed itself). The
+    transcript is the only place that queue is visible, so the waiter asks it.
+
+    Returns one of:
+      "idle"    the last turn is closed and nothing is queued behind it
+      "busy"    a turn is open, or input is queued that the harness has not
+                started on yet: keep waiting, it will be read first
+      "input"   something other than a tool result reached the session after
+                SINCE (a delivery, or a person typing): the session is no
+                longer finished, so the caller must stand down
+      "unknown" no transcript can be tied to the session: never remove on
+                evidence we do not have
+
+    SINCE is epoch seconds. Codex rollouts carry no queue records, so for
+    Codex only an open turn is visible and "input" is never returned.
+    """
+    if not isinstance(entry, dict):
+        return "unknown"
+    harness = entry.get("agent")
+    if harness == "claude":
+        target = _hibernate_claude_transcript(name, entry)
+    elif harness == "codex":
+        target = _hibernate_codex_transcript(name, entry)
+    else:
+        return "unknown"
+    if target is None:
+        return "unknown"
+    _native, transcript, _state_path = target
+    if harness == "claude":
+        records = _hibernate_records(transcript)
+        if records is None:
+            return "unknown"
+        for record in records:
+            stamp = _archived_parse_time(record.get("timestamp"))
+            if stamp is None or stamp <= since:
+                continue
+            kind = record.get("type")
+            if kind == "queue-operation":
+                return "input"
+            message = record.get("message")
+            if kind == "user" and isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str):
+                    return "input"
+                if isinstance(content, list) and any(
+                        not isinstance(block, dict)
+                        or block.get("type") != "tool_result"
+                        for block in content):
+                    return "input"
+    return "idle" if _hibernate_transcript_state(transcript, harness) else "busy"
