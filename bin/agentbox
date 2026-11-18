@@ -4333,9 +4333,12 @@ class Renderer:
                    "[Service]",
                    f"Environment=AGENT_BOX_TAILSCALE_OWNER={owner.name}",
                    f"Environment=AGENT_BOX_TAILSCALE_MARKER={marker}",
+                   f"Environment=AGENT_BOX_NFT={self.bin}/nft",
                    f"ExecStartPre={cli} install-client",
+                   f"ExecStartPre={cli} firewall-on",
                    f"ExecStart={cli} daemon",
                    f"ExecStartPost={cli} set-operator",
+                   f"ExecStopPost={cli} firewall-off",
                    f"ExecStopPost={cli} stopped",
                    "",
                ]), 0o444)

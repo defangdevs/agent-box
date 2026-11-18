@@ -314,10 +314,12 @@ a browser asks to accept once. The site is the owner's
 `~/sites/agent-box-tailnet.caddy`, written by Connect and removed by
 Disconnect; do not edit it.
 
-A service bound to 127.0.0.1 stays private. The box's own firewall governs
-the tailnet interface like any other, so a service bound to 0.0.0.0 is
-reachable from the tailnet only on a port that firewall opens, as from the
-internet. Tailscale SSH, exit nodes and subnet routes stay off.
+The tailnet reaches the box's front door (HTTPS on 443) and nothing else:
+while the node runs, an nftables table (`inet agent_box_tailnet`) drops every
+other inbound connection on `tailscale0`, whatever the box's own firewall or
+the tailnet's access rules allow. So SSH and any service you start, on
+127.0.0.1 or 0.0.0.0, stay off the tailnet. Tailscale SSH, exit nodes and
+subnet routes stay off.
 
 Disconnect logs the node out and erases it on the box, but the tailnet keeps
 listing it until someone removes it in the admin console (or with `headscale

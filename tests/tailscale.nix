@@ -68,7 +68,7 @@ in
       };
     };
     networking.firewall = {
-      allowedTCPPorts = [ 80 443 ];
+      allowedTCPPorts = [ 80 443 9997 ];
       allowedUDPPorts = [ stunPort ];
     };
     environment.systemPackages = [ pkgs.headscale ];
@@ -231,8 +231,24 @@ in
         client.fail(f"curl -sS --max-time 5 http://{box_ip}:9998/")
         box.succeed("systemctl stop wildcard-9998")
 
+    with subtest("3c. the tailnet reaches only the front door, even past an open port"):
+        # A native box usually has no host firewall at all, so the unit's own
+        # nftables table is what keeps 0.0.0.0 services off the tailnet. Here
+        # the NixOS firewall OPENS 9997, so only that table can refuse it.
+        box.succeed("${pkgs.nftables}/bin/nft list table inet agent_box_tailnet")
+        box.succeed("systemd-run --unit wildcard-9997 -p DynamicUser=yes"
+                    " ${pkgs.python3}/bin/python3 -m http.server 9997 --bind 0.0.0.0")
+        box.wait_for_open_port(9997)
+        lan_ip = box.succeed(
+            "ip -4 -o addr show eth1 | awk '{print $4}' | cut -d/ -f1").strip()
+        client.succeed(f"curl -sf --max-time 5 http://{lan_ip}:9997/ >/dev/null")
+        client.fail(f"curl -sS --max-time 5 http://{box_ip}:9997/")
+        box.succeed("systemctl stop wildcard-9997")
+
     with subtest("4. disconnect: marker, unit, node state, site all gone"):
         box.succeed(as_agent("agent-box-tailscale disconnect >&2"))
+        # Stop removes the tailnet-ingress table with the daemon.
+        box.fail("${pkgs.nftables}/bin/nft list table inet agent_box_tailnet")
         box.succeed(f"test ! -e {MARKER}")
         box.fail(f"systemctl is-active {UNIT}")
         box.succeed("test -z \"$(ls -A /var/lib/agent-box-tailscale)\"")

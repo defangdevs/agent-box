@@ -2,6 +2,7 @@
 ConditionPathExists=/home/agent/.local/state/agent-box-tailscale/enabled
 
 [Service]
+Environment="AGENT_BOX_NFT=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-nftables-1.1.6/bin/nft"
 Environment="AGENT_BOX_TAILSCALE_MARKER=/home/agent/.local/state/agent-box-tailscale/enabled"
 Environment="AGENT_BOX_TAILSCALE_OWNER=agent"
 Environment="CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt"
@@ -16,4 +17,6 @@ Environment="TZDIR=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-tzdata-2026c/shar
 ExecStart=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-tailscale/bin/agent-box-tailscale daemon
 ExecStartPost=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-tailscale/bin/agent-box-tailscale set-operator
 ExecStartPre=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-tailscale/bin/agent-box-tailscale install-client
+ExecStartPre=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-tailscale/bin/agent-box-tailscale firewall-on
+ExecStopPost=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-tailscale/bin/agent-box-tailscale firewall-off
 ExecStopPost=/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-agent-box-tailscale/bin/agent-box-tailscale stopped

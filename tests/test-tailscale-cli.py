@@ -222,6 +222,33 @@ class TailscaleCli(unittest.TestCase):
         self.assertEqual(list(self.state_dir.iterdir()), [])
         self.assertTrue(self.state_dir.is_dir())
 
+    def test_firewall_admits_only_the_front_door_on_tailscale0(self):
+        nft = self.tools / "nft"
+        nft.write_text("#!%s\nimport json, os, sys\n"
+                       "open(os.environ['FAKE_LOG'], 'a').write("
+                       "'nft ' + json.dumps(sys.argv[1:]) + ' ' + json.dumps(sys.stdin.read() "
+                       "if '-f' in sys.argv else '') + '\\n')\n" % sys.executable)
+        nft.chmod(0o755)
+        # No usable nft: refuse rather than start tailscaled unfiltered.
+        self.assertNotEqual(self.run_cli("firewall-on").returncode, 0)
+        self.assertNotEqual(self.run_cli("firewall-on", AGENT_BOX_NFT="nft").returncode, 0)
+        proc = self.run_cli("firewall-on", AGENT_BOX_NFT=str(nft))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        line = [c for c in self.calls() if c.startswith("nft ")][0]
+        argv = json.loads(line[4:line.index("] ") + 1])
+        rules = json.loads(line[line.index("] ") + 2:])
+        self.assertEqual(argv, ["-f", "-"])
+        self.assertIn('iifname "tailscale0" tcp dport 443 accept', rules)
+        self.assertIn('iifname "tailscale0" drop', rules)
+        # The drop comes after the two accepts.
+        self.assertLess(rules.index("dport 443 accept"), rules.index('"tailscale0" drop'))
+        # Idempotent load: a leftover table is replaced, not duplicated.
+        self.assertIn("delete table inet agent_box_tailnet", rules)
+        proc = self.run_cli("firewall-off", AGENT_BOX_NFT=str(nft))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('nft ["delete", "table", "inet", "agent_box_tailnet"]',
+                      self.calls()[-1])
+
     def test_set_operator_needs_a_valid_owner(self):
         proc = self.run_cli("set-operator", AGENT_BOX_TAILSCALE_OWNER="bad owner")
         self.assertNotEqual(proc.returncode, 0)

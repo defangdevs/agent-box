@@ -3918,12 +3918,22 @@ in
       environment = {
         AGENT_BOX_TAILSCALE_OWNER = rootUser;
         AGENT_BOX_TAILSCALE_MARKER = tailscaleMarker;
+        # The tailnet-ingress table (tailscale-cli.py firewall-on): on a box
+        # with no host firewall it is the only thing between tailnet peers and
+        # services bound to 0.0.0.0.
+        AGENT_BOX_NFT = "${pkgs.nftables}/bin/nft";
       };
       serviceConfig = {
-        ExecStartPre = "${tailscaleCli}/bin/agent-box-tailscale install-client";
+        ExecStartPre = [
+          "${tailscaleCli}/bin/agent-box-tailscale install-client"
+          "${tailscaleCli}/bin/agent-box-tailscale firewall-on"
+        ];
         ExecStart = "${tailscaleCli}/bin/agent-box-tailscale daemon";
         ExecStartPost = "${tailscaleCli}/bin/agent-box-tailscale set-operator";
-        ExecStopPost = "${tailscaleCli}/bin/agent-box-tailscale stopped";
+        ExecStopPost = [
+          "${tailscaleCli}/bin/agent-box-tailscale firewall-off"
+          "${tailscaleCli}/bin/agent-box-tailscale stopped"
+        ];
       };
     };
     systemd.targets.multi-user.wants = [ "agent-box-tailscale.service" ];

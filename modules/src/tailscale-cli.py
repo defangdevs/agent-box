@@ -314,6 +314,46 @@ def disconnect():
 
 # ------------------------------------------------------------ unit side
 
+# The tailnet reaches the box's front door and nothing else. `connect` runs
+# tailscaled with --netfilter-mode=off, so the host firewall governs
+# tailscale0; but a native (non-NixOS) box usually has no host firewall at
+# all - the cloud firewall it relies on never sees tailnet traffic - so every
+# service bound to 0.0.0.0 (SSH, SMTP, a user's dev server) would be open to
+# every tailnet peer. This table makes that the same on both backends: on
+# tailscale0, replies and TCP 443 (Caddy) are accepted and everything else is
+# dropped. It is loaded before tailscaled starts and removed after it stops.
+NFT_TABLE = "agent_box_tailnet"
+NFT_RULES = """table inet %(t)s
+delete table inet %(t)s
+table inet %(t)s {
+  chain input {
+    type filter hook input priority filter - 10; policy accept;
+    iifname "tailscale0" ct state established,related accept
+    iifname "tailscale0" tcp dport 443 accept
+    iifname "tailscale0" drop
+  }
+}
+""" % {"t": NFT_TABLE}
+
+
+def nft():
+    path = os.environ.get("AGENT_BOX_NFT", "")
+    if not os.path.isabs(path) or not os.access(path, os.X_OK):
+        raise RuntimeError("AGENT_BOX_NFT does not name an nft binary")
+    return path
+
+
+def firewall_on():
+    subprocess.run([nft(), "-f", "-"], input=NFT_RULES, text=True, check=True,
+                   timeout=30)
+
+
+def firewall_off():
+    # Best effort: the table may already be gone, and a stop must not fail.
+    subprocess.run([nft(), "delete", "table", "inet", NFT_TABLE],
+                   capture_output=True, text=True, check=False, timeout=30)
+
+
 def install_client():
     """Fetch the pinned client from the binary cache and keep it from GC."""
     if os.access(tailscale_bin("tailscaled"), os.X_OK) and os.path.islink(GC_ROOT) \
@@ -379,7 +419,8 @@ def main():
         return
     commands = {"connect": connect, "status": status, "disconnect": disconnect,
                 "install-client": install_client, "daemon": daemon,
-                "set-operator": set_operator, "stopped": stopped}
+                "set-operator": set_operator, "stopped": stopped,
+                "firewall-on": firewall_on, "firewall-off": firewall_off}
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         raise RuntimeError("usage: agent-box-tailscale "
                            "configure|connect|status|disconnect")

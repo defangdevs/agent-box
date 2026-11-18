@@ -1747,10 +1747,12 @@ let
     `~/sites/agent-box-tailnet.caddy`, written by Connect and removed by
     Disconnect; do not edit it.
 
-    A service bound to 127.0.0.1 stays private. The box's own firewall governs
-    the tailnet interface like any other, so a service bound to 0.0.0.0 is
-    reachable from the tailnet only on a port that firewall opens, as from the
-    internet. Tailscale SSH, exit nodes and subnet routes stay off.
+    The tailnet reaches the box's front door (HTTPS on 443) and nothing else:
+    while the node runs, an nftables table (`inet agent_box_tailnet`) drops every
+    other inbound connection on `tailscale0`, whatever the box's own firewall or
+    the tailnet's access rules allow. So SSH and any service you start, on
+    127.0.0.1 or 0.0.0.0, stay off the tailnet. Tailscale SSH, exit nodes and
+    subnet routes stay off.
 
     Disconnect logs the node out and erases it on the box, but the tailnet keeps
     listing it until someone removes it in the admin console (or with `headscale
@@ -12375,6 +12377,46 @@ def disconnect():
 
 # ------------------------------------------------------------ unit side
 
+# The tailnet reaches the box's front door and nothing else. `connect` runs
+# tailscaled with --netfilter-mode=off, so the host firewall governs
+# tailscale0; but a native (non-NixOS) box usually has no host firewall at
+# all - the cloud firewall it relies on never sees tailnet traffic - so every
+# service bound to 0.0.0.0 (SSH, SMTP, a user's dev server) would be open to
+# every tailnet peer. This table makes that the same on both backends: on
+# tailscale0, replies and TCP 443 (Caddy) are accepted and everything else is
+# dropped. It is loaded before tailscaled starts and removed after it stops.
+NFT_TABLE = "agent_box_tailnet"
+NFT_RULES = """table inet %(t)s
+delete table inet %(t)s
+table inet %(t)s {
+  chain input {
+    type filter hook input priority filter - 10; policy accept;
+    iifname "tailscale0" ct state established,related accept
+    iifname "tailscale0" tcp dport 443 accept
+    iifname "tailscale0" drop
+  }
+}
+""" % {"t": NFT_TABLE}
+
+
+def nft():
+    path = os.environ.get("AGENT_BOX_NFT", "")
+    if not os.path.isabs(path) or not os.access(path, os.X_OK):
+        raise RuntimeError("AGENT_BOX_NFT does not name an nft binary")
+    return path
+
+
+def firewall_on():
+    subprocess.run([nft(), "-f", "-"], input=NFT_RULES, text=True, check=True,
+                   timeout=30)
+
+
+def firewall_off():
+    # Best effort: the table may already be gone, and a stop must not fail.
+    subprocess.run([nft(), "delete", "table", "inet", NFT_TABLE],
+                   capture_output=True, text=True, check=False, timeout=30)
+
+
 def install_client():
     """Fetch the pinned client from the binary cache and keep it from GC."""
     if os.access(tailscale_bin("tailscaled"), os.X_OK) and os.path.islink(GC_ROOT) \
@@ -12440,7 +12482,8 @@ def main():
         return
     commands = {"connect": connect, "status": status, "disconnect": disconnect,
                 "install-client": install_client, "daemon": daemon,
-                "set-operator": set_operator, "stopped": stopped}
+                "set-operator": set_operator, "stopped": stopped,
+                "firewall-on": firewall_on, "firewall-off": firewall_off}
     if len(sys.argv) != 2 or sys.argv[1] not in commands:
         raise RuntimeError("usage: agent-box-tailscale "
                            "configure|connect|status|disconnect")
@@ -26233,12 +26276,22 @@ in
       environment = {
         AGENT_BOX_TAILSCALE_OWNER = rootUser;
         AGENT_BOX_TAILSCALE_MARKER = tailscaleMarker;
+        # The tailnet-ingress table (tailscale-cli.py firewall-on): on a box
+        # with no host firewall it is the only thing between tailnet peers and
+        # services bound to 0.0.0.0.
+        AGENT_BOX_NFT = "${pkgs.nftables}/bin/nft";
       };
       serviceConfig = {
-        ExecStartPre = "${tailscaleCli}/bin/agent-box-tailscale install-client";
+        ExecStartPre = [
+          "${tailscaleCli}/bin/agent-box-tailscale install-client"
+          "${tailscaleCli}/bin/agent-box-tailscale firewall-on"
+        ];
         ExecStart = "${tailscaleCli}/bin/agent-box-tailscale daemon";
         ExecStartPost = "${tailscaleCli}/bin/agent-box-tailscale set-operator";
-        ExecStopPost = "${tailscaleCli}/bin/agent-box-tailscale stopped";
+        ExecStopPost = [
+          "${tailscaleCli}/bin/agent-box-tailscale firewall-off"
+          "${tailscaleCli}/bin/agent-box-tailscale stopped"
+        ];
       };
     };
     systemd.targets.multi-user.wants = [ "agent-box-tailscale.service" ];
