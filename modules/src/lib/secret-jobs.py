@@ -85,6 +85,14 @@ class Job:
         # exits 0, returns the summary to report instead. While it is set,
         # status never shows stdout at all, not even a prefix mid-run.
         self.capture = None
+        # A capture job's stdout pump writes HERE, never to stdout: status
+        # only ever shows stdout, so the captured bytes cannot reach a
+        # caller even if the pump outlives the drain thread's join and
+        # publishes after the sink has run. capture_sealed then makes that
+        # late publish a no-op, so the bytes are not retained either.
+        self.capture_out = b""
+        self.capture_out_truncated = False
+        self.capture_sealed = False
         self.lock = threading.Lock()
 
     def public(self):
@@ -326,6 +334,8 @@ class JobManager:
                     clean = clean[:self.max_output_bytes]
                     truncated = True
                 with job.lock:
+                    if attr == "capture_out" and job.capture_sealed:
+                        return
                     setattr(job, attr, clean)
                     setattr(job, attr + "_truncated", truncated)
 
@@ -342,7 +352,8 @@ class JobManager:
                         truncated = True
                         discarded = True
                         with job.lock:
-                            setattr(job, attr + "_truncated", True)
+                            if not (attr == "capture_out" and job.capture_sealed):
+                                setattr(job, attr + "_truncated", True)
                         continue
                     if len(chunk) > room:
                         raw.extend(chunk[:room])
@@ -358,7 +369,8 @@ class JobManager:
                 with contextlib.suppress(OSError, ValueError):
                     stream.close()
 
-        out_thread = threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True)
+        out_attr = "capture_out" if job.capture is not None else "stdout"
+        out_thread = threading.Thread(target=pump, args=(proc.stdout, out_attr), daemon=True)
         err_thread = threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True)
         out_thread.start()
         err_thread.start()
@@ -389,17 +401,27 @@ class JobManager:
                 job.exit_code = rc
                 job.state = "done" if rc == 0 else "error"
             if job.capture is not None:
-                self._finish_capture(job)
+                self._finish_capture(job, complete=not out_thread.is_alive())
 
-    def _finish_capture(self, job):
-        """Runs under job.lock. Hands a capture job's stdout to its sink and
-        replaces it with the sink's summary; on any failure the job is an
-        error and the captured bytes are dropped, never shown."""
-        captured, job.stdout = job.stdout, b""
+    def _finish_capture(self, job, complete):
+        """Runs under job.lock. Hands a capture job's private output to its
+        sink and reports the sink's summary as stdout; on any failure the
+        job is an error and the captured bytes are dropped, never shown.
+        complete is False when the stdout pump had not reached EOF by the
+        join's deadline (a descendant still holding the pipe): what it has
+        published so far may be a prefix, so it is never stored."""
+        captured, job.capture_out = job.capture_out, b""
+        truncated = job.capture_out_truncated
+        job.capture_sealed = True
         sink, job.capture = job.capture, None
+        job.stdout = b""
         if job.state != "done":
             return
-        if job.stdout_truncated:
+        if not complete:
+            job.state = "error"
+            job.stderr = b"captured value did not finish in time; nothing stored"
+            return
+        if truncated:
             job.state = "error"
             job.stderr = b"captured value too large to store"
             return

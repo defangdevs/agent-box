@@ -154,7 +154,11 @@ class Broker:
             return {"ok": True, **self.job_manager.status(profile, req["jobId"])}
         if op == "cancel":
             return {"ok": True, **self.job_manager.cancel(profile, req["jobId"])}
-        store = self._store(profile, create=(op in ("set", "generate", "save-cookies")))
+        # Not save-cookies: its job can still be refused (both job slots
+        # busy) or fail, and a namespace made for it would keep one of
+        # SECRET_MAX_NAMESPACES_PER_USER forever. Its sink creates the
+        # namespace only when it has a validated capture to store.
+        store = self._store(profile, create=(op in ("set", "generate")))
         if op in ("list", "set", "remove", "generate"):
             if store is None:
                 if op == "list":
@@ -169,8 +173,8 @@ class Broker:
             job_id = self.job_manager.start(profile, req, resolve)
             return {"ok": True, "jobId": job_id}
         if op in ("fill", "save-cookies", "load-cookies"):
-            builtin = self._browser_job(store, profile, req, op)
-            job_id = self.job_manager.start(profile, req, self._fill_resolver(store), builtin)
+            builtin, resolve = self._browser_job(store, profile, req, op)
+            job_id = self.job_manager.start(profile, req, resolve, builtin)
             return {"ok": True, "jobId": job_id}
         raise SecretError("unsupported operation")
 
@@ -182,22 +186,15 @@ class Broker:
         def resolve(name):
             if store is None:
                 return None
-            meta = store.meta(name)
-            if meta is None:
+            # One record version supplies both the permission and the
+            # value, so a concurrent replace cannot pair them up wrong.
+            snap = store.snapshot(name)
+            if snap is None:
                 return None
+            meta, value = snap
             if meta["fillOnly"]:
                 raise SecretError(f"{name} is fill-only: use fill, not exec")
-            value = store.get(name)
-            if value is not None and meta["kind"] == "totp":
-                return totp_code(value)
-            return value
-        return resolve
-
-    @staticmethod
-    def _fill_resolver(store):
-        def resolve(name):
-            value = store.get(name)
-            if value is not None and store.meta(name)["kind"] == "totp":
+            if meta["kind"] == "totp":
                 return totp_code(value)
             return value
         return resolve
@@ -212,11 +209,16 @@ class Broker:
         if op == "save-cookies":
             browser["origins"] = list(req["origins"])
             meta = record_meta_from_request(req, kind="cookies")
-            return {"secretNames": [], "browser": browser,
-                    "capture": self._cookie_sink(profile, name, meta)}
-        meta = store.meta(name) if store is not None else None
-        if meta is None:
+            return ({"secretNames": [], "browser": browser,
+                     "capture": self._cookie_sink(profile, name, meta)}, None)
+        # The kind and origins that authorize this job and the value it
+        # carries come from ONE record version: a save-cookies finishing in
+        # the background must not hand the old record's origin policy a new
+        # record's value.
+        snap = store.snapshot(name) if store is not None else None
+        if snap is None:
             raise SecretError(f"no such secret: {name}")
+        meta, value = snap
         if not meta["origins"]:
             raise SecretError(f"{name} has no origins: set it again with --origin")
         if op == "fill" and meta["kind"] == "cookies":
@@ -227,7 +229,12 @@ class Broker:
         browser["secret"] = name
         if op == "fill":
             browser["selector"] = req["selector"]
-        return {"secretNames": [name], "browser": browser}
+
+        def resolve(asked):
+            if asked != name:
+                return None
+            return totp_code(value) if meta["kind"] == "totp" else value
+        return {"secretNames": [name], "browser": browser}, resolve
 
     def _cookie_sink(self, profile, name, meta):
         """Stores what a save-cookies worker printed. Runs on the job's

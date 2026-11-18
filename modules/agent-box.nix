@@ -3497,6 +3497,7 @@ import socket
 import stat
 import string
 import struct
+import threading
 import time
 import urllib.parse
 
@@ -3560,6 +3561,12 @@ SECRET_MAX_ORIGINS = 8
 SECRET_MAX_ORIGIN_LEN = 256
 SECRET_MAX_SELECTOR_LEN = 1024
 SECRET_MAX_COOKIES = 300
+# The most bytes one profile's `list` reply may take, leaving headroom under
+# SECRET_MAX_FRAME for the envelope. Store.set refuses a write that would
+# push the listing past it - origins are what grow it (8 x 256 bytes per
+# record), and a profile that could no longer be listed would hide every
+# name in it from the CLI, MCP and env-exec's stripping alike.
+SECRET_MAX_LIST_BYTES = SECRET_MAX_FRAME - 1024
 SECRET_GENERATE_DEFAULT_LENGTH = 24
 SECRET_GENERATE_MIN_LENGTH = 12
 SECRET_GENERATE_MAX_LENGTH = 128
@@ -4128,6 +4135,11 @@ class Store:
         except (FileNotFoundError, NotADirectoryError):
             return False
 
+    # The quota count and the mkdir below must not interleave between two
+    # threads (the serving thread and a save-cookies drain thread both
+    # construct Stores), or both can pass the count and overshoot it.
+    _create_lock = threading.Lock()
+
     def __init__(self, root, namespace, user, uid, root_key):
         if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", namespace) or namespace in (".", ".."):
             raise SecretError("invalid namespace")
@@ -4137,13 +4149,15 @@ class Store:
             try:
                 os.stat(namespace, dir_fd=root_fd, follow_symlinks=False)
             except FileNotFoundError:
-                existing = [e for e in os.listdir(root_fd) if not e.startswith(".")]
-                if len(existing) >= SECRET_MAX_NAMESPACES_PER_USER:
-                    raise SecretError("too many secret profiles for this user") from None
-                try:
-                    os.mkdir(namespace, 0o700, dir_fd=root_fd)
-                except FileExistsError:
-                    pass
+                with Store._create_lock:
+                    existing = [e for e in os.listdir(root_fd) if not e.startswith(".")]
+                    if (namespace not in existing
+                            and len(existing) >= SECRET_MAX_NAMESPACES_PER_USER):
+                        raise SecretError("too many secret profiles for this user") from None
+                    try:
+                        os.mkdir(namespace, 0o700, dir_fd=root_fd)
+                    except FileExistsError:
+                        pass
             # Every time, not only after our own mkdir: fsync on the
             # namespace itself (in _write) does not persist its ENTRY in
             # the parent, and a retry after a failed sync finds the
@@ -4210,13 +4224,21 @@ class Store:
         fcntl.flock(fd, fcntl.LOCK_EX)
         return fd
 
-    def list(self):
-        """Names and metadata only; no value is ever decrypted here."""
+    def list(self, replace=None):
+        """Names and metadata only; no value is ever decrypted here.
+        replace=(name, record) lists as if that record were already
+        written, which is how set() measures a write before making it."""
         out = []
-        for entry in sorted(os.listdir(self.dir_fd)):
+        entries = set(os.listdir(self.dir_fd))
+        if replace is not None:
+            entries.add(replace[0] + ".rec")
+        for entry in sorted(entries):
             if not entry.endswith(".rec") or not valid_secret_name(entry[:-4]):
                 continue
-            rec = self._read(entry) or {}
+            if replace is not None and entry == replace[0] + ".rec":
+                rec = replace[1]
+            else:
+                rec = self._read(entry) or {}
             item = {"name": entry[:-4], "version": rec.get("version", 0),
                     "configured": not rec.get("tombstone", False)}
             if item["configured"]:
@@ -4251,10 +4273,27 @@ class Store:
                 # caller cannot move a fill-only secret to a new origin
                 # without also replacing what the old origin knew.
                 record["meta"] = meta
+            listed = self.list(replace=(name, record))
+            if len(json.dumps(listed, separators=(",", ":")).encode("utf-8")) > SECRET_MAX_LIST_BYTES:
+                # Refuse here rather than store a record that makes the
+                # whole profile unlistable (see SECRET_MAX_LIST_BYTES).
+                raise SecretError("too much origin metadata in this profile to list it: "
+                                  "use fewer or shorter origins")
             self._write(name + ".rec", record)
             return version
         finally:
             os.close(lock)
+
+    def snapshot(self, name):
+        """(meta, value) of ONE record version, or None for a name that is
+        missing or removed. A caller that authorizes on the metadata and
+        then uses the value must take both from here: a meta() then a get()
+        can straddle a concurrent set (a background save-cookies, say) and
+        pair the old record's permissions with the new record's value."""
+        rec = self._read(name + ".rec")
+        if rec is None or rec.get("tombstone"):
+            return None
+        return _public_meta(rec), self._decrypt_record(name, rec)
 
     def get(self, name):
         """Decrypt one value. Only the exec path calls this - list/set/
@@ -4266,6 +4305,9 @@ class Store:
         rec = self._read(name + ".rec")
         if rec is None or rec.get("tombstone"):
             return None
+        return self._decrypt_record(name, rec)
+
+    def _decrypt_record(self, name, rec):
         try:
             nonce = base64.b64decode(rec["nonce"], validate=True)
             ct = base64.b64decode(rec["ct"], validate=True)
@@ -4417,6 +4459,14 @@ class Job:
         # exits 0, returns the summary to report instead. While it is set,
         # status never shows stdout at all, not even a prefix mid-run.
         self.capture = None
+        # A capture job's stdout pump writes HERE, never to stdout: status
+        # only ever shows stdout, so the captured bytes cannot reach a
+        # caller even if the pump outlives the drain thread's join and
+        # publishes after the sink has run. capture_sealed then makes that
+        # late publish a no-op, so the bytes are not retained either.
+        self.capture_out = b""
+        self.capture_out_truncated = False
+        self.capture_sealed = False
         self.lock = threading.Lock()
 
     def public(self):
@@ -4658,6 +4708,8 @@ class JobManager:
                     clean = clean[:self.max_output_bytes]
                     truncated = True
                 with job.lock:
+                    if attr == "capture_out" and job.capture_sealed:
+                        return
                     setattr(job, attr, clean)
                     setattr(job, attr + "_truncated", truncated)
 
@@ -4674,7 +4726,8 @@ class JobManager:
                         truncated = True
                         discarded = True
                         with job.lock:
-                            setattr(job, attr + "_truncated", True)
+                            if not (attr == "capture_out" and job.capture_sealed):
+                                setattr(job, attr + "_truncated", True)
                         continue
                     if len(chunk) > room:
                         raw.extend(chunk[:room])
@@ -4690,7 +4743,8 @@ class JobManager:
                 with contextlib.suppress(OSError, ValueError):
                     stream.close()
 
-        out_thread = threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True)
+        out_attr = "capture_out" if job.capture is not None else "stdout"
+        out_thread = threading.Thread(target=pump, args=(proc.stdout, out_attr), daemon=True)
         err_thread = threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True)
         out_thread.start()
         err_thread.start()
@@ -4721,17 +4775,27 @@ class JobManager:
                 job.exit_code = rc
                 job.state = "done" if rc == 0 else "error"
             if job.capture is not None:
-                self._finish_capture(job)
+                self._finish_capture(job, complete=not out_thread.is_alive())
 
-    def _finish_capture(self, job):
-        """Runs under job.lock. Hands a capture job's stdout to its sink and
-        replaces it with the sink's summary; on any failure the job is an
-        error and the captured bytes are dropped, never shown."""
-        captured, job.stdout = job.stdout, b""
+    def _finish_capture(self, job, complete):
+        """Runs under job.lock. Hands a capture job's private output to its
+        sink and reports the sink's summary as stdout; on any failure the
+        job is an error and the captured bytes are dropped, never shown.
+        complete is False when the stdout pump had not reached EOF by the
+        join's deadline (a descendant still holding the pipe): what it has
+        published so far may be a prefix, so it is never stored."""
+        captured, job.capture_out = job.capture_out, b""
+        truncated = job.capture_out_truncated
+        job.capture_sealed = True
         sink, job.capture = job.capture, None
+        job.stdout = b""
         if job.state != "done":
             return
-        if job.stdout_truncated:
+        if not complete:
+            job.state = "error"
+            job.stderr = b"captured value did not finish in time; nothing stored"
+            return
+        if truncated:
             job.state = "error"
             job.stderr = b"captured value too large to store"
             return
@@ -5388,7 +5452,11 @@ class Broker:
             return {"ok": True, **self.job_manager.status(profile, req["jobId"])}
         if op == "cancel":
             return {"ok": True, **self.job_manager.cancel(profile, req["jobId"])}
-        store = self._store(profile, create=(op in ("set", "generate", "save-cookies")))
+        # Not save-cookies: its job can still be refused (both job slots
+        # busy) or fail, and a namespace made for it would keep one of
+        # SECRET_MAX_NAMESPACES_PER_USER forever. Its sink creates the
+        # namespace only when it has a validated capture to store.
+        store = self._store(profile, create=(op in ("set", "generate")))
         if op in ("list", "set", "remove", "generate"):
             if store is None:
                 if op == "list":
@@ -5403,8 +5471,8 @@ class Broker:
             job_id = self.job_manager.start(profile, req, resolve)
             return {"ok": True, "jobId": job_id}
         if op in ("fill", "save-cookies", "load-cookies"):
-            builtin = self._browser_job(store, profile, req, op)
-            job_id = self.job_manager.start(profile, req, self._fill_resolver(store), builtin)
+            builtin, resolve = self._browser_job(store, profile, req, op)
+            job_id = self.job_manager.start(profile, req, resolve, builtin)
             return {"ok": True, "jobId": job_id}
         raise SecretError("unsupported operation")
 
@@ -5416,22 +5484,15 @@ class Broker:
         def resolve(name):
             if store is None:
                 return None
-            meta = store.meta(name)
-            if meta is None:
+            # One record version supplies both the permission and the
+            # value, so a concurrent replace cannot pair them up wrong.
+            snap = store.snapshot(name)
+            if snap is None:
                 return None
+            meta, value = snap
             if meta["fillOnly"]:
                 raise SecretError(f"{name} is fill-only: use fill, not exec")
-            value = store.get(name)
-            if value is not None and meta["kind"] == "totp":
-                return totp_code(value)
-            return value
-        return resolve
-
-    @staticmethod
-    def _fill_resolver(store):
-        def resolve(name):
-            value = store.get(name)
-            if value is not None and store.meta(name)["kind"] == "totp":
+            if meta["kind"] == "totp":
                 return totp_code(value)
             return value
         return resolve
@@ -5446,11 +5507,16 @@ class Broker:
         if op == "save-cookies":
             browser["origins"] = list(req["origins"])
             meta = record_meta_from_request(req, kind="cookies")
-            return {"secretNames": [], "browser": browser,
-                    "capture": self._cookie_sink(profile, name, meta)}
-        meta = store.meta(name) if store is not None else None
-        if meta is None:
+            return ({"secretNames": [], "browser": browser,
+                     "capture": self._cookie_sink(profile, name, meta)}, None)
+        # The kind and origins that authorize this job and the value it
+        # carries come from ONE record version: a save-cookies finishing in
+        # the background must not hand the old record's origin policy a new
+        # record's value.
+        snap = store.snapshot(name) if store is not None else None
+        if snap is None:
             raise SecretError(f"no such secret: {name}")
+        meta, value = snap
         if not meta["origins"]:
             raise SecretError(f"{name} has no origins: set it again with --origin")
         if op == "fill" and meta["kind"] == "cookies":
@@ -5461,7 +5527,12 @@ class Broker:
         browser["secret"] = name
         if op == "fill":
             browser["selector"] = req["selector"]
-        return {"secretNames": [name], "browser": browser}
+
+        def resolve(asked):
+            if asked != name:
+                return None
+            return totp_code(value) if meta["kind"] == "totp" else value
+        return {"secretNames": [name], "browser": browser}, resolve
 
     def _cookie_sink(self, profile, name, meta):
         """Stores what a save-cookies worker printed. Runs on the job's
@@ -6268,6 +6339,58 @@ def _host_matches(cookie_domain, origins):
     return False
 
 
+# Runs as `this` = the resolved input. Refuses unless the node is still in
+# the main document of the checked origin and takes focus; then sets the
+# value through the element's own prototype setter (what a framework's
+# value tracking sees, as typing would) and fires input and change.
+FILL_FUNCTION = (
+    "function (origin, value) {"
+    " if (window.top !== window || self.origin !== origin) return 'origin';"
+    " if (!this.isConnected || this.ownerDocument !== document) return 'detached';"
+    " if (this.disabled || this.readOnly) return 'not editable';"
+    " this.focus();"
+    " if (document.activeElement !== this) return 'no focus';"
+    " var proto = this instanceof HTMLTextAreaElement"
+    "   ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
+    " Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, value);"
+    " this.dispatchEvent(new InputEvent('input',"
+    "   {bubbles: true, inputType: 'insertReplacementText'}));"
+    " this.dispatchEvent(new Event('change', {bubbles: true}));"
+    " return 'ok'; }")
+
+
+def _partition_key(cookie):
+    """(ok, key): a cookie's CDP partitionKey in the one shape that can be
+    stored and set again ({topLevelSite, hasCrossSiteAncestor}), None for
+    an unpartitioned cookie, or ok=False for a partition that cannot be
+    carried (opaque, or a shape this code does not know). Such a cookie is
+    skipped: restoring it without its partition would widen where the
+    browser sends it."""
+    if cookie.get("partitionKeyOpaque"):
+        return False, None
+    key = cookie.get("partitionKey")
+    if key is None:
+        return True, None
+    if not isinstance(key, dict) or not set(key) <= {"topLevelSite", "hasCrossSiteAncestor"}:
+        return False, None
+    if not isinstance(key.get("topLevelSite"), str):
+        return False, None
+    if not isinstance(key.get("hasCrossSiteAncestor", False), bool):
+        return False, None
+    return True, dict(key)
+
+
+def _all_cookies(cdp):
+    """Every cookie in the browser context, not only the ones a URL would
+    get: Network.getCookies filters by the URL's path, so a session cookie
+    scoped to Path=/app is invisible to a query for origin + "/". The
+    caller filters by host."""
+    try:
+        return cdp.call("Storage.getCookies")["cookies"]
+    except BrowserJobError:
+        return cdp.call("Network.getAllCookies")["cookies"]
+
+
 def _browser_fill(cdp, spec, value):
     origins = spec["origins"]
     frame_id, loader_id, origin = _main_frame(cdp)
@@ -6283,30 +6406,42 @@ def _browser_fill(cdp, spec, value):
     if node.get("localName") not in ("input", "textarea"):
         raise BrowserJobError(f"{spec['selector']} is a <{node.get('localName')}>, not an input")
     object_id = cdp.call("DOM.resolveNode", nodeId=node_id)["object"]["objectId"]
-    focused = cdp.call(
-        "Runtime.callFunctionOn", objectId=object_id, returnByValue=True,
-        functionDeclaration="function () { this.focus(); if (this.select) this.select();"
-                            " return document.activeElement === this; }")
-    if focused.get("result", {}).get("value") is not True:
-        raise BrowserJobError(f"{spec['selector']} would not take focus")
-    # Re-read the frame right before the value goes in: a navigation since
-    # the first check gives a new loaderId, and the value is not typed.
+    # Re-read the frame before the value goes in: a navigation since the
+    # first check gives a new loaderId, and the value is not sent.
     if _main_frame(cdp) != (frame_id, loader_id, origin):
         raise BrowserJobError("refused: the page navigated during the fill", code=3)
-    cdp.call("Input.insertText", text=value)
+    # Check and write in ONE call on the resolved node, never through
+    # Input.insertText: that types into whatever has focus when it lands,
+    # which page script can move after any separate check. Page script
+    # cannot run in the middle of this function, and the object id belongs
+    # to the document it was resolved in, so a navigation since makes the
+    # call fail rather than write elsewhere.
+    result = cdp.call(
+        "Runtime.callFunctionOn", objectId=object_id, returnByValue=True,
+        arguments=[{"value": origin}, {"value": value}],
+        functionDeclaration=FILL_FUNCTION)
+    outcome = result.get("result", {}).get("value")
+    if outcome == "origin":
+        raise BrowserJobError("refused: the page navigated during the fill", code=3)
+    if outcome != "ok":
+        raise BrowserJobError(f"{spec['selector']} could not be filled ({outcome})")
     return {"filled": True, "origin": origin, "selector": spec["selector"]}
 
 
 def _browser_save_cookies(cdp, spec):
     origins = spec["origins"]
-    cookies = cdp.call("Network.getCookies", urls=[o + "/" for o in origins])["cookies"]
     keep = []
-    for cookie in cookies:
+    for cookie in _all_cookies(cdp):
         if not _host_matches(cookie.get("domain", ""), origins):
+            continue
+        ok, partition = _partition_key(cookie)
+        if not ok:
             continue
         item = {key: cookie[key] for key in
                 ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
                 if key in cookie}
+        if partition is not None:
+            item["partitionKey"] = partition
         keep.append(item)
     if not keep:
         raise BrowserJobError(f"the browser holds no cookies for {', '.join(origins)}")
@@ -6327,6 +6462,11 @@ def _browser_load_cookies(cdp, spec, value):
                 if key in cookie}
         if isinstance(cookie.get("expires"), (int, float)) and cookie["expires"] > 0:
             item["expires"] = cookie["expires"]
+        ok, partition = _partition_key(cookie)
+        if not ok:
+            continue
+        if partition is not None:
+            item["partitionKey"] = partition
         params.append(item)
     if params:
         cdp.call("Network.setCookies", cookies=params)

@@ -231,6 +231,58 @@ def _host_matches(cookie_domain, origins):
     return False
 
 
+# Runs as `this` = the resolved input. Refuses unless the node is still in
+# the main document of the checked origin and takes focus; then sets the
+# value through the element's own prototype setter (what a framework's
+# value tracking sees, as typing would) and fires input and change.
+FILL_FUNCTION = (
+    "function (origin, value) {"
+    " if (window.top !== window || self.origin !== origin) return 'origin';"
+    " if (!this.isConnected || this.ownerDocument !== document) return 'detached';"
+    " if (this.disabled || this.readOnly) return 'not editable';"
+    " this.focus();"
+    " if (document.activeElement !== this) return 'no focus';"
+    " var proto = this instanceof HTMLTextAreaElement"
+    "   ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;"
+    " Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, value);"
+    " this.dispatchEvent(new InputEvent('input',"
+    "   {bubbles: true, inputType: 'insertReplacementText'}));"
+    " this.dispatchEvent(new Event('change', {bubbles: true}));"
+    " return 'ok'; }")
+
+
+def _partition_key(cookie):
+    """(ok, key): a cookie's CDP partitionKey in the one shape that can be
+    stored and set again ({topLevelSite, hasCrossSiteAncestor}), None for
+    an unpartitioned cookie, or ok=False for a partition that cannot be
+    carried (opaque, or a shape this code does not know). Such a cookie is
+    skipped: restoring it without its partition would widen where the
+    browser sends it."""
+    if cookie.get("partitionKeyOpaque"):
+        return False, None
+    key = cookie.get("partitionKey")
+    if key is None:
+        return True, None
+    if not isinstance(key, dict) or not set(key) <= {"topLevelSite", "hasCrossSiteAncestor"}:
+        return False, None
+    if not isinstance(key.get("topLevelSite"), str):
+        return False, None
+    if not isinstance(key.get("hasCrossSiteAncestor", False), bool):
+        return False, None
+    return True, dict(key)
+
+
+def _all_cookies(cdp):
+    """Every cookie in the browser context, not only the ones a URL would
+    get: Network.getCookies filters by the URL's path, so a session cookie
+    scoped to Path=/app is invisible to a query for origin + "/". The
+    caller filters by host."""
+    try:
+        return cdp.call("Storage.getCookies")["cookies"]
+    except BrowserJobError:
+        return cdp.call("Network.getAllCookies")["cookies"]
+
+
 def _browser_fill(cdp, spec, value):
     origins = spec["origins"]
     frame_id, loader_id, origin = _main_frame(cdp)
@@ -246,30 +298,42 @@ def _browser_fill(cdp, spec, value):
     if node.get("localName") not in ("input", "textarea"):
         raise BrowserJobError(f"{spec['selector']} is a <{node.get('localName')}>, not an input")
     object_id = cdp.call("DOM.resolveNode", nodeId=node_id)["object"]["objectId"]
-    focused = cdp.call(
-        "Runtime.callFunctionOn", objectId=object_id, returnByValue=True,
-        functionDeclaration="function () { this.focus(); if (this.select) this.select();"
-                            " return document.activeElement === this; }")
-    if focused.get("result", {}).get("value") is not True:
-        raise BrowserJobError(f"{spec['selector']} would not take focus")
-    # Re-read the frame right before the value goes in: a navigation since
-    # the first check gives a new loaderId, and the value is not typed.
+    # Re-read the frame before the value goes in: a navigation since the
+    # first check gives a new loaderId, and the value is not sent.
     if _main_frame(cdp) != (frame_id, loader_id, origin):
         raise BrowserJobError("refused: the page navigated during the fill", code=3)
-    cdp.call("Input.insertText", text=value)
+    # Check and write in ONE call on the resolved node, never through
+    # Input.insertText: that types into whatever has focus when it lands,
+    # which page script can move after any separate check. Page script
+    # cannot run in the middle of this function, and the object id belongs
+    # to the document it was resolved in, so a navigation since makes the
+    # call fail rather than write elsewhere.
+    result = cdp.call(
+        "Runtime.callFunctionOn", objectId=object_id, returnByValue=True,
+        arguments=[{"value": origin}, {"value": value}],
+        functionDeclaration=FILL_FUNCTION)
+    outcome = result.get("result", {}).get("value")
+    if outcome == "origin":
+        raise BrowserJobError("refused: the page navigated during the fill", code=3)
+    if outcome != "ok":
+        raise BrowserJobError(f"{spec['selector']} could not be filled ({outcome})")
     return {"filled": True, "origin": origin, "selector": spec["selector"]}
 
 
 def _browser_save_cookies(cdp, spec):
     origins = spec["origins"]
-    cookies = cdp.call("Network.getCookies", urls=[o + "/" for o in origins])["cookies"]
     keep = []
-    for cookie in cookies:
+    for cookie in _all_cookies(cdp):
         if not _host_matches(cookie.get("domain", ""), origins):
+            continue
+        ok, partition = _partition_key(cookie)
+        if not ok:
             continue
         item = {key: cookie[key] for key in
                 ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
                 if key in cookie}
+        if partition is not None:
+            item["partitionKey"] = partition
         keep.append(item)
     if not keep:
         raise BrowserJobError(f"the browser holds no cookies for {', '.join(origins)}")
@@ -290,6 +354,11 @@ def _browser_load_cookies(cdp, spec, value):
                 if key in cookie}
         if isinstance(cookie.get("expires"), (int, float)) and cookie["expires"] > 0:
             item["expires"] = cookie["expires"]
+        ok, partition = _partition_key(cookie)
+        if not ok:
+            continue
+        if partition is not None:
+            item["partitionKey"] = partition
         params.append(item)
     if params:
         cdp.call("Network.setCookies", cookies=params)
