@@ -12,6 +12,24 @@ SOURCES="$STATE_DIR/sources.json"
 export LOCAL_WEBHOOK_STATE_DIR="$STATE_DIR"
 # Never let a CLI invocation bind the ingress the daemon owns.
 export LOCAL_WEBHOOK_PORT=0
+# A Claude Remote Control daemon gives every app conversation the same
+# LOCAL_WEBHOOK_SESSION. In claude-send mode local-webhook keys the filter per
+# conversation instead (webhook.py conversation_scoped):
+# "<LOCAL_WEBHOOK_SESSION>.c<first 8 hex of CLAUDE_CODE_SESSION_ID>". Export the
+# same key, so this CLI's own reads of filter.<key>.json (stored notes, codex
+# wake) look at the file the plugin delivers from. webhook.py leaves an
+# already-scoped key alone. Without this, one conversation's subscription was
+# delivered to every conversation of the daemon.
+if [ "${LOCAL_WEBHOOK_CLAUDE_DELIVERY:-}" = send ] && [ -n "${LOCAL_WEBHOOK_SESSION:-}" ]; then
+  _conv="$(printf '%s' "${CLAUDE_CODE_SESSION_ID:-}" | tr 'A-Z' 'a-z' | tr -cd '0-9a-f' | cut -c1-8)"
+  if [ "${#_conv}" -eq 8 ]; then
+    case "$LOCAL_WEBHOOK_SESSION" in
+      (*".c$_conv") ;;
+      (*) LOCAL_WEBHOOK_SESSION="$LOCAL_WEBHOOK_SESSION.c$_conv" ;;
+    esac
+    export LOCAL_WEBHOOK_SESSION
+  fi
+fi
 # The box's own per-user state, not local-webhook's: the session registry the
 # hook-* ceiling is counted from, and where the spawn wrapper writes down a
 # batch it refused (issue #170). Both are read-only here.
