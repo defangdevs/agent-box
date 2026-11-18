@@ -16,6 +16,7 @@ AGENT_BOX_TEST_PYBIN at one if `sys.executable` lacks it, e.g.:
   nix build --no-link --print-out-paths \
     '.#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).python3.withPackages(ps: [ps.cryptography])'
 """
+import io
 import json
 import os
 import socket
@@ -835,7 +836,7 @@ class Bounds(unittest.TestCase):
             time.sleep(0.1)
         status = manager.status("p", job_id)
         self.assertEqual(status["state"], "error", status)
-        self.assertIn("did not finish", status["stderr"])
+        self.assertIn("not read to the end", status["stderr"])
         # Outlast the descendant's write and EOF.
         time.sleep(3)
         status = manager.status("p", job_id)
@@ -845,6 +846,56 @@ class Bounds(unittest.TestCase):
         job = manager._jobs[job_id]
         self.assertEqual(job.capture_out, b"")
         self.assertEqual(job.stdout, b"")
+
+    def test_capture_is_discarded_when_reading_it_fails(self):
+        """A read error ends the stdout pump without EOF; the prefix it
+        had read must not reach the sink (CodeRabbit on PR 1076)."""
+        prefix = b'{"cookies": [{"name": "sid", "value": "' + CANARY.encode()
+
+        class FailingStream:
+            def __init__(self):
+                self.chunks = [prefix]
+
+            def read(self, size):
+                if self.chunks:
+                    return self.chunks.pop(0)
+                raise OSError(5, "injected read failure")
+
+            def close(self):
+                pass
+
+        class Handle:
+            stdout = FailingStream()
+            stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return 0
+
+        class Launcher:
+            def start(self, job, *args):
+                job.handle = Handle()
+
+            def poll(self, job):
+                return 0
+
+            def kill(self, job):
+                pass
+
+        stored = []
+        manager = ns["JobManager"](Launcher(), 4096, 2)
+        builtin = {"secretNames": [], "browser": {"mode": "save-cookies"},
+                   "capture": lambda raw: stored.append(raw) or "saved\n"}
+        job_id = manager.start("p", {"op": "save-cookies"}, lambda name: None, builtin)
+        deadline = time.time() + 10
+        while manager.status("p", job_id)["state"] in ("pending", "running"):
+            self.assertLess(time.time(), deadline)
+            time.sleep(0.05)
+        status = manager.status("p", job_id)
+        self.assertEqual(status["state"], "error", status)
+        self.assertIn("not read to the end", status["stderr"])
+        self.assertNotIn(CANARY, json.dumps(status))
+        self.assertEqual(stored, [])
+        self.assertEqual(manager._jobs[job_id].capture_out, b"")
 
     def test_origin_metadata_never_makes_a_profile_unlistable(self):
         """Each record may carry 8 origins of up to 256 bytes, so enough of
