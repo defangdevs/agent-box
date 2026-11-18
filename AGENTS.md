@@ -518,9 +518,11 @@ one here has already cost at least one.
 
 ## Filing Issues, and when to skip straight to the PR
 
-This section guides agents working on our repositories. Agents on users' boxes
-should prefer reporting agent-box problems upstream as issues, as the shipped
-guide in `modules/src/default-agents.md` says.
+This section guides agents working on our behalf in our repositories. An agent
+working for a user on their box should prefer reporting agent-box problems
+upstream as issues, even when working in an agent-box checkout, as the shipped
+guide in `modules/src/default-agents.md` says. Follow an explicit user request
+to contribute a PR.
 
 When you hit something wrong - a bug, a design gap, a stale doc, a flaky check, surprising behavior you had to work around - do not let it die in a session transcript: the next agent starts with none of your context. But an issue is not automatically the right container for it. This is a repo we control, so **when you know the fix and can push it, open the PR instead**; an issue that already carries the diagnosis and the patch is churn, costing a read for every future triager and giving nothing the PR does not carry. Name the symptom in the PR body, so the work is still findable by what went wrong.
 

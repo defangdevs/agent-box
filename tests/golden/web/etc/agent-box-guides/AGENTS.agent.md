@@ -1072,10 +1072,12 @@ repo you cloned yourself, so it is what ~/worktrees is for: run
 `git worktree add ~/worktrees/NAME --detach ${AGENT_BOX_CHECKOUT_REV}`
 from the checkout and work there. Never commit in the shared tree.
 
-Changing this box means the same round trip as changing any other
-repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
-remote if you have one, and open a PR. Editing THIS tree changes
-nothing about what the box runs - the box rebuilds from root's own
+When asked to contribute a change to this box, use the same round trip
+as any other repo: edit, `nix run .#assemble`, run the checks, push to
+the `fork` remote if you have one, and open a PR. For an unsolicited
+platform bug, follow "This platform has its own upstream repo" instead.
+Editing THIS tree changes nothing about what the box runs - the box
+rebuilds from root's own
 checkout (see Updating above), which only ever fast-forwards along the
 repo the deployment points at. So a commit reaches this machine once it
 is merged there and the update above runs; a commit that only exists
