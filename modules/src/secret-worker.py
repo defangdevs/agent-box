@@ -130,7 +130,7 @@ class Cdp:
         status = head.split(b"\r\n", 1)[0]
         if b" 101 " not in status + b" ":
             raise BrowserJobError(f"DevTools refused target {target_id}: {status.decode('latin-1')}")
-        expect = base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest())
+        expect = base64.b64encode(hashlib.sha1((key + WS_GUID).encode("ascii")).digest())  # NOSONAR - RFC 6455 handshake digest, not a security use
         if expect not in head:
             raise BrowserJobError("DevTools handshake failed")
 
