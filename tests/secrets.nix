@@ -100,6 +100,16 @@
         env = machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ")
         assert "AGENT_BOX_SECRET_SOCKET=/run/agent-box-secrets/robot.sock" in env.splitlines()
 
+    with subtest("claude gets the secrets MCP server without a manual add"):
+        # The supervisor seeds it at user scope when the broker is on; the bare
+        # command name is what keeps it valid across an update (issue #922).
+        machine.wait_until_succeeds(
+            "jq -e '.mcpServers[\"agent-box-secrets\"]"
+            " | .type == \"stdio\" and .command == \"agent-box-secrets-mcp\"'"
+            " /home/agent/.claude.json",
+            timeout=60,
+        )
+
     with subtest("set / list / at-rest encryption / root key"):
         agent(f"printf %s '{VALUE}' | agent-box-secret --profile t set K --stdin")
         out = agent("agent-box-secret --profile t list")
