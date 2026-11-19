@@ -36,7 +36,7 @@
         };
         host = {
           jobs = 1;
-          checks = [ "ipv4-tcp-mitigation" "containers" "secrets" "memory-protection" "ttyd-isolation" "web-surface" "email" ];
+          checks = [ "ipv4-tcp-mitigation" "containers" "secrets" "memory-protection" "ttyd-isolation" "web-surface" "email" "tailscale" ];
         };
       };
 
@@ -63,6 +63,15 @@
 
           connect = pkgs.testers.runNixOSTest
             (import ./tests/connect.nix { agent-box = self.nixosModules.agent-box; });
+
+          # Interactive VM test (PR #1069): the settings page's Tailscale
+          # card for real - a root kernel-mode tailscaled the owner starts
+          # through polkit, joined to a Headscale guest, the box's pages
+          # served under its tailnet name to a second tailnet node, a
+          # loopback-only port that stays private, Disconnect erasing the
+          # node, and the unit returning after a reboot.
+          tailscale = pkgs.testers.runNixOSTest
+            (import ./tests/tailscale.nix { agent-box = self.nixosModules.agent-box; });
 
           # Interactive VM test (issue 62): protectMemory defaults — zram
           # swap active, agent unit's OOMScoreAdjust applied, and earlyoom
@@ -3045,6 +3054,26 @@ open(sys.argv[3], "w").write(header + yaml.safe_dump(data, sort_keys=True))' \
                 exit 1
               }
               bash "$codexResumeTests" "$supervisor" "$sessionStartHook" >> log 2>&1 || {
+                cat log
+                exit 1
+              }
+              cat log
+              cp log "$out"
+            '';
+
+          # The Tailscale card's CLI against fake tailscale/systemctl: key
+          # handling, the Caddy site it writes, and what Disconnect erases.
+          tailscale-cli =
+            pkgs.runCommand "agent-box-tailscale-cli"
+              {
+                nativeBuildInputs = [ pkgs.python3 ];
+                cli = ./modules/src/tailscale-cli.py;
+                tests = ./tests/test-tailscale-cli.py;
+              } ''
+              install -d repo/modules/src repo/tests
+              cp "$cli" repo/modules/src/tailscale-cli.py
+              cp "$tests" repo/tests/test-tailscale-cli.py
+              python3 repo/tests/test-tailscale-cli.py > log 2>&1 || {
                 cat log
                 exit 1
               }

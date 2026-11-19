@@ -403,7 +403,7 @@
 
       const views = {
         context: {
-          title: 'System context', meta: 'People, entry points, and trust boundaries', size: [1180, 900],
+          title: 'System context', meta: 'People, entry points, and trust boundaries', size: [1180, 1000],
           boundaries: [
             { x: 280, y: 40, w: 590, h: 820, label: 'AGENT-BOX HOST · OPERATOR-CONTROLLED SANDBOX' },
             { x: 310, y: 150, w: 530, h: 480, label: 'LINUX USER · TRUST BOUNDARY' }
@@ -416,11 +416,12 @@
             { id: 'mail', x: 35, y: 710, w: 200, h: 106, type: 'External system', title: 'Mail sender', desc: ['Mail to a registered', 'purpose address'], kind: 'external', tech: ['SMTP', 'SPF / DKIM'] },
             { id: 'agentbox', x: 340, y: 195, w: 470, h: 120, type: 'Software system', title: 'agent-box', desc: ['Runs durable coding-agent conversations', 'inside hardened, unprivileged user accounts'], kind: 'platform', tech: ['Nix / NixOS', 'systemd', 'tmux'] },
             { id: 'channels', x: 340, y: 450, w: 250, h: 130, type: 'Software system', title: 'local-channels', desc: ['Connects chat, mail and', 'signed events to sessions'], kind: 'channel', tech: ['Node.js', 'Python 3', 'Unix sockets'] },
-            { id: 'rootsvc', x: 600, y: 700, w: 230, h: 120, type: 'Privileged services', title: 'Root custodians', desc: ['Update, mail intake,', 'secrets, reboot helper'], kind: 'platform', tech: ['root', 'SO_PEERCRED'] },
+            { id: 'rootsvc', x: 600, y: 700, w: 230, h: 120, type: 'Privileged services', title: 'Root custodians', desc: ['Update, mail intake, secrets,', 'reboot helper, tailscaled'], kind: 'platform', tech: ['root', 'SO_PEERCRED'] },
             { id: 'model', x: 940, y: 70, w: 210, h: 106, type: 'External system', title: 'Model provider', desc: ['Claude or OpenAI', 'agent service'], kind: 'external', tech: ['HTTPS'] },
             { id: 'github', x: 940, y: 270, w: 210, h: 106, type: 'External system', title: 'Code + CI systems', desc: ['Repositories, checks,', 'reviews, and issues'], kind: 'external', tech: ['Git', 'APIs'] },
             { id: 'buzz', x: 940, y: 470, w: 210, h: 106, type: 'External system', title: 'Buzz', desc: ['Remote ACP client that', 'drives one fixed profile'], kind: 'external', tech: ['ACP', 'SSH'] },
-            { id: 'portal', x: 940, y: 670, w: 210, h: 106, type: 'External system (optional)', title: 'Sign-in portal', desc: ['Hands a signed session', 'to the box front door'], kind: 'external', tech: ['JWT', 'JWKS'] }
+            { id: 'portal', x: 940, y: 670, w: 210, h: 106, type: 'External system (optional)', title: 'Sign-in portal', desc: ['Hands a signed session', 'to the box front door'], kind: 'external', tech: ['JWT', 'JWKS'] },
+            { id: 'tailnet', x: 940, y: 850, w: 210, h: 106, type: 'External system (optional)', title: 'Tailnet', desc: ['Tailscale or Headscale', 'and the owner\'s devices'], kind: 'external', tech: ['WireGuard'] }
           ],
           rels: [
             { from: 'operator', to: 'agentbox', label: 'controls sessions and configuration' },
@@ -434,7 +435,8 @@
             { from: 'agentbox', to: 'model', label: 'runs harness against' },
             { from: 'agentbox', to: 'github', label: 'reads and changes code; reacts and replies' },
             { from: 'buzz', to: 'agentbox', label: 'ACP over an SSH forced command' },
-            { from: 'portal', to: 'agentbox', label: 'signed session handover' }
+            { from: 'portal', to: 'agentbox', label: 'signed session handover' },
+            { from: 'tailnet', to: 'rootsvc', label: 'private HTTPS with no inbound port', async: true }
           ]
         },
         containers: {
@@ -451,6 +453,8 @@
             { id: 'buzz2', x: 10, y: 920, w: 190, h: 98, type: 'External system', title: 'Buzz', desc: ['Remote ACP client'], kind: 'external', tech: ['SSH'] },
             { id: 'mail2', x: 10, y: 1090, w: 190, h: 98, type: 'External system', title: 'Mail sender', desc: ['Mail to a purpose', 'address'], kind: 'external', tech: ['SMTP'] },
             { id: 'caddy', x: 500, y: 40, w: 510, h: 92, type: 'Container', title: 'Caddy', desc: ['TLS, basic auth or portal session, reverse proxy'], kind: 'platform', tech: ['Caddy', 'forward_auth'] },
+            { id: 'tailscaled', x: 1080, y: 40, w: 220, h: 100, type: 'Root service (optional)', title: 'Tailnet node', desc: ['One node per box, kernel', 'mode; owner connects it'], kind: 'platform', tech: ['tailscaled', 'polkit'] },
+            { id: 'tailnet2', x: 1410, y: 40, w: 140, h: 100, type: 'External system', title: 'Tailnet', desc: ['Tailscale or', 'Headscale'], kind: 'external', tech: ['WireGuard'] },
             { id: 'reboot', x: 235, y: 380, w: 210, h: 105, type: 'Root service', title: 'Reboot helper', desc: ['sysrq reboot that needs', 'nothing from the disk'], kind: 'platform', tech: ['root', 'mlock'] },
             { id: 'settings', x: 500, y: 200, w: 220, h: 105, type: 'Container', title: 'Settings daemon', desc: ['Sessions, profiles, secrets,', 'connections + resources'], kind: 'platform', tech: ['Python', 'SSE'] },
             { id: 'supervisor', x: 500, y: 380, w: 220, h: 105, type: 'Container', title: 'Session supervisor', desc: ['Lifecycles, capacity,', 'hibernation + bridges'], kind: 'platform', tech: ['Shell', 'tmux'] },
@@ -477,6 +481,9 @@
             { from: 'settings', to: 'supervisor', label: 'create / stop / restart' },
             { from: 'settings', to: 'bridge', label: 'pair / unlink / choose profile' },
             { from: 'settings', to: 'reboot', label: 'fallback reboot socket' },
+            { from: 'settings', to: 'tailscaled', label: 'connect / disconnect (polkit start, stop)' },
+            { from: 'tailnet2', to: 'tailscaled', label: 'WireGuard, DERP relay', async: true },
+            { from: 'tailscaled', to: 'caddy', label: 'tailnet HTTPS to :443; *.ts.net cert' },
             { from: 'settings', to: 'broker', label: 'store / rotate (never read back)' },
             { from: 'receiver', to: 'state', label: 'reads sources; broadcasts envelopes' },
             { from: 'state', to: 'claude', label: 'per-session filter + peer socket', async: true },
@@ -569,9 +576,12 @@
       const details = {
         slack: { summary: 'A Slack workspace whose app tokens are in the user\'s env store.', responsibilities: ['Delivers channel and thread messages over Socket Mode, so the box needs no public Slack URL', 'Serves thread files (images, PDF, text, audio) to the agent on request', 'Receives thread replies, uploads and allowlisted DMs under write rules'], tech: ['Slack Socket Mode', 'Web API'] },
         mail: { summary: 'Any mail server sending to an address the user registered with a purpose and a worker profile.', responsibilities: ['Must pass SPF or DKIM for the exact From domain', 'Reaches only explicitly registered addresses; there is no catch-all', 'Supplies untrusted content and attachments'], tech: ['SMTP', 'STARTTLS', 'SPF', 'DKIM'] },
-        rootsvc: { summary: 'The few root-owned services an agent user may reach, each through a narrow, peer-checked door.', responsibilities: ['Update: fast-forwards the root-owned source tree and swaps the Nix profile', 'Mail intake: authenticates SMTP and delivers as the recipient user', 'Secret broker: keeps values out of the agent user\'s reach', 'Reboot helper: reboots through sysrq when the disk is gone'], tech: ['systemd', 'sudo allowlist', 'SO_PEERCRED'] },
+        rootsvc: { summary: 'The few root-owned services an agent user may reach, each through a narrow, peer-checked door.', responsibilities: ['Update: fast-forwards the root-owned source tree and swaps the Nix profile', 'Mail intake: authenticates SMTP and delivers as the recipient user', 'Secret broker: keeps values out of the agent user\'s reach', 'Reboot helper: reboots through sysrq when the disk is gone', 'Tailnet node (optional): the box owner starts it through a polkit grant'], tech: ['systemd', 'sudo allowlist', 'polkit', 'SO_PEERCRED'] },
         buzz: { summary: 'A remote ACP client (Buzz) that drives one Agentbox profile on the box over SSH.', responsibilities: ['Owns channel/thread routing and ACP session reuse', 'Connects with a dedicated key whose forced command fixes the profile and directory', 'Gets trusted native-agent execution as that Linux user'], tech: ['ACP', 'OpenSSH forced command'] },
         portal: { summary: 'An optional external portal that signs the operator in and hands a session to the box.', responsibilities: ['Issues a handover token with the configured iss', 'Publishes signing keys that the box caches with a bound', 'Is the return target of the 401 page'], tech: ['JWT', 'JWKS', 'web.portalIssuer'] },
+        tailnet: { summary: 'An optional private network the box owner joins the box to from the settings page: Tailscale\'s hosted service or a self-hosted Headscale server.', responsibilities: ['Admits the owner\'s devices by the tailnet\'s own access rules', 'Lets the box be used with no inbound port open', 'Issues *.ts.net certificates when HTTPS is on (Tailscale only)'], tech: ['WireGuard', 'Tailscale', 'Headscale'] },
+        tailnet2: { summary: 'The tailnet the owner connected: coordination server, DERP relays and the owner\'s own devices.', responsibilities: ['Carries the owner\'s browser to the box over WireGuard', 'Relays through DERP when no direct path exists'], tech: ['WireGuard', 'DERP'] },
+        tailscaled: { summary: 'One tailnet node per box, run by root in kernel (TUN) mode and started only by the box owner (optional).', responsibilities: ['Starts and stops only through the owner\'s polkit grant and marker file', 'Fetches the pinned client on first start; erases its state on Disconnect', 'Kernel mode keeps services bound to 127.0.0.1 private (user-space mode would forward the tailnet to every loopback port)', 'Its own nftables table admits only TCP 443 on tailscale0, so SSH and other services stay off the tailnet even on a box with no host firewall', 'Gives Caddy the *.ts.net certificate; other names use Caddy\'s local CA'], tech: ['tailscaled', 'agent-box-tailscale', 'polkit', 'nftables'] },
         reboot: { summary: 'A root daemon that can reboot the box when the disk is gone and sudo cannot run.', responsibilities: ['Holds /proc/sysrq-trigger open and writes only s, u, b', 'Accepts only the exact REBOOT request from the root terminal user\'s uid', 'Pins Caddy and the settings daemon in RAM so the button still loads'], tech: ['Python', 'mlockall', 'SO_PEERCRED'] },
         slackd: { summary: 'The per-user Slack daemon that turns Socket Mode events into signed bus events.', responsibilities: ['Runs only while SLACK_APP_TOKEN and SLACK_BOT_TOKEN are set', 'Emits slack:<TEAM>/<CHANNEL> topics to the user ingress socket', 'Fetches allowlisted files and posts replies, uploads and DMs'], tech: ['local-slack', 'slack.py'] },
         acp: { summary: 'The ACP stdio endpoint that Buzz reaches through an SSH forced command.', responsibilities: ['Pins one profile and one remote working directory', 'Rewrites session cwd and path anchors to that directory', 'Refuses MCP server definitions unless explicitly allowed', 'Ends the adapter process group on EOF or disconnect'], tech: ['agent-box-acp', 'codex-acp', 'claude-agent-acp'] },
@@ -591,7 +601,7 @@
         github: { summary: 'The external systems the agent reads and changes while doing development work.', responsibilities: ['Hosts code and reviews', 'Emits CI, issue, PR, and comment events', 'Accepts authenticated changes from the agent'], tech: ['GitHub API', 'Git', 'CI'] },
         browser: { summary: 'The operator-facing workspace for terminals, settings, sessions, secrets, connections, and webhooks.', responsibilities: ['Embeds the terminal and the session grid', 'Calls settings routes and receives live resource readings over SSE', 'Serves ~/downloads and resumable one-file upload links'], tech: ['HTML', 'ttyd', 'HTTP'] },
         caddy: { summary: 'The only public web edge on the box.', responsibilities: ['Terminates TLS (internal CA for a private IPv4)', 'Authenticates operator routes by password or portal handover', 'Routes webhook ingress to a per-user Unix socket', 'Imports user ~/sites snippets; strips identifying headers'], tech: ['Caddy', 'TLS', 'Unix sockets'] },
-        settings: { summary: 'The per-user control plane for the box.', responsibilities: ['Renders sessions, profiles, automations and host resources', 'Pairs or unlinks WhatsApp; registers mail addresses', 'Writes the env store and invokes scoped lifecycle operations', 'Falls back to the reboot helper when the normal reboot fails or hangs'], tech: ['Python HTTP server', 'JSON state'] },
+        settings: { summary: 'The per-user control plane for the box.', responsibilities: ['Renders sessions, profiles, automations and host resources', 'Pairs or unlinks WhatsApp; connects Tailscale; registers mail addresses', 'Writes the env store and invokes scoped lifecycle operations', 'Falls back to the reboot helper when the normal reboot fails or hangs'], tech: ['Python HTTP server', 'JSON state'] },
         supervisor: { summary: 'Maintains agent runtimes and the user-owned channel daemons.', responsibilities: ['Starts the chosen harness or profile; gives each session its own TMPDIR', 'Reserves hook capacity; hibernates an idle hook to make room and resumes it exactly', 'Supervises the WhatsApp bridge and Slack daemon without spending a session slot'], tech: ['Shell', 'tmux', 'systemd'] },
         receiver: { summary: 'The single ingress owner in agent-box daemon mode.', responsibilities: ['Adopts the systemd-activated socket', 'Verifies the raw request body before parsing', 'Broadcasts a normalized envelope to every live peer', 'Retains full untrusted content for 24 hours and adds GitHub pickup reactions'], tech: ['webhook.py', 'Python http.server', 'socket activation'] },
         state: { summary: 'Shared per-user runtime state for sources, routing, subscriptions, and peers.', responsibilities: ['Keeps source configuration and 0600 secrets', 'Stores one filter per session (claims + events policy) plus named standing watches', 'Tracks live peer sockets, spawn leases and retained content'], tech: ['sources.json', 'filter.<session>.json', 'instances/*.sock'] },
@@ -630,6 +640,7 @@
         router: ['local-router implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-router'],
         'w-route': ['local-router implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-router'],
         slackd: ['local-slack implementation', 'https://github.com/defangdevs/local-channels/tree/main/local-slack'],
+        tailscaled: ['tailscale-cli.py', 'https://github.com/defangdevs/agent-box/blob/master/modules/src/tailscale-cli.py'],
         reboot: ['PR #1055: reboot helper', 'https://github.com/defangdevs/agent-box/pull/1055'],
         broker: ['secret-broker.py', 'https://github.com/defangdevs/agent-box/blob/master/modules/src/secret-broker.py'],
         acp: ['acp-cli.py', 'https://github.com/defangdevs/agent-box/blob/master/modules/src/acp-cli.py'],

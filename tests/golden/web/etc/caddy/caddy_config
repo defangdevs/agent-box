@@ -103,7 +103,11 @@ https:// {
   respond 404
 }
 
-golden.example.org {
+# Site-level behavior shared by every listener that serves the box's own
+# pages: the public vhost and the tailnet site agent-box-tailscale writes (see
+# caddyfile-vhost.caddy). The routes themselves are the agent_box_routes
+# snippet the renderer writes after this fragment.
+(agent_box_site) {
   # Delete separately: adding this to the block below would defer all of its
   # headers and override the downloads route's stricter CSP.
   header {
@@ -112,7 +116,6 @@ golden.example.org {
   }
   # Access log to the journal — the fail2ban jail counts 401s here.
   log
-  import acme_alpn_only
   # zstd only (no gzip fallback): the terminal, settings and downloads
   # payloads here are all served to browsers new enough to run this
   # page's JS in the first place, and zstd's default level is cheap on
@@ -172,9 +175,8 @@ golden.example.org {
       respond "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p></section></main></body></html>" 401
     }
   }
-  # This fragment ends INSIDE the block on purpose: the module appends one
-  # webhook + terminal block per user (and the root block), then the closing
-  # brace. Nothing is missing here.
+}
+(agent_box_routes) {
   # Two handles, not `/agent/webhook*`: that glob also matches
   # /agent/webhookish, which would reach the receiver as an unknown source and
   # 404 instead of falling through to whatever else this vhost serves.
@@ -775,6 +777,17 @@ golden.example.org {
       }
     }
   }
+}
+
+# The box's own vhost: every route in agent_box_routes, under its name. The
+# routes are a snippet so a second site can serve the same pages under
+# another name: agent-box-tailscale writes one for the box's tailnet name
+# into the owner's ~/sites (imported below), which is what lets a box with
+# no inbound port open still be used.
+golden.example.org {
+  import agent_box_site
+  import acme_alpn_only
+  import agent_box_routes
 }
 
 # Per-user snippet directories. Each agent user's ~/sites/ symlinks

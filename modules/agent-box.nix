@@ -1731,6 +1731,36 @@ let
     independently of queue consumption. Do not execute or automatically extract
     attachments. `agent-box-webhook status` reports pending and retained content.
 
+    ## Tailscale connection
+
+    The box owner's settings page has a Tailscale card under Connections. Connect
+    joins this BOX to a tailnet as one node named after the box: Tailscale's own
+    service, or a self-hosted Headscale server given as the login server. An
+    optional auth key joins without a sign-in link. The node is the root unit
+    `agent-box-tailscale.service` in kernel mode; only the owner can start or stop
+    it, through the card or `agent-box-tailscale connect` / `disconnect`.
+    `agent-box-tailscale status` prints its state as JSON.
+
+    Once joined, Caddy also serves the box's own pages at
+    `https://<node name>/<user>/`, behind the same login, so the box stays usable
+    with no inbound port open. A `ts.net` name gets a trusted certificate when
+    HTTPS is turned on for the tailnet; any other name uses Caddy's local CA, which
+    a browser asks to accept once. The site is the owner's
+    `~/sites/agent-box-tailnet.caddy`, written by Connect and removed by
+    Disconnect; do not edit it.
+
+    The tailnet reaches the box's front door (HTTPS on 443) and nothing else:
+    while the node runs, an nftables table (`inet agent_box_tailnet`) drops every
+    other inbound connection on `tailscale0`, whatever the box's own firewall or
+    the tailnet's access rules allow. So SSH and any service you start, on
+    127.0.0.1 or 0.0.0.0, stay off the tailnet. Tailscale SSH, exit nodes and
+    subnet routes stay off.
+
+    Disconnect logs the node out and erases it on the box, but the tailnet keeps
+    listing it until someone removes it in the admin console (or with `headscale
+    nodes delete`). Until then, the next Connect joins as `<box>-1`, so the URL
+    changes; the card shows the new one.
+
     ## Personal WhatsApp connection
 
     The settings page's Connections section can link this user's WhatsApp as a
@@ -2297,6 +2327,44 @@ let
       SuccessExitStatus=0 1
       StandardInput=null
     ''} $out/etc/systemd/system/agent-box-harness-upgrade@.service
+  '' + lib.optionalString tailscaleEnabled ''
+    install -m444 ${pkgs.writeText "agent-box-tailscale.service" ''
+      [Unit]
+      Description=Tailscale for this box (agent-box, started from the settings page)
+      # One tailnet node per BOX, run by root in kernel (TUN) mode. Not a
+      # user-space daemon in the agent unit: in user-space mode tailscaled forwards
+      # every tailnet TCP connection it does not serve to 127.0.0.1 on the same
+      # port, so every loopback-only service on the box would be open to the
+      # tailnet, and --shields-up also blocks the front door. A TUN keeps the usual
+      # semantics: a service bound to 127.0.0.1 stays private.
+      #
+      # Each backend adds a drop-in with the Exec lines (the absolute path of
+      # agent-box-tailscale), the box owner's name, and
+      #   ConditionPathExists=<owner home>/.local/state/agent-box-tailscale/enabled
+      # The owner's Connect writes that marker and starts this unit through a
+      # polkit grant; Disconnect removes it and stops the unit. So the unit comes
+      # back at boot only while the box is connected, and a box nobody connected
+      # never fetches the client at all.
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      # Caddy asks tailscaled for the *.ts.net certificate of the tailnet site
+      # agent-box-tailscale writes (Tailscale's own Caddy integration).
+      Environment=TS_PERMIT_CERT_UID=caddy
+      StateDirectory=agent-box-tailscale
+      StateDirectoryMode=0700
+      # The default socket path, so the plain `tailscale` CLI finds it.
+      RuntimeDirectory=tailscale
+      RuntimeDirectoryMode=0755
+      Restart=on-failure
+      RestartSec=5s
+      # The first start fetches the client from the binary cache.
+      TimeoutStartSec=600
+
+      [Install]
+      WantedBy=multi-user.target
+    ''} $out/etc/systemd/system/agent-box-tailscale.service
   '' + lib.optionalString cfg.containers.enable ''
     install -m444 ${pkgs.writeText "agent-box-docker@.service" ''
       [Unit]
@@ -8694,6 +8762,25 @@ done
   # - and grant /run/wrappers + disable NoNewPrivileges - for a rule that
   # was never actually rendered (CodeRabbit, PR #655).
   rebootGranted = cfg.web.enable && cfg.web.rebootButton && rootUser != null;
+  # The settings page's Tailscale card (src/tailscale-cli.py): one tailnet
+  # node per box, controlled by the box owner (the root web user) alone.
+  tailscaleEnabled = cfg.web.enable && rootUser != null;
+  tailscaleMarker =
+    "${config.users.users.${rootUser}.home}/.local/state/agent-box-tailscale/enabled";
+  # The owner may start and stop exactly that unit, and nothing else: the
+  # same narrow polkit shape as the Caddy reload grant above. Connect writes
+  # the marker the unit's condition reads, then starts it; Disconnect
+  # removes the marker and stops it.
+  tailscalePolkitRule = ''
+    polkit.addRule(function(action, subject) {
+      if (action.id == "org.freedesktop.systemd1.manage-units" &&
+          action.lookup("unit") == "agent-box-tailscale.service" &&
+          (action.lookup("verb") == "start" || action.lookup("verb") == "stop") &&
+          subject.user == ${builtins.toJSON rootUser}) {
+        return polkit.Result.YES;
+      }
+    });
+  '';
   # Whether this box grants an agent user ANY sudo, which is a different
   # question from whether effectiveSudoAllowlist is non-empty: the
   # containers arm grants each user `systemctl restart/stop` on its OWN
@@ -8942,7 +9029,7 @@ done
 
   agentRuntimePackages = lib.unique (
     eagerAgentPackages
-    ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli uploadCli receiveCli transcribeCli
+    ++ [ pkgs.bubblewrap pkgs.nftables pkgs.tmux pkgs.which sessionCli profileCli acpCli whatsappCli slackCli tailscaleCli uploadCli receiveCli transcribeCli
          harnessCli secretCli secretsMcpBin secretCandidatesReport ]
     # Webhook self-service (issue #101). On PATH only when there is an endpoint
     # to talk about, so its mere presence tells an agent the feature is live.
@@ -11970,6 +12057,451 @@ if __name__ == "__main__":
   # local-slack (issue #864): the supervisor runs its daemon while both Slack
   # tokens are in the env store. The CLI fetches the one pinned slack.py and
   # supplies the receiver socket path, which only this box knows.
+  # The box's Tailscale connection (settings page, box owner only). The
+  # client's store path is embedded WITHOUT a dependency on it, so the system
+  # closure does not carry tailscale: the unit fetches exactly this path from
+  # the binary cache when the owner first connects.
+  tailscaleCli = pkgs.writers.writePython3Bin "agent-box-tailscale" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } (lib.replaceStrings [ "@TAILSCALE_PKG@" ]
+      [ (builtins.unsafeDiscardStringContext "${pkgs.tailscale}") ] ''
+"""Optional Tailscale connection for an agent-box.
+
+One tailnet node per box. The box owner's settings page runs `connect`,
+which starts the root unit agent-box-tailscale.service (a polkit grant lets
+the owner start and stop exactly that unit), joins the tailnet, and gives
+Caddy a site for the node's tailnet name. Then the box is usable with no
+inbound port open.
+
+The same open-source client works with Tailscale's hosted coordination
+server and with a self-hosted Headscale server (`--login-server`).
+
+User-side commands (the box owner): configure, connect, status, disconnect.
+Unit-side commands (root, from the unit's drop-in only): install-client,
+daemon, set-operator, stopped.
+"""
+
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+
+
+# The tailscale store path from the box's own pinned nixpkgs, substituted at
+# build time WITHOUT a dependency on it: the box carries the client only once
+# its owner connects, and then it is the exact version the box was built with.
+PACKAGE = os.environ.get("AGENT_BOX_TAILSCALE_PKG") or "@TAILSCALE_PKG@"
+UNIT = "agent-box-tailscale.service"
+# Fixed paths; the environment overrides exist for tests/test-tailscale-cli.py.
+GC_ROOT = os.environ.get("AGENT_BOX_TAILSCALE_GC_ROOT",
+                         "/nix/var/nix/gcroots/agent-box-tailscale")
+DAEMON_STATE = Path(os.environ.get("AGENT_BOX_TAILSCALE_STATE_DIR",
+                                   "/var/lib/agent-box-tailscale"))
+SOCKET = os.environ.get("AGENT_BOX_TAILSCALE_SOCKET", "/run/tailscale/tailscaled.sock")
+TOOL_PATH = ("/run/current-system/sw/bin", "/nix/var/nix/profiles/default/bin",
+             "/usr/bin", "/bin")
+
+HOME = Path.home()
+STATE = HOME / ".local/state/agent-box-tailscale"
+MARKER = STATE / "enabled"
+CONFIG = STATE / "config.json"
+AUTH_KEY = STATE / "authkey"
+SITE = HOME / "sites/agent-box-tailnet.caddy"
+
+SOCKET_WAIT = 60
+UP_TIMEOUT = "10m"
+LOGIN_SERVER_RE = re.compile(
+    r"https://[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[0-9]{1,5})?/?")
+AUTH_KEY_RE = re.compile(r"[A-Za-z0-9_:-]{8,256}")
+LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+DNS_NAME_RE = re.compile(r"(?=.{1,253}$)%s(?:\.%s)+" % (LABEL, LABEL))
+
+
+def tool(name):
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in TOOL_PATH:
+        candidate = os.path.join(directory, name)
+        if os.access(candidate, os.X_OK):
+            return candidate
+    raise RuntimeError("%s is not available on this box" % name)
+
+
+def tailscale_bin(name="tailscale"):
+    return os.path.join(PACKAGE, "bin", name)
+
+
+def user_name():
+    return os.environ.get("USER") or HOME.name
+
+
+# ------------------------------------------------------------ user side
+
+def private_dir(path):
+    if path.is_symlink():
+        raise RuntimeError("Tailscale state cannot be a symlink")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)
+
+
+def write_private(path, text, mode=0o600):
+    pending = path.with_name(path.name + ".pending")
+    pending.unlink(missing_ok=True)
+    fd = os.open(pending, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
+    pending.replace(path)
+
+
+def load_config():
+    try:
+        data = json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def login_server():
+    value = load_config().get("loginServer", "")
+    return value if isinstance(value, str) and LOGIN_SERVER_RE.fullmatch(value) else ""
+
+
+def check_login_server(value):
+    """An https origin and nothing else: the card links to it."""
+    value = value.strip()
+    if not value:
+        return ""
+    if not LOGIN_SERVER_RE.fullmatch(value):
+        raise RuntimeError("The login server must be an https:// address with no path")
+    try:
+        urllib.parse.urlsplit(value).port
+    except ValueError:
+        raise RuntimeError("The login server port is out of range") from None
+    return value.rstrip("/")
+
+
+def configure(args):
+    """Save the login server, and an auth key read from stdin.
+
+    The key never reaches a command line: `connect` passes it to tailscale as
+    a file reference and deletes the file once the node has joined.
+    """
+    server = None
+    key_from_stdin = False
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--login-server" and rest:
+            server = check_login_server(rest.pop(0))
+        elif flag == "--auth-key-stdin":
+            key_from_stdin = True
+        else:
+            raise RuntimeError("usage: agent-box-tailscale configure "
+                               "[--login-server URL] [--auth-key-stdin]")
+    private_dir(STATE)
+    if server is not None:
+        config = load_config()
+        config["loginServer"] = server
+        write_private(CONFIG, json.dumps(config) + "\n")
+    if key_from_stdin:
+        key = sys.stdin.read(4096).strip()
+        if not key:
+            AUTH_KEY.unlink(missing_ok=True)
+        elif not AUTH_KEY_RE.fullmatch(key):
+            raise RuntimeError("That does not look like a Tailscale auth key")
+        else:
+            write_private(AUTH_KEY, key)
+
+
+def node_name():
+    """The box's host name, as a tailnet machine name."""
+    name = re.sub(r"[^a-z0-9-]+", "-", socket.gethostname().lower()).strip("-")
+    return name[:63].rstrip("-") or "agent-box"
+
+
+def cli(*args, timeout=30, check=False, capture=True):
+    return subprocess.run([tailscale_bin(), "--socket", SOCKET] + list(args),
+                          capture_output=capture, text=True, timeout=timeout,
+                          check=check)
+
+
+def systemctl(*args, timeout=900):
+    # --no-ask-password: the owner's polkit grant answers YES with no agent;
+    # anybody else must fail at once, not wait on a prompt nobody sees.
+    return subprocess.run([tool("systemctl"), "--no-ask-password"] + list(args),
+                          capture_output=True, text=True, timeout=timeout,
+                          check=False)
+
+
+def status_json():
+    if not os.path.exists(SOCKET) or not os.access(tailscale_bin(), os.X_OK):
+        return {}
+    try:
+        proc = cli("status", "--json", "--peers=false", timeout=10)
+        data = json.loads(proc.stdout or "{}")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def dns_name(data):
+    node = data.get("Self") if isinstance(data.get("Self"), dict) else {}
+    name = str(node.get("DNSName") or "").rstrip(".").lower()
+    return name if DNS_NAME_RE.fullmatch(name) else ""
+
+
+def public_certificate(data, name):
+    """Whether Caddy can get a publicly trusted certificate for `name`.
+
+    Tailscale's hosted service issues *.ts.net certificates once HTTPS is
+    turned on for the tailnet, and Caddy fetches them from tailscaled by
+    itself. Headscale issues none, so its names use Caddy's local CA.
+    """
+    domains = data.get("CertDomains") or []
+    return name.endswith(".ts.net") and name in domains
+
+
+def front_door_url(name):
+    return "https://%s/%s/" % (name, user_name()) if name else ""
+
+
+def status():
+    data = status_json()
+    state = str(data.get("BackendState") or "")
+    name = dns_name(data)
+    print(json.dumps({
+        "enabled": MARKER.is_file(),
+        "backendState": state,
+        "dnsName": name,
+        "trustedCertificate": public_certificate(data, name),
+        "url": front_door_url(name) if state == "Running" else "",
+        "loginServer": login_server(),
+    }))
+
+
+def site_text(name, trusted):
+    tls = "" if trusted else (
+        "  # No public CA can issue for this name: Caddy's local CA signs it,\n"
+        "  # and a browser asks once per device to accept it.\n"
+        "  tls internal\n")
+    return ("# Written by agent-box-tailscale. Disconnect on the settings page\n"
+            "# removes it. The box's own pages under its tailnet name, reached\n"
+            "# over the tailnet only.\n"
+            "https://%s {\n"
+            "  import agent_box_site\n"
+            "%s"
+            "  import agent_box_routes\n"
+            "}\n" % (name, tls))
+
+
+def reload_caddy():
+    proc = systemctl("reload", "caddy.service", timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError("Could not reload Caddy: " + (proc.stderr or "").strip())
+
+
+def publish(data):
+    name = dns_name(data)
+    if not name:
+        raise RuntimeError("The tailnet gave this node no DNS name; turn on MagicDNS")
+    if SITE.parent.is_symlink() and not SITE.parent.exists():
+        raise RuntimeError("~/sites is missing its target; is the web front door enabled?")
+    trusted = public_certificate(data, name)
+    write_private(SITE, site_text(name, trusted), mode=0o644)
+    reload_caddy()
+    return name, trusted
+
+
+def unpublish():
+    if SITE.is_file() or SITE.is_symlink():
+        SITE.unlink()
+        reload_caddy()
+
+
+def connect():
+    private_dir(STATE)
+    write_private(MARKER, "")
+    print("Starting Tailscale. The first start downloads the client.", flush=True)
+    proc = systemctl("start", UNIT)
+    if proc.returncode != 0:
+        raise RuntimeError("Could not start %s: %s" % (UNIT, (proc.stderr or "").strip()))
+    # --netfilter-mode=off: by default tailscaled puts `-i tailscale0 -j
+    # ACCEPT` ahead of the host firewall, so every port the firewall closes
+    # to the internet (a dev server on 0.0.0.0) would be open to the tailnet.
+    # Off, the box's own firewall decides for tailscale0 as for any interface.
+    args = ["up", "--reset", "--operator=" + user_name(), "--hostname", node_name(),
+            "--ssh=false", "--accept-dns=false", "--accept-routes=false",
+            "--netfilter-mode=off", "--timeout", UP_TIMEOUT]
+    server = login_server()
+    if server:
+        args += ["--login-server", server]
+    if AUTH_KEY.is_file():
+        args += ["--auth-key", "file:" + str(AUTH_KEY)]
+    try:
+        # Not captured: the card reads the sign-in URL tailscale prints.
+        joined = cli(*args, timeout=None, capture=False)
+    finally:
+        AUTH_KEY.unlink(missing_ok=True)
+    if joined.returncode != 0:
+        raise RuntimeError("tailscale up failed")
+    name, trusted = publish(status_json())
+    print("Connected to the tailnet as %s." % name, flush=True)
+    print("This box is at %s" % front_door_url(name), flush=True)
+    if not trusted:
+        print("The certificate comes from Caddy's local CA, so the browser asks "
+              "once to accept it. With Tailscale's hosted service, turn on HTTPS "
+              "certificates for the tailnet and connect again to get a trusted one.",
+              flush=True)
+
+
+def disconnect():
+    """Leave the tailnet and erase the node.
+
+    `logout` expires the node key with the coordination server. With the
+    marker gone, stopping the unit makes its stop hook erase the node state.
+    """
+    if os.path.exists(SOCKET) and os.access(tailscale_bin(), os.X_OK):
+        try:
+            cli("logout", timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    unpublish()
+    MARKER.unlink(missing_ok=True)
+    proc = systemctl("stop", UNIT, timeout=120)
+    if proc.returncode != 0:
+        raise RuntimeError("Could not stop %s: %s" % (UNIT, (proc.stderr or "").strip()))
+
+
+# ------------------------------------------------------------ unit side
+
+# The tailnet reaches the box's front door and nothing else. `connect` runs
+# tailscaled with --netfilter-mode=off, so the host firewall governs
+# tailscale0; but a native (non-NixOS) box usually has no host firewall at
+# all - the cloud firewall it relies on never sees tailnet traffic - so every
+# service bound to 0.0.0.0 (SSH, SMTP, a user's dev server) would be open to
+# every tailnet peer. This table makes that the same on both backends: on
+# tailscale0, replies and TCP 443 (Caddy) are accepted and everything else is
+# dropped. It is loaded before tailscaled starts and removed after it stops.
+NFT_TABLE = "agent_box_tailnet"
+NFT_RULES = """table inet %(t)s
+delete table inet %(t)s
+table inet %(t)s {
+  chain input {
+    type filter hook input priority filter - 10; policy accept;
+    iifname "tailscale0" ct state established,related accept
+    iifname "tailscale0" tcp dport 443 accept
+    iifname "tailscale0" drop
+  }
+}
+""" % {"t": NFT_TABLE}
+
+
+def nft():
+    path = os.environ.get("AGENT_BOX_NFT", "")
+    if not os.path.isabs(path) or not os.access(path, os.X_OK):
+        raise RuntimeError("AGENT_BOX_NFT does not name an nft binary")
+    return path
+
+
+def firewall_on():
+    subprocess.run([nft(), "-f", "-"], input=NFT_RULES, text=True, check=True,
+                   timeout=30)
+
+
+def firewall_off():
+    # Best effort: the table may already be gone, and a stop must not fail.
+    subprocess.run([nft(), "delete", "table", "inet", NFT_TABLE],
+                   capture_output=True, text=True, check=False, timeout=30)
+
+
+def install_client():
+    """Fetch the pinned client from the binary cache and keep it from GC."""
+    if os.access(tailscale_bin("tailscaled"), os.X_OK) and os.path.islink(GC_ROOT) \
+            and os.readlink(GC_ROOT) == PACKAGE:
+        return
+    subprocess.run([tool("nix-store"), "--realise", PACKAGE, "--add-root", GC_ROOT],
+                   check=True, timeout=600, stdout=subprocess.DEVNULL)
+
+
+def daemon():
+    """Replace this process with tailscaled in kernel (TUN) mode.
+
+    Log upload to Tailscale is off: a self-hosted tailnet must not report to
+    a third party, and the journal keeps the daemon's output.
+    """
+    argv = [tailscale_bin("tailscaled"),
+            "--state", str(DAEMON_STATE / "tailscaled.state"),
+            "--statedir", str(DAEMON_STATE),
+            "--socket", SOCKET, "--port", "41641", "--no-logs-no-support"]
+    os.execv(argv[0], argv)
+
+
+def owner():
+    name = os.environ.get("AGENT_BOX_TAILSCALE_OWNER", "")
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", name):
+        raise RuntimeError("AGENT_BOX_TAILSCALE_OWNER is not set")
+    return name
+
+
+def set_operator():
+    """Let the box owner run `tailscale up`, `logout` and `status`."""
+    deadline = time.monotonic() + SOCKET_WAIT
+    while True:
+        proc = cli("set", "--operator=" + owner(), timeout=30)
+        if proc.returncode == 0:
+            return
+        if time.monotonic() >= deadline:
+            detail = (proc.stderr or "").strip()
+            raise RuntimeError("Could not set the Tailscale operator: " + detail)
+        time.sleep(0.5)
+
+
+def stopped():
+    """Erase the node state after Disconnect, and only then.
+
+    A reboot or a box update also stops the unit; the owner's marker is what
+    tells those apart from a Disconnect.
+    """
+    marker = os.environ.get("AGENT_BOX_TAILSCALE_MARKER", "")
+    if not marker or os.path.exists(marker):
+        return
+    if DAEMON_STATE.is_dir() and not DAEMON_STATE.is_symlink():
+        for entry in DAEMON_STATE.iterdir():
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "configure":
+        configure(sys.argv[2:])
+        return
+    commands = {"connect": connect, "status": status, "disconnect": disconnect,
+                "install-client": install_client, "daemon": daemon,
+                "set-operator": set_operator, "stopped": stopped,
+                "firewall-on": firewall_on, "firewall-off": firewall_off}
+    if len(sys.argv) != 2 or sys.argv[1] not in commands:
+        raise RuntimeError("usage: agent-box-tailscale "
+                           "configure|connect|status|disconnect")
+    commands[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print("agent-box-tailscale: " + str(error), file=sys.stderr)
+        sys.exit(1)
+  '');
+
   slackCli = pkgs.writers.writePython3Bin "agent-box-slack" {
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
@@ -19736,6 +20268,7 @@ esac
     "agent-box-session-capacity" = "${capacityCli}/bin/agent-box-session-capacity";
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
+    "agent-box-tailscale" = "${tailscaleCli}/bin/agent-box-tailscale";
     "agent-box-slack" = "${slackCli}/bin/agent-box-slack";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
@@ -20244,6 +20777,7 @@ esac
       "github=${pkgs.gh}/bin/gh"
       "defang=${defangCliBinDir}/defang"
       "whatsapp=${whatsappCli}/bin/agent-box-whatsapp"
+      "tailscale=${tailscaleCli}/bin/agent-box-tailscale"
     ]
   );
 
@@ -25765,6 +26299,37 @@ in
     # systemd-oomd overlaps earlyoom (two daemons racing to kill under
     # pressure); keep exactly one, explicitly.
     systemd.oomd.enable = lib.mkDefault false;
+  }) (lib.mkIf tailscaleEnabled {
+    # The box's tailnet node (src/units/agent-box-tailscale.service, installed
+    # by agentBoxUnitsPackage above). This drop-in is the backend half: the
+    # CLI's store path, the owner, and the owner's marker. The native renderer
+    # writes the same keys. Wanted at boot, but the condition keeps it off
+    # until the owner connects, and off again after Disconnect.
+    systemd.services."agent-box-tailscale" = {
+      overrideStrategy = "asDropin";
+      unitConfig.ConditionPathExists = tailscaleMarker;
+      environment = {
+        AGENT_BOX_TAILSCALE_OWNER = rootUser;
+        AGENT_BOX_TAILSCALE_MARKER = tailscaleMarker;
+        # The tailnet-ingress table (tailscale-cli.py firewall-on): on a box
+        # with no host firewall it is the only thing between tailnet peers and
+        # services bound to 0.0.0.0.
+        AGENT_BOX_NFT = "${pkgs.nftables}/bin/nft";
+      };
+      serviceConfig = {
+        ExecStartPre = [
+          "${tailscaleCli}/bin/agent-box-tailscale install-client"
+          "${tailscaleCli}/bin/agent-box-tailscale firewall-on"
+        ];
+        ExecStart = "${tailscaleCli}/bin/agent-box-tailscale daemon";
+        ExecStartPost = "${tailscaleCli}/bin/agent-box-tailscale set-operator";
+        ExecStopPost = [
+          "${tailscaleCli}/bin/agent-box-tailscale firewall-off"
+          "${tailscaleCli}/bin/agent-box-tailscale stopped"
+        ];
+      };
+    };
+    systemd.targets.multi-user.wants = [ "agent-box-tailscale.service" ];
   }) (lib.mkIf cfg.containers.enable {
     # Rootless containers for the agent users (issue 600).
     #
@@ -29372,12 +29937,29 @@ def parse_whatsapp_status(proc):
     return (False, "")
 
 
+def parse_tailscale_status(proc):
+    if proc.returncode != 0:
+        return (False, "")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return (False, "")
+    if not isinstance(data, dict):
+        return (False, "")
+    if data.get("backendState") == "Running":
+        return (True, str(data.get("dnsName") or "connected"))
+    if data.get("enabled") is True:
+        return (False, "starting the tailnet connection")
+    return (False, "")
+
+
 CONNECT_PARSERS = {
     "claude": parse_claude_status,
     "codex": parse_codex_status,
     "gh": parse_gh_status,
     "defang": parse_defang_status,
     "whatsapp": parse_whatsapp_status,
+    "tailscale": parse_tailscale_status,
 }
 
 # One row per flow, in render order. `start` and `status` are argv tails
@@ -29513,7 +30095,34 @@ CONNECT_DEFS = [
         "prompt_re": None,
         "destructive": False,
     },
+    {
+        # One tailnet node per box, for the box owner only: the daemon shows
+        # this card only where AGENT_BOX_TAILSCALE_UNIT is set (see
+        # connect_flows). Its sign-in host is Tailscale's, or the configured
+        # Headscale server's (connect_hosts).
+        "id": "tailscale",
+        "binary": "agent-box-tailscale",
+        "attr": None,
+        "label": "Tailscale",
+        "note": "Reach this box over your tailnet, with no inbound port open. "
+                "Works with Tailscale or a self-hosted Headscale server. "
+                "Services bound only to 127.0.0.1 stay private.",
+        "start": ["connect"],
+        "status": ["status"],
+        "logout": ["disconnect"],
+        "remove": (),
+        "parse": "tailscale",
+        "hosts": ("tailscale.com",),
+        "needs_code": False,
+        "show_code": False,
+        "unset": (),
+        "shadow": (),
+        "prompt_re": None,
+        "destructive": False,
+    },
 ]
+# Set for the box owner's daemon only (the polkit grant is theirs alone).
+TAILSCALE_UNIT = os.environ.get("AGENT_BOX_TAILSCALE_UNIT", "")
 
 _connect_status_cache = {}
 # The Defang CLI's structured workspace list, populated beside its status
@@ -29554,6 +30163,8 @@ def connect_flows():
     """
     flows = []
     for spec in CONNECT_DEFS:
+        if spec["id"] == "tailscale" and not TAILSCALE_UNIT:
+            continue
         flow = dict(spec)
         # Where this card would fetch the CLI from, if it is missing: a
         # nixpkgs attribute, or a pinned expression file for a CLI nixpkgs
@@ -29643,6 +30254,30 @@ def connect_run(flow, args, timeout=15, unset=()):
         )
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def tailscale_configure(flow, server, key):
+    """Hand the card's two optional fields to the CLI; an error or None.
+
+    The key goes over stdin, never a command line, and the CLI deletes its
+    copy once the node has joined.
+    """
+    if not flow["bin"]:
+        return "The Tailscale helper is not installed on this box."
+    if len(server) > 300 or len(key) > 300:
+        return "That login server or auth key is too long."
+    try:
+        proc = subprocess.run(
+            [flow["bin"], "configure", "--login-server", server.strip(),
+             "--auth-key-stdin"],
+            input=key.strip(), capture_output=True, text=True, timeout=15,
+            check=False)
+    except (OSError, subprocess.SubprocessError):
+        return "Could not save the Tailscale settings."
+    if proc.returncode != 0:
+        message = (proc.stderr or "").strip().replace("agent-box-tailscale: ", "")
+        return message[:200] or "Could not save the Tailscale settings."
+    return None
 
 
 def whatsapp_profile(value=None):
@@ -29865,6 +30500,14 @@ def connect_confirmed_disconnected(flow, proc):
             return False
         return (proc.returncode == 0 and isinstance(data, dict)
                 and data.get("paired") is False)
+    if flow["id"] == "tailscale":
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except ValueError:
+            return False
+        return (proc.returncode == 0 and isinstance(data, dict)
+                and data.get("enabled") is False
+                and data.get("backendState") != "Running")
     return False
 
 
@@ -30058,6 +30701,30 @@ def connect_age(flow_id):
         return max(0.0, time.time() - int(proc.stdout.strip()))
     except ValueError:
         return None
+
+
+def tailscale_login_host():
+    """The configured Headscale server's host, or "" for Tailscale's own.
+
+    Read from the CLI's private config, which only `configure` writes and
+    which accepts nothing but an https origin.
+    """
+    try:
+        with open(os.path.join(os.path.expanduser("~"), ".local", "state",
+                               "agent-box-tailscale", "config.json")) as handle:
+            server = json.load(handle).get("loginServer", "")
+        return (urllib.parse.urlsplit(server).hostname or "").lower() \
+            if isinstance(server, str) and server.startswith("https://") else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def connect_hosts(flow):
+    """The hosts this flow may send the user to."""
+    if flow["id"] == "tailscale":
+        host = tailscale_login_host()
+        return (host,) if host else flow["hosts"]
+    return flow["hosts"]
 
 
 def connect_trusted_url(text, hosts):
@@ -30834,7 +31501,7 @@ def connect_state(flow, keys=None, tmux_state=None):
         else:
             if flow["prompt_re"] is not None:
                 connect_answer_prompt(flow, text)
-            url = connect_trusted_url(text, flow["hosts"])
+            url = connect_trusted_url(text, connect_hosts(flow))
             code = connect_user_code(text, flow_id) if flow["show_code"] else None
             state = "waiting" if url or code else "starting"
     elif os.path.exists(connect_done_path(flow_id)):
@@ -30911,7 +31578,8 @@ def connect_state(flow, keys=None, tmux_state=None):
         # WhatsApp remains removable while its stored device is linked but
         # the bridge is still reconnecting. Other providers expose removal
         # once their own status command reports the connection live.
-        "removable": connected or (flow_id == "whatsapp" and bool(detail)),
+        "removable": connected or (flow_id in ("whatsapp", "tailscale")
+                                   and bool(detail)),
     }
 
 
@@ -36082,6 +36750,11 @@ def render_connect_card(state):
             pill = ("live", "Connected")
         elif state["state"] in ("idle", "failed"):
             pill = ("stopped", "Not linked" if not state["detail"] else "Connecting")
+    if flow_id == "tailscale":
+        if state["state"] == "connected":
+            pill = ("live", "Connected")
+        elif state["state"] in ("idle", "failed"):
+            pill = ("stopped", "Not connected" if not state["detail"] else "Connecting")
     if not state["installed"] and state["state"] in ("idle", "checking",
                                                      "failed"):
         # "Not signed in" would be a half-truth for a CLI that is not even
@@ -36129,8 +36802,10 @@ def render_connect_card(state):
         # destructive flow's confirmation on the strength of a guess, so
         # that guard stays armed until the probe actually clears it.
         label, confirm = "Sign in", (state["state"] == "checking" and state["destructive"])
-    if flow_id == "whatsapp":
-        label = None  # The pairing form needs a phone field inside the card.
+    if flow_id in ("whatsapp", "tailscale"):
+        # The pairing form needs a phone field inside the card; Tailscale's
+        # needs its optional login server and auth key.
+        label = None
     action = ""
     if label:
         guard = ""
@@ -36144,10 +36819,15 @@ def render_connect_card(state):
         )
     logout = ""
     if state.get("removable"):
-        logout_label = "Unlink" if flow_id == "whatsapp" else "Sign out"
+        logout_label = {"whatsapp": "Unlink",
+                        "tailscale": "Disconnect"}.get(flow_id, "Sign out")
         if flow_id == "whatsapp":
             question = ("Unlink WhatsApp from this box? This stops the bridge and "
                         "deletes its linked-device keys, queued messages and routing state.")
+        elif flow_id == "tailscale":
+            question = ("Disconnect this box from the tailnet? This logs the node out "
+                        "and erases its state. If no public port is open, the box is "
+                        "then unreachable until it is connected again.")
         else:
             question = ("Sign out of %s on this box? This removes its stored sign-in "
                         "and matching API keys. Running sessions may need a restart."
@@ -36201,6 +36881,45 @@ def render_connect_card(state):
     )
 
 
+def render_tailscale_step(state):
+    """Connect form, or where the connected box is on the tailnet."""
+    base = html.escape(BASE)
+    if state["state"] == "connected":
+        name = state["detail"] or ""
+        user = pwd.getpwuid(os.getuid()).pw_name
+        url = "https://%s/%s/" % (name, user)
+        link = (f'<a href="{html.escape(url, quote=True)}" target="_blank" '
+                f'rel="noopener noreferrer"><code>{html.escape(url)}</code></a>'
+                if re.fullmatch(r"[a-z0-9.-]{1,253}", name) else "")
+        error = (f'<p class="note conn-error">{html.escape(state["error"])}</p>'
+                 if state["error"] else "")
+        return (
+            '<div class="conn-step">' + error + '<p class="note">This box is on the '
+            f'tailnet at {link}. Devices on the tailnet reach it there, behind '
+            'the same login as this page. A name outside <code>ts.net</code> '
+            "uses Caddy's local certificate, so a browser asks once to accept "
+            'it.</p></div>')
+    error = ""
+    if state["state"] == "failed" and state["error"]:
+        error = f'<p class="note conn-error">{html.escape(state["error"])}</p>'
+    return (
+        f'<div class="conn-step">{error}<form method="post" action="{base}/connect/start" '
+        'class="row conn-form">'
+        '<input type="hidden" name="flow" value="tailscale">'
+        '<label class="field conn-field"><span class="note">Login server '
+        '(optional)</span><input type="url" name="login_server" '
+        'autocomplete="off" placeholder="https://headscale.example.com" '
+        'aria-label="Headscale login server"></label>'
+        '<label class="field conn-field"><span class="note">Auth key '
+        '(optional)</span><input type="password" name="auth_key" '
+        'autocomplete="off" aria-label="Tailscale auth key"></label>'
+        '<button type="submit" class="btn">Connect</button></form>'
+        '<p class="note">Leave the login server empty for Tailscale. Without an '
+        'auth key, the next step gives a sign-in link. The node is one per box '
+        'and is named after the box.</p></div>'
+    )
+
+
 def render_connect_step(state):
     """The wizard body: what the user has to do right now."""
     base = html.escape(BASE)
@@ -36210,6 +36929,8 @@ def render_connect_step(state):
         f'<input type="hidden" name="flow" value="{flow_id}">'
         f'<button type="submit" class="btn small">Cancel</button></form>'
     )
+    if flow_id == "tailscale" and state["state"] in ("idle", "failed", "connected"):
+        return render_tailscale_step(state)
     if flow_id == "whatsapp":
         if state["state"] == "waiting" and state["code"]:
             code = state["code"]
@@ -39968,6 +40689,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._redirect("ok=whatsapp_profile_saved")
                 return
             if action == "start":
+                if flow["id"] == "tailscale":
+                    refused = tailscale_configure(
+                        flow, form.get("login_server", [""])[0],
+                        form.get("auth_key", [""])[0])
+                    if refused:
+                        self._send_html(render_page(refused, kind="error"), status=400)
+                        return
                 if flow["id"] == "whatsapp":
                     raw_phone = form.get("phone", [""])[0].strip()
                     raw_country = form.get("phone_country", [""])[0].strip()
@@ -41514,11 +42242,9 @@ if __name__ == "__main__":
       # can't read /home. See the comment block at the top of the rendered
       # file below (agents will read that from the running box).
       managedCaddyfile = pkgs.writeText "agent-box-caddyfile" (
-      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@TLS_POLICY@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
+      lib.replaceStrings [ "@DOMAIN@" "@MANAGED_BY@" "@APPLY_CMD@" "@RELOAD_CMD@" "@DEFAULT_SNI@" "@PORTAL_HINT@" ]
         [ cfg.web.domain "services.agent-box" "nixos-rebuild switch"
           caddyReloadCmd
-          (if webDomainIsPrivateIpv4 then "internal_ca"
-           else if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only")
           (if webDomainIsIpv4 then "  default_sni ${cfg.web.domain}" else "")
           portalHint ] ''
         # This file is managed by @MANAGED_BY@ — edits here get OVERWRITTEN on
@@ -41626,7 +42352,11 @@ if __name__ == "__main__":
           respond 404
         }
 
-        @DOMAIN@ {
+        # Site-level behavior shared by every listener that serves the box's own
+        # pages: the public vhost and the tailnet site agent-box-tailscale writes (see
+        # caddyfile-vhost.caddy). The routes themselves are the agent_box_routes
+        # snippet the renderer writes after this fragment.
+        (agent_box_site) {
           # Delete separately: adding this to the block below would defer all of its
           # headers and override the downloads route's stricter CSP.
           header {
@@ -41635,7 +42365,6 @@ if __name__ == "__main__":
           }
           # Access log to the journal — the fail2ban jail counts 401s here.
           log
-          import @TLS_POLICY@
           # zstd only (no gzip fallback): the terminal, settings and downloads
           # payloads here are all served to browsers new enough to run this
           # page's JS in the first place, and zstd's default level is cheap on
@@ -41695,16 +42424,35 @@ if __name__ == "__main__":
               respond "<!doctype html><html lang='en'><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'><meta name='robots' content='noindex'><title>Sign in required - Agent Box</title><body style='margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,BlinkMacSystemFont,system-ui,sans-serif'><main style='max-width:720px;margin:0 auto;padding:32px 20px 48px'><section style='margin:28px 0;padding:20px;border:1px solid #30363d;border-radius:8px;background:#161b22'><p style='margin:0 0 4px;color:#8b949e;font-size:13px'>Agent Box</p><h1 style='margin:0 0 4px;font-size:24px;font-weight:600'>Sign in required</h1><p style='margin:0;color:#8b949e;font-size:13px'>Reload this page to sign in.</p>@PORTAL_HINT@</section></main></body></html>" 401
             }
           }
-          # This fragment ends INSIDE the block on purpose: the module appends one
-          # webhook + terminal block per user (and the root block), then the closing
-          # brace. Nothing is missing here.
+        }
       ''
+      # The routes are a snippet so the public vhost and the loopback tailnet
+      # listener in caddyfile-vhost.caddy serve the same pages from one copy.
+      # A snippet must be defined before it is imported.
+      + "(agent_box_routes) {\n"
       + lib.concatMapStringsSep "\n"
           (name: indent "  " (webhookCaddyBlock name + portalCaddyBlock name
                               + terminalCaddyBlock name)) terminalUsers
       + "\n"
       + lib.optionalString (rootUser != null) (indent "  " (rootBlock rootUser))
-      + "}\n\n"
+      + "}\n"
+      + lib.replaceStrings [ "@DOMAIN@" "@TLS_POLICY@" ]
+        [ cfg.web.domain
+          (if webDomainIsPrivateIpv4 then "internal_ca"
+           else if webDomainIsIpv4 then "acme_ip_shortlived" else "acme_alpn_only") ] ''
+
+        # The box's own vhost: every route in agent_box_routes, under its name. The
+        # routes are a snippet so a second site can serve the same pages under
+        # another name: agent-box-tailscale writes one for the box's tailnet name
+        # into the owner's ~/sites (imported below), which is what lets a box with
+        # no inbound port open still be used.
+        @DOMAIN@ {
+          import agent_box_site
+          import @TLS_POLICY@
+          import agent_box_routes
+        }
+      ''
+      + "\n"
       + lib.concatMapStrings (alias:
         lib.replaceStrings [ "@ALIAS@" "@DOMAIN@" "@WEBHOOK_ROUTES@" ]
           [ alias cfg.web.domain
@@ -41967,7 +42715,8 @@ if __name__ == "__main__":
       # daemon-reload all keep the platform defaults.
       security.polkit = {
         enable = true;
-        extraConfig = caddyReloadPolkitRule;
+        extraConfig = caddyReloadPolkitRule
+          + lib.optionalString tailscaleEnabled tailscalePolkitRule;
       };
 
 
@@ -42281,6 +43030,11 @@ if __name__ == "__main__":
             # here, unlike AGENT_BOX_UPDATE_CMD, which triggers the run.
             AGENT_BOX_UPDATE_UNIT = "agent-box-update.service";
             AGENT_BOX_SYSTEMCTL = "/run/current-system/sw/bin/systemctl";
+          }
+          // lib.optionalAttrs (tailscaleEnabled && name == rootUser) {
+            # The Tailscale card. Root user only, matching the polkit grant:
+            # the daemon hides the card without it.
+            AGENT_BOX_TAILSCALE_UNIT = "agent-box-tailscale.service";
           }
           // lib.optionalAttrs (rebootButton && name == rootUser) {
             # The Danger zone's "Reboot box" (web.rebootButton). Set for
