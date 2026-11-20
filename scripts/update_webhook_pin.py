@@ -54,6 +54,62 @@ def version(payload):
     return tuple(int(part) for part in match[1].split("."))
 
 
+def ci_runs(rev, branch):
+    """The latest push run of upstream ci.yml for exactly this commit."""
+    return api(
+        f"repos/{UPSTREAM}/actions/workflows/ci.yml/runs"
+        f"?branch={branch}&event=push&head_sha={rev}&per_page=1"
+    )["workflow_runs"]
+
+
+RELEASE_BOT = "github-actions[bot]"
+COMMIT_FILES_PAGE_LIMIT = 300
+
+
+def version_only_release_parent(rev, target_version):
+    """The single parent of an automated release commit, or None.
+
+    Only when the bot authored it, its subject starts with `release:`, it has
+    one parent, and every changed line pair is the previous version string
+    replaced by the target one (webhook.py VERSION, plugin.json, README row).
+    Anything else, even one more changed character, keeps the strict rule.
+    """
+    commit = api(f"repos/{UPSTREAM}/commits/{rev}")
+    author = (commit.get("author") or {}).get("login")
+    message = (commit.get("commit") or {}).get("message", "")
+    parents = commit.get("parents") or []
+    files = commit.get("files") or []
+    if author != RELEASE_BOT or not message.startswith("release:") or len(parents) != 1 or not files:
+        return None
+    # GitHub lists at most 300 files per commit page; a full page may hide more.
+    if len(files) >= COMMIT_FILES_PAGE_LIMIT:
+        return None
+    new = ".".join(map(str, target_version))
+
+    def pairs(file):
+        patch = file.get("patch") or ""
+        removed = [line[1:] for line in patch.splitlines()
+                   if line.startswith("-")]
+        added = [line[1:] for line in patch.splitlines()
+                 if line.startswith("+")]
+        return list(zip(removed, added)) if removed and len(removed) == len(added) else None
+
+    source = [file for file in files if file.get("filename") == "local-webhook/webhook.py"]
+    source_pairs = pairs(source[0]) if len(source) == 1 else None
+    if not source_pairs or len(source_pairs) != 1:
+        return None
+    before, after = (VERSION.fullmatch(line) for line in source_pairs[0])
+    if not before or not after or after[1] != new or before[1] == new:
+        return None
+    old = before[1]
+    for file in files:
+        changed = pairs(file)
+        if not changed or any(b.replace(old, new) != a for b, a in changed):
+            return None
+    parent = parents[0].get("sha", "")
+    return parent if SHA.fullmatch(parent) else None
+
+
 def pin_fields(text):
     """Validate the pin format before any network access or replacement."""
     fields = {}
@@ -101,12 +157,20 @@ def prepare(root, repository):
         raise ValueError("Release tag does not match webhook.py VERSION")
 
     branch = api(f"repos/{UPSTREAM}")["default_branch"]
-    runs = api(
-        f"repos/{UPSTREAM}/actions/workflows/ci.yml/runs"
-        f"?branch={branch}&event=push&head_sha={rev}&per_page=1"
-    )["workflow_runs"]
+    ci_rev = rev
+    runs = ci_runs(rev, branch)
+    if not runs:
+        # Upstream's release job pushes `release: ...` with the workflow
+        # token, and GitHub starts no workflow for such a push, so a release
+        # commit never has a CI run of its own. That stalled every bump after
+        # 0.38.0. Accept the parent's run only for a commit that changes
+        # nothing but the version string.
+        parent = version_only_release_parent(rev, target_version)
+        if parent:
+            ci_rev = parent
+            runs = ci_runs(parent, branch)
     if not runs or any((
-        runs[0]["head_sha"] != rev,
+        runs[0]["head_sha"] != ci_rev,
         runs[0]["head_branch"] != branch,
         runs[0]["event"] != "push",
         runs[0]["path"] != ".github/workflows/ci.yml",

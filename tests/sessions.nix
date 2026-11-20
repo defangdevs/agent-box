@@ -278,6 +278,22 @@ in
             " | grep -Fx /etc/agent-box-guides/AGENTS.agent.md"
         )
         machine.succeed("stat -c '%U' /home/agent/.codex/AGENTS.md | grep -x agent")
+        # The secret broker is on by default, so the same session start also
+        # registers its MCP adapter in codex's config (issue #922). Codex hands
+        # a stdio MCP server only a short allowlist of variables, so the entry
+        # must NAME the two the adapter reads - without env_vars it would
+        # silently resolve the box default profile instead of this session's.
+        machine.wait_until_succeeds(
+            "grep -Fx '[mcp_servers.agent-box-secrets]' /home/agent/.codex/config.toml",
+            timeout=60,
+        )
+        machine.succeed(
+            "grep -F 'command = \"agent-box-secrets-mcp\"' /home/agent/.codex/config.toml"
+        )
+        machine.succeed(
+            "grep -F 'env_vars = [\"AGENT_BOX_PROFILE\", \"AGENT_BOX_SECRET_SOCKET\"]'"
+            " /home/agent/.codex/config.toml"
+        )
         machine.succeed(as_agent("agent-box-session rm cx"))
 
         # A shell session gets neither: no agent there reads them.

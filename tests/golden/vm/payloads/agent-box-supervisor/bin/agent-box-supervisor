@@ -1090,6 +1090,19 @@ seed_claude_state() {
        | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
     sync_webhook_plugin
   fi
+  # Secret broker (issue #922): the unit exports AGENT_BOX_SECRET_SOCKET
+  # only when the broker is on, so it doubles as the enable flag, exactly as
+  # AGENT_BOX_WEBHOOK_REPO does above. Register the stdio adapter at user
+  # scope so exec_with_secrets is a native tool with no `claude mcp add`.
+  # The bare command name resolves through PATH at connect time, so the
+  # entry survives an update that moves the store path. A plain merge: a
+  # hand-edited entry of the same name is replaced, any other server stays.
+  if [ -n "${AGENT_BOX_SECRET_SOCKET:-}" ]; then
+    seed_json_settled "$HOME"/.claude.json \
+      '.mcpServers = ((.mcpServers // {})
+         + {"agent-box-secrets": {type: "stdio", command: "agent-box-secrets-mcp",
+            args: [], env: {}}})'
+  fi
   if [ "${3:-false}" = true ]; then
     seed_json "$HOME"/.claude/settings.json \
       --arg repo "$WHATSAPP_PLUGIN_REPO" \
@@ -1162,12 +1175,23 @@ seed_claude_state() {
 # Keep its stdin open until request 2 answers; closing the pipe immediately can
 # make app-server exit after initialize without processing the queued write.
 #
+# The same short-lived app-server also registers the secret broker's MCP
+# adapter (issue #922) when AGENT_BOX_SECRET_SOCKET is set - the unit exports
+# it only when the broker is on, so it doubles as the enable flag exactly as
+# it does for claude's ~/.claude.json entry. Unlike claude, Codex does NOT
+# hand a stdio MCP server the session environment: it passes a short
+# allowlist (HOME, PATH, ...) and nothing else (verified against Codex
+# 0.165.0). Without `env_vars` the adapter would never see AGENT_BOX_PROFILE
+# and would silently fall back to the box's default profile - the wrong
+# secret scope. `env_vars` names variables to forward from the parent, so no
+# value is written into config.toml.
+#
 # Best effort, like seed_claude_state: an old/broken Codex must still start and
 # show its ordinary dialog rather than make the whole agent-box session fail.
 # $1 = working directory, $2 = agent profile name (or empty), $3 = Codex bin.
 seed_codex_state() {
-  local wd=$1 profile=$2 bin=$3 cxhome init write pid out_fd in_fd line ok
-  local deadline remaining
+  local wd=$1 profile=$2 bin=$3 cxhome init write mcpwrite pid out_fd in_fd line ok
+  local deadline remaining want=1 got=0
   cxhome="$(resolve_codex_home "$profile")"
   mkdir -p "$cxhome"
   init="$($JQ -cn \
@@ -1176,6 +1200,13 @@ seed_codex_state() {
   write="$($JQ -cn --arg wd "$wd" \
     '{jsonrpc:"2.0", id:2, method:"config/value/write", params:{keyPath:"projects", value:{($wd):{trust_level:"trusted"}}, mergeStrategy:"upsert"}}')" \
     || return 0
+  mcpwrite=""
+  if [ -n "${AGENT_BOX_SECRET_SOCKET:-}" ]; then
+    mcpwrite="$($JQ -cn \
+      '{jsonrpc:"2.0", id:3, method:"config/value/write", params:{keyPath:"mcp_servers", value:{"agent-box-secrets":{command:"agent-box-secrets-mcp", args:[], env_vars:["AGENT_BOX_PROFILE","AGENT_BOX_SECRET_SOCKET"]}}, mergeStrategy:"upsert"}}')" \
+      || mcpwrite=""
+    [ -z "$mcpwrite" ] || want=2
+  fi
 
   coproc CODEX_CONFIG_WRITER {
     # The outer lifetime bound also bounds cleanup if app-server ignores the
@@ -1188,24 +1219,28 @@ seed_codex_state() {
   in_fd="${CODEX_CONFIG_WRITER[1]:-}"
   ok=false
   if [ -n "$pid" ] && [ -n "$out_fd" ] && [ -n "$in_fd" ] \
-       && printf '%s\n' "$init" "$write" >&"$in_fd"; then
+       && printf '%s\n' "$init" "$write" ${mcpwrite:+"$mcpwrite"} >&"$in_fd"; then
     deadline=$((SECONDS + 5))
     while [ "$SECONDS" -lt "$deadline" ]; do
       remaining=$((deadline - SECONDS))
       IFS= read -r -t "$remaining" -u "$out_fd" line || break
-      if $JQ -e '.id == 2 and .result.status == "ok"' \
+      if $JQ -e '(.id == 2 or .id == 3) and .result.status == "ok"' \
            >/dev/null 2>&1 <<<"$line"; then
-        ok=true
-        break
+        got=$((got + 1))
+        if [ "$got" -ge "$want" ]; then
+          ok=true
+          break
+        fi
+        continue
       fi
-      $JQ -e '.id == 2 and .error != null' \
+      $JQ -e '(.id == 2 or .id == 3) and .error != null' \
         >/dev/null 2>&1 <<<"$line" && break
     done
   fi
   [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
   [ -z "$pid" ] || wait "$pid" 2>/dev/null || :
   [ "$ok" = true ] || echo \
-    "session: could not pre-trust Codex directory $wd; Codex may ask interactively" >&2
+    "session: could not seed Codex config for $wd (project trust, secrets MCP); Codex may ask interactively" >&2
 }
 
 # Keep the local-webhook a SESSION loads in step with the one the box PINS
@@ -3003,6 +3038,14 @@ start_session() {
   whargs=""
   if [ -n "${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
     whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$WEBHOOK_STATE_DIR -e LOCAL_WEBHOOK_PORT=0"
+    # A Claude Remote Control daemon cannot pass --channels to the
+    # conversations it starts, so channel notifications from local-webhook are
+    # dropped there. This tells the plugin in each conversation to deliver
+    # through Claude's cross-session inbox instead (local-channels#149). Only
+    # here: a session that has the channel would get every event twice.
+    if [ "$agent" = claude ] && [ "$rcdaemon" = true ]; then
+      whargs="$whargs -e LOCAL_WEBHOOK_CLAUDE_DELIVERY=send"
+    fi
   fi
   # AGENT_BOX_SESSION_ID rides the same session environment: it is the
   # launch id the SessionStart hook keys its live-id record by (the
@@ -3364,6 +3407,11 @@ park_archived_rc() {
   done < <(printf '%s\n' "$_arch")
 }
 
+# The tick's pause is a builtin `read -t` on a pipe nobody writes, not
+# `sleep`: with the disk gone every exec dies at once (SIGBUS), and a
+# failed `sleep 2` turned this loop into a fork storm (PR #1055).
+exec {TICK_FD}<> <(:)
+
 # Reconcile forever; systemd stop tears the whole tree down (ExecStop
 # kill-server + cgroup kill), Restart=always revives a crashed loop.
 # Sessions flagged stopped (a clean agent exit, or agent-box-session
@@ -3396,6 +3444,6 @@ while true; do
   sync_codex_threads
   supervise_whatsapp
   supervise_slack
-  sleep 2
+  read -rt 2 -u "$TICK_FD" || :
 done
 

@@ -122,10 +122,12 @@ let
       `git worktree add ~/worktrees/NAME --detach ${"$"}{AGENT_BOX_CHECKOUT_REV}`
       from the checkout and work there. Never commit in the shared tree.
 
-      Changing this box means the same round trip as changing any other
-      repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
-      remote if you have one, and open a PR. Editing THIS tree changes
-      nothing about what the box runs - the box rebuilds from root's own
+      When asked to contribute a change to this box, use the same round trip
+      as any other repo: edit, `nix run .#assemble`, run the checks, push to
+      the `fork` remote if you have one, and open a PR. For an unsolicited
+      platform bug, follow "This platform has its own upstream repo" instead.
+      Editing THIS tree changes nothing about what the box runs - the box
+      rebuilds from root's own
       checkout (see Updating above), which only ever fast-forwards along the
       repo the deployment points at. So a commit reaches this machine once it
       is merged there and the update above runs; a commit that only exists
@@ -376,6 +378,19 @@ let
   # No web.enable dependency, unlike webhookEnabled above: this is a plain
   # Unix socket, not an HTTP endpoint behind the per-user Caddy vhost.
   secretsEnabled = cfg.secrets.enable;
+  # Secret custody (issue #922): the store parent is root-only (the broker
+  # creates its own per-user subdirectory under it at startup) and the
+  # socket dir is world-traversable - listing a socket's NAME is not a
+  # secret, its 0600 mode is what gates connect(). Applied by the broker
+  # block's own systemd.tmpfiles.rules, NOT by the web-gated `tmpfilesRules`
+  # below: a box with web.enable off still runs the broker, and without
+  # these the unit fails 226/NAMESPACE (ReadWritePaths= names a directory
+  # that does not exist). The broker block also publishes them in
+  # internal.tmpfilesRules, whether or not web is enabled.
+  secretsTmpfilesRules = lib.optionals secretsEnabled [
+    "d /var/lib/agent-box-secrets 0700 root root - -"
+    "d /run/agent-box-secrets 0755 root root - -"
+  ];
   webhookSocketDir = "/run/agent-box-webhook";
   webhookSocketOf = name: "${webhookSocketDir}/${name}.sock";
   webhookStateDirOf = name: "/home/${name}/.local/state/local-webhook";
@@ -512,6 +527,13 @@ let
 
 @@include:src/secret-broker.py@@
   '');
+  # Root reboot helper (issue #1054): a reboot that needs nothing from the
+  # disk when the settings page's normal `sudo systemctl reboot` cannot exec.
+  rebootHelperBin = pkgs.writers.writePython3Bin "agent-box-reboot-helper" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/reboot-helper.py@@
+  '';
   secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
@@ -2312,15 +2334,12 @@ in
     };
 
     secrets = {
-      # OFF by default, unlike containers/webhook above (issue #922): this
-      # is a root-privileged custodian daemon whose OS boundary - the one
-      # thing the whole feature is for - has no VM test yet
-      # (tests/secrets.nix does not exist), so it has never been proven on
-      # a real two-user box. "Default off during rollout" is the issue's
-      # own instruction. Flip this only once that test exists and passes.
+      # ON by default (issue #922). NOTE: the OS boundary this feature is
+      # for - root custody, a two-user box - still has no VM test
+      # (tests/secrets.nix does not exist yet).
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = false;
+        default = true;
         example = true;
         description = ''
           Start a root-owned secret-custody broker per configured terminal
@@ -3939,14 +3958,11 @@ in
     # keyed, web-gated block the webhook/settings units are instantiated
     # in further down. Every configured user gets one, not just the ones
     # with a web front door.
-    systemd.tmpfiles.rules = [
-      # Root-only store parent (the broker creates its own per-user
-      # subdirectory under this at startup) and a world-traversable
-      # socket dir - listing a socket's NAME is not a secret, its 0600
-      # mode is what gates connect().
-      "d /var/lib/agent-box-secrets 0700 root root - -"
-      "d /run/agent-box-secrets 0755 root root - -"
-    ];
+    systemd.tmpfiles.rules = secretsTmpfilesRules;
+    # Published HERE, not in the web-gated block: a box with web.enable off
+    # still applies these rules, so the inventory has to name them too.
+    # mkAfter keeps them after the web rules, the order the golden records.
+    services.agent-box.internal.tmpfilesRules = lib.mkAfter secretsTmpfilesRules;
     systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
       overrideStrategy = "asDropin";
       # Same restart-in-one-step reasoning as the webhook receiver's own
@@ -4790,6 +4806,35 @@ in
           Restart = lib.mkForce "always";
         };
       }
+      // lib.optionalAttrs rebootButton {
+        # Issue #1054: a reboot that needs nothing from the disk. Runs from
+        # boot so its code and /proc/sysrq-trigger are already in RAM and
+        # open when a failing disk makes `sudo systemctl reboot` unable to
+        # exec. See src/reboot-helper.py for the request protocol.
+        agent-box-reboot-helper = {
+          description = "agent-box: disk-independent reboot helper";
+          wantedBy = [ "multi-user.target" ];
+          # The settings daemon is socket-activated; one never started
+          # cannot start once the disk is gone, so bring it up at boot.
+          wants = [ "agent-box-settings@${rootUser}.service" ];
+          environment = {
+            AGENT_BOX_REBOOT_USER = rootUser;
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
+            # The front door the button's request crosses; the helper keeps
+            # their mapped files in RAM so a dead disk cannot SIGBUS them.
+            AGENT_BOX_REBOOT_PIN_UNITS = "caddy.service agent-box-settings@${rootUser}.service";
+          };
+          serviceConfig = {
+            ExecStart = "${rebootHelperBin}/bin/agent-box-reboot-helper";
+            RuntimeDirectory = "agent-box-reboot";
+            RuntimeDirectoryMode = "0755";
+            Restart = "always";
+            RestartSec = "5s";
+            LimitMEMLOCK = "infinity";
+            OOMScoreAdjust = -900;
+          };
+        };
+      }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
         # The attach script (src/attach.sh) resolves tmux, jq and head
@@ -4903,6 +4948,8 @@ in
             # the daemon hides the card and 404s the route without it, so
             # another user's page cannot even ask.
             AGENT_BOX_REBOOT_CMD = "/run/wrappers/bin/sudo -n ${rebootCmd}";
+            # Fallback when that cannot exec (issue #1054).
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
           })
           // {
             # mkForce for the reason spelled out on the "agent-box@" unit:

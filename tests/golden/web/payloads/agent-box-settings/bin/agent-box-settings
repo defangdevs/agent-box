@@ -593,6 +593,7 @@ import fcntl
 import functools
 import glob
 import hashlib
+import hmac
 import html
 import http.server
 import json
@@ -717,6 +718,13 @@ SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
 # reboots (see the box's apt policy). Without this the box has no way to
 # finish those updates at all — nobody inside it can reboot.
 REBOOT_CMD = os.environ.get("AGENT_BOX_REBOOT_CMD", "")
+# Socket of the root reboot helper (modules/src/reboot-helper.py), the
+# fallback when REBOOT_CMD cannot run because the disk is gone (issue 1054).
+# Empty on a box without the helper.
+REBOOT_SOCKET = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+# How long the normal reboot command gets before the helper is tried. A
+# failed disk may HANG the exec instead of failing it.
+REBOOT_CMD_TIMEOUT_S = 15
 # The distro's own "a reboot would apply something" marker: Debian and
 # Ubuntu's update machinery creates it, and the .pkgs file beside it
 # lists what asked. Both are world-readable, so the card reports WHY a
@@ -1217,18 +1225,98 @@ def receive_remove_locked(slot, record=None):
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
 
-def receive_create(ttl, max_bytes, now=None):
-    """Mint a capability, persist only its digest, and return slot+token."""
+RECEIVE_MAX_FILES = 100
+
+
+def receive_child(secret, index):
+    """Derive the slot id and secret that carry file INDEX of a link.
+
+    One link holds up to RECEIVE_MAX_FILES independent slots, each bound to
+    exactly one file, so the per-slot protocol is unchanged. File 0 is the
+    link's own slot and token. The others are HMAC-SHA256 of file 0's secret,
+    which the daemon only stores as a hash and so cannot derive. The page
+    computes the same values with WebCrypto. Hex keeps every id alphanumeric,
+    which RECEIVE_SLOT_RE and argparse both accept.
+    """
+    key = secret.encode("ascii")
+
+    def part(label, size):
+        message = ("agent-box-receive-v1\n%s\n%d" % (label, index)).encode()
+        return hmac.new(key, message, hashlib.sha256).hexdigest()[:size]
+    return part("slot", 24), part("secret", 64)
+
+
+def receive_store_new(record):
+    """Persist a brand-new record; FileExistsError if the slot is taken."""
+    path = receive_record_path(record["slot"])
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True,
+                      separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        receive_fsync_dir(RECEIVE_STATE_DIR)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+
+
+@contextlib.contextmanager
+def receive_links_lock():
+    """Serialize link creation against link-wide revocation.
+
+    A revoke that listed a link's slots while its creator was still writing
+    the children would report success and leave them usable.
+    """
+    receive_ensure_dirs()
+    path = os.path.join(RECEIVE_STATE_DIR, ".links.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+                 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def receive_link_slots(slot):
+    """Return the live slots a revoke of SLOT must cover.
+
+    SLOT itself, when its record exists, plus every child minted with it.
+    The children are found by their link field, so a link whose first
+    record is already gone can still be revoked. An unreadable state
+    directory raises OSError instead of passing for a complete answer.
+    """
+    try:
+        names = sorted(os.listdir(RECEIVE_STATE_DIR))
+    except FileNotFoundError:
+        names = []
+    slots = [slot] if receive_read(slot) is not None else []
+    for name in names:
+        child = name[:-5]
+        if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
+            continue
+        record = receive_read(child)
+        if record is not None and record.get("link") == slot:
+            slots.append(child)
+    return slots
+
+
+def receive_create(ttl, max_bytes, now=None, files=1):
+    """Mint a capability, persist only its digest, and return slot+token.
+
+    FILES > 1 also persists FILES - 1 derived slots (see receive_child), so
+    one link accepts that many files of up to MAX_BYTES each.
+    """
     receive_ensure_dirs()
     now = int(time.time() if now is None else now)
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
+    if not 1 <= files <= RECEIVE_MAX_FILES:
+        raise ValueError("files must be between 1 and %d" % RECEIVE_MAX_FILES)
+
+    def fresh(slot, secret, **extra):
         record = {
             "version": RECEIVE_VERSION,
             "slot": slot,
@@ -1238,26 +1326,37 @@ def receive_create(ttl, max_bytes, now=None):
             "max_bytes": max_bytes,
             "status": "waiting",
         }
-        path = receive_record_path(slot)
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
-        except FileExistsError:
-            continue
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, sort_keys=True,
-                          separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            receive_fsync_dir(RECEIVE_STATE_DIR)
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(path)
-            raise
-        return slot, slot + "." + secret, record
-    raise RuntimeError("could not allocate an upload slot")
+        record.update(extra)
+        return record
+
+    with receive_links_lock():
+        for _attempt in range(32):
+            slot = secrets.token_urlsafe(12)
+            # A leading "-" is URL-safe but argparse reads it as an option in
+            # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+            # as ordinary positional arguments without requiring a hidden `--`.
+            if not slot[0].isalnum():
+                continue
+            secret = secrets.token_urlsafe(32)
+            record = fresh(slot, secret, files=files)
+            try:
+                receive_store_new(record)
+            except FileExistsError:
+                continue
+            created = [slot]
+            try:
+                for index in range(1, files):
+                    child, child_secret = receive_child(secret, index)
+                    receive_store_new(fresh(child, child_secret, link=slot))
+                    created.append(child)
+            except Exception:
+                # Nobody holds the token yet, so no slot lock is needed.
+                for name in created:
+                    receive_remove_locked(name)
+                raise
+            return slot, slot + "." + secret, record
+        # Every attempt collided with an existing slot.
+        raise RuntimeError("could not allocate an upload slot")
 
 
 def receive_prune(now=None):
@@ -5201,19 +5300,63 @@ def update_box():
         sys.stderr.write("update_box: %s\n" % exc)
 
 
+def reboot_via_helper():
+    """Ask the root reboot helper to sysrq-reboot. True when it accepted.
+
+    Sends the one fixed request the helper understands. Nothing here reads
+    the disk: the socket module is already imported and the helper is
+    already running.
+    """
+    if not REBOOT_SOCKET:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(REBOOT_SOCKET)
+            conn.sendall(b"REBOOT\n")
+            answer = conn.recv(64).strip()
+    except OSError as exc:
+        sys.stderr.write("reboot_box: helper: %s\n" % exc)
+        return False
+    sys.stderr.write("reboot_box: helper answered %r\n" % answer[:32])
+    return answer in (b"OK", b"BUSY")
+
+
+def _run_reboot_cmd(result):
+    try:
+        proc = subprocess.run(REBOOT_CMD.split(), check=False,
+                              capture_output=True)
+        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
+        result.append(proc.returncode)
+    except OSError as exc:
+        sys.stderr.write("reboot_box: %s\n" % exc)
+
+
 def reboot_box():
-    """Trigger the reboot through the allowlisted sudo command.
+    """Trigger the reboot through the allowlisted sudo command, and when
+    that cannot run (no disk to exec sudo from), through the root helper.
+
+    The normal command runs in a worker thread and this function waits for
+    it with a deadline. subprocess's own timeout is not enough: on a dying
+    disk the fork/exec itself, or the wait after a kill, can block, and the
+    helper would never be asked.
 
     The caller sends its HTTP response BEFORE calling this (see the
     /reboot route): --no-block returns immediately, but systemd starts
     stopping units at once, and this daemon is one of them — a response
     written afterwards can lose the race with its own socket going away.
     """
-    try:
-        proc = subprocess.run(REBOOT_CMD.split(), check=False, capture_output=True)
-        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
-    except OSError as exc:
-        sys.stderr.write("reboot_box: %s\n" % exc)
+    result = []
+    worker = threading.Thread(target=_run_reboot_cmd, args=(result,),
+                              daemon=True)
+    worker.start()
+    worker.join(REBOOT_CMD_TIMEOUT_S)
+    if result and result[0] == 0:
+        return
+    if worker.is_alive():
+        sys.stderr.write("reboot_box: trigger did not finish in %ds\n"
+                         % REBOOT_CMD_TIMEOUT_S)
+    reboot_via_helper()
 
 
 def reboot_pending():
@@ -5935,6 +6078,12 @@ STYLE = """<style>
   .conn-code { font-size: 15px; letter-spacing: 1px; color: #e6edf3; }
   .conn-error { color: #f85149; }
   .conn-field { gap: 6px; }
+  /* A field stacks its label over the input, so the .row default of
+     align-items:center parked the button level with the label+input pair's
+     middle. Bottom-align it with the input instead (same fix as
+     .new-session-row). It needs the .row. prefix: .row is defined later
+     with the same specificity, so a bare .conn-form lost to it. */
+  .row.conn-form { align-items: flex-end; }
   .conn-country { flex: 0 0 7em; }
   .conn-national { flex: 1 1 180px; }
   .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
@@ -8509,8 +8658,14 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     } catch (err) { return []; }
   }
   function acFrag(input) {
-    return acKind(input) === "model"
-      ? input.value : acSplit(input.value).frag;
+    if (acKind(input) !== "model") { return acSplit(input.value).frag; }
+    // A model field filters only on what was TYPED since it opened. An
+    // existing profile's row opens on its saved model, and filtering by
+    // that showed the one name already in the field - or nothing at all
+    // for a full ID that no alias starts with - so editing a profile never
+    // offered the list that adding one did.
+    var st = input._dir;
+    return st && st.typed ? input.value : "";
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -8525,7 +8680,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var ul = acList(input);
     if (ul) { ul.hidden = true; ul.innerHTML = ""; }
     var st = input._dir;
-    if (st) { st.active = -1; }
+    if (st) { st.active = -1; st.typed = false; }
   }
   function acRender(input) {
     var ul = acList(input);
@@ -8622,25 +8777,38 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   document.addEventListener("input", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    (input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 })).typed = true;
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    // A close still pending from a previous visit would fire into this
+    // one and wipe its typed state, so refocusing cancels it.
+    if (input._dir && input._dir.closeTimer) {
+      window.clearTimeout(input._dir.closeTimer);
+      input._dir.closeTimer = null;
+    }
     // The directory field starts on the untouched default "~": select it
     // so the first keystroke replaces it instead of appending, which is
     // what produced an invalid "~docu" (issue #308). A model field has no
     // such default - it starts empty, or on what the profile already says,
     // and selecting THAT would throw the value away on a stray focus.
     if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    if (input._dir) { input._dir.typed = false; }
     acFetch(input);
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
     // Delay so a mousedown-selected item still registers its click.
-    window.setTimeout(function () { acClose(input); }, 150);
+    var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+    if (st.closeTimer) { window.clearTimeout(st.closeTimer); }
+    st.closeTimer = window.setTimeout(function () {
+      st.closeTimer = null;
+      acClose(input);
+    }, 150);
   });
   document.addEventListener("keydown", function (e) {
     var input = e.target;
@@ -8894,6 +9062,9 @@ _MODEL_HINT_MAX = 12
 # holds spaces, so no match is possible there and the scan resumes at the
 # real opening quote of the example that follows.
 _MODEL_NAME_RE = re.compile(r"'([A-Za-z0-9][A-Za-z0-9._-]{1,63})'")
+# The same charset, for a name that arrives bare (codex's catalog) rather
+# than quoted in prose.
+_MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,63}")
 # harness_model_aliases()' answers, keyed on (binary, stamp) and holding
 # (names, retry_at). retry_at is None for a real answer - it stands until
 # the binary itself changes - and a monotonic deadline for a probe that
@@ -8914,17 +9085,78 @@ def binary_stamp(path):
     return (info.st_mtime_ns, info.st_size)
 
 
-def probe_model_aliases(binary):
+def probe_codex_catalog(binary):
+    """codex's own model catalog as a tuple of names.
+
+    () is an ANSWER: this codex ran and has no `debug models` (a non-zero
+    exit), which will not change until the binary does. None is a
+    NON-answer - a timeout, a spawn failure or output that is not the
+    catalog - which probe_model_aliases() must not let the help fallback
+    turn into a cached empty list.
+
+    codex's `--help` names no model, but `codex debug models` prints the
+    catalog its own /model picker reads (codex-cli 0.165 has it; an older
+    one does not, and answers with an error). That is the same "read it off
+    the harness" rule as the help scrape, from a better page: the slugs the
+    harness itself LISTS to its users (visibility "list"), in its own
+    priority order, so a hidden internal entry is never offered.
+
+    Only ever run for codex. The subcommand is codex's; handed to another
+    CLI, `debug models` could just as well be read as a prompt.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "debug", "models"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("profiles: codex model catalog: %s\n" % exc)
+        return None
+    if proc.returncode != 0:
+        return ()
+    try:
+        models = json.loads(proc.stdout).get("models")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(models, list):
+        return None
+    listed = [m for m in models if isinstance(m, dict)
+              and m.get("visibility") == "list"
+              and isinstance(m.get("slug"), str)
+              and _MODEL_SLUG_RE.fullmatch(m["slug"])]
+    listed.sort(key=lambda m: m.get("priority")
+                if isinstance(m.get("priority"), int) else 1 << 30)
+    names = []
+    for model in listed:
+        if model["slug"] not in names:
+            names.append(model["slug"])
+        if len(names) >= _MODEL_HINT_MAX:
+            break
+    return tuple(names)
+
+
+def probe_model_aliases(binary, harness=None):
     """Ask one harness what models it names, or None when it could not be
     asked at all.
 
+    codex first asks its catalog (probe_codex_catalog) and falls back to
+    its help page only when that cannot answer.
+
     The two answers are deliberately different things. () is an ANSWER -
-    the CLI ran and its `--model` puts no name forward, which is codex
-    today. None is a non-answer: the probe timed out, or raced a lazy
-    `nix profile add` still linking the binary, or the CLI printed nothing
+    the CLI ran and its `--model` puts no name forward, which is an old
+    codex without a catalog. None is a non-answer: the probe timed out, or
+    raced a lazy `nix profile add` still linking the binary, or the CLI printed nothing
     whatsoever, and asking again later may well succeed. Only the caller
     can act on that difference, and it does - see the cache above.
     """
+    catalog = None
+    if harness == "codex":
+        catalog = probe_codex_catalog(binary)
+        if catalog:
+            return catalog
     try:
         proc = subprocess.run(
             [binary, "--help"],
@@ -8944,6 +9176,10 @@ def probe_model_aliases(binary):
         return None
     opt = _MODEL_OPT_RE.search(text)
     if not opt:
+        if harness == "codex" and catalog is None:
+            # Same rule as below: without a catalog this help is not the
+            # CLI's final word, so keep the empty retryable.
+            return None
         return ()
     rest = text[opt.end():]
     end = _NEXT_OPT_RE.search(rest)
@@ -8954,18 +9190,24 @@ def probe_model_aliases(binary):
             names.append(name)
         if len(names) >= _MODEL_HINT_MAX:
             break
+    if harness == "codex" and catalog is None and not names:
+        # The catalog could not be asked and the help names nothing, which
+        # is what codex's help always says: that empty is the help's
+        # answer, not the catalog's, so keep it retryable.
+        return None
     return tuple(names)
 
 
-def harness_model_aliases(binary, stamp):
+def harness_model_aliases(binary, stamp, harness=None):
     """The model names a harness's own `--help` puts forward, as a tuple.
 
     claude names them ("an alias for the latest model (e.g. 'fable',
     'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')").
-    codex documents none - its `--model` says only "Model the agent should
-    use", and its shell completion file-completes the value - so it
-    contributes nothing here rather than us guessing a list on its behalf
-    and shipping it stale.
+    codex's help documents none - its `--model` says only "Model the agent
+    should use" - so codex is asked for its catalog instead (see
+    probe_codex_catalog). A codex too old to have one contributes nothing
+    here rather than us guessing a list on its behalf and shipping it
+    stale.
 
     Empty either way to the caller: the field is free text, so a probe
     that cannot run costs a suggestion and never a save. What the two
@@ -8980,11 +9222,11 @@ def harness_model_aliases(binary, stamp):
     """
     if not binary:
         return ()
-    key = (binary, stamp)
+    key = (binary, stamp, harness)
     hit = _model_alias_cache.get(key)
     if hit is not None and (hit[1] is None or time.monotonic() < hit[1]):
         return hit[0]
-    names = probe_model_aliases(binary)
+    names = probe_model_aliases(binary, harness)
     if len(_model_alias_cache) > 16:
         # Same reasoning as _transcript_cache: the keyspace grows with
         # every binary ever probed, and there is nothing here worth an
@@ -9014,7 +9256,8 @@ def model_hints(harness, profiles):
     binary = flow["bin"] if flow else None
     hints = []
     if binary:
-        for name in harness_model_aliases(binary, binary_stamp(binary)):
+        for name in harness_model_aliases(binary, binary_stamp(binary),
+                                          harness):
             if name not in hints:
                 hints.append(name)
     for name in sorted(profiles):
@@ -11701,7 +11944,7 @@ RECEIVE_FILE_RE = re.compile(
 RECEIVE_PAGE = r'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Send a file to __USER__</title>
+<title>Send files to __USER__</title>
 <style nonce="__NONCE__">
 :root{color-scheme:light dark}body{margin:0;background:#0d1117;color:#e6edf3;
 font:15px/1.5 system-ui,sans-serif}.card{max-width:38rem;margin:8vh auto;
@@ -11716,14 +11959,18 @@ border-color:#58a6ff;background:#1f6feb26}.drop:focus-within{outline:2px solid
 #file{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;
 clip-path:inset(50%);white-space:nowrap;border:0}
 progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
+#queue{list-style:none;margin:0;padding:0}#queue li{padding:.25rem 0;
+border-top:1px solid #30363d;overflow-wrap:anywhere;color:#8b949e}
+#queue li.done{color:#3fb950}#queue li.error{color:#f85149}
 </style></head><body data-slot="__SLOT__"><main class="card">
-<h1>Send one file to __USER__</h1>
-<p>This private link accepts one resumable upload. It does not grant access
-to the terminal or any existing files.</p>
-<label id="drop" class="drop" for="file"><strong id="prompt">Drop a file here</strong>
-<span>or tap to choose one</span><input id="file" type="file"></label>
+<h1>Send files to __USER__</h1>
+<p>This private link accepts a limited number of resumable uploads. It does
+not grant access to the terminal or any existing files.</p>
+<label id="drop" class="drop" for="file"><strong id="prompt">Drop files here</strong>
+<span>or tap to choose them</span><input id="file" type="file" multiple></label>
 <progress id="progress" aria-label="Upload progress" value="0" max="1"></progress>
 <p id="status" role="status"></p>
+<ul id="queue" aria-label="Files"></ul>
 </main><script nonce="__NONCE__">
 (() => {
   'use strict';
@@ -11734,39 +11981,81 @@ to the terminal or any existing files.</p>
   const prompt = document.getElementById('prompt');
   const progress = document.getElementById('progress');
   const status = document.getElementById('status');
+  const queue = document.getElementById('queue');
+  const MAX_FILES = __MAX_FILES__;
   let uploading = false;
-  const collection = location.pathname.replace(/\/?$/, '/') + 'files';
-  const resource = collection + '/upload';
+  // /<user>/receive/<slot>/ -> /<user>/receive/
+  const base = location.pathname.replace(/[^/]+\/?$/, '');
   const validToken = token.startsWith(slot + '.') &&
     /^[A-Za-z0-9_.-]+$/.test(token);
-  const auth = () => ({'Authorization': 'Bearer ' + token,
-                       'Tus-Resumable': '1.0.0'});
+  const master = token.slice(slot.length + 1);
+  const encoder = new TextEncoder();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const hex = bytes => Array.from(bytes, byte =>
+    byte.toString(16).padStart(2, '0')).join('');
   const b64 = value => {
-    const bytes = new TextEncoder().encode(value);
+    const bytes = encoder.encode(value);
     let binary = '';
     for (const byte of bytes) binary += String.fromCharCode(byte);
     return btoa(binary);
   };
+  // One link carries up to MAX_FILES slots, each bound to one file. Slot 0
+  // is the link itself; the rest are HMAC-SHA256 of its secret, the same
+  // derivation agent-box-receive uses when it mints them.
+  const derive = async (label, index, size) => {
+    const key = await crypto.subtle.importKey(
+      'raw', encoder.encode(master), {name: 'HMAC', hash: 'SHA-256'},
+      false, ['sign']);
+    const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(
+      'agent-box-receive-v1\n' + label + '\n' + index));
+    return hex(new Uint8Array(mac)).slice(0, size);
+  };
+  const lanes = [];
+  const lane = async index => {
+    if (!lanes[index]) {
+      let id = slot;
+      let bearer = token;
+      if (index > 0) {
+        id = await derive('slot', index, 24);
+        bearer = id + '.' + await derive('secret', index, 64);
+      }
+      const collection = base + id + '/files';
+      lanes[index] = {collection, resource: collection + '/upload',
+                      bearer};
+    }
+    return lanes[index];
+  };
+  const auth = l => ({'Authorization': 'Bearer ' + l.bearer,
+                      'Tus-Resumable': '1.0.0'});
   const metadata = (file, content) => 'filename ' + b64(file.name) +
     ',fingerprint ' + b64(file.name + '\n' + file.size + '\n' +
                           file.lastModified) + ',content ' + b64(content);
   const contentEtag = content => '"' + content + '"';
-  const hex = bytes => Array.from(bytes, byte =>
-    byte.toString(16).padStart(2, '0')).join('');
-  const contentId = async file => {
+  // One bar for the whole batch: bytes of finished files plus the bytes of
+  // the file in flight, over the total size of every selected file.
+  const tally = {done: 0, total: 0};
+  const bar = offset => {
+    progress.max = Math.max(tally.total, 1);
+    progress.value = Math.min(tally.done + offset, progress.max);
+    return Math.floor(100 * progress.value / progress.max);
+  };
+  const show = (text, offset) => {
+    const percent = bar(offset);
+    status.textContent = text + ' ' + percent + '%';
+  };
+  const contentId = async (file, label) => {
     const leaves = [];
     let checked = 0;
-    show('Checking ' + file.name + '...', 0, file.size);
+    show('Checking ' + label + '...', 0);
     while (checked < file.size) {
       const end = Math.min(checked + __HASH_CHUNK__, file.size);
       const block = await file.slice(checked, end).arrayBuffer();
       leaves.push(new Uint8Array(
         await crypto.subtle.digest('SHA-256', block)));
       checked = end;
-      show('Checking ' + file.name + '...', checked, file.size);
+      show('Checking ' + label + '...', 0);
     }
-    const prefix = new TextEncoder().encode(
+    const prefix = encoder.encode(
       'agent-box-content-v1\n' + file.size + '\n');
     const tree = new Uint8Array(prefix.length + leaves.length * 32);
     tree.set(prefix);
@@ -11779,102 +12068,233 @@ to the terminal or any existing files.</p>
     try { detail = (await response.text()).trim(); } catch (_) {}
     throw new Error(detail || ('Upload request failed (' + response.status + ')'));
   };
-  const head = async (file, content) => {
-    const response = await fetch(resource, {method: 'HEAD', headers: auth(),
-                                            cache: 'no-store'});
-    if (response.status === 404) return null;
+  // What one slot holds: nothing yet (free), a file (bound), a transfer that
+  // failed its content check (dead), or no such slot (absent).
+  const probe = async (l, extra) => {
+    const headers = auth(l);
+    if (extra) Object.assign(headers, extra);
+    const response = await fetch(l.resource, {method: 'HEAD', headers,
+                                              cache: 'no-store'});
+    // Only the link's first slot says how many files it was minted for.
+    const files = Number(response.headers.get('Agent-Box-Link-Files')) || 0;
+    if (response.status === 404) return {state: 'free', files};
+    if (response.status === 403) return {state: 'absent', files};
+    if (response.status === 422) return {state: 'dead', files};
+    if (response.status === 412) return {state: 'changed', files};
     if (!response.ok) return fail(response);
-    if (Number(response.headers.get('Upload-Length')) !== file.size) {
-      throw new Error('This link is already bound to a different file.');
-    }
-    if (response.headers.get('Upload-Complete') === '?1') {
-      const headers = auth();
-      headers['If-Match'] = contentEtag(content);
-      const verified = await fetch(resource, {
-        method: 'HEAD', headers, cache: 'no-store'
-      });
-      if (verified.status === 412) {
-        throw new Error('This link is already bound to a different file.');
-      }
-      if (!verified.ok) return fail(verified);
-      return Number(verified.headers.get('Upload-Offset'));
-    }
-    if (response.headers.get('Upload-Content') !== content) {
-      throw new Error('This link is already bound to a different file.');
-    }
-    return Number(response.headers.get('Upload-Offset'));
+    const complete = response.headers.get('Upload-Complete') === '?1';
+    return {
+      state: 'bound', complete, files,
+      offset: Number(response.headers.get('Upload-Offset')),
+      content: complete
+        ? (response.headers.get('ETag') || '').replace(/^"|"$/g, '')
+        : response.headers.get('Upload-Content'),
+    };
   };
-  const create = async (file, details) => {
-    const headers = auth();
+  const survey = async () => {
+    const first = await lane(0);
+    const head = await probe(first);
+    if (head.state === 'absent') {
+      throw new Error('This upload link is invalid, expired, or revoked.');
+    }
+    const slots = [Object.assign({lane: first}, head)];
+    // A link minted before multi-file support reports no count: one file.
+    // A slot revoked on its own is skipped, not taken for the end.
+    const count = Math.min(head.files || 1, MAX_FILES);
+    for (let index = 1; index < count; index++) {
+      const l = await lane(index);
+      const info = await probe(l);
+      if (info.state !== 'absent') slots.push(Object.assign({lane: l}, info));
+    }
+    return slots;
+  };
+  const create = async (l, file, details) => {
+    const headers = auth(l);
     headers['Upload-Length'] = String(file.size);
     headers['Upload-Metadata'] = details;
-    const response = await fetch(collection, {method: 'POST', headers});
+    const response = await fetch(l.collection, {method: 'POST', headers});
     if (!response.ok) return fail(response);
     return Number(response.headers.get('Upload-Offset') || '0');
   };
-  const show = (text, offset, size) => {
-    status.textContent = text;
-    progress.max = Math.max(size, 1);
-    progress.value = offset;
-  };
-  async function upload(file) {
-    const content = await contentId(file);
-    const details = metadata(file, content);
-    let offset = await head(file, content);
-    if (offset === null) offset = await create(file, details);
-    show('Uploading ' + file.name + '...', offset, file.size);
+  async function send(file, slots, caption) {
+    const content = await contentId(file, caption);
+    let target = slots.find(s => s.state === 'bound' && s.content === content);
+    let offset;
+    if (target) {
+      if (target.complete) {
+        // Trust the bytes, not the metadata: the server confirms the
+        // completed file's content before this one is skipped.
+        const verified = await probe(
+          target.lane, {'If-Match': contentEtag(content)});
+        if (verified.state !== 'bound') {
+          throw new Error('This link is already bound to a different file.');
+        }
+        return;
+      }
+      // An unfinished slot may have moved since it was cached, for example
+      // after an earlier file with the same bytes ran out of retries.
+      const fresh = await probe(target.lane);
+      if (fresh.state !== 'bound' || fresh.content !== content) {
+        throw new Error('This link is already bound to a different file.');
+      }
+      if (fresh.complete) {
+        target.complete = true;
+        return;
+      }
+      offset = fresh.offset;
+    } else {
+      target = slots.find(s => s.state === 'free');
+      if (!target) {
+        throw new Error(slots.length === 1
+          ? 'This link is already bound to a different file.'
+          : 'This link accepts at most ' + slots.length +
+            ' files and all of them are in use.');
+      }
+      try {
+        offset = await create(target.lane, file, metadata(file, content));
+      } catch (error) {
+        // The server may have stored the file even though the answer never
+        // arrived. Ask, so a later file does not pick the same slot again.
+        let now;
+        try { now = await probe(target.lane); } catch (_) { throw error; }
+        if (now.state === 'bound' || now.state === 'dead') {
+          Object.assign(target, now);
+        }
+        if (now.state !== 'bound' || now.content !== content) throw error;
+        // Created after all: carry on with the bytes it holds.
+        if (now.complete) return;
+        offset = now.offset;
+      }
+      target.state = 'bound';
+      target.content = content;
+      target.complete = false;
+    }
+    const l = target.lane;
+    show('Uploading ' + caption + '...', offset);
     let failures = 0;
     while (offset < file.size) {
       const end = Math.min(offset + __CHUNK__, file.size);
-      const headers = auth();
+      const headers = auth(l);
       headers['Upload-Offset'] = String(offset);
       headers['Content-Type'] = 'application/offset+octet-stream';
       try {
-        const response = await fetch(resource, {
+        const response = await fetch(l.resource, {
           method: 'PATCH', headers, body: file.slice(offset, end)
         });
         if (!response.ok) await fail(response);
         offset = Number(response.headers.get('Upload-Offset'));
         failures = 0;
-        show('Uploading ' + file.name + '...', offset, file.size);
+        show('Uploading ' + caption + '...', offset);
       } catch (error) {
         if (++failures > 6) throw error;
-        show('Connection interrupted; resuming...', offset, file.size);
+        show('Connection interrupted; resuming...', offset);
         await sleep(Math.min(1000 * (2 ** failures), 15000));
-        const resumed = await head(file, content);
-        if (resumed === null) throw error;
+        const resumed = await probe(l);
+        if (resumed.state !== 'bound' || resumed.content !== content) {
+          throw error;
+        }
         // A timed-out or cut-off chunk can still persist bytes. Count only
         // failures that made no progress, so a slow link is not abandoned.
-        if (resumed > offset) failures = 0;
-        offset = resumed;
+        if (resumed.offset > offset) failures = 0;
+        offset = resumed.offset;
       }
     }
-    show('Upload complete. You may close this page.', offset, file.size);
+    target.complete = true;
   }
+  const row = file => {
+    const item = document.createElement('li');
+    item.textContent = file.name + ' - waiting';
+    queue.appendChild(item);
+    return item;
+  };
+  const mark = (item, file, text, kind) => {
+    item.textContent = file.name + ' - ' + text;
+    item.className = kind || '';
+  };
+  const upload = async (files, note) => {
+    uploading = true;
+    input.disabled = true;
+    drop.classList.add('disabled');
+    prompt.textContent = files.length === 1 ? files[0].name
+                                            : files.length + ' files';
+    queue.textContent = '';
+    tally.done = 0;
+    tally.total = files.reduce((sum, file) => sum + file.size, 0);
+    bar(0);
+    const rows = files.map(row);
+    let done = 0;
+    let lastError = '';
+    try {
+      const slots = await survey();
+      for (let n = 0; n < files.length; n++) {
+        const file = files[n];
+        const caption = files.length === 1 ? file.name
+          : file.name + ' (' + (n + 1) + ' of ' + files.length + ')';
+        try {
+          await send(file, slots, caption);
+          done++;
+          tally.done += file.size;
+          bar(0);
+          mark(rows[n], file, 'done', 'done');
+        } catch (error) {
+          lastError = error.message;
+          mark(rows[n], file, error.message, 'error');
+        }
+      }
+      if (done === files.length) {
+        status.textContent = files.length === 1
+          ? 'Upload complete. You may close this page.'
+          : 'Uploaded ' + done + ' of ' + files.length +
+            ' files. You may close this page.';
+        progress.max = Math.max(tally.total, 1);
+        progress.value = progress.max;
+      } else {
+        status.textContent = files.length === 1 ? lastError
+          : 'Uploaded ' + done + ' of ' + files.length + ' files.';
+      }
+    } catch (error) {
+      status.textContent = error.message;
+    }
+    if (note) status.textContent += ' ' + note;
+    uploading = false;
+    input.disabled = false;
+    input.value = '';
+    drop.classList.remove('disabled');
+  };
   if (!validToken) {
     status.textContent = 'This upload link is incomplete.';
   } else {
-    const selectFile = async files => {
+    // A drop hands over every dragged item, folders included, and there is
+    // no accept filter as in the file dialog. Folders are skipped here.
+    const dropped = transfer => {
+      const files = [];
+      let folders = 0;
+      const items = Array.from(transfer.items || []);
+      if (items.length) {
+        for (const item of items) {
+          if (item.kind !== 'file') continue;
+          const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+          if (entry && entry.isDirectory) { folders++; continue; }
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      } else {
+        files.push(...transfer.files);
+      }
+      return {files, folders};
+    };
+    const selectFiles = (files, folders) => {
       if (uploading) return;
-      if (files.length !== 1) {
+      const note = folders
+        ? 'Skipped ' + folders + (folders === 1 ? ' folder' : ' folders') +
+          '; choose files only.' : '';
+      if (!files.length) {
         input.value = '';
-        prompt.textContent = 'Drop a file here';
-        status.textContent = 'Choose exactly one file.';
+        prompt.textContent = 'Drop files here';
+        status.textContent = note || 'Choose at least one file.';
         return;
       }
-      const file = files[0];
-      prompt.textContent = file.name;
-      uploading = true;
-      input.disabled = true;
-      drop.classList.add('disabled');
-      try { await upload(file); }
-      catch (error) {
-        uploading = false;
-        input.disabled = false;
-        input.value = '';
-        drop.classList.remove('disabled');
-        status.textContent = error.message;
-      }
+      upload(files, note);
     };
     const stopDrag = event => {
       event.preventDefault();
@@ -11897,9 +12317,11 @@ to the terminal or any existing files.</p>
     drop.addEventListener('drop', event => {
       stopDrag(event);
       drop.classList.remove('dragging');
-      selectFile(event.dataTransfer.files);
+      const result = dropped(event.dataTransfer);
+      selectFiles(result.files, result.folders);
     });
-    input.addEventListener('change', () => selectFile(input.files));
+    input.addEventListener('change', () => selectFiles(
+      Array.from(input.files), 0));
   }
 })();
 </script></body></html>'''
@@ -11910,7 +12332,8 @@ def receive_page(slot, nonce):
             .replace("__SLOT__", slot)
             .replace("__NONCE__", nonce)
             .replace("__CHUNK__", str(RECEIVE_CHUNK_MAX))
-            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK)))
+            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK))
+            .replace("__MAX_FILES__", str(RECEIVE_MAX_FILES)))
 
 
 def receive_metadata(raw):
@@ -12110,6 +12533,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if send_body:
             self.wfile.write(data)
 
+    @staticmethod
+    def _receive_link_headers(record):
+        """Tell the page how many slots the link was minted with.
+
+        Only a link's first record carries the count. A link minted before
+        multi-file support has none, and the page reads that as one file.
+        """
+        files = record.get("files")
+        if isinstance(files, int) and files > 0:
+            return {"Agent-Box-Link-Files": files}
+        return {}
+
     def _receive_headers(self, record, offset):
         headers = {
             "Tus-Resumable": "1.0.0",
@@ -12134,6 +12569,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The partial upload changes after each PATCH, so its target
             # identity is resume metadata rather than an HTTP entity tag.
             headers["Upload-Content"] = record["content"]
+        headers.update(self._receive_link_headers(record))
         return headers
 
     def _receive_create(self, slot):
@@ -12264,11 +12700,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if record is None:
                     return
                 if record["status"] == "waiting":
-                    self._receive_error(404, "No file has been started for this link.")
+                    self._receive_error(
+                        404, "No file has been started for this link.",
+                        self._receive_link_headers(record))
                     return
                 if record["status"] == "failed":
                     self._receive_error(
-                        422, "Uploaded bytes did not match the selected file.")
+                        422, "Uploaded bytes did not match the selected file.",
+                        self._receive_link_headers(record))
                     return
                 offset = receive_offset(record)
                 if offset is None:

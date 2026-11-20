@@ -1377,10 +1377,12 @@ let
       `git worktree add ~/worktrees/NAME --detach ${"$"}{AGENT_BOX_CHECKOUT_REV}`
       from the checkout and work there. Never commit in the shared tree.
 
-      Changing this box means the same round trip as changing any other
-      repo: edit, `nix run .#assemble`, run the checks, push to the `fork`
-      remote if you have one, and open a PR. Editing THIS tree changes
-      nothing about what the box runs - the box rebuilds from root's own
+      When asked to contribute a change to this box, use the same round trip
+      as any other repo: edit, `nix run .#assemble`, run the checks, push to
+      the `fork` remote if you have one, and open a PR. For an unsolicited
+      platform bug, follow "This platform has its own upstream repo" instead.
+      Editing THIS tree changes nothing about what the box runs - the box
+      rebuilds from root's own
       checkout (see Updating above), which only ever fast-forwards along the
       repo the deployment points at. So a commit reaches this machine once it
       is merged there and the update above runs; a commit that only exists
@@ -1754,8 +1756,9 @@ let
     device. Enter the account's phone number with country code, start pairing,
     and give the displayed code to WhatsApp's Linked devices screen on the
     primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
-    Media must either be captioned that way or sent during an explicitly opened
-    ten-minute upload window. The bridge accepts them only from that
+    When the prefix is set, media must either be captioned that way or sent during
+    an explicitly opened ten-minute upload window. With an empty prefix, captionless
+    media is accepted directly. The bridge accepts them only from that
     account's Message Yourself chat. The device link belongs to the Linux user and
     survives agent session restarts. When you begin work on a WhatsApp message,
     acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
@@ -1822,7 +1825,8 @@ let
     after sending. No download link or re-pairing is needed.
 
     For an inbound image, video, or document, add `@agent` at the start of its
-    caption (a caption containing only `@agent` works). To send captionless media,
+    caption (a caption containing only `@agent` works). If the prefix is empty,
+    captionless media is accepted directly. Otherwise, to send captionless media,
     first send `@agent /attach`; that opens a ten-minute upload window for this
     account's Message Yourself chat. An agent can open the same window with `node
     ~/.local/share/local-whatsapp/bridge.mjs receive-files`. View-once media is not
@@ -1898,20 +1902,24 @@ let
 
     @CONTAINERS_SECTION@@WEBHOOK_SECTION@## Receiving a large file from the user
 
-    When the user needs to give this box a file that is too large for chat, mint
+    When the user needs to give this box files that are too large for chat, mint
     one temporary resumable upload link:
 
-        agent-box-receive --ttl 4h --max-size 2G
+        agent-box-receive --ttl 4h --max-size 2G --files 10
 
     Hand them the complete URL the command prints. The part after `#` is the
     upload credential: treat the whole link as a secret and revoke it if it is
-    sent to the wrong person. It authorizes one file up to the stated size and
-    never signs the holder into the terminal or settings page. Interrupted browser
-    uploads resume automatically, and the completed file appears in `~/uploads`.
+    sent to the wrong person. It authorizes up to `--files` files (default 10,
+    at most 100), each up to `--max-size`, and never signs the holder into the
+    terminal or settings page. The page takes several files in one go. Interrupted
+    browser uploads resume automatically, and the completed files appear in
+    `~/uploads`.
 
-    `agent-box-receive list` shows active slots. `agent-box-receive revoke SLOT`
-    invalidates one immediately and removes its unfinished bytes. Expired slots
-    are removed opportunistically. Do not open the upload URL yourself before
+    `agent-box-receive list` shows active slots; each file of a link is one slot,
+    and the LINK column names the link's first slot. `agent-box-receive revoke
+    SLOT` invalidates that slot immediately, and the first slot of a link revokes
+    the whole link, removing unfinished bytes. Expired slots are removed
+    opportunistically. Do not open the upload URL yourself before
     handing it over if your chat client or browser sync might expose its fragment.
 
     ## Handing a file to the user
@@ -1995,9 +2003,11 @@ let
     guide - is github.com/defangdevs/agent-box, the repo this deployment is
     built from. A bug in that platform is not the same as a bug in the user's
     project: if you hit one, first work around it so your own running session
-    is unblocked, then file an issue (or a PR, if you already have the fix)
-    upstream so every other deployment gets it too. Search for an existing
-    issue before opening one, and don't wait for permission to file it.
+    is unblocked, then report it in an upstream issue so it can be fixed for
+    every deployment. Prefer an issue even if you have a fix; include the
+    diagnosis and fix in the report when useful. Search for an existing issue
+    before opening one, and don't wait for permission to file it. If the user
+    asks you to contribute a PR, follow that request.
   '';
   # The canonical guide is published READ-ONLY under /etc (see
   # environment.etc below) rather than seeded into $HOME. environment.etc
@@ -2623,6 +2633,19 @@ let
   # No web.enable dependency, unlike webhookEnabled above: this is a plain
   # Unix socket, not an HTTP endpoint behind the per-user Caddy vhost.
   secretsEnabled = cfg.secrets.enable;
+  # Secret custody (issue #922): the store parent is root-only (the broker
+  # creates its own per-user subdirectory under it at startup) and the
+  # socket dir is world-traversable - listing a socket's NAME is not a
+  # secret, its 0600 mode is what gates connect(). Applied by the broker
+  # block's own systemd.tmpfiles.rules, NOT by the web-gated `tmpfilesRules`
+  # below: a box with web.enable off still runs the broker, and without
+  # these the unit fails 226/NAMESPACE (ReadWritePaths= names a directory
+  # that does not exist). The broker block also publishes them in
+  # internal.tmpfilesRules, whether or not web is enabled.
+  secretsTmpfilesRules = lib.optionals secretsEnabled [
+    "d /var/lib/agent-box-secrets 0700 root root - -"
+    "d /run/agent-box-secrets 0755 root root - -"
+  ];
   webhookSocketDir = "/run/agent-box-webhook";
   webhookSocketOf = name: "${webhookSocketDir}/${name}.sock";
   webhookStateDirOf = name: "/home/${name}/.local/state/local-webhook";
@@ -2659,8 +2682,8 @@ let
 # module-generated-up-to-date check fails until it matches.
 {
   repo = "defangdevs/local-channels";
-  rev = "c0021f6c491d3710c498a3b8739ecd9d7932fe8d";
-  sha256 = "sha256-2+lTrqU3+ZJSA5+CN9WQ1XbWoRe5tmaTmlVwEDPm6js=";
+  rev = "f669f161cb6731e9aaae592175f72af76195ba83";
+  sha256 = "sha256-mGE3oos9hA2h5OXtT/ZFZQqtHxj9m5gizfsXQJ+R49E=";
 }
   ;
   localWebhookScript = builtins.fetchurl {
@@ -3489,6 +3512,7 @@ import json
 import os
 import re
 import socket
+import stat
 import struct
 
 from cryptography.hazmat.primitives import hashes
@@ -3512,6 +3536,18 @@ SECRET_MAX_TIMEOUT_MS = 60 * 60 * 1000
 SECRET_MAX_JOBS_PER_USER = 2
 SECRET_MAX_OUTPUT_BYTES = 64 * 1024
 SECRET_JOB_RETENTION_SECONDS = 24 * 60 * 60
+# Finished jobs keep their (capped) output for the retention window above, and
+# a finished job no longer counts against SECRET_MAX_JOBS_PER_USER. Without a
+# second bound a caller could run jobs back to back and grow the broker's
+# memory for a whole day: 256 retained jobs is at most 256 x 2 x 64 KiB = 32
+# MiB per user. A new exec is refused at the bound, not an old result evicted,
+# so a result stays readable for its whole retention window.
+SECRET_MAX_RETAINED_JOBS_PER_USER = 256
+# A profile name is cheap to mint and each new one is a persistent directory
+# plus meta.json under the user's store. The broker's open-store cache bounds
+# descriptors, not disk, so the number of namespaces is capped here; existing
+# namespaces stay reachable past the cap, only a NEW one is refused.
+SECRET_MAX_NAMESPACES_PER_USER = 128
 
 # Where agent-box-profile's own default pointer lives (profile-cli.sh's
 # DIR/DEFAULT_FILE). Secrets have no separate "global" bucket (deprecated in
@@ -3839,6 +3875,34 @@ def _next_version(old_record):
         return 1
 
 
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _makedirs_durable(path):
+    """os.makedirs(path, 0o700), then fsync EVERY ancestor of path, on every
+    call (fsync(2): syncing a directory does not persist its own entry in
+    ITS parent). Unconditional because a retry cannot tell which levels an
+    earlier attempt created before one of its syncs failed: it finds them
+    all existing, and every entry on the way down must still be made
+    durable before a write under them is acknowledged. The Store is cached
+    per namespace, so this is a handful of fsyncs per profile, not per
+    request."""
+    path = os.path.abspath(path)
+    os.makedirs(path, mode=0o700, exist_ok=True)
+    ancestor = os.path.dirname(path)
+    while True:
+        _fsync_dir(ancestor)
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            break
+        ancestor = parent
+
+
 class Store:
     """Root-only records for ONE (user, profile) namespace.
 
@@ -3854,16 +3918,38 @@ class Store:
     about atomic JSON records.
     """
 
+    @staticmethod
+    def exists(root, namespace):
+        """True if this namespace already has a directory. Read-only ops
+        ask this first so a `list` with an invented profile name does not
+        create (and permanently spend a quota slot on) a namespace."""
+        try:
+            return stat.S_ISDIR(os.lstat(os.path.join(root, namespace)).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+
     def __init__(self, root, namespace, user, uid, root_key):
         if not re.match(r"^[A-Za-z0-9_.-]{1,64}$", namespace) or namespace in (".", ".."):
             raise SecretError("invalid namespace")
-        os.makedirs(root, mode=0o700, exist_ok=True)
+        _makedirs_durable(root)
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             try:
-                os.mkdir(namespace, 0o700, dir_fd=root_fd)
-            except FileExistsError:
-                pass
+                os.stat(namespace, dir_fd=root_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                existing = [e for e in os.listdir(root_fd) if not e.startswith(".")]
+                if len(existing) >= SECRET_MAX_NAMESPACES_PER_USER:
+                    raise SecretError("too many secret profiles for this user") from None
+                try:
+                    os.mkdir(namespace, 0o700, dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+            # Every time, not only after our own mkdir: fsync on the
+            # namespace itself (in _write) does not persist its ENTRY in
+            # the parent, and a retry after a failed sync finds the
+            # directory already there. Without this a crash after an
+            # acknowledged `set` could lose the whole profile.
+            os.fsync(root_fd)
             self.dir_fd = os.open(namespace, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                   dir_fd=root_fd)
         finally:
@@ -4191,10 +4277,12 @@ class JobManager:
     of that user - the "2 active jobs per user" limit in the issue is a
     per-user limit, not per-profile."""
 
-    def __init__(self, launcher, max_output_bytes, max_jobs):
+    def __init__(self, launcher, max_output_bytes, max_jobs,
+                 max_retained=SECRET_MAX_RETAINED_JOBS_PER_USER):
         self.launcher = launcher
         self.max_output_bytes = max_output_bytes
         self.max_jobs = max_jobs
+        self.max_retained = max_retained
         self._jobs = {}
         self._by_idempotency = {}  # (namespace, key) -> job id
         self._lock = threading.Lock()
@@ -4215,6 +4303,10 @@ class JobManager:
                     return existing.id
             if self._active_count() >= self.max_jobs:
                 raise SecretError("too many active jobs")
+            if len(self._jobs) >= self.max_retained:
+                # See SECRET_MAX_RETAINED_JOBS_PER_USER: finished results are
+                # kept for the retention window, so refuse instead of evicting.
+                raise SecretError("too many retained job results; try again later")
             job = Job(new_job_id(), namespace, fingerprint, req, time.time())
             self._jobs[job.id] = job
             if key is not None:
@@ -4804,9 +4896,13 @@ class SystemdLauncher(Launcher):
     actually runs.
     """
 
-    def __init__(self, user, worker_path, python_bin="python3"):
+    def __init__(self, user, worker_path, python_bin=None):
         self.user = user
         self.worker_path = worker_path
+        # None: exec the worker by its own absolute path. It is a generated
+        # script with a store-path shebang, so nothing here depends on a
+        # bare `python3` being on the PATH of the broker's unit or of the
+        # transient job unit - neither of which has one on NixOS.
         self.python_bin = python_bin
 
     @staticmethod
@@ -4825,7 +4921,7 @@ class SystemdLauncher(Launcher):
             "--property=PrivateTmp=yes",
             "--property=TimeoutStopSec=5",
             "--",
-            self.python_bin, self.worker_path,
+            *([self.python_bin] if self.python_bin else []), self.worker_path,
         ]
         job.handle = spawn_worker(cmd, frame_bytes)
         return job.handle
@@ -4849,11 +4945,12 @@ class Broker:
     # PROFILE_NAME_RE), and each new one costs this process a directory, a
     # meta.json, a lock fd and a cached Store with its own open dir_fd. None
     # of that is reclaimed on its own, so without a bound the agent user can
-    # exhaust this root process's file descriptors (and, at the fs level,
-    # fill /var/lib/agent-box-secrets with empty namespaces) just by asking
-    # `list` for enough distinct names. Evicting the least-recently-used
-    # Store when the cache is full bounds both; a profile that is actually
-    # in use stays resident because it keeps getting touched.
+    # exhaust this root process's file descriptors just by asking `list` for
+    # enough distinct names. Evicting the least-recently-used Store when the
+    # cache is full bounds the descriptors; a profile that is actually in use
+    # stays resident because it keeps getting touched. Eviction never deletes
+    # anything on disk: the persistent namespaces are bounded separately, by
+    # SECRET_MAX_NAMESPACES_PER_USER in Store.
     MAX_OPEN_STORES = 64
 
     def __init__(self, user, uid, store_root, root_key, job_manager):
@@ -4865,7 +4962,12 @@ class Broker:
         self._stores = {}
         self._stores_lock = threading.Lock()
 
-    def _store(self, profile):
+    def _store(self, profile, create):
+        """The cached Store for this profile. With create=False (every op
+        but `set`) a namespace that does not exist yet is NOT made: the
+        answer is None, so a `list` or `exec` naming an invented profile
+        costs nothing on disk and no slot of SECRET_MAX_NAMESPACES_PER_USER.
+        """
         # Already validated by validate_request (every request names a
         # concrete profile - see resolve_profile's docstring): "profile" is
         # the namespace, with no further resolution needed here.
@@ -4873,6 +4975,8 @@ class Broker:
         with self._stores_lock:
             store = self._stores.pop(namespace, None)
             if store is None:
+                if not create and not Store.exists(self.store_root, namespace):
+                    return None
                 store = Store(self.store_root, namespace, self.user, self.uid, self.root_key)
             self._stores[namespace] = store  # re-insert: most-recently-used
             while len(self._stores) > self.MAX_OPEN_STORES:
@@ -4884,16 +4988,27 @@ class Broker:
 
     def handle(self, req):
         op = validate_request(req)
-        store = self._store(req.get("profile"))
+        profile = req.get("profile")
+        # status/cancel only need the job manager, which keys jobs by the
+        # profile name; they never touch the store.
+        if op == "status":
+            return {"ok": True, **self.job_manager.status(profile, req["jobId"])}
+        if op == "cancel":
+            return {"ok": True, **self.job_manager.cancel(profile, req["jobId"])}
+        store = self._store(profile, create=(op == "set"))
         if op in ("list", "set", "remove"):
+            if store is None:
+                if op == "list":
+                    return {"ok": True, "secrets": []}
+                raise SecretError("no such secret")
             return handle_request(store, req)
         if op == "exec":
-            job_id = self.job_manager.start(store.namespace, req, store.get)
+            # A missing namespace resolves no name, so _dispatch reports
+            # "no such secret: NAME" for each; with no secretNames the job
+            # simply runs.
+            resolve = store.get if store is not None else (lambda name: None)
+            job_id = self.job_manager.start(profile, req, resolve)
             return {"ok": True, "jobId": job_id}
-        if op == "status":
-            return {"ok": True, **self.job_manager.status(store.namespace, req["jobId"])}
-        if op == "cancel":
-            return {"ok": True, **self.job_manager.cancel(store.namespace, req["jobId"])}
         raise SecretError("unsupported operation")
 
 
@@ -5058,6 +5173,396 @@ def main():
 if __name__ == "__main__":
     main()
   '');
+  # Root reboot helper (issue #1054): a reboot that needs nothing from the
+  # disk when the settings page's normal `sudo systemctl reboot` cannot exec.
+  rebootHelperBin = pkgs.writers.writePython3Bin "agent-box-reboot-helper" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+"""agent-box-reboot-helper - a reboot that needs nothing from the disk.
+
+The settings page's "Reboot box" button normally runs `sudo systemctl
+reboot`: two programs, both read from disk at the moment of the request.
+When the disk has gone away (issue #1053) the page still answers - it runs
+from RAM - and the button does nothing, because the `exec` cannot find its
+program. This helper is the last resort for that case.
+
+It is a root daemon that is ALREADY RUNNING when the disk fails. Everything
+it needs is open or loaded before it serves the first request:
+
+  * /proc/sysrq-trigger is open for writing, so a reboot is a `write()` on
+    a descriptor it holds - no path lookup, no exec;
+  * every module it uses is imported at the top, and mlockall() keeps its
+    pages resident, so a stalled disk cannot page the code out;
+  * the listening socket is bound, so no systemd socket activation (which
+    would have to start a process on demand) is involved.
+
+It then drops root. The open descriptor keeps working; what is left is a
+process that can write to one file and nothing else.
+
+Misuse hardening (the point of the design, not an afterthought):
+
+  * Only ONE agent user may connect: the kernel reports the peer's uid
+    (SO_PEERCRED) and anything else is closed unanswered. The socket file
+    is also 0600 and owned by that user.
+  * The request is exactly the seven bytes b"REBOOT\\n". The helper never
+    forwards a client byte anywhere: what it writes to sysrq-trigger comes
+    from the constants below, so no client can select another sysrq key
+    (crash, kill-all, ...). Any other request, longer, shorter, or slow, is
+    refused.
+  * It refuses outright unless the kernel's kernel.sysrq mask allows the
+    reboot function (bit 128, or the value 1).
+  * One request starts the sequence; later ones are answered "BUSY".
+
+The front door has to survive too: the request reaches this helper through
+Caddy and the settings daemon, and a code page of theirs that was never
+loaded since boot is a SIGBUS once the disk is gone (a KVM fault test
+killed Caddy on its first TLS handshake). So a second, root process forked
+before the drop pins every file the AGENT_BOX_REBOOT_PIN_UNITS processes
+have mapped: mmap + mlock, refreshed every PIN_REFRESH_S so an update's new
+store paths are picked up. It takes no client input, pins only root-owned
+files nobody else can write, and stops at PIN_MAX_BYTES.
+
+The sequence is the classic sync (s), remount read-only (u), reboot (b),
+with a pause between each. The kernel runs s and u asynchronously and `b`
+does not wait for them, so the pauses are what give them a chance. They are
+bounded: a dead disk cannot stop the final `b`.
+"""
+import ctypes
+import grp
+import os
+import pwd
+import signal
+import socket
+import stat
+import struct
+import sys
+import time
+
+REQUEST = b"REBOOT\n"
+SYSRQ_TRIGGER = "/proc/sysrq-trigger"
+SYSRQ_MASK = "/proc/sys/kernel/sysrq"
+# Bit 128 of kernel.sysrq allows reboot/poweroff; 1 allows everything.
+SYSRQ_REBOOT_BIT = 128
+# The ONLY bytes ever written to the trigger. Never derived from input.
+SEQUENCE = ((b"s", 3.0), (b"u", 3.0), (b"b", 0.0))
+CLIENT_TIMEOUT_S = 2.0
+NOBODY = 65534
+PIN_REFRESH_S = 60
+# Caddy plus the settings daemon came to 72 MiB in the fault test.
+PIN_MAX_BYTES = 256 << 20
+PROT_READ = 1
+MAP_SHARED = 1
+
+
+def sysrq_allows_reboot(mask_fd):
+    """True when kernel.sysrq lets the `b` function run."""
+    try:
+        raw = os.pread(mask_fd, 32, 0).strip()
+        value = int(raw)
+    except (OSError, ValueError):
+        return False
+    return value == 1 or bool(value & SYSRQ_REBOOT_BIT)
+
+
+def peer_uid(conn):
+    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                            struct.calcsize("3i"))
+    return struct.unpack("3i", creds)[1]
+
+
+def read_request(conn):
+    """Read at most len(REQUEST)+1 bytes before a deadline; the caller
+    compares them with REQUEST. One byte too many is read on purpose so a
+    longer message is a mismatch and not a silently truncated match."""
+    conn.settimeout(CLIENT_TIMEOUT_S)
+    data = b""
+    limit = len(REQUEST) + 1
+    deadline = time.monotonic() + CLIENT_TIMEOUT_S
+    while len(data) < limit and time.monotonic() < deadline:
+        try:
+            chunk = conn.recv(limit - len(data))
+        except OSError:
+            break
+        if not chunk:
+            break
+        data += chunk
+        if data == REQUEST:
+            # Complete request: stop here instead of waiting for EOF. A
+            # trailing byte would not have been read yet, so ask once
+            # more without blocking.
+            conn.settimeout(0.05)
+            try:
+                extra = conn.recv(1)
+            except OSError:
+                extra = b""
+            return data + extra
+    return data
+
+
+def reply(conn, text):
+    try:
+        conn.sendall(text)
+    except OSError:
+        pass
+
+
+def run_sequence(trigger_fd, sleep, delays=True):
+    for key, pause in SEQUENCE:
+        os.write(trigger_fd, key)
+        if pause and delays:
+            sleep(pause)
+
+
+def shield_from_shutdown():
+    """An accepted request must reach its final `b` even if a late normal
+    shutdown sends SIGTERM meanwhile (systemd would still SIGKILL after its
+    stop timeout, far longer than the sequence)."""
+    try:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    except ValueError:  # not the main thread (tests)
+        pass
+
+
+def serve(sock, allowed_uid, trigger_fd, mask_fd, sleep=time.sleep,
+          delays=True, once=False):
+    started = False
+    while True:
+        conn, _ = sock.accept()
+        with conn:
+            try:
+                uid = peer_uid(conn)
+            except OSError:
+                continue
+            if uid != allowed_uid:
+                # Not answered: a stranger learns nothing, not even that a
+                # reboot helper is here.
+                continue
+            if read_request(conn) != REQUEST:
+                reply(conn, b"ERR request\n")
+                continue
+            if started:
+                reply(conn, b"BUSY\n")
+                continue
+            if not sysrq_allows_reboot(mask_fd):
+                reply(conn, b"ERR sysrq-disabled\n")
+                continue
+            started = True
+            # Before the reply: nothing may stop an accepted request.
+            shield_from_shutdown()
+            reply(conn, b"OK\n")
+        try:
+            run_sequence(trigger_fd, sleep, delays)
+        except OSError as exc:
+            sys.stderr.write("agent-box-reboot-helper: sysrq write: %s\n" % exc)
+            started = False
+        if once:
+            return
+
+
+def unit_pids(units, proc="/proc", errors=None):
+    """PIDs whose cgroup v2 path ends in one of `units`. A read that fails
+    for a reason other than the process having exited is appended to
+    `errors`: the answer is then incomplete."""
+    pids = []
+    for name in os.listdir(proc):
+        if not name.isdigit():
+            continue
+        try:
+            with open(os.path.join(proc, name, "cgroup")) as f:
+                lines = f.read().splitlines()
+        except OSError as exc:
+            note_error(exc, errors)
+            continue
+        for line in lines:
+            if line.startswith("0::") and line.rsplit("/", 1)[-1] in units:
+                pids.append(name)
+                break
+    return pids
+
+
+def note_error(exc, errors):
+    if errors is not None and not isinstance(
+            exc, (FileNotFoundError, ProcessLookupError)):
+        errors.append(exc)
+
+
+def mapped_files(pids, proc="/proc", errors=None):
+    """Paths of the files these processes have mapped (see unit_pids for
+    `errors`)."""
+    paths = set()
+    for pid in pids:
+        try:
+            with open(os.path.join(proc, pid, "maps")) as f:
+                lines = f.read().splitlines()
+        except OSError as exc:
+            note_error(exc, errors)
+            continue
+        for line in lines:
+            fields = line.split(None, 5)
+            if len(fields) < 6 or not fields[5].startswith("/"):
+                continue
+            if not fields[5].endswith(" (deleted)"):
+                paths.add(fields[5])
+    return paths
+
+
+def pinnable(st, owner=0):
+    """A regular, non-empty file owned by `owner` that group and others
+    cannot write: a process we pin for cannot grow it into our RAM."""
+    if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+        return False
+    return st.st_uid == owner and not st.st_mode & 0o022
+
+
+class Pinner:
+    """Keeps a set of files mmapped and mlocked; refresh() reconciles."""
+
+    def __init__(self, libc, owner=0, limit=PIN_MAX_BYTES):
+        self.libc = libc
+        self.owner = owner
+        self.limit = limit
+        self.pinned = {}  # (st_dev, st_ino) -> (addr, size, path)
+
+    def total(self):
+        return sum(size for _, size, _ in self.pinned.values())
+
+    def refresh(self, paths, complete=True):
+        """Reconcile with `paths`. With complete=False (discovery could not
+        read everything) nothing is unpinned: absence proves nothing."""
+        wanted = {}
+        unknown = set()
+        for path in sorted(paths):
+            try:
+                st = os.stat(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # Could not look (a failing disk): not proof the file is
+                # gone, so an existing pin on it must stay.
+                unknown.add(path)
+                continue
+            if pinnable(st, self.owner):
+                wanted.setdefault((st.st_dev, st.st_ino), (path, st.st_size))
+        for key in [k for k, v in self.pinned.items()
+                    if complete and k not in wanted and v[2] not in unknown]:
+            addr, size, _ = self.pinned.pop(key)
+            self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+        skipped = 0
+        for key, (path, size) in wanted.items():
+            if key in self.pinned:
+                continue
+            if self.total() + size > self.limit:
+                skipped += 1
+                continue
+            addr = self.map(path, size)
+            if addr is not None:
+                self.pinned[key] = (addr, size, path)
+        return skipped
+
+    def map(self, path, size):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except OSError:
+            return None
+        try:
+            addr = self.libc.mmap(None, size, PROT_READ, MAP_SHARED, fd, 0)
+        finally:
+            os.close(fd)
+        if addr in (None, ctypes.c_void_p(-1).value):
+            return None
+        if self.libc.mlock(ctypes.c_void_p(addr), ctypes.c_size_t(size)):
+            self.libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
+            return None
+        return addr
+
+
+def load_libc():
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+                          ctypes.c_int, ctypes.c_int, ctypes.c_long]
+    return libc
+
+
+def run_pinner(units):
+    """The root child: pin the front door's mapped files, forever."""
+    lock_memory()
+    pinner = Pinner(load_libc())
+    last = None
+    while True:
+        try:
+            errors = []
+            pids = unit_pids(units, errors=errors)
+            paths = mapped_files(pids, errors=errors)
+            skipped = pinner.refresh(paths, complete=not errors)
+            now = (len(pinner.pinned), pinner.total() >> 20, skipped)
+            if now != last:
+                sys.stderr.write("agent-box-reboot-helper: pinned %d files "
+                                 "(%d MiB), %d over the limit\n" % now)
+                last = now
+        except Exception as exc:  # keep pinning through one bad refresh
+            sys.stderr.write("agent-box-reboot-helper: pin: %r\n" % exc)
+        time.sleep(PIN_REFRESH_S)
+
+
+def lock_memory():
+    libc = ctypes.CDLL(None, use_errno=True)
+    # MCL_CURRENT | MCL_FUTURE
+    if libc.mlockall(1 | 2) != 0:
+        sys.stderr.write("agent-box-reboot-helper: mlockall failed: errno %d\n"
+                         % ctypes.get_errno())
+
+
+def drop_privileges():
+    os.setgroups([])
+    os.setgid(NOBODY)
+    os.setuid(NOBODY)
+
+
+def main():
+    user = os.environ.get("AGENT_BOX_REBOOT_USER", "")
+    path = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+    if not user or not path:
+        sys.stderr.write("agent-box-reboot-helper: AGENT_BOX_REBOOT_USER and "
+                         "AGENT_BOX_REBOOT_SOCKET are required\n")
+        return 2
+    entry = pwd.getpwnam(user)
+    # Preload everything a later lookup could need, before the disk can fail.
+    grp.getgrall()
+    trigger_fd = os.open(SYSRQ_TRIGGER, os.O_WRONLY)
+    mask_fd = os.open(SYSRQ_MASK, os.O_RDONLY)
+    if os.path.lexists(path):
+        os.unlink(path)
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    os.umask(0o177)
+    sock.bind(path)
+    os.chown(path, entry.pw_uid, -1)
+    os.chmod(path, 0o600)
+    sock.listen(4)
+    units = os.environ.get("AGENT_BOX_REBOOT_PIN_UNITS", "").split()
+    if units:
+        # Auto-reap: a pinner that dies must not leave a zombie, and the
+        # reboot path does not depend on it.
+        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        if os.fork() == 0:
+            # The child keeps root (reading another user's maps needs it)
+            # and so holds nothing a client can reach.
+            sock.close()
+            os.close(trigger_fd)
+            os.close(mask_fd)
+            run_pinner(set(units))
+            os._exit(1)
+    lock_memory()
+    drop_privileges()
+    sys.stderr.write("agent-box-reboot-helper: ready for uid %d on %s\n"
+                     % (entry.pw_uid, path))
+    serve(sock, entry.pw_uid, trigger_fd, mask_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+  '';
   secretWorkerBin = pkgs.writers.writePython3Bin "agent-box-secret-worker" {
     flakeIgnore = [ "E501" "E302" "E305" ];
   } ''
@@ -10772,16 +11277,16 @@ import time
 from urllib.request import urlopen
 
 
-REV = "a54bb56dba4e6c8aafb57231ba81211eeb1e78ab"
+REV = "af3d7eb7ac1fe6e0ff8330a33a4936c103f80445"
 FILES = {
     "bridge.mjs": "d4f0a60f85bc14e870ba0dd4a8706992550c23f9949d83f926b332e3d9ba98c9",
-    "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
+    "state.mjs": "f66f127f150a3f46a4de6a40e4e860ec088a949641b64e407f01f4d27ae91af3",
     "package.json": "a685e52bfe73a8965869cf1884c98280bca5a9ada31ae2fa1ce8829dc5cb16eb",
     "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
 # local-router's single file, fetched with the bridge at the same REV. The
 # route subcommand loads it from the runtime directory.
-ROUTER_FILE = ("local-router/router.py", "cd0f1a591b8ccd1f0bba29b45098c5c4c3f631ea9b07acab31fb855651298a8d")
+ROUTER_FILE = ("local-router/router.py", "ef913fc4c41109e6ed97b5ed6279fe2d491990a5de39a9087a7b83889ea2640c")
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
 STATE = HOME / ".local/state/local-whatsapp"
@@ -13392,6 +13897,24 @@ _hc_main "$@"
     export LOCAL_WEBHOOK_STATE_DIR="$STATE_DIR"
     # Never let a CLI invocation bind the ingress the daemon owns.
     export LOCAL_WEBHOOK_PORT=0
+    # A Claude Remote Control daemon gives every app conversation the same
+    # LOCAL_WEBHOOK_SESSION. In claude-send mode local-webhook keys the filter per
+    # conversation instead (webhook.py conversation_scoped):
+    # "<LOCAL_WEBHOOK_SESSION>.c<first 8 hex of CLAUDE_CODE_SESSION_ID>". Export the
+    # same key, so this CLI's own reads of filter.<key>.json (stored notes, codex
+    # wake) look at the file the plugin delivers from. webhook.py leaves an
+    # already-scoped key alone. Without this, one conversation's subscription was
+    # delivered to every conversation of the daemon.
+    if [ "''${LOCAL_WEBHOOK_CLAUDE_DELIVERY:-}" = send ] && [ -n "''${LOCAL_WEBHOOK_SESSION:-}" ]; then
+      _conv="$(printf '%s' "''${CLAUDE_CODE_SESSION_ID:-}" | tr 'A-Z' 'a-z' | tr -cd '0-9a-f' | cut -c1-8)"
+      if [ "''${#_conv}" -eq 8 ]; then
+        case "$LOCAL_WEBHOOK_SESSION" in
+          (*".c$_conv") ;;
+          (*) LOCAL_WEBHOOK_SESSION="$LOCAL_WEBHOOK_SESSION.c$_conv" ;;
+        esac
+        export LOCAL_WEBHOOK_SESSION
+      fi
+    fi
     # The box's own per-user state, not local-webhook's: the session registry the
     # hook-* ceiling is counted from, and where the spawn wrapper writes down a
     # batch it refused (issue #170). Both are read-only here.
@@ -13434,6 +13957,21 @@ _hc_main "$@"
       else
         rm -f "$_tmp"
       fi
+    }
+
+    # True when this process runs inside a conversation of a Claude Remote Control
+    # daemon session (`agent-box-session add NAME --harness claude --daemon`).
+    # LOCAL_WEBHOOK_SESSION is "<user>-<session>" (webhookSessionEnvArgs), and the
+    # registry marks the daemon. A Codex caller is never one: Codex delivers through
+    # its own peer, not a Claude channel.
+    claude_rc_daemon_conversation() {
+      [ -z "''${CODEX_THREAD_ID:-}''${CODEX_SESSION_ID:-}" ] || return 1
+      _cs="''${LOCAL_WEBHOOK_SESSION:-}"
+      _cs="''${_cs#"$(id -un)"-}"
+      [ -n "$_cs" ] && [ -r "$SESSIONS" ] || return 1
+      "$JQ" -e --arg s "$_cs" \
+        '.sessions[$s] | (.agent // "claude") == "claude" and (.remoteControlDaemon == true or .remoteControlServer == true)' \
+        "$SESSIONS" >/dev/null 2>&1
     }
 
     forget_codex_wake_if_idle() {
@@ -14554,6 +15092,28 @@ _hc_main "$@"
                 fi
                 set -- "$@" --spawn-config "profile=$profile" ;;
             esac
+          fi
+          # A Claude Remote Control DAEMON runs each app conversation as a
+          # `claude --print --sdk-url` child with no --channels, so its plugin peer
+          # starts and owns the socket but every delivery goes nowhere. Worse, a
+          # claim from it still brakes the standing watch, so a review on the PR
+          # spawns nobody and reaches nobody (PR #1051's CodeRabbit review). The
+          # guide already says a daemon is no webhook target; refuse here rather
+          # than write a subscription that silently swallows its events.
+          # A daemon started by a supervisor that knows the inbox path carries
+          # LOCAL_WEBHOOK_CLAUDE_DELIVERY=send, and then the plugin delivers
+          # through Claude's cross-session inbox (local-channels#149). Only a
+          # daemon without it (started before that release) is refused.
+          if [ "$deliver_to" = session ] && [ "''${LOCAL_WEBHOOK_CLAUDE_DELIVERY:-}" != send ] \
+              && claude_rc_daemon_conversation; then
+            echo "agent-box-webhook: this is a conversation of the Claude Remote" \
+                 "Control daemon ''\'''${LOCAL_WEBHOOK_SESSION#"$(id -un)"-}', which has no" \
+                 "channel to deliver session events into: they would be dropped," \
+                 "and a --claim would also stop the standing watch from spawning" \
+                 "anyone for them. Restart the daemon after a box update (agent-box-session" \
+                 "restart NAME) so it delivers through the Claude inbox, use a standing" \
+                 "watch (--deliver-to subagent), or work in an interactive session" >&2
+            exit 2
           fi
           # The relevance dimension, resolved once: a named policy or the
           # caller's own predicate, never both — they are two spellings of the
@@ -16308,6 +16868,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -16589,18 +17150,98 @@ def receive_remove_locked(slot, record=None):
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
 
-def receive_create(ttl, max_bytes, now=None):
-    """Mint a capability, persist only its digest, and return slot+token."""
+RECEIVE_MAX_FILES = 100
+
+
+def receive_child(secret, index):
+    """Derive the slot id and secret that carry file INDEX of a link.
+
+    One link holds up to RECEIVE_MAX_FILES independent slots, each bound to
+    exactly one file, so the per-slot protocol is unchanged. File 0 is the
+    link's own slot and token. The others are HMAC-SHA256 of file 0's secret,
+    which the daemon only stores as a hash and so cannot derive. The page
+    computes the same values with WebCrypto. Hex keeps every id alphanumeric,
+    which RECEIVE_SLOT_RE and argparse both accept.
+    """
+    key = secret.encode("ascii")
+
+    def part(label, size):
+        message = ("agent-box-receive-v1\n%s\n%d" % (label, index)).encode()
+        return hmac.new(key, message, hashlib.sha256).hexdigest()[:size]
+    return part("slot", 24), part("secret", 64)
+
+
+def receive_store_new(record):
+    """Persist a brand-new record; FileExistsError if the slot is taken."""
+    path = receive_record_path(record["slot"])
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True,
+                      separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        receive_fsync_dir(RECEIVE_STATE_DIR)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+
+
+@contextlib.contextmanager
+def receive_links_lock():
+    """Serialize link creation against link-wide revocation.
+
+    A revoke that listed a link's slots while its creator was still writing
+    the children would report success and leave them usable.
+    """
+    receive_ensure_dirs()
+    path = os.path.join(RECEIVE_STATE_DIR, ".links.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+                 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def receive_link_slots(slot):
+    """Return the live slots a revoke of SLOT must cover.
+
+    SLOT itself, when its record exists, plus every child minted with it.
+    The children are found by their link field, so a link whose first
+    record is already gone can still be revoked. An unreadable state
+    directory raises OSError instead of passing for a complete answer.
+    """
+    try:
+        names = sorted(os.listdir(RECEIVE_STATE_DIR))
+    except FileNotFoundError:
+        names = []
+    slots = [slot] if receive_read(slot) is not None else []
+    for name in names:
+        child = name[:-5]
+        if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
+            continue
+        record = receive_read(child)
+        if record is not None and record.get("link") == slot:
+            slots.append(child)
+    return slots
+
+
+def receive_create(ttl, max_bytes, now=None, files=1):
+    """Mint a capability, persist only its digest, and return slot+token.
+
+    FILES > 1 also persists FILES - 1 derived slots (see receive_child), so
+    one link accepts that many files of up to MAX_BYTES each.
+    """
     receive_ensure_dirs()
     now = int(time.time() if now is None else now)
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
+    if not 1 <= files <= RECEIVE_MAX_FILES:
+        raise ValueError("files must be between 1 and %d" % RECEIVE_MAX_FILES)
+
+    def fresh(slot, secret, **extra):
         record = {
             "version": RECEIVE_VERSION,
             "slot": slot,
@@ -16610,26 +17251,37 @@ def receive_create(ttl, max_bytes, now=None):
             "max_bytes": max_bytes,
             "status": "waiting",
         }
-        path = receive_record_path(slot)
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
-        except FileExistsError:
-            continue
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, sort_keys=True,
-                          separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            receive_fsync_dir(RECEIVE_STATE_DIR)
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(path)
-            raise
-        return slot, slot + "." + secret, record
-    raise RuntimeError("could not allocate an upload slot")
+        record.update(extra)
+        return record
+
+    with receive_links_lock():
+        for _attempt in range(32):
+            slot = secrets.token_urlsafe(12)
+            # A leading "-" is URL-safe but argparse reads it as an option in
+            # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+            # as ordinary positional arguments without requiring a hidden `--`.
+            if not slot[0].isalnum():
+                continue
+            secret = secrets.token_urlsafe(32)
+            record = fresh(slot, secret, files=files)
+            try:
+                receive_store_new(record)
+            except FileExistsError:
+                continue
+            created = [slot]
+            try:
+                for index in range(1, files):
+                    child, child_secret = receive_child(secret, index)
+                    receive_store_new(fresh(child, child_secret, link=slot))
+                    created.append(child)
+            except Exception:
+                # Nobody holds the token yet, so no slot lock is needed.
+                for name in created:
+                    receive_remove_locked(name)
+                raise
+            return slot, slot + "." + secret, record
+        # Every attempt collided with an existing slot.
+        raise RuntimeError("could not allocate an upload slot")
 
 
 def receive_prune(now=None):
@@ -16759,18 +17411,25 @@ def cmd_create(args):
         raise SystemExit("agent-box-receive: --ttl must be between 10m and 7d")
     if args.max_size < 1 or args.max_size > (1 << 40):
         raise SystemExit("agent-box-receive: --max-size must be at most 1T")
+    if not 1 <= args.files <= RECEIVE_MAX_FILES:
+        raise SystemExit("agent-box-receive: --files must be between 1 and %d"
+                         % RECEIVE_MAX_FILES)
     receive_prune()
-    slot, token, record = receive_create(args.ttl, args.max_size)
+    slot, token, record = receive_create(
+        args.ttl, args.max_size, files=args.files)
     url = base.rstrip("/") + "/receive/" + slot + "/#" + token
     if args.json:
         print(json.dumps({"slot": slot, "url": url,
                           "expires": record["expires"],
-                          "maxBytes": record["max_bytes"]},
+                          "maxBytes": record["max_bytes"],
+                          "files": args.files},
                          separators=(",", ":")))
     else:
         print(url)
-        print("agent-box-receive: slot %s accepts one file up to %s for %s"
-              % (slot, human_size(args.max_size), args.ttl_text),
+        print("agent-box-receive: slot %s accepts %s up to %s each for %s"
+              % (slot, "1 file" if args.files == 1
+                 else "%d files" % args.files,
+                 human_size(args.max_size), args.ttl_text),
               file=sys.stderr)
 
 
@@ -16780,7 +17439,7 @@ def cmd_list(_args):
         names = sorted(os.listdir(RECEIVE_STATE_DIR))
     except OSError:
         names = []
-    print("SLOT\tSTATUS\tOFFSET/TOTAL\tEXPIRES")
+    print("SLOT\tSTATUS\tOFFSET/TOTAL\tEXPIRES\tLINK")
     for name in names:
         if not name.endswith(".json"):
             continue
@@ -16795,23 +17454,39 @@ def cmd_list(_args):
             offset = total if record["status"] == "complete" else 0
         expires = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                 time.gmtime(record["expires"]))
-        print("%s\t%s\t%d/%d\t%s" %
-              (slot, record["status"], offset, total, expires))
+        print("%s\t%s\t%d/%d\t%s\t%s" %
+              (slot, record["status"], offset, total, expires,
+               record.get("link", "-")))
 
 
 def cmd_revoke(args):
-    record = receive_read(args.slot)
-    if record is None:
-        raise SystemExit("agent-box-receive: no such slot: %s" % args.slot)
-    receive_mark_revoked(args.slot)
+    # A link's first slot also revokes the slots minted with it, so one
+    # command ends the whole multi-file capability. Discovery and marking
+    # share a lock with link creation, so no half-written link is missed,
+    # and an unreadable state directory stops here before any record is
+    # touched. The children are found by their link field, which lets a
+    # retry finish a revoke whose first record was already pruned.
     try:
-        with receive_slot_lock(args.slot, blocking=False):
-            receive_remove_locked(args.slot, receive_read(args.slot))
-    except BlockingIOError:
-        # The marker already makes authorization fail. An active PATCH checks
-        # it between reads and performs the same cleanup while holding the
-        # lock, so revocation itself never waits on a slow uploader.
-        pass
+        with receive_links_lock():
+            slots = receive_link_slots(args.slot)
+            if not slots:
+                raise SystemExit(
+                    "agent-box-receive: no such slot: %s" % args.slot)
+            for slot in slots:
+                receive_mark_revoked(slot)
+    except OSError as exc:
+        raise SystemExit(
+            "agent-box-receive: cannot revoke %s: %s" % (args.slot, exc))
+    for slot in slots:
+        try:
+            with receive_slot_lock(slot, blocking=False):
+                receive_remove_locked(slot, receive_read(slot))
+        except BlockingIOError:
+            # The marker already makes authorization fail. An active PATCH
+            # checks it between reads and performs the same cleanup while
+            # holding the lock, so revocation itself never waits on a slow
+            # uploader.
+            pass
     print("revoked %s" % args.slot)
 
 
@@ -16822,7 +17497,11 @@ def parser():
     sub = result.add_subparsers(dest="command")
     create = sub.add_parser("create", help="create an upload link (default)")
     create.add_argument("--ttl", default="24h", type=parse_ttl_arg)
-    create.add_argument("--max-size", default="2G", type=parse_size)
+    create.add_argument("--max-size", default="2G", type=parse_size,
+                        help="size limit for EACH file (default 2G)")
+    create.add_argument("--files", default=10, type=int,
+                        help="how many files the link accepts, 1-%d "
+                        "(default 10)" % RECEIVE_MAX_FILES)
     create.add_argument("--url", help=argparse.SUPPRESS)
     create.add_argument("--json", action="store_true")
     sub.add_parser("list", help="list live upload slots")
@@ -18632,9 +19311,25 @@ if [ -n "''${LOCAL_WEBHOOK_STATE_DIR:-}" ] && [ -n "''${LOCAL_WEBHOOK_SPAWN_KEY:
   include="$(claim_include)" || include=""
   note="$(claim_note "$LOCAL_WEBHOOK_SPAWN_KEY")" || note=""
   [ -n "$note" ] || note="seeded at spawn: this session was started for an event on $own"
+  # Mute this box's own DIRECT echoes (its comments, pushes, PR edits), never
+  # the CI those pushes trigger. This used to be ignoreSenders ["@self"], but
+  # since local-webhook 0.23.0 that is a pure sender mute, and GitHub stamps a
+  # CI run with whoever pushed. So a hook session that pushed a fix lost its own
+  # CI: no delivery, and no claim, so the standing watch spawned a stranger
+  # for the red run instead (PR #1041). The list matches local-webhook's
+  # DEFAULT_DIRECT_GITHUB_ECHO_EVENTS, the exclude it seeds for a fresh
+  # session subscription. A re-subscribe keeps it, as it kept ignoreSenders.
+  self_login="''${LOCAL_WEBHOOK_SELF:-}"
+  if [ -z "$self_login" ] && [ -r "$LOCAL_WEBHOOK_STATE_DIR/self.env" ]; then
+    # Builtins only: the receiver's PATH carries jq and coreutils, not sed.
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in (LOCAL_WEBHOOK_SELF=*) self_login="''${line#LOCAL_WEBHOOK_SELF=}" ;; esac
+    done < "$LOCAL_WEBHOOK_STATE_DIR/self.env"
+  fi
+  self_login="$(printf '%s' "$self_login" | tr -cd 'A-Za-z0-9._-' | tr 'A-Z' 'a-z')"
   if "$JQ" -n --arg topic "$own" --arg ts "$ts" --arg note "$note" \
-      --argjson include "''${include:-null}" \
-      '{"//": "Seeded by agent-box-webhook-spawn for a dispatched hook-* session, so the dispatch brake can see which OBJECT this session owns (agent-box#251). Same schema as any session filter; webhook_subscribe rewrites it.", enabled: true, ttlHours: 2, topics: [{topic: $topic, note: $note, ignoreSenders: ["@self"], renewOnEvent: true, subscribedAt: $ts, lastActivityAt: $ts} + (if $include == null then {} else {include: $include} end)]}' \
+      --argjson include "''${include:-null}" --arg self "$self_login" \
+      '{"//": "Seeded by agent-box-webhook-spawn for a dispatched hook-* session, so the dispatch brake can see which OBJECT this session owns (agent-box#251). Same schema as any session filter; webhook_subscribe rewrites it.", enabled: true, ttlHours: 2, topics: [{topic: $topic, note: $note, renewOnEvent: true, subscribedAt: $ts, lastActivityAt: $ts} + (if $include == null then {} else {include: $include} end) + (if $self == "" or ($topic | startswith("github:") | not) then {} else {exclude: {all: [{path: "_senderLower", in: [$self]}, {path: "event", in: ["commit_comment", "create", "discussion", "discussion_comment", "issue_comment", "issues", "pull_request", "pull_request_review", "pull_request_review_comment", "pull_request_review_thread", "push", "release"]}]}} end)]}' \
       > "$ff.$$" && mv -f "$ff.$$" "$ff"; then
     seeded="$own"
   else
@@ -21408,6 +22103,19 @@ esac
            | .enabledPlugins = ((.enabledPlugins // {}) + {($ref): true})'
         sync_webhook_plugin
       fi
+      # Secret broker (issue #922): the unit exports AGENT_BOX_SECRET_SOCKET
+      # only when the broker is on, so it doubles as the enable flag, exactly as
+      # AGENT_BOX_WEBHOOK_REPO does above. Register the stdio adapter at user
+      # scope so exec_with_secrets is a native tool with no `claude mcp add`.
+      # The bare command name resolves through PATH at connect time, so the
+      # entry survives an update that moves the store path. A plain merge: a
+      # hand-edited entry of the same name is replaced, any other server stays.
+      if [ -n "''${AGENT_BOX_SECRET_SOCKET:-}" ]; then
+        seed_json_settled "$HOME"/.claude.json \
+          '.mcpServers = ((.mcpServers // {})
+             + {"agent-box-secrets": {type: "stdio", command: "agent-box-secrets-mcp",
+                args: [], env: {}}})'
+      fi
       if [ "''${3:-false}" = true ]; then
         seed_json "$HOME"/.claude/settings.json \
           --arg repo "$WHATSAPP_PLUGIN_REPO" \
@@ -21480,12 +22188,23 @@ esac
     # Keep its stdin open until request 2 answers; closing the pipe immediately can
     # make app-server exit after initialize without processing the queued write.
     #
+    # The same short-lived app-server also registers the secret broker's MCP
+    # adapter (issue #922) when AGENT_BOX_SECRET_SOCKET is set - the unit exports
+    # it only when the broker is on, so it doubles as the enable flag exactly as
+    # it does for claude's ~/.claude.json entry. Unlike claude, Codex does NOT
+    # hand a stdio MCP server the session environment: it passes a short
+    # allowlist (HOME, PATH, ...) and nothing else (verified against Codex
+    # 0.165.0). Without `env_vars` the adapter would never see AGENT_BOX_PROFILE
+    # and would silently fall back to the box's default profile - the wrong
+    # secret scope. `env_vars` names variables to forward from the parent, so no
+    # value is written into config.toml.
+    #
     # Best effort, like seed_claude_state: an old/broken Codex must still start and
     # show its ordinary dialog rather than make the whole agent-box session fail.
     # $1 = working directory, $2 = agent profile name (or empty), $3 = Codex bin.
     seed_codex_state() {
-      local wd=$1 profile=$2 bin=$3 cxhome init write pid out_fd in_fd line ok
-      local deadline remaining
+      local wd=$1 profile=$2 bin=$3 cxhome init write mcpwrite pid out_fd in_fd line ok
+      local deadline remaining want=1 got=0
       cxhome="$(resolve_codex_home "$profile")"
       mkdir -p "$cxhome"
       init="$($JQ -cn \
@@ -21494,6 +22213,13 @@ esac
       write="$($JQ -cn --arg wd "$wd" \
         '{jsonrpc:"2.0", id:2, method:"config/value/write", params:{keyPath:"projects", value:{($wd):{trust_level:"trusted"}}, mergeStrategy:"upsert"}}')" \
         || return 0
+      mcpwrite=""
+      if [ -n "''${AGENT_BOX_SECRET_SOCKET:-}" ]; then
+        mcpwrite="$($JQ -cn \
+          '{jsonrpc:"2.0", id:3, method:"config/value/write", params:{keyPath:"mcp_servers", value:{"agent-box-secrets":{command:"agent-box-secrets-mcp", args:[], env_vars:["AGENT_BOX_PROFILE","AGENT_BOX_SECRET_SOCKET"]}}, mergeStrategy:"upsert"}}')" \
+          || mcpwrite=""
+        [ -z "$mcpwrite" ] || want=2
+      fi
 
       coproc CODEX_CONFIG_WRITER {
         # The outer lifetime bound also bounds cleanup if app-server ignores the
@@ -21506,24 +22232,28 @@ esac
       in_fd="''${CODEX_CONFIG_WRITER[1]:-}"
       ok=false
       if [ -n "$pid" ] && [ -n "$out_fd" ] && [ -n "$in_fd" ] \
-           && printf '%s\n' "$init" "$write" >&"$in_fd"; then
+           && printf '%s\n' "$init" "$write" ''${mcpwrite:+"$mcpwrite"} >&"$in_fd"; then
         deadline=$((SECONDS + 5))
         while [ "$SECONDS" -lt "$deadline" ]; do
           remaining=$((deadline - SECONDS))
           IFS= read -r -t "$remaining" -u "$out_fd" line || break
-          if $JQ -e '.id == 2 and .result.status == "ok"' \
+          if $JQ -e '(.id == 2 or .id == 3) and .result.status == "ok"' \
                >/dev/null 2>&1 <<<"$line"; then
-            ok=true
-            break
+            got=$((got + 1))
+            if [ "$got" -ge "$want" ]; then
+              ok=true
+              break
+            fi
+            continue
           fi
-          $JQ -e '.id == 2 and .error != null' \
+          $JQ -e '(.id == 2 or .id == 3) and .error != null' \
             >/dev/null 2>&1 <<<"$line" && break
         done
       fi
       [ -z "$pid" ] || kill "$pid" 2>/dev/null || :
       [ -z "$pid" ] || wait "$pid" 2>/dev/null || :
       [ "$ok" = true ] || echo \
-        "session: could not pre-trust Codex directory $wd; Codex may ask interactively" >&2
+        "session: could not seed Codex config for $wd (project trust, secrets MCP); Codex may ask interactively" >&2
     }
 
     # Keep the local-webhook a SESSION loads in step with the one the box PINS
@@ -23321,6 +24051,14 @@ esac
       whargs=""
       if [ -n "''${AGENT_BOX_WEBHOOK_REPO:-}" ]; then
         whargs="-e LOCAL_WEBHOOK_SESSION=$USER-$sname -e LOCAL_WEBHOOK_STATE_DIR=$WEBHOOK_STATE_DIR -e LOCAL_WEBHOOK_PORT=0"
+        # A Claude Remote Control daemon cannot pass --channels to the
+        # conversations it starts, so channel notifications from local-webhook are
+        # dropped there. This tells the plugin in each conversation to deliver
+        # through Claude's cross-session inbox instead (local-channels#149). Only
+        # here: a session that has the channel would get every event twice.
+        if [ "$agent" = claude ] && [ "$rcdaemon" = true ]; then
+          whargs="$whargs -e LOCAL_WEBHOOK_CLAUDE_DELIVERY=send"
+        fi
       fi
       # AGENT_BOX_SESSION_ID rides the same session environment: it is the
       # launch id the SessionStart hook keys its live-id record by (the
@@ -23682,6 +24420,11 @@ esac
       done < <(printf '%s\n' "$_arch")
     }
 
+    # The tick's pause is a builtin `read -t` on a pipe nobody writes, not
+    # `sleep`: with the disk gone every exec dies at once (SIGBUS), and a
+    # failed `sleep 2` turned this loop into a fork storm (PR #1055).
+    exec {TICK_FD}<> <(:)
+
     # Reconcile forever; systemd stop tears the whole tree down (ExecStop
     # kill-server + cgroup kill), Restart=always revives a crashed loop.
     # Sessions flagged stopped (a clean agent exit, or agent-box-session
@@ -23714,7 +24457,7 @@ esac
       sync_codex_threads
       supervise_whatsapp
       supervise_slack
-      sleep 2
+      read -rt 2 -u "$TICK_FD" || :
     done
   '';
 
@@ -24186,15 +24929,12 @@ in
     };
 
     secrets = {
-      # OFF by default, unlike containers/webhook above (issue #922): this
-      # is a root-privileged custodian daemon whose OS boundary - the one
-      # thing the whole feature is for - has no VM test yet
-      # (tests/secrets.nix does not exist), so it has never been proven on
-      # a real two-user box. "Default off during rollout" is the issue's
-      # own instruction. Flip this only once that test exists and passes.
+      # ON by default (issue #922). NOTE: the OS boundary this feature is
+      # for - root custody, a two-user box - still has no VM test
+      # (tests/secrets.nix does not exist yet).
       enable = lib.mkOption {
         type = lib.types.bool;
-        default = false;
+        default = true;
         example = true;
         description = ''
           Start a root-owned secret-custody broker per configured terminal
@@ -25824,14 +26564,11 @@ in
     # keyed, web-gated block the webhook/settings units are instantiated
     # in further down. Every configured user gets one, not just the ones
     # with a web front door.
-    systemd.tmpfiles.rules = [
-      # Root-only store parent (the broker creates its own per-user
-      # subdirectory under this at startup) and a world-traversable
-      # socket dir - listing a socket's NAME is not a secret, its 0600
-      # mode is what gates connect().
-      "d /var/lib/agent-box-secrets 0700 root root - -"
-      "d /run/agent-box-secrets 0755 root root - -"
-    ];
+    systemd.tmpfiles.rules = secretsTmpfilesRules;
+    # Published HERE, not in the web-gated block: a box with web.enable off
+    # still applies these rules, so the inventory has to name them too.
+    # mkAfter keeps them after the web rules, the order the golden records.
+    services.agent-box.internal.tmpfilesRules = lib.mkAfter secretsTmpfilesRules;
     systemd.services = lib.listToAttrs (map (name: lib.nameValuePair "agent-box-secret-broker@${name}" {
       overrideStrategy = "asDropin";
       # Same restart-in-one-step reasoning as the webhook receiver's own
@@ -26503,6 +27240,7 @@ import fcntl
 import functools
 import glob
 import hashlib
+import hmac
 import html
 import http.server
 import json
@@ -26627,6 +27365,13 @@ SYSTEMCTL = os.environ.get("AGENT_BOX_SYSTEMCTL", "")
 # reboots (see the box's apt policy). Without this the box has no way to
 # finish those updates at all — nobody inside it can reboot.
 REBOOT_CMD = os.environ.get("AGENT_BOX_REBOOT_CMD", "")
+# Socket of the root reboot helper (modules/src/reboot-helper.py), the
+# fallback when REBOOT_CMD cannot run because the disk is gone (issue 1054).
+# Empty on a box without the helper.
+REBOOT_SOCKET = os.environ.get("AGENT_BOX_REBOOT_SOCKET", "")
+# How long the normal reboot command gets before the helper is tried. A
+# failed disk may HANG the exec instead of failing it.
+REBOOT_CMD_TIMEOUT_S = 15
 # The distro's own "a reboot would apply something" marker: Debian and
 # Ubuntu's update machinery creates it, and the .pkgs file beside it
 # lists what asked. Both are world-readable, so the card reports WHY a
@@ -27127,18 +27872,98 @@ def receive_remove_locked(slot, record=None):
     receive_fsync_dir(RECEIVE_STATE_DIR)
 
 
-def receive_create(ttl, max_bytes, now=None):
-    """Mint a capability, persist only its digest, and return slot+token."""
+RECEIVE_MAX_FILES = 100
+
+
+def receive_child(secret, index):
+    """Derive the slot id and secret that carry file INDEX of a link.
+
+    One link holds up to RECEIVE_MAX_FILES independent slots, each bound to
+    exactly one file, so the per-slot protocol is unchanged. File 0 is the
+    link's own slot and token. The others are HMAC-SHA256 of file 0's secret,
+    which the daemon only stores as a hash and so cannot derive. The page
+    computes the same values with WebCrypto. Hex keeps every id alphanumeric,
+    which RECEIVE_SLOT_RE and argparse both accept.
+    """
+    key = secret.encode("ascii")
+
+    def part(label, size):
+        message = ("agent-box-receive-v1\n%s\n%d" % (label, index)).encode()
+        return hmac.new(key, message, hashlib.sha256).hexdigest()[:size]
+    return part("slot", 24), part("secret", 64)
+
+
+def receive_store_new(record):
+    """Persist a brand-new record; FileExistsError if the slot is taken."""
+    path = receive_record_path(record["slot"])
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True,
+                      separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        receive_fsync_dir(RECEIVE_STATE_DIR)
+    except Exception:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+        raise
+
+
+@contextlib.contextmanager
+def receive_links_lock():
+    """Serialize link creation against link-wide revocation.
+
+    A revoke that listed a link's slots while its creator was still writing
+    the children would report success and leave them usable.
+    """
+    receive_ensure_dirs()
+    path = os.path.join(RECEIVE_STATE_DIR, ".links.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
+                 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def receive_link_slots(slot):
+    """Return the live slots a revoke of SLOT must cover.
+
+    SLOT itself, when its record exists, plus every child minted with it.
+    The children are found by their link field, so a link whose first
+    record is already gone can still be revoked. An unreadable state
+    directory raises OSError instead of passing for a complete answer.
+    """
+    try:
+        names = sorted(os.listdir(RECEIVE_STATE_DIR))
+    except FileNotFoundError:
+        names = []
+    slots = [slot] if receive_read(slot) is not None else []
+    for name in names:
+        child = name[:-5]
+        if not name.endswith(".json") or not RECEIVE_SLOT_RE.fullmatch(child):
+            continue
+        record = receive_read(child)
+        if record is not None and record.get("link") == slot:
+            slots.append(child)
+    return slots
+
+
+def receive_create(ttl, max_bytes, now=None, files=1):
+    """Mint a capability, persist only its digest, and return slot+token.
+
+    FILES > 1 also persists FILES - 1 derived slots (see receive_child), so
+    one link accepts that many files of up to MAX_BYTES each.
+    """
     receive_ensure_dirs()
     now = int(time.time() if now is None else now)
-    for _attempt in range(32):
-        slot = secrets.token_urlsafe(12)
-        # A leading "-" is URL-safe but argparse reads it as an option in
-        # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
-        # as ordinary positional arguments without requiring a hidden `--`.
-        if not slot[0].isalnum():
-            continue
-        secret = secrets.token_urlsafe(32)
+    if not 1 <= files <= RECEIVE_MAX_FILES:
+        raise ValueError("files must be between 1 and %d" % RECEIVE_MAX_FILES)
+
+    def fresh(slot, secret, **extra):
         record = {
             "version": RECEIVE_VERSION,
             "slot": slot,
@@ -27148,26 +27973,37 @@ def receive_create(ttl, max_bytes, now=None):
             "max_bytes": max_bytes,
             "status": "waiting",
         }
-        path = receive_record_path(slot)
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                         0o600)
-        except FileExistsError:
-            continue
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(record, handle, sort_keys=True,
-                          separators=(",", ":"))
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            receive_fsync_dir(RECEIVE_STATE_DIR)
-        except Exception:
-            with contextlib.suppress(OSError):
-                os.unlink(path)
-            raise
-        return slot, slot + "." + secret, record
-    raise RuntimeError("could not allocate an upload slot")
+        record.update(extra)
+        return record
+
+    with receive_links_lock():
+        for _attempt in range(32):
+            slot = secrets.token_urlsafe(12)
+            # A leading "-" is URL-safe but argparse reads it as an option in
+            # `agent-box-receive revoke SLOT`. Keep generated capabilities usable
+            # as ordinary positional arguments without requiring a hidden `--`.
+            if not slot[0].isalnum():
+                continue
+            secret = secrets.token_urlsafe(32)
+            record = fresh(slot, secret, files=files)
+            try:
+                receive_store_new(record)
+            except FileExistsError:
+                continue
+            created = [slot]
+            try:
+                for index in range(1, files):
+                    child, child_secret = receive_child(secret, index)
+                    receive_store_new(fresh(child, child_secret, link=slot))
+                    created.append(child)
+            except Exception:
+                # Nobody holds the token yet, so no slot lock is needed.
+                for name in created:
+                    receive_remove_locked(name)
+                raise
+            return slot, slot + "." + secret, record
+        # Every attempt collided with an existing slot.
+        raise RuntimeError("could not allocate an upload slot")
 
 
 def receive_prune(now=None):
@@ -31111,19 +31947,63 @@ def update_box():
         sys.stderr.write("update_box: %s\n" % exc)
 
 
+def reboot_via_helper():
+    """Ask the root reboot helper to sysrq-reboot. True when it accepted.
+
+    Sends the one fixed request the helper understands. Nothing here reads
+    the disk: the socket module is already imported and the helper is
+    already running.
+    """
+    if not REBOOT_SOCKET:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(REBOOT_SOCKET)
+            conn.sendall(b"REBOOT\n")
+            answer = conn.recv(64).strip()
+    except OSError as exc:
+        sys.stderr.write("reboot_box: helper: %s\n" % exc)
+        return False
+    sys.stderr.write("reboot_box: helper answered %r\n" % answer[:32])
+    return answer in (b"OK", b"BUSY")
+
+
+def _run_reboot_cmd(result):
+    try:
+        proc = subprocess.run(REBOOT_CMD.split(), check=False,
+                              capture_output=True)
+        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
+        result.append(proc.returncode)
+    except OSError as exc:
+        sys.stderr.write("reboot_box: %s\n" % exc)
+
+
 def reboot_box():
-    """Trigger the reboot through the allowlisted sudo command.
+    """Trigger the reboot through the allowlisted sudo command, and when
+    that cannot run (no disk to exec sudo from), through the root helper.
+
+    The normal command runs in a worker thread and this function waits for
+    it with a deadline. subprocess's own timeout is not enough: on a dying
+    disk the fork/exec itself, or the wait after a kill, can block, and the
+    helper would never be asked.
 
     The caller sends its HTTP response BEFORE calling this (see the
     /reboot route): --no-block returns immediately, but systemd starts
     stopping units at once, and this daemon is one of them — a response
     written afterwards can lose the race with its own socket going away.
     """
-    try:
-        proc = subprocess.run(REBOOT_CMD.split(), check=False, capture_output=True)
-        sys.stderr.write("reboot_box: trigger rc=%d\n" % proc.returncode)
-    except OSError as exc:
-        sys.stderr.write("reboot_box: %s\n" % exc)
+    result = []
+    worker = threading.Thread(target=_run_reboot_cmd, args=(result,),
+                              daemon=True)
+    worker.start()
+    worker.join(REBOOT_CMD_TIMEOUT_S)
+    if result and result[0] == 0:
+        return
+    if worker.is_alive():
+        sys.stderr.write("reboot_box: trigger did not finish in %ds\n"
+                         % REBOOT_CMD_TIMEOUT_S)
+    reboot_via_helper()
 
 
 def reboot_pending():
@@ -31845,6 +32725,12 @@ STYLE = """<style>
   .conn-code { font-size: 15px; letter-spacing: 1px; color: #e6edf3; }
   .conn-error { color: #f85149; }
   .conn-field { gap: 6px; }
+  /* A field stacks its label over the input, so the .row default of
+     align-items:center parked the button level with the label+input pair's
+     middle. Bottom-align it with the input instead (same fix as
+     .new-session-row). It needs the .row. prefix: .row is defined later
+     with the same specificity, so a bare .conn-form lost to it. */
+  .row.conn-form { align-items: flex-end; }
   .conn-country { flex: 0 0 7em; }
   .conn-national { flex: 1 1 180px; }
   .btn { font: inherit; font-size: 13px; font-weight: 500; padding: 5px 14px;
@@ -34419,8 +35305,14 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     } catch (err) { return []; }
   }
   function acFrag(input) {
-    return acKind(input) === "model"
-      ? input.value : acSplit(input.value).frag;
+    if (acKind(input) !== "model") { return acSplit(input.value).frag; }
+    // A model field filters only on what was TYPED since it opened. An
+    // existing profile's row opens on its saved model, and filtering by
+    // that showed the one name already in the field - or nothing at all
+    // for a full ID that no alias starts with - so editing a profile never
+    // offered the list that adding one did.
+    var st = input._dir;
+    return st && st.typed ? input.value : "";
   }
   function acSplit(v) {
     // Directory portion (browsed) and trailing fragment (filter).
@@ -34435,7 +35327,7 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
     var ul = acList(input);
     if (ul) { ul.hidden = true; ul.innerHTML = ""; }
     var st = input._dir;
-    if (st) { st.active = -1; }
+    if (st) { st.active = -1; st.typed = false; }
   }
   function acRender(input) {
     var ul = acList(input);
@@ -34532,25 +35424,38 @@ var Idiomorph=function(){"use strict";const e=()=>{};const n={morphStyle:"outerH
   document.addEventListener("input", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    (input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 })).typed = true;
     if (acTimer) { window.clearTimeout(acTimer); }
     acTimer = window.setTimeout(function () { acTimer = null; acFetch(input); }, 120);
   });
   document.addEventListener("focusin", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
+    // A close still pending from a previous visit would fire into this
+    // one and wipe its typed state, so refocusing cancels it.
+    if (input._dir && input._dir.closeTimer) {
+      window.clearTimeout(input._dir.closeTimer);
+      input._dir.closeTimer = null;
+    }
     // The directory field starts on the untouched default "~": select it
     // so the first keystroke replaces it instead of appending, which is
     // what produced an invalid "~docu" (issue #308). A model field has no
     // such default - it starts empty, or on what the profile already says,
     // and selecting THAT would throw the value away on a stray focus.
     if (acKind(input) === "dir" && input.value === "~") { input.select(); }
+    if (input._dir) { input._dir.typed = false; }
     acFetch(input);
   });
   document.addEventListener("focusout", function (e) {
     var input = e.target;
     if (!acKind(input)) { return; }
     // Delay so a mousedown-selected item still registers its click.
-    window.setTimeout(function () { acClose(input); }, 150);
+    var st = input._dir || (input._dir = { dir: null, entries: [], active: -1, seq: 0 });
+    if (st.closeTimer) { window.clearTimeout(st.closeTimer); }
+    st.closeTimer = window.setTimeout(function () {
+      st.closeTimer = null;
+      acClose(input);
+    }, 150);
   });
   document.addEventListener("keydown", function (e) {
     var input = e.target;
@@ -34804,6 +35709,9 @@ _MODEL_HINT_MAX = 12
 # holds spaces, so no match is possible there and the scan resumes at the
 # real opening quote of the example that follows.
 _MODEL_NAME_RE = re.compile(r"'([A-Za-z0-9][A-Za-z0-9._-]{1,63})'")
+# The same charset, for a name that arrives bare (codex's catalog) rather
+# than quoted in prose.
+_MODEL_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{1,63}")
 # harness_model_aliases()' answers, keyed on (binary, stamp) and holding
 # (names, retry_at). retry_at is None for a real answer - it stands until
 # the binary itself changes - and a monotonic deadline for a probe that
@@ -34824,17 +35732,78 @@ def binary_stamp(path):
     return (info.st_mtime_ns, info.st_size)
 
 
-def probe_model_aliases(binary):
+def probe_codex_catalog(binary):
+    """codex's own model catalog as a tuple of names.
+
+    () is an ANSWER: this codex ran and has no `debug models` (a non-zero
+    exit), which will not change until the binary does. None is a
+    NON-answer - a timeout, a spawn failure or output that is not the
+    catalog - which probe_model_aliases() must not let the help fallback
+    turn into a cached empty list.
+
+    codex's `--help` names no model, but `codex debug models` prints the
+    catalog its own /model picker reads (codex-cli 0.165 has it; an older
+    one does not, and answers with an error). That is the same "read it off
+    the harness" rule as the help scrape, from a better page: the slugs the
+    harness itself LISTS to its users (visibility "list"), in its own
+    priority order, so a hidden internal entry is never offered.
+
+    Only ever run for codex. The subcommand is codex's; handed to another
+    CLI, `debug models` could just as well be read as a prompt.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "debug", "models"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        sys.stderr.write("profiles: codex model catalog: %s\n" % exc)
+        return None
+    if proc.returncode != 0:
+        return ()
+    try:
+        models = json.loads(proc.stdout).get("models")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(models, list):
+        return None
+    listed = [m for m in models if isinstance(m, dict)
+              and m.get("visibility") == "list"
+              and isinstance(m.get("slug"), str)
+              and _MODEL_SLUG_RE.fullmatch(m["slug"])]
+    listed.sort(key=lambda m: m.get("priority")
+                if isinstance(m.get("priority"), int) else 1 << 30)
+    names = []
+    for model in listed:
+        if model["slug"] not in names:
+            names.append(model["slug"])
+        if len(names) >= _MODEL_HINT_MAX:
+            break
+    return tuple(names)
+
+
+def probe_model_aliases(binary, harness=None):
     """Ask one harness what models it names, or None when it could not be
     asked at all.
 
+    codex first asks its catalog (probe_codex_catalog) and falls back to
+    its help page only when that cannot answer.
+
     The two answers are deliberately different things. () is an ANSWER -
-    the CLI ran and its `--model` puts no name forward, which is codex
-    today. None is a non-answer: the probe timed out, or raced a lazy
-    `nix profile add` still linking the binary, or the CLI printed nothing
+    the CLI ran and its `--model` puts no name forward, which is an old
+    codex without a catalog. None is a non-answer: the probe timed out, or
+    raced a lazy `nix profile add` still linking the binary, or the CLI printed nothing
     whatsoever, and asking again later may well succeed. Only the caller
     can act on that difference, and it does - see the cache above.
     """
+    catalog = None
+    if harness == "codex":
+        catalog = probe_codex_catalog(binary)
+        if catalog:
+            return catalog
     try:
         proc = subprocess.run(
             [binary, "--help"],
@@ -34854,6 +35823,10 @@ def probe_model_aliases(binary):
         return None
     opt = _MODEL_OPT_RE.search(text)
     if not opt:
+        if harness == "codex" and catalog is None:
+            # Same rule as below: without a catalog this help is not the
+            # CLI's final word, so keep the empty retryable.
+            return None
         return ()
     rest = text[opt.end():]
     end = _NEXT_OPT_RE.search(rest)
@@ -34864,18 +35837,24 @@ def probe_model_aliases(binary):
             names.append(name)
         if len(names) >= _MODEL_HINT_MAX:
             break
+    if harness == "codex" and catalog is None and not names:
+        # The catalog could not be asked and the help names nothing, which
+        # is what codex's help always says: that empty is the help's
+        # answer, not the catalog's, so keep it retryable.
+        return None
     return tuple(names)
 
 
-def harness_model_aliases(binary, stamp):
+def harness_model_aliases(binary, stamp, harness=None):
     """The model names a harness's own `--help` puts forward, as a tuple.
 
     claude names them ("an alias for the latest model (e.g. 'fable',
     'opus', or 'sonnet') or a model's full name (e.g. 'claude-fable-5')").
-    codex documents none - its `--model` says only "Model the agent should
-    use", and its shell completion file-completes the value - so it
-    contributes nothing here rather than us guessing a list on its behalf
-    and shipping it stale.
+    codex's help documents none - its `--model` says only "Model the agent
+    should use" - so codex is asked for its catalog instead (see
+    probe_codex_catalog). A codex too old to have one contributes nothing
+    here rather than us guessing a list on its behalf and shipping it
+    stale.
 
     Empty either way to the caller: the field is free text, so a probe
     that cannot run costs a suggestion and never a save. What the two
@@ -34890,11 +35869,11 @@ def harness_model_aliases(binary, stamp):
     """
     if not binary:
         return ()
-    key = (binary, stamp)
+    key = (binary, stamp, harness)
     hit = _model_alias_cache.get(key)
     if hit is not None and (hit[1] is None or time.monotonic() < hit[1]):
         return hit[0]
-    names = probe_model_aliases(binary)
+    names = probe_model_aliases(binary, harness)
     if len(_model_alias_cache) > 16:
         # Same reasoning as _transcript_cache: the keyspace grows with
         # every binary ever probed, and there is nothing here worth an
@@ -34924,7 +35903,8 @@ def model_hints(harness, profiles):
     binary = flow["bin"] if flow else None
     hints = []
     if binary:
-        for name in harness_model_aliases(binary, binary_stamp(binary)):
+        for name in harness_model_aliases(binary, binary_stamp(binary),
+                                          harness):
             if name not in hints:
                 hints.append(name)
     for name in sorted(profiles):
@@ -37611,7 +38591,7 @@ RECEIVE_FILE_RE = re.compile(
 RECEIVE_PAGE = r''''<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Send a file to __USER__</title>
+<title>Send files to __USER__</title>
 <style nonce="__NONCE__">
 :root{color-scheme:light dark}body{margin:0;background:#0d1117;color:#e6edf3;
 font:15px/1.5 system-ui,sans-serif}.card{max-width:38rem;margin:8vh auto;
@@ -37626,14 +38606,18 @@ border-color:#58a6ff;background:#1f6feb26}.drop:focus-within{outline:2px solid
 #file{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;
 clip-path:inset(50%);white-space:nowrap;border:0}
 progress{width:100%;height:1rem;margin-top:1rem}#status{min-height:1.5rem}
+#queue{list-style:none;margin:0;padding:0}#queue li{padding:.25rem 0;
+border-top:1px solid #30363d;overflow-wrap:anywhere;color:#8b949e}
+#queue li.done{color:#3fb950}#queue li.error{color:#f85149}
 </style></head><body data-slot="__SLOT__"><main class="card">
-<h1>Send one file to __USER__</h1>
-<p>This private link accepts one resumable upload. It does not grant access
-to the terminal or any existing files.</p>
-<label id="drop" class="drop" for="file"><strong id="prompt">Drop a file here</strong>
-<span>or tap to choose one</span><input id="file" type="file"></label>
+<h1>Send files to __USER__</h1>
+<p>This private link accepts a limited number of resumable uploads. It does
+not grant access to the terminal or any existing files.</p>
+<label id="drop" class="drop" for="file"><strong id="prompt">Drop files here</strong>
+<span>or tap to choose them</span><input id="file" type="file" multiple></label>
 <progress id="progress" aria-label="Upload progress" value="0" max="1"></progress>
 <p id="status" role="status"></p>
+<ul id="queue" aria-label="Files"></ul>
 </main><script nonce="__NONCE__">
 (() => {
   'use strict';
@@ -37644,39 +38628,81 @@ to the terminal or any existing files.</p>
   const prompt = document.getElementById('prompt');
   const progress = document.getElementById('progress');
   const status = document.getElementById('status');
+  const queue = document.getElementById('queue');
+  const MAX_FILES = __MAX_FILES__;
   let uploading = false;
-  const collection = location.pathname.replace(/\/?$/, '/') + 'files';
-  const resource = collection + '/upload';
+  // /<user>/receive/<slot>/ -> /<user>/receive/
+  const base = location.pathname.replace(/[^/]+\/?$/, ''');
   const validToken = token.startsWith(slot + '.') &&
     /^[A-Za-z0-9_.-]+$/.test(token);
-  const auth = () => ({'Authorization': 'Bearer ' + token,
-                       'Tus-Resumable': '1.0.0'});
+  const master = token.slice(slot.length + 1);
+  const encoder = new TextEncoder();
   const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const hex = bytes => Array.from(bytes, byte =>
+    byte.toString(16).padStart(2, '0')).join(''');
   const b64 = value => {
-    const bytes = new TextEncoder().encode(value);
+    const bytes = encoder.encode(value);
     let binary = ''';
     for (const byte of bytes) binary += String.fromCharCode(byte);
     return btoa(binary);
   };
+  // One link carries up to MAX_FILES slots, each bound to one file. Slot 0
+  // is the link itself; the rest are HMAC-SHA256 of its secret, the same
+  // derivation agent-box-receive uses when it mints them.
+  const derive = async (label, index, size) => {
+    const key = await crypto.subtle.importKey(
+      'raw', encoder.encode(master), {name: 'HMAC', hash: 'SHA-256'},
+      false, ['sign']);
+    const mac = await crypto.subtle.sign('HMAC', key, encoder.encode(
+      'agent-box-receive-v1\n' + label + '\n' + index));
+    return hex(new Uint8Array(mac)).slice(0, size);
+  };
+  const lanes = [];
+  const lane = async index => {
+    if (!lanes[index]) {
+      let id = slot;
+      let bearer = token;
+      if (index > 0) {
+        id = await derive('slot', index, 24);
+        bearer = id + '.' + await derive('secret', index, 64);
+      }
+      const collection = base + id + '/files';
+      lanes[index] = {collection, resource: collection + '/upload',
+                      bearer};
+    }
+    return lanes[index];
+  };
+  const auth = l => ({'Authorization': 'Bearer ' + l.bearer,
+                      'Tus-Resumable': '1.0.0'});
   const metadata = (file, content) => 'filename ' + b64(file.name) +
     ',fingerprint ' + b64(file.name + '\n' + file.size + '\n' +
                           file.lastModified) + ',content ' + b64(content);
   const contentEtag = content => '"' + content + '"';
-  const hex = bytes => Array.from(bytes, byte =>
-    byte.toString(16).padStart(2, '0')).join(''');
-  const contentId = async file => {
+  // One bar for the whole batch: bytes of finished files plus the bytes of
+  // the file in flight, over the total size of every selected file.
+  const tally = {done: 0, total: 0};
+  const bar = offset => {
+    progress.max = Math.max(tally.total, 1);
+    progress.value = Math.min(tally.done + offset, progress.max);
+    return Math.floor(100 * progress.value / progress.max);
+  };
+  const show = (text, offset) => {
+    const percent = bar(offset);
+    status.textContent = text + ' ' + percent + '%';
+  };
+  const contentId = async (file, label) => {
     const leaves = [];
     let checked = 0;
-    show('Checking ' + file.name + '...', 0, file.size);
+    show('Checking ' + label + '...', 0);
     while (checked < file.size) {
       const end = Math.min(checked + __HASH_CHUNK__, file.size);
       const block = await file.slice(checked, end).arrayBuffer();
       leaves.push(new Uint8Array(
         await crypto.subtle.digest('SHA-256', block)));
       checked = end;
-      show('Checking ' + file.name + '...', checked, file.size);
+      show('Checking ' + label + '...', 0);
     }
-    const prefix = new TextEncoder().encode(
+    const prefix = encoder.encode(
       'agent-box-content-v1\n' + file.size + '\n');
     const tree = new Uint8Array(prefix.length + leaves.length * 32);
     tree.set(prefix);
@@ -37689,102 +38715,233 @@ to the terminal or any existing files.</p>
     try { detail = (await response.text()).trim(); } catch (_) {}
     throw new Error(detail || ('Upload request failed (' + response.status + ')'));
   };
-  const head = async (file, content) => {
-    const response = await fetch(resource, {method: 'HEAD', headers: auth(),
-                                            cache: 'no-store'});
-    if (response.status === 404) return null;
+  // What one slot holds: nothing yet (free), a file (bound), a transfer that
+  // failed its content check (dead), or no such slot (absent).
+  const probe = async (l, extra) => {
+    const headers = auth(l);
+    if (extra) Object.assign(headers, extra);
+    const response = await fetch(l.resource, {method: 'HEAD', headers,
+                                              cache: 'no-store'});
+    // Only the link's first slot says how many files it was minted for.
+    const files = Number(response.headers.get('Agent-Box-Link-Files')) || 0;
+    if (response.status === 404) return {state: 'free', files};
+    if (response.status === 403) return {state: 'absent', files};
+    if (response.status === 422) return {state: 'dead', files};
+    if (response.status === 412) return {state: 'changed', files};
     if (!response.ok) return fail(response);
-    if (Number(response.headers.get('Upload-Length')) !== file.size) {
-      throw new Error('This link is already bound to a different file.');
-    }
-    if (response.headers.get('Upload-Complete') === '?1') {
-      const headers = auth();
-      headers['If-Match'] = contentEtag(content);
-      const verified = await fetch(resource, {
-        method: 'HEAD', headers, cache: 'no-store'
-      });
-      if (verified.status === 412) {
-        throw new Error('This link is already bound to a different file.');
-      }
-      if (!verified.ok) return fail(verified);
-      return Number(verified.headers.get('Upload-Offset'));
-    }
-    if (response.headers.get('Upload-Content') !== content) {
-      throw new Error('This link is already bound to a different file.');
-    }
-    return Number(response.headers.get('Upload-Offset'));
+    const complete = response.headers.get('Upload-Complete') === '?1';
+    return {
+      state: 'bound', complete, files,
+      offset: Number(response.headers.get('Upload-Offset')),
+      content: complete
+        ? (response.headers.get('ETag') || ''').replace(/^"|"$/g, ''')
+        : response.headers.get('Upload-Content'),
+    };
   };
-  const create = async (file, details) => {
-    const headers = auth();
+  const survey = async () => {
+    const first = await lane(0);
+    const head = await probe(first);
+    if (head.state === 'absent') {
+      throw new Error('This upload link is invalid, expired, or revoked.');
+    }
+    const slots = [Object.assign({lane: first}, head)];
+    // A link minted before multi-file support reports no count: one file.
+    // A slot revoked on its own is skipped, not taken for the end.
+    const count = Math.min(head.files || 1, MAX_FILES);
+    for (let index = 1; index < count; index++) {
+      const l = await lane(index);
+      const info = await probe(l);
+      if (info.state !== 'absent') slots.push(Object.assign({lane: l}, info));
+    }
+    return slots;
+  };
+  const create = async (l, file, details) => {
+    const headers = auth(l);
     headers['Upload-Length'] = String(file.size);
     headers['Upload-Metadata'] = details;
-    const response = await fetch(collection, {method: 'POST', headers});
+    const response = await fetch(l.collection, {method: 'POST', headers});
     if (!response.ok) return fail(response);
     return Number(response.headers.get('Upload-Offset') || '0');
   };
-  const show = (text, offset, size) => {
-    status.textContent = text;
-    progress.max = Math.max(size, 1);
-    progress.value = offset;
-  };
-  async function upload(file) {
-    const content = await contentId(file);
-    const details = metadata(file, content);
-    let offset = await head(file, content);
-    if (offset === null) offset = await create(file, details);
-    show('Uploading ' + file.name + '...', offset, file.size);
+  async function send(file, slots, caption) {
+    const content = await contentId(file, caption);
+    let target = slots.find(s => s.state === 'bound' && s.content === content);
+    let offset;
+    if (target) {
+      if (target.complete) {
+        // Trust the bytes, not the metadata: the server confirms the
+        // completed file's content before this one is skipped.
+        const verified = await probe(
+          target.lane, {'If-Match': contentEtag(content)});
+        if (verified.state !== 'bound') {
+          throw new Error('This link is already bound to a different file.');
+        }
+        return;
+      }
+      // An unfinished slot may have moved since it was cached, for example
+      // after an earlier file with the same bytes ran out of retries.
+      const fresh = await probe(target.lane);
+      if (fresh.state !== 'bound' || fresh.content !== content) {
+        throw new Error('This link is already bound to a different file.');
+      }
+      if (fresh.complete) {
+        target.complete = true;
+        return;
+      }
+      offset = fresh.offset;
+    } else {
+      target = slots.find(s => s.state === 'free');
+      if (!target) {
+        throw new Error(slots.length === 1
+          ? 'This link is already bound to a different file.'
+          : 'This link accepts at most ' + slots.length +
+            ' files and all of them are in use.');
+      }
+      try {
+        offset = await create(target.lane, file, metadata(file, content));
+      } catch (error) {
+        // The server may have stored the file even though the answer never
+        // arrived. Ask, so a later file does not pick the same slot again.
+        let now;
+        try { now = await probe(target.lane); } catch (_) { throw error; }
+        if (now.state === 'bound' || now.state === 'dead') {
+          Object.assign(target, now);
+        }
+        if (now.state !== 'bound' || now.content !== content) throw error;
+        // Created after all: carry on with the bytes it holds.
+        if (now.complete) return;
+        offset = now.offset;
+      }
+      target.state = 'bound';
+      target.content = content;
+      target.complete = false;
+    }
+    const l = target.lane;
+    show('Uploading ' + caption + '...', offset);
     let failures = 0;
     while (offset < file.size) {
       const end = Math.min(offset + __CHUNK__, file.size);
-      const headers = auth();
+      const headers = auth(l);
       headers['Upload-Offset'] = String(offset);
       headers['Content-Type'] = 'application/offset+octet-stream';
       try {
-        const response = await fetch(resource, {
+        const response = await fetch(l.resource, {
           method: 'PATCH', headers, body: file.slice(offset, end)
         });
         if (!response.ok) await fail(response);
         offset = Number(response.headers.get('Upload-Offset'));
         failures = 0;
-        show('Uploading ' + file.name + '...', offset, file.size);
+        show('Uploading ' + caption + '...', offset);
       } catch (error) {
         if (++failures > 6) throw error;
-        show('Connection interrupted; resuming...', offset, file.size);
+        show('Connection interrupted; resuming...', offset);
         await sleep(Math.min(1000 * (2 ** failures), 15000));
-        const resumed = await head(file, content);
-        if (resumed === null) throw error;
+        const resumed = await probe(l);
+        if (resumed.state !== 'bound' || resumed.content !== content) {
+          throw error;
+        }
         // A timed-out or cut-off chunk can still persist bytes. Count only
         // failures that made no progress, so a slow link is not abandoned.
-        if (resumed > offset) failures = 0;
-        offset = resumed;
+        if (resumed.offset > offset) failures = 0;
+        offset = resumed.offset;
       }
     }
-    show('Upload complete. You may close this page.', offset, file.size);
+    target.complete = true;
   }
+  const row = file => {
+    const item = document.createElement('li');
+    item.textContent = file.name + ' - waiting';
+    queue.appendChild(item);
+    return item;
+  };
+  const mark = (item, file, text, kind) => {
+    item.textContent = file.name + ' - ' + text;
+    item.className = kind || ''';
+  };
+  const upload = async (files, note) => {
+    uploading = true;
+    input.disabled = true;
+    drop.classList.add('disabled');
+    prompt.textContent = files.length === 1 ? files[0].name
+                                            : files.length + ' files';
+    queue.textContent = ''';
+    tally.done = 0;
+    tally.total = files.reduce((sum, file) => sum + file.size, 0);
+    bar(0);
+    const rows = files.map(row);
+    let done = 0;
+    let lastError = ''';
+    try {
+      const slots = await survey();
+      for (let n = 0; n < files.length; n++) {
+        const file = files[n];
+        const caption = files.length === 1 ? file.name
+          : file.name + ' (' + (n + 1) + ' of ' + files.length + ')';
+        try {
+          await send(file, slots, caption);
+          done++;
+          tally.done += file.size;
+          bar(0);
+          mark(rows[n], file, 'done', 'done');
+        } catch (error) {
+          lastError = error.message;
+          mark(rows[n], file, error.message, 'error');
+        }
+      }
+      if (done === files.length) {
+        status.textContent = files.length === 1
+          ? 'Upload complete. You may close this page.'
+          : 'Uploaded ' + done + ' of ' + files.length +
+            ' files. You may close this page.';
+        progress.max = Math.max(tally.total, 1);
+        progress.value = progress.max;
+      } else {
+        status.textContent = files.length === 1 ? lastError
+          : 'Uploaded ' + done + ' of ' + files.length + ' files.';
+      }
+    } catch (error) {
+      status.textContent = error.message;
+    }
+    if (note) status.textContent += ' ' + note;
+    uploading = false;
+    input.disabled = false;
+    input.value = ''';
+    drop.classList.remove('disabled');
+  };
   if (!validToken) {
     status.textContent = 'This upload link is incomplete.';
   } else {
-    const selectFile = async files => {
+    // A drop hands over every dragged item, folders included, and there is
+    // no accept filter as in the file dialog. Folders are skipped here.
+    const dropped = transfer => {
+      const files = [];
+      let folders = 0;
+      const items = Array.from(transfer.items || []);
+      if (items.length) {
+        for (const item of items) {
+          if (item.kind !== 'file') continue;
+          const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+          if (entry && entry.isDirectory) { folders++; continue; }
+          const file = item.getAsFile();
+          if (file) files.push(file);
+        }
+      } else {
+        files.push(...transfer.files);
+      }
+      return {files, folders};
+    };
+    const selectFiles = (files, folders) => {
       if (uploading) return;
-      if (files.length !== 1) {
+      const note = folders
+        ? 'Skipped ' + folders + (folders === 1 ? ' folder' : ' folders') +
+          '; choose files only.' : ''';
+      if (!files.length) {
         input.value = ''';
-        prompt.textContent = 'Drop a file here';
-        status.textContent = 'Choose exactly one file.';
+        prompt.textContent = 'Drop files here';
+        status.textContent = note || 'Choose at least one file.';
         return;
       }
-      const file = files[0];
-      prompt.textContent = file.name;
-      uploading = true;
-      input.disabled = true;
-      drop.classList.add('disabled');
-      try { await upload(file); }
-      catch (error) {
-        uploading = false;
-        input.disabled = false;
-        input.value = ''';
-        drop.classList.remove('disabled');
-        status.textContent = error.message;
-      }
+      upload(files, note);
     };
     const stopDrag = event => {
       event.preventDefault();
@@ -37807,9 +38964,11 @@ to the terminal or any existing files.</p>
     drop.addEventListener('drop', event => {
       stopDrag(event);
       drop.classList.remove('dragging');
-      selectFile(event.dataTransfer.files);
+      const result = dropped(event.dataTransfer);
+      selectFiles(result.files, result.folders);
     });
-    input.addEventListener('change', () => selectFile(input.files));
+    input.addEventListener('change', () => selectFiles(
+      Array.from(input.files), 0));
   }
 })();
 </script></body></html>''''
@@ -37820,7 +38979,8 @@ def receive_page(slot, nonce):
             .replace("__SLOT__", slot)
             .replace("__NONCE__", nonce)
             .replace("__CHUNK__", str(RECEIVE_CHUNK_MAX))
-            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK)))
+            .replace("__HASH_CHUNK__", str(RECEIVE_CONTENT_BLOCK))
+            .replace("__MAX_FILES__", str(RECEIVE_MAX_FILES)))
 
 
 def receive_metadata(raw):
@@ -38020,6 +39180,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if send_body:
             self.wfile.write(data)
 
+    @staticmethod
+    def _receive_link_headers(record):
+        """Tell the page how many slots the link was minted with.
+
+        Only a link's first record carries the count. A link minted before
+        multi-file support has none, and the page reads that as one file.
+        """
+        files = record.get("files")
+        if isinstance(files, int) and files > 0:
+            return {"Agent-Box-Link-Files": files}
+        return {}
+
     def _receive_headers(self, record, offset):
         headers = {
             "Tus-Resumable": "1.0.0",
@@ -38044,6 +39216,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # The partial upload changes after each PATCH, so its target
             # identity is resume metadata rather than an HTTP entity tag.
             headers["Upload-Content"] = record["content"]
+        headers.update(self._receive_link_headers(record))
         return headers
 
     def _receive_create(self, slot):
@@ -38174,11 +39347,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if record is None:
                     return
                 if record["status"] == "waiting":
-                    self._receive_error(404, "No file has been started for this link.")
+                    self._receive_error(
+                        404, "No file has been started for this link.",
+                        self._receive_link_headers(record))
                     return
                 if record["status"] == "failed":
                     self._receive_error(
-                        422, "Uploaded bytes did not match the selected file.")
+                        422, "Uploaded bytes did not match the selected file.",
+                        self._receive_link_headers(record))
                     return
                 offset = receive_offset(record)
                 if offset is None:
@@ -41693,6 +42869,35 @@ if __name__ == "__main__":
           Restart = lib.mkForce "always";
         };
       }
+      // lib.optionalAttrs rebootButton {
+        # Issue #1054: a reboot that needs nothing from the disk. Runs from
+        # boot so its code and /proc/sysrq-trigger are already in RAM and
+        # open when a failing disk makes `sudo systemctl reboot` unable to
+        # exec. See src/reboot-helper.py for the request protocol.
+        agent-box-reboot-helper = {
+          description = "agent-box: disk-independent reboot helper";
+          wantedBy = [ "multi-user.target" ];
+          # The settings daemon is socket-activated; one never started
+          # cannot start once the disk is gone, so bring it up at boot.
+          wants = [ "agent-box-settings@${rootUser}.service" ];
+          environment = {
+            AGENT_BOX_REBOOT_USER = rootUser;
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
+            # The front door the button's request crosses; the helper keeps
+            # their mapped files in RAM so a dead disk cannot SIGBUS them.
+            AGENT_BOX_REBOOT_PIN_UNITS = "caddy.service agent-box-settings@${rootUser}.service";
+          };
+          serviceConfig = {
+            ExecStart = "${rebootHelperBin}/bin/agent-box-reboot-helper";
+            RuntimeDirectory = "agent-box-reboot";
+            RuntimeDirectoryMode = "0755";
+            Restart = "always";
+            RestartSec = "5s";
+            LimitMEMLOCK = "infinity";
+            OOMScoreAdjust = -900;
+          };
+        };
+      }
       // (lib.listToAttrs (map (name: lib.nameValuePair "agent-web-terminal@${name}" {
         overrideStrategy = "asDropin";
         # The attach script (src/attach.sh) resolves tmux, jq and head
@@ -41806,6 +43011,8 @@ if __name__ == "__main__":
             # the daemon hides the card and 404s the route without it, so
             # another user's page cannot even ask.
             AGENT_BOX_REBOOT_CMD = "/run/wrappers/bin/sudo -n ${rebootCmd}";
+            # Fallback when that cannot exec (issue #1054).
+            AGENT_BOX_REBOOT_SOCKET = "/run/agent-box-reboot/reboot.sock";
           })
           // {
             # mkForce for the reason spelled out on the "agent-box@" unit:

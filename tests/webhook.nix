@@ -408,6 +408,10 @@
             " kill-server"
         )
         machine.wait_until_succeeds("! pgrep -u agent -x 'tmux: server'", timeout=30)
+        # Pane wrapper and plugin sync can outlive the server (#950).
+        machine.wait_until_succeeds(
+            "! pgrep -u agent -f 'env-exec|claude plugin'", timeout=60
+        )
 
     machine.succeed("systemctl stop agent-box@agent.service")
     quiesce_sessions()
@@ -2289,8 +2293,9 @@
         machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {stale}")
 
     # --- who "@self" is, resolved at runtime (issue #261) -------------------
-    # webhook-spawn.sh seeds every hook-* session with ignoreSenders
-    # ["@self"]; webhook.py resolves that against LOCAL_WEBHOOK_SELF. The
+    # webhook-spawn.sh seeds every hook-* session with an exclude naming
+    # LOCAL_WEBHOOK_SELF (direct echoes only, never its CI); webhook.py
+    # resolves "@self" against that same variable. The
     # resolver itself is a pure function of a token, a state dir and a
     # stubbed `gh` — asserted natively in `webhook-self` instead (#610). Only
     # a VM shows what is downstream: a session's peer and the receiver both

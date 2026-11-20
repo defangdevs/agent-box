@@ -287,8 +287,9 @@ The settings page's Connections section can link this user's WhatsApp as a
 device. Enter the account's phone number with country code, start pairing,
 and give the displayed code to WhatsApp's Linked devices screen on the
 primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
-Media must either be captioned that way or sent during an explicitly opened
-ten-minute upload window. The bridge accepts them only from that
+When the prefix is set, media must either be captioned that way or sent during
+an explicitly opened ten-minute upload window. With an empty prefix, captionless
+media is accepted directly. The bridge accepts them only from that
 account's Message Yourself chat. The device link belongs to the Linux user and
 survives agent session restarts. When you begin work on a WhatsApp message,
 acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
@@ -355,7 +356,8 @@ caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most
 after sending. No download link or re-pairing is needed.
 
 For an inbound image, video, or document, add `@agent` at the start of its
-caption (a caption containing only `@agent` works). To send captionless media,
+caption (a caption containing only `@agent` works). If the prefix is empty,
+captionless media is accepted directly. Otherwise, to send captionless media,
 first send `@agent /attach`; that opens a ten-minute upload window for this
 account's Message Yourself chat. An agent can open the same window with `node
 ~/.local/share/local-whatsapp/bridge.mjs receive-files`. View-once media is not
@@ -431,20 +433,24 @@ set it again, or make it permanent at creation with
 
 @CONTAINERS_SECTION@@WEBHOOK_SECTION@## Receiving a large file from the user
 
-When the user needs to give this box a file that is too large for chat, mint
+When the user needs to give this box files that are too large for chat, mint
 one temporary resumable upload link:
 
-    agent-box-receive --ttl 4h --max-size 2G
+    agent-box-receive --ttl 4h --max-size 2G --files 10
 
 Hand them the complete URL the command prints. The part after `#` is the
 upload credential: treat the whole link as a secret and revoke it if it is
-sent to the wrong person. It authorizes one file up to the stated size and
-never signs the holder into the terminal or settings page. Interrupted browser
-uploads resume automatically, and the completed file appears in `~/uploads`.
+sent to the wrong person. It authorizes up to `--files` files (default 10,
+at most 100), each up to `--max-size`, and never signs the holder into the
+terminal or settings page. The page takes several files in one go. Interrupted
+browser uploads resume automatically, and the completed files appear in
+`~/uploads`.
 
-`agent-box-receive list` shows active slots. `agent-box-receive revoke SLOT`
-invalidates one immediately and removes its unfinished bytes. Expired slots
-are removed opportunistically. Do not open the upload URL yourself before
+`agent-box-receive list` shows active slots; each file of a link is one slot,
+and the LINK column names the link's first slot. `agent-box-receive revoke
+SLOT` invalidates that slot immediately, and the first slot of a link revokes
+the whole link, removing unfinished bytes. Expired slots are removed
+opportunistically. Do not open the upload URL yourself before
 handing it over if your chat client or browser sync might expose its fragment.
 
 ## Handing a file to the user
@@ -528,6 +534,8 @@ The box itself - the terminal, session manager, webhook wiring, this
 guide - is github.com/defangdevs/agent-box, the repo this deployment is
 built from. A bug in that platform is not the same as a bug in the user's
 project: if you hit one, first work around it so your own running session
-is unblocked, then file an issue (or a PR, if you already have the fix)
-upstream so every other deployment gets it too. Search for an existing
-issue before opening one, and don't wait for permission to file it.
+is unblocked, then report it in an upstream issue so it can be fixed for
+every deployment. Prefer an issue even if you have a fix; include the
+diagnosis and fix in the report when useful. Search for an existing issue
+before opening one, and don't wait for permission to file it. If the user
+asks you to contribute a PR, follow that request.

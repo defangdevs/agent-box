@@ -9,6 +9,19 @@ Read the [wiki](https://github.com/defangdevs/agent-box/wiki) before you design 
 
 This file owns repo conventions; the wiki owns design rationale and maintainer notes. Host-specific setup belongs in neither — `PATH`, git identity, token paths and one box's migration history describe a deployment, so they go in that host's own config repo.
 
+### Keep the C4 diagram current
+
+[`docs/architecture/index.html`](docs/architecture/index.html) is the published C4 explorer (context, containers, event trace, WhatsApp trace). Update it in the same PR when you add, remove or rename one of these:
+- a process, daemon or systemd unit;
+- a data store;
+- an entry point or external system (a new channel, sender or client);
+- a root service;
+- a relationship between any of these.
+
+Also update it when you move an item across a trust boundary. A new flag or a bug fix does not need an update, unless it changes what a node's inspector text says, or it adds, removes or changes a relationship, or it affects a trust boundary.
+
+The page is data, not layout code: edit the `views` (nodes, rels, boundaries), `details` and `sourceLinks` objects. Do not change the renderer for a content change. Put new nodes in the gaps between columns, so that edges do not run behind other nodes. Check each view in headless chromium from `file://`, and attach the screenshots to the PR. It drifted once already: about 90 PRs merged between #870 and #1064 without an update, and that left mail, Slack, the router, ACP, the secret broker and the reboot helper off the map.
+
 ## Which agent file a note belongs in
 
 Two different files in this checkout carry instructions for agents, and they
@@ -504,6 +517,12 @@ one here has already cost at least one.
   status without a pipe first, then look at the output.
 
 ## Filing Issues, and when to skip straight to the PR
+
+This section guides agents working on our behalf in our repositories. An agent
+working for a user on their box should prefer reporting agent-box problems
+upstream as issues, even when working in an agent-box checkout, as the shipped
+guide in `modules/src/default-agents.md` says. Follow an explicit user request
+to contribute a PR.
 
 When you hit something wrong - a bug, a design gap, a stale doc, a flaky check, surprising behavior you had to work around - do not let it die in a session transcript: the next agent starts with none of your context. But an issue is not automatically the right container for it. This is a repo we control, so **when you know the fix and can push it, open the PR instead**; an issue that already carries the diagnosis and the patch is churn, costing a read for every future triager and giving nothing the PR does not carry. Name the symptom in the PR body, so the work is still findable by what went wrong.
 
