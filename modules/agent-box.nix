@@ -1737,8 +1737,9 @@ let
     device. Enter the account's phone number with country code, start pairing,
     and give the displayed code to WhatsApp's Linked devices screen on the
     primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
-    Media must either be captioned that way or sent during an explicitly opened
-    ten-minute upload window. The bridge accepts them only from that
+    When the prefix is set, media must either be captioned that way or sent during
+    an explicitly opened ten-minute upload window. With an empty prefix, captionless
+    media is accepted directly. The bridge accepts them only from that
     account's Message Yourself chat. The device link belongs to the Linux user and
     survives agent session restarts. When you begin work on a WhatsApp message,
     acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
@@ -11257,7 +11258,7 @@ import time
 from urllib.request import urlopen
 
 
-REV = "1fc9e8524f2ed8e77620b74c0074e0151289a72d"
+REV = "af3d7eb7ac1fe6e0ff8330a33a4936c103f80445"
 FILES = {
     "bridge.mjs": "d4f0a60f85bc14e870ba0dd4a8706992550c23f9949d83f926b332e3d9ba98c9",
     "state.mjs": "f66f127f150a3f46a4de6a40e4e860ec088a949641b64e407f01f4d27ae91af3",

@@ -302,8 +302,9 @@ The settings page's Connections section can link this user's WhatsApp as a
 device. Enter the account's phone number with country code, start pairing,
 and give the displayed code to WhatsApp's Linked devices screen on the
 primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
-Media must either be captioned that way or sent during an explicitly opened
-ten-minute upload window. The bridge accepts them only from that
+When the prefix is set, media must either be captioned that way or sent during
+an explicitly opened ten-minute upload window. With an empty prefix, captionless
+media is accepted directly. The bridge accepts them only from that
 account's Message Yourself chat. The device link belongs to the Linux user and
 survives agent session restarts. When you begin work on a WhatsApp message,
 acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
