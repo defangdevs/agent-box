@@ -78,6 +78,10 @@ def ttyd_socket(user_name):
     return f"{TTYD_SOCKET_DIR}/{user_name}/ttyd.sock"
 
 DEFAULT_CONFIG = "/etc/agent-box/config.yaml"
+# Workspaces (Linux users) added after deploy, issue #1088. Root-owned state
+# beside the declared config: `agentbox workspace add` writes it and every
+# apply merges it into `users`, so config.yaml stays the operator's file.
+WORKSPACES_FILE = "/var/lib/agent-box/workspaces.json"
 
 # The self-update unit (issue #358). `agentbox apply` renders it but never
 # enables or starts it: it is on-demand only, triggered through the sudo
@@ -325,6 +329,39 @@ def load_config(path):
         raise ConfigError(f"{path}: top level must be a mapping, got "
                           f"{data!r}")
     return data
+
+
+def load_workspaces(path=None):
+    """The names recorded by `agentbox workspace add`, as a sorted list."""
+    try:
+        data = json.loads(Path(path or WORKSPACES_FILE).read_text())
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as e:
+        raise ConfigError(f"{path or WORKSPACES_FILE} is unreadable: {e}")
+    names = data.get("workspaces") if isinstance(data, dict) else None
+    if not isinstance(names, list) or not all(
+            isinstance(n, str) and USER_RE.match(n) for n in names):
+        raise ConfigError(
+            f"{path or WORKSPACES_FILE}: expected {{\"workspaces\": "
+            "[user names]}")
+    return sorted(set(names))
+
+
+def merge_workspaces(data, path=None):
+    """Add the recorded workspaces to the config's users (a copy).
+
+    A name config.yaml already declares keeps the operator's settings.
+    """
+    names = load_workspaces(path)
+    if not names:
+        return data
+    merged = dict(data)
+    users = dict(merged.get("users") or {})
+    for name in names:
+        users.setdefault(name, {})
+    merged["users"] = users
+    return merged
 
 
 def profile_manifest(profile):
@@ -5271,7 +5308,10 @@ def cmd_apply(args):
     back to the previous release on a non-zero apply.
     """
     profile = resolve_profile(args.profile)
-    spec = Spec(load_config(args.config), profile, root=args.root or "/")
+    config = load_config(args.config)
+    if args.root is None:
+        config = merge_workspaces(config)
+    spec = Spec(config, profile, root=args.root or "/")
     if args.first_boot:
         first_boot(spec, args)
     rend = Renderer(spec, profile, root=args.root or "/", config=args.config)
@@ -6097,7 +6137,7 @@ def start_harness_upgrades(config, profile):
     than holding the one the settings page polls.
     """
     try:
-        spec = Spec(load_config(config), profile)
+        spec = Spec(merge_workspaces(load_config(config)), profile)
     except Exception:  # noqa: BLE001 - never fail an applied update here.
         # The apply above already succeeded against this same file, so a
         # parse failure here is not a thing this box can act on - and the
@@ -6366,6 +6406,53 @@ def cmd_signal(args):
 
 # --------------------------------------------------------------------------
 
+def cmd_workspace(args):
+    """`workspace ls|add NAME`: list or create a workspace (a Linux user).
+
+    add records the name in WORKSPACES_FILE and runs a normal apply, which
+    creates the user, its home, units, sudoers and Caddy route like any other
+    declared user. Only root may do it: this is the one step an agent user
+    can never take for itself.
+    """
+    declared = load_config(args.config).get("users") or {}
+    recorded = load_workspaces(args.state)
+    if args.action == "ls":
+        for name in sorted(set(declared) | set(recorded)):
+            print(name + ("" if name in declared else "  (added)"))
+        return 0
+    name = args.name
+    if not name or not USER_RE.match(name):
+        raise ConfigError(f"invalid workspace name {name!r}: lower-case "
+                          "letters, digits, _ and -, at most 32")
+    if name in declared or name in recorded:
+        print(f"workspace {name} already exists")
+        return 0
+    try:
+        import pwd
+        pwd.getpwnam(name)
+    except KeyError:
+        pass
+    else:
+        raise ConfigError(f"{name!r} is already a login on this host that "
+                          "agent-box does not manage; pick another name")
+    if os.geteuid() != 0 and not args.no_apply:
+        raise ConfigError("adding a workspace needs root")
+    path = Path(args.state or WORKSPACES_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".workspaces.")
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"workspaces": sorted(recorded + [name])}, fh)
+        fh.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, path)
+    print(f"recorded workspace {name} in {path}")
+    if args.no_apply:
+        return 0
+    return cmd_apply(argparse.Namespace(
+        config=args.config, profile=args.profile, root=None, dry_run=False,
+        first_boot=False, settle_delay=0))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="agentbox", description=__doc__.split("\n")[0])
@@ -6388,6 +6475,18 @@ def main(argv=None):
         "--settle-delay", type=int, default=0,
         help="seconds to wait before the first IP probe")
     a.set_defaults(func=cmd_apply)
+
+    ws = sub.add_parser(
+        "workspace", help="list or add workspaces (Linux users)")
+    ws.add_argument("action", choices=["ls", "add"])
+    ws.add_argument("name", nargs="?")
+    ws.add_argument("--config", default=DEFAULT_CONFIG)
+    ws.add_argument("--profile",
+                    help="runtime profile path (default: derived from argv[0])")
+    ws.add_argument("--state", help=argparse.SUPPRESS)
+    ws.add_argument("--no-apply", action="store_true",
+                    help="record the name only; apply later")
+    ws.set_defaults(func=cmd_workspace)
 
     up = sub.add_parser(
         "update",

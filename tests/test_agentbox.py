@@ -4109,6 +4109,42 @@ class SelfUpdateLogicTest(unittest.TestCase):
                          "a failed pull must not touch the profile")
 
 
+class WorkspaceTest(unittest.TestCase):
+    """`agentbox workspace add` (issue #1088): extra users merge into apply."""
+
+    def setUp(self):
+        self.mod = load_agentbox()
+
+    def test_add_records_and_merges_without_touching_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "workspaces.json")
+            rc = self.mod.cmd_workspace(argparse.Namespace(
+                action="add", name="research", config=str(CONFIG_JSON),
+                profile=None, state=state, no_apply=True))
+            self.assertEqual(rc, 0)
+            self.assertEqual(self.mod.load_workspaces(state), ["research"])
+            data = self.mod.load_config(str(CONFIG_JSON))
+            merged = self.mod.merge_workspaces(data, state)
+            self.assertIn("research", merged["users"])
+            self.assertNotIn("research", data["users"])
+            self.mod.Spec(merged, str(Path(tmp)))  # still a valid box
+
+    def test_bad_and_taken_names_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = str(Path(tmp) / "workspaces.json")
+            for name in ("Bad Name", "../x", ""):
+                with self.assertRaises(self.mod.ConfigError):
+                    self.mod.cmd_workspace(argparse.Namespace(
+                        action="add", name=name, config=str(CONFIG_JSON),
+                        profile=None, state=state, no_apply=True))
+            with mock.patch("pwd.getpwnam", return_value=object()):
+                with self.assertRaises(self.mod.ConfigError):
+                    self.mod.cmd_workspace(argparse.Namespace(
+                        action="add", name="nobody", config=str(CONFIG_JSON),
+                        profile=None, state=state, no_apply=True))
+            self.assertFalse(Path(state).exists())
+
+
 class ApplyActivationTest(unittest.TestCase):
     """What `agentbox apply` does when a host command says no (issue #526).
 
