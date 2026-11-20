@@ -4130,6 +4130,32 @@ class WorkspaceTest(unittest.TestCase):
             self.assertNotIn("research", data["users"])
             self.mod.Spec(merged, str(Path(tmp)))  # still a valid box
 
+    def test_recorded_names_do_not_change_the_root_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "workspaces.json"
+            state.write_text('{"workspaces": ["aardvark"]}')
+            data = {"users": {"agent": {}, "zed": {}}}
+            merged = self.mod.merge_workspaces(data, str(state))
+            self.assertTrue(merged["users"]["agent"]["root"])
+            self.assertNotIn("root", merged["users"]["aardvark"])
+            self.assertEqual(data, {"users": {"agent": {}, "zed": {}}})
+
+    def test_projects_secrets_for_users_with_a_hash(self):
+        spec = mock.Mock(web_enable=True)
+        spec.users = [mock.Mock(), mock.Mock()]
+        spec.users[0].name, spec.users[1].name = "agent", "research"
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "agent.hash").write_text("H\n")
+            (Path(tmp) / "research.hash").write_text("H\n")
+            with mock.patch.object(self.mod, "write_auth_env") as wae:
+                self.mod.project_web_secrets(spec, etc=tmp)
+            self.assertEqual([n for n, _ in wae.call_args[0][0]],
+                             ["agent", "research"])
+            spec.web_enable = False
+            with mock.patch.object(self.mod, "write_auth_env") as wae:
+                self.mod.project_web_secrets(spec, etc=tmp)
+            wae.assert_not_called()
+
     def test_bad_and_taken_names_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "workspaces.json")

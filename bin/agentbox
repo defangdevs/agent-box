@@ -359,6 +359,12 @@ def merge_workspaces(data, path=None):
         return data
     merged = dict(data)
     users = dict(merged.get("users") or {})
+    # Spec picks the first user in sorted order as root when none is flagged.
+    # A recorded name sorting earlier must not take that over, so pin the
+    # declared choice before adding anything.
+    if users and not any((u or {}).get("root") for u in users.values()):
+        first = sorted(users)[0]
+        users[first] = {**(users[first] or {}), "root": True}
     for name in names:
         users.setdefault(name, {})
     merged["users"] = users
@@ -6463,9 +6469,23 @@ def cmd_workspace(args):
     spec = Spec(merge_workspaces(load_config(args.config), args.state),
                 profile, root="/")
     ensure_web_hash(spec, name)
+    project_web_secrets(spec)
     return cmd_apply(argparse.Namespace(
         config=args.config, profile=args.profile, root=None, dry_run=False,
         first_boot=False, settle_delay=0))
+
+
+def project_web_secrets(spec, etc="/etc/agent-box"):
+    """Put every web user's secrets in /run/agent-box-web/env now.
+
+    apply validates the rendered Caddyfile against that file before it
+    commits anything, so the new user's WEB_PASSWORD_* variables must be
+    there first or the validation fails and no route is made.
+    """
+    if not spec.web_enable:
+        return
+    write_auth_env([(u.name, f"{etc}/{u.name}.hash") for u in spec.users
+                    if Path(f"{etc}/{u.name}.hash").is_file()])
 
 
 def ensure_web_hash(spec, name, etc="/etc/agent-box"):
