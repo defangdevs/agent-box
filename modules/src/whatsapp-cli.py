@@ -17,16 +17,16 @@ import time
 from urllib.request import urlopen
 
 
-REV = "a54bb56dba4e6c8aafb57231ba81211eeb1e78ab"
+REV = "1fc9e8524f2ed8e77620b74c0074e0151289a72d"
 FILES = {
     "bridge.mjs": "d4f0a60f85bc14e870ba0dd4a8706992550c23f9949d83f926b332e3d9ba98c9",
-    "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
+    "state.mjs": "f66f127f150a3f46a4de6a40e4e860ec088a949641b64e407f01f4d27ae91af3",
     "package.json": "a685e52bfe73a8965869cf1884c98280bca5a9ada31ae2fa1ce8829dc5cb16eb",
     "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
 # local-router's single file, fetched with the bridge at the same REV. The
 # route subcommand loads it from the runtime directory.
-ROUTER_FILE = ("local-router/router.py", "cd0f1a591b8ccd1f0bba29b45098c5c4c3f631ea9b07acab31fb855651298a8d")
+ROUTER_FILE = ("local-router/router.py", "ef913fc4c41109e6ed97b5ed6279fe2d491990a5de39a9087a7b83889ea2640c")
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
 STATE = HOME / ".local/state/local-whatsapp"

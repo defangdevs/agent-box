@@ -370,7 +370,8 @@ caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most
 after sending. No download link or re-pairing is needed.
 
 For an inbound image, video, or document, add `@agent` at the start of its
-caption (a caption containing only `@agent` works). To send captionless media,
+caption (a caption containing only `@agent` works). If the prefix is empty,
+captionless media is accepted directly. Otherwise, to send captionless media,
 first send `@agent /attach`; that opens a ten-minute upload window for this
 account's Message Yourself chat. An agent can open the same window with `node
 ~/.local/share/local-whatsapp/bridge.mjs receive-files`. View-once media is not
