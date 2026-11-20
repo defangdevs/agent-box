@@ -23497,6 +23497,10 @@ esac
       # saving AGENT_BOX_WHATSAPP_ROUTER=off or a router backend/model takes
       # effect at the next bridge start. Empty keeps the bridge's default.
       wa_debug=""; wa_router=""; wa_backend=""; wa_model=""
+      # LOCAL_WHATSAPP_PREFIX is different: an explicitly empty value turns the
+      # "@agent " requirement off, so unset and empty must stay distinguishable.
+      # It is only passed to the bridge when the store defines it (issue #1089).
+      wa_prefix_env=()
       envstore="''${AGENT_BOX_ENVSTORE_BIN:-}"
       if [ -x "$envstore" ]; then
         wa_env="$("$envstore" json 2>/dev/null)" || wa_env=""
@@ -23505,15 +23509,21 @@ esac
           wa_router="$("$JQ" -r '.AGENT_BOX_WHATSAPP_ROUTER // empty' <<<"$wa_env" 2>/dev/null)" || wa_router=""
           wa_backend="$("$JQ" -r '.AGENT_BOX_ROUTER_BACKEND // empty' <<<"$wa_env" 2>/dev/null)" || wa_backend=""
           wa_model="$("$JQ" -r '.AGENT_BOX_ROUTER_MODEL // empty' <<<"$wa_env" 2>/dev/null)" || wa_model=""
+          if [ "$("$JQ" -r 'if (type == "object" and has("LOCAL_WHATSAPP_PREFIX") and (.LOCAL_WHATSAPP_PREFIX | type) == "string") then "yes" else "no" end' <<<"$wa_env" 2>/dev/null)" = yes ]; then
+            wa_prefix="$("$JQ" -r '.LOCAL_WHATSAPP_PREFIX' <<<"$wa_env")" || wa_prefix=""
+            wa_prefix_env=("LOCAL_WHATSAPP_PREFIX=$wa_prefix")
+          fi
         fi
       fi
       if [ -n "$codex_cli" ]; then
-        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
+        env ''${wa_prefix_env[@]+"''${wa_prefix_env[@]}"} \
+          LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
           AGENT_BOX_WHATSAPP_ROUTER="$wa_router" AGENT_BOX_ROUTER_BACKEND="$wa_backend" \
           AGENT_BOX_ROUTER_MODEL="$wa_model" \
           LOCAL_WHATSAPP_CODEX_BIN="$codex_cli" "$whatsapp" serve &
       else
-        LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
+        env ''${wa_prefix_env[@]+"''${wa_prefix_env[@]}"} \
+          LOCAL_WHATSAPP_SESSION_BIN="$session_cli" LOCAL_WHATSAPP_DEBUG="$wa_debug" \
           AGENT_BOX_WHATSAPP_ROUTER="$wa_router" AGENT_BOX_ROUTER_BACKEND="$wa_backend" \
           AGENT_BOX_ROUTER_MODEL="$wa_model" \
           "$whatsapp" serve &
