@@ -1063,6 +1063,15 @@ let
 @@include:src/whatsapp-cli.py@@
   '';
 
+  # Routes a standing-watch batch to a session that already works on its
+  # object (issue #1056). Called by agent-box-webhook-spawn before it starts
+  # anything; Python stdlib only, and it fails open to "start a session".
+  watchRouteCli = pkgs.writers.writePython3Bin "agent-box-watch-route" {
+    flakeIgnore = [ "E501" "E302" "E305" ];
+  } ''
+@@include:src/watch-route.py@@
+  '';
+
   # local-slack (issue #864): the supervisor runs its daemon while both Slack
   # tokens are in the env store. The CLI fetches the one pinned slack.py and
   # supplies the receiver socket path, which only this box knows.
@@ -1354,6 +1363,7 @@ GH_BIN = "${pkgs.gh}/bin/gh"
     "agent-box-profile" = "${profileCli}/bin/agent-box-profile";
     "agent-box-whatsapp" = "${whatsappCli}/bin/agent-box-whatsapp";
     "agent-box-slack" = "${slackCli}/bin/agent-box-slack";
+    "agent-box-watch-route" = "${watchRouteCli}/bin/agent-box-watch-route";
     "agent-box-harness" = "${harnessCli}/bin/agent-box-harness";
     hostname = "${pkgs.unixtools.hostname}/bin/hostname";
     "agent-box-env-exec" = "${envExecWrapper}";

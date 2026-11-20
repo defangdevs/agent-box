@@ -446,6 +446,15 @@ source_template() {
       # owner wrote the text may emit here.
       printf '%s' '{"format":"generic","keyPath":"session","trust":"owner"}'
       ;;
+    routed)
+      # GitHub (or other) events the standing watch routes to a session that
+      # already works on their object (agent-box-watch-route, issue #1056):
+      # keyed on the session name, so routed:<name> reaches exactly one
+      # session. NO trust field: unlike `inbox` this text was written by a
+      # stranger, so the receiving session sees it as untrusted data. The full
+      # text is retained and read with `read-content`, like email.
+      printf '%s' '{"format":"generic","keyPath":"session","retainPayload":true}'
+      ;;
     slack)
       # local-slack emits through `webhook.py emit`, which signs with this
       # source's own secret. It routes on `route` (<team>/<channel>), so a topic

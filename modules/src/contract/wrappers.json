@@ -155,6 +155,18 @@
           ]
         },
         {
+          "name": "AGENT_BOX_WATCH_ROUTE_BIN",
+          "kind": "bin",
+          "program": "agent-box-watch-route",
+          "why": [
+            "Before a standing watch starts a session it asks this command whether",
+            "a live or earlier session already works on the event's object, and",
+            "delivers the batch there instead (issue #1056). Pinned like the other",
+            "CLIs: the receiver unit's PATH carries none of the profile. A missing",
+            "pin only means the watch starts a session as it always did."
+          ]
+        },
+        {
           "name": "AGENT_BOX_PYTHON_BIN",
           "kind": "bin",
           "program": "python3",

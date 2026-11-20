@@ -222,6 +222,7 @@ SESSION_BIN="${AGENT_BOX_SESSION_BIN:?the session CLI is pinned by the generated
 # yet (and so exports no such variable) still spawns standalone sessions
 # exactly as before - checked lazily, at the one call site, rather than here.
 WEBHOOK_BIN="${AGENT_BOX_WEBHOOK_BIN:-}"
+WATCH_ROUTE_BIN="${AGENT_BOX_WATCH_ROUTE_BIN:-}"
 hook_args_source=""
 if [ -n "${AGENT_BOX_HOOK_SESSION_ARGS:-}" ]; then
   hook_args_source="${AGENT_BOX_HOOK_ARGS_OPTION_NAME:-the fleet-wide default}"
@@ -815,6 +816,45 @@ if [ "${#name}" -gt "$NAME_MAX" ]; then
        "so its tab is anonymous but never ambiguous" >&2
 fi
 
+# Is a session already working on what these events are about? A standing
+# watch is for events nobody has DECLARED, and a declared claim is only one way
+# to own an object: an interactive session often works a PR without claiming it,
+# and a claim lapses after a couple of hours while the PR lives on. Starting a
+# worker for those events gives a session that finds the owner, cannot reach it
+# and stalls (issue #1056, and the Claude-worker/Codex-owner pairs in particular).
+#
+# agent-box-watch-route reads the event text, finds sessions (any harness, live
+# or earlier) whose transcripts name the object, and asks one small model call
+# whether the event belongs to one of them. CONTINUE means it has already woken
+# that session and delivered the batch, so nothing is started here. Every other
+# answer, and every failure, means start a session exactly as before: it never
+# costs a batch. NEW_LINKS adds the earlier transcripts to the prompt below.
+#
+# Before the claim, lease and name are used: a batch delivered to somebody else
+# must not seed a claim for a session that never exists. The receiver re-offers
+# a deferred batch with the same text, and the command answers a repeat with its
+# recorded decision instead of delivering twice.
+route_links=""
+if [ -n "$WATCH_ROUTE_BIN" ] && [ -x "$WATCH_ROUTE_BIN" ]; then
+  route_id="$(printf '%s\n%s\n%s\n%s' "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" "$PROMPT" "${LOCAL_WEBHOOK_SPAWN_META:-}" | cksum | tr -d ' ')"
+  route_decision="$("$JQ" -n --arg id "$route_id" --arg src "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" \
+      --arg key "${LOCAL_WEBHOOK_SPAWN_KEY:-}" --arg topic "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
+      --arg event "${LOCAL_WEBHOOK_SPAWN_EVENT:-}" --arg text "$PROMPT" \
+      --argjson meta "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
+      '{id: $id, source: $src, key: $key, topic: $topic, event: $event, text: $text, meta: $meta}' 2>/dev/null \
+    | timeout 400 "$WATCH_ROUTE_BIN" route)" || route_decision=""
+  case "$(printf '%s' "$route_decision" | "$JQ" -r '.action // empty' 2>/dev/null)" in
+    CONTINUE)
+      echo "agent-box-webhook-spawn: routed this batch to session" \
+           "$(printf '%s' "$route_decision" | "$JQ" -r '.session // "?"') instead of starting one" >&2
+      exit 0
+      ;;
+    NEW_LINKS)
+      route_links="$(printf '%s' "$route_decision" | timeout 20 "$WATCH_ROUTE_BIN" links 2>/dev/null)" || route_links=""
+      ;;
+  esac
+fi
+
 # A hook session OWNS what it was spawned for, and says so in the one place
 # the dispatcher reads: its own filter file, written BEFORE the session
 # exists. webhook.py 0.10.0 already declines to spawn for a CI event that a
@@ -1157,6 +1197,25 @@ $peers"
 else
   preamble="$(render_preamble "$topic" "$note" "$assignment" "$name" "$seeded" "$peers" \
     "$(ownership_advice "$advice_src")")"
+fi
+
+# Earlier sessions the router found working on these events' object, in any
+# harness: the owner of a PR a Claude watch worker is asked about is often a
+# Codex session, and its transcript is the only record of what it did. A line
+# marked unreachable names an owner no message can reach, so the yield rule
+# above would hand the event to nobody: the worker answers it from the
+# transcript instead, without touching the owner's branch or worktree.
+if [ -n "$route_links" ]; then
+  preamble="$preamble
+
+EARLIER WORK ON THESE EVENTS' OBJECT. These session transcripts name it (JSONL;
+Claude or Codex format, whichever harness wrote them: tail -c 20000 FILE shows
+the end). Read them before you act, and cite what they say.
+$route_links
+The router already tried to hand this batch to a session that holds the object
+and could not, so there is nobody to yield to on that line. Do not edit that
+session's worktree or push to its branch; answer from what the transcript shows
+(reply on the PR or issue, run read-only checks) and say what you could not do."
 fi
 
 # --profile resolves the harness and its arguments (issue #321); the extra

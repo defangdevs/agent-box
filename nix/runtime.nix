@@ -378,6 +378,9 @@ let
     (pkgs.writers.writePython3Bin "agent-box-slack" {
       flakeIgnore = [ "E501" "E302" "E305" ];
     } (readSrc "slack-cli.py"))
+    (pkgs.writers.writePython3Bin "agent-box-watch-route" {
+      flakeIgnore = [ "E501" "E302" "E305" ];
+    } (readSrc "watch-route.py"))
     (payload "agent-box-session-bare" "session-cli.sh")
     # Agent profiles (issue #321): the worker `--profile` selects. Bare, so
     # `agentbox apply` can pin the env store and the harness list into the
