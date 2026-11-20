@@ -154,6 +154,27 @@ let
       chmod +x $out/bin/agent-box-receive
     '';
 
+  # transcribe-cli.py carries an @@include:transcribe/requirements.txt@@
+  # marker (the hash-pinned wheels, which Dependabot bumps). readFile'ing it
+  # shipped the marker verbatim, so every run died at pip (issue #1085).
+  transcribeCli = pkgs.runCommand "agent-box-transcribe"
+    {
+      nativeBuildInputs = [ pkgs.python3 pkgs.python3Packages.flake8 ];
+    } ''
+      ${resolveTree}
+      python3 ${../bin/assemble-module.py} \
+        --resolve tree/modules/src/transcribe-cli.py > transcribe.py
+      if grep -q '@@include' transcribe.py; then
+        echo "an @@include@@ marker survived resolve() in transcribe-cli.py" >&2
+        exit 1
+      fi
+      flake8 --show-source --ignore E501,E302,E305 transcribe.py
+      install -d $out/bin
+      { printf '#!%s\n' ${pkgs.python3}/bin/python3; cat transcribe.py; } \
+        > $out/bin/agent-box-transcribe
+      chmod +x $out/bin/agent-box-transcribe
+    '';
+
   # The tree the assembler resolves markers in: the paths in an @@include@@
   # are relative to the including file, and settings-daemon.py's reach out
   # to docs/, so the repo layout has to be rebuilt around modules/src.
@@ -372,9 +393,7 @@ let
     (payload "agent-box-upload" "upload-cli.sh")
     # Speech to text for voice notes (issue #970). Fetches its prebuilt
     # engine on first use; nothing here is compiled.
-    (pkgs.writers.writePython3Bin "agent-box-transcribe" {
-      flakeIgnore = [ "E501" "E302" "E305" ];
-    } (readSrc "transcribe-cli.py"))
+    transcribeCli
     receiveCli
     # Secret custody (issue #922): the unprivileged CLI. Needs no env
     # wrapper - it reads AGENT_BOX_SECRET_SOCKET straight from the
