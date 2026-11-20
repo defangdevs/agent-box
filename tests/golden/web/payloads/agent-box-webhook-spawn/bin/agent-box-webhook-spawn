@@ -1106,7 +1106,7 @@ fi
 # recorded decision instead of delivering twice.
 route_links=""
 if [ -n "$WATCH_ROUTE_BIN" ] && [ -x "$WATCH_ROUTE_BIN" ]; then
-  route_id="$(printf '%s\n%s\n%s' "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" "$PROMPT" | cksum | tr -d ' ')"
+  route_id="$(printf '%s\n%s\n%s\n%s' "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" "${LOCAL_WEBHOOK_SPAWN_KEY:-}" "$PROMPT" "${LOCAL_WEBHOOK_SPAWN_META:-}" | cksum | tr -d ' ')"
   route_decision="$("$JQ" -n --arg id "$route_id" --arg src "${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" \
       --arg key "${LOCAL_WEBHOOK_SPAWN_KEY:-}" --arg topic "${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg event "${LOCAL_WEBHOOK_SPAWN_EVENT:-}" --arg text "$PROMPT" \

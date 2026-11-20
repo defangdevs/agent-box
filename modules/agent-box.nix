@@ -12494,7 +12494,8 @@ def deliver(name, candidate, request, why):
     if candidate["harness"] == "codex":
         # subscribe only warns when it cannot start the delivery peer.
         info = json.loads(run([WEBHOOK_BIN, "status"], timeout=30, env=env).stdout or "{}")
-        if not info.get("codexPeer") or str(info.get("codexThread") or "").lower() != thread.lower():
+        peer = info.get("codexPeer") if isinstance(info.get("codexPeer"), dict) else {}
+        if peer.get("alive") is not True or str(peer.get("thread") or "").lower() != thread.lower():
             raise RuntimeError("no delivery peer is attached to the thread of %s" % name)
     payload = {"session": name, "via": clean(request.get("topic"), 200), "event": clean(request.get("event"), 100),
                "reason": clean(why, 200), "text": text,
@@ -12621,7 +12622,10 @@ def main():
     if sys.argv[1] == "links":
         print(links_text(data))
         return
-    lock = open(STATE.parent / "watch-route.lock", "a") if STATE.parent.is_dir() else None
+    # One lock per batch: a repeat of THIS batch must wait for the first answer,
+    # but a slow model call for another repository must not hold it up.
+    batch = re.sub(r"[^A-Za-z0-9]", "", str(data.get("id") or ""))[:64] or "anon"
+    lock = open(STATE.parent / ("watch-route-%s.lock" % batch), "a") if STATE.parent.is_dir() else None
     try:
         if lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -19123,7 +19127,7 @@ fi
 # recorded decision instead of delivering twice.
 route_links=""
 if [ -n "$WATCH_ROUTE_BIN" ] && [ -x "$WATCH_ROUTE_BIN" ]; then
-  route_id="$(printf '%s\n%s\n%s' "''${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" "$PROMPT" | cksum | tr -d ' ')"
+  route_id="$(printf '%s\n%s\n%s\n%s' "''${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" "$PROMPT" "''${LOCAL_WEBHOOK_SPAWN_META:-}" | cksum | tr -d ' ')"
   route_decision="$("$JQ" -n --arg id "$route_id" --arg src "''${LOCAL_WEBHOOK_SPAWN_SOURCE:-github}" \
       --arg key "''${LOCAL_WEBHOOK_SPAWN_KEY:-}" --arg topic "''${LOCAL_WEBHOOK_SPAWN_TOPIC:-}" \
       --arg event "''${LOCAL_WEBHOOK_SPAWN_EVENT:-}" --arg text "$PROMPT" \

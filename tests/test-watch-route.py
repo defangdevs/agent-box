@@ -393,6 +393,24 @@ class WatchRouteTest(unittest.TestCase):
                     self.wr.deliver("cx", {"harness": "codex", "native": "99999999-9999-9999-9999-999999999999"},
                                     self.request(), "x")
 
+    def test_a_codex_peer_must_be_alive_and_on_the_selected_thread(self):
+        self.register("cx", harness="codex")
+        candidate = {"harness": "codex", "native": THREAD}
+        for peer in (None, {"alive": False, "thread": THREAD}, {"alive": True, "thread": "other"}):
+            out = mock.Mock(stdout=json.dumps({"codexPeer": peer}), check_returncode=mock.Mock())
+            with mock.patch.object(self.wr, "CODEX_THREADS", self.home / "threads.json"), \
+                    mock.patch.object(self.wr, "run", return_value=out), \
+                    mock.patch.object(self.wr, "ensure_routed_source"):
+                (self.home / "threads.json").write_text(json.dumps({"cx": {"thread": THREAD}}))
+                with self.assertRaises(RuntimeError):
+                    self.wr.deliver("cx", candidate, self.request(), "x")
+        good = mock.Mock(stdout=json.dumps({"codexPeer": {"alive": True, "thread": THREAD}}),
+                         check_returncode=mock.Mock())
+        with mock.patch.object(self.wr, "CODEX_THREADS", self.home / "threads.json"), \
+                mock.patch.object(self.wr, "run", return_value=good), \
+                mock.patch.object(self.wr, "ensure_routed_source"):
+            self.wr.deliver("cx", candidate, self.request(), "x")
+
     def test_old_decision_records_are_pruned(self):
         old = self.wr.STATE / "stale.json"
         self.wr.STATE.mkdir(parents=True)
