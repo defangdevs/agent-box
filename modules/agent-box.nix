@@ -1737,8 +1737,9 @@ let
     device. Enter the account's phone number with country code, start pairing,
     and give the displayed code to WhatsApp's Linked devices screen on the
     primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
-    Media must either be captioned that way or sent during an explicitly opened
-    ten-minute upload window. The bridge accepts them only from that
+    When the prefix is set, media must either be captioned that way or sent during
+    an explicitly opened ten-minute upload window. With an empty prefix, captionless
+    media is accepted directly. The bridge accepts them only from that
     account's Message Yourself chat. The device link belongs to the Linux user and
     survives agent session restarts. When you begin work on a WhatsApp message,
     acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
@@ -1805,7 +1806,8 @@ let
     after sending. No download link or re-pairing is needed.
 
     For an inbound image, video, or document, add `@agent` at the start of its
-    caption (a caption containing only `@agent` works). To send captionless media,
+    caption (a caption containing only `@agent` works). If the prefix is empty,
+    captionless media is accepted directly. Otherwise, to send captionless media,
     first send `@agent /attach`; that opens a ten-minute upload window for this
     account's Message Yourself chat. An agent can open the same window with `node
     ~/.local/share/local-whatsapp/bridge.mjs receive-files`. View-once media is not
@@ -11256,16 +11258,16 @@ import time
 from urllib.request import urlopen
 
 
-REV = "a54bb56dba4e6c8aafb57231ba81211eeb1e78ab"
+REV = "af3d7eb7ac1fe6e0ff8330a33a4936c103f80445"
 FILES = {
     "bridge.mjs": "d4f0a60f85bc14e870ba0dd4a8706992550c23f9949d83f926b332e3d9ba98c9",
-    "state.mjs": "1cc9f07e4ec4a5a004cfcffa4bb99af33638fb84153dbe775a973004eae138ff",
+    "state.mjs": "f66f127f150a3f46a4de6a40e4e860ec088a949641b64e407f01f4d27ae91af3",
     "package.json": "a685e52bfe73a8965869cf1884c98280bca5a9ada31ae2fa1ce8829dc5cb16eb",
     "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
 # local-router's single file, fetched with the bridge at the same REV. The
 # route subcommand loads it from the runtime directory.
-ROUTER_FILE = ("local-router/router.py", "cd0f1a591b8ccd1f0bba29b45098c5c4c3f631ea9b07acab31fb855651298a8d")
+ROUTER_FILE = ("local-router/router.py", "ef913fc4c41109e6ed97b5ed6279fe2d491990a5de39a9087a7b83889ea2640c")
 HOME = Path.home()
 RUNTIME = HOME / ".local/share/local-whatsapp"
 STATE = HOME / ".local/state/local-whatsapp"

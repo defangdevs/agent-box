@@ -302,8 +302,9 @@ The settings page's Connections section can link this user's WhatsApp as a
 device. Enter the account's phone number with country code, start pairing,
 and give the displayed code to WhatsApp's Linked devices screen on the
 primary phone. Text must start with `@agent ` (`@` plus this box's Linux user).
-Media must either be captioned that way or sent during an explicitly opened
-ten-minute upload window. The bridge accepts them only from that
+When the prefix is set, media must either be captioned that way or sent during
+an explicitly opened ten-minute upload window. With an empty prefix, captionless
+media is accepted directly. The bridge accepts them only from that
 account's Message Yourself chat. The device link belongs to the Linux user and
 survives agent session restarts. When you begin work on a WhatsApp message,
 acknowledge it with `node ~/.local/share/local-whatsapp/bridge.mjs ack MESSAGE_ID`
@@ -370,7 +371,8 @@ caption. PNG, JPEG, and WebP files are supported, up to 10 MiB, with at most
 after sending. No download link or re-pairing is needed.
 
 For an inbound image, video, or document, add `@agent` at the start of its
-caption (a caption containing only `@agent` works). To send captionless media,
+caption (a caption containing only `@agent` works). If the prefix is empty,
+captionless media is accepted directly. Otherwise, to send captionless media,
 first send `@agent /attach`; that opens a ten-minute upload window for this
 account's Message Yourself chat. An agent can open the same window with `node
 ~/.local/share/local-whatsapp/bridge.mjs receive-files`. View-once media is not
