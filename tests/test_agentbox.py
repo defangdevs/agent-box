@@ -4118,9 +4118,10 @@ class WorkspaceTest(unittest.TestCase):
     def test_add_records_and_merges_without_touching_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "workspaces.json")
-            rc = self.mod.cmd_workspace(argparse.Namespace(
-                action="add", name="research", config=str(CONFIG_JSON),
-                profile=None, state=state, no_apply=True))
+            with mock.patch("pwd.getpwnam", side_effect=KeyError):
+                rc = self.mod.cmd_workspace(argparse.Namespace(
+                    action="add", name="research", config=str(CONFIG_JSON),
+                    profile=None, state=state, no_apply=True))
             self.assertEqual(rc, 0)
             self.assertEqual(self.mod.load_workspaces(state), ["research"])
             data = self.mod.load_config(str(CONFIG_JSON))
@@ -4132,7 +4133,7 @@ class WorkspaceTest(unittest.TestCase):
     def test_bad_and_taken_names_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = str(Path(tmp) / "workspaces.json")
-            for name in ("Bad Name", "../x", ""):
+            for name in ("Bad Name", "../x", "", "research\n"):
                 with self.assertRaises(self.mod.ConfigError):
                     self.mod.cmd_workspace(argparse.Namespace(
                         action="add", name=name, config=str(CONFIG_JSON),
@@ -4143,6 +4144,35 @@ class WorkspaceTest(unittest.TestCase):
                         action="add", name="nobody", config=str(CONFIG_JSON),
                         profile=None, state=state, no_apply=True))
             self.assertFalse(Path(state).exists())
+
+
+class WorkspaceWebHashTest(unittest.TestCase):
+    """A new web user gets a hash before apply lists it (CodeRabbit, #1091)."""
+
+    def test_copies_root_hash_once_and_never_overwrites(self):
+        mod = load_agentbox()
+        spec = mock.Mock(web_enable=True)
+        spec.root_user.name = "agent"
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "agent.hash").write_text("HASH\n")
+            mod.ensure_web_hash(spec, "research", etc=tmp)
+            new = Path(tmp) / "research.hash"
+            self.assertEqual(new.read_text(), "HASH\n")
+            self.assertEqual(new.stat().st_mode & 0o777, 0o600)
+            new.write_text("OWN\n")
+            mod.ensure_web_hash(spec, "research", etc=tmp)
+            self.assertEqual(new.read_text(), "OWN\n")
+
+    def test_refuses_without_a_source_hash_and_skips_when_web_off(self):
+        mod = load_agentbox()
+        spec = mock.Mock(web_enable=True)
+        spec.root_user.name = "agent"
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(mod.ConfigError):
+                mod.ensure_web_hash(spec, "research", etc=tmp)
+            spec.web_enable = False
+            mod.ensure_web_hash(spec, "research", etc=tmp)
+            self.assertFalse((Path(tmp) / "research.hash").exists())
 
 
 class ApplyActivationTest(unittest.TestCase):

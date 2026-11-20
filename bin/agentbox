@@ -39,6 +39,7 @@ comparison.
 
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import html
 import ipaddress
@@ -341,7 +342,7 @@ def load_workspaces(path=None):
         raise ConfigError(f"{path or WORKSPACES_FILE} is unreadable: {e}")
     names = data.get("workspaces") if isinstance(data, dict) else None
     if not isinstance(names, list) or not all(
-            isinstance(n, str) and USER_RE.match(n) for n in names):
+            isinstance(n, str) and USER_RE.fullmatch(n) for n in names):
         raise ConfigError(
             f"{path or WORKSPACES_FILE}: expected {{\"workspaces\": "
             "[user names]}")
@@ -6421,36 +6422,73 @@ def cmd_workspace(args):
             print(name + ("" if name in declared else "  (added)"))
         return 0
     name = args.name
-    if not name or not USER_RE.match(name):
+    if not name or not USER_RE.fullmatch(name):
         raise ConfigError(f"invalid workspace name {name!r}: lower-case "
                           "letters, digits, _ and -, at most 32")
-    if name in declared or name in recorded:
-        print(f"workspace {name} already exists")
-        return 0
     try:
         import pwd
         pwd.getpwnam(name)
     except KeyError:
         pass
     else:
-        raise ConfigError(f"{name!r} is already a login on this host that "
-                          "agent-box does not manage; pick another name")
+        if name not in recorded:
+            raise ConfigError(f"{name!r} is already a login on this host "
+                              "that agent-box does not manage; pick another "
+                              "name")
+    if name in declared:
+        print(f"workspace {name} already exists")
+        return 0
     if os.geteuid() != 0 and not args.no_apply:
         raise ConfigError("adding a workspace needs root")
     path = Path(args.state or WORKSPACES_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".workspaces.")
-    with os.fdopen(fd, "w") as fh:
-        json.dump({"workspaces": sorted(recorded + [name])}, fh)
-        fh.write("\n")
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
-    print(f"recorded workspace {name} in {path}")
+    # Serialize read-modify-write: two concurrent adds must not drop a name.
+    with open(str(path) + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        recorded = load_workspaces(args.state)
+        if name not in recorded:
+            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".workspaces.")
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"workspaces": sorted(recorded + [name])}, fh)
+                fh.write("\n")
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+            print(f"recorded workspace {name} in {path}")
     if args.no_apply:
         return 0
+    # Also reached when the name was recorded by an earlier attempt whose
+    # apply failed: re-running finishes the provisioning instead of
+    # reporting success over a half-made user.
+    profile = resolve_profile(args.profile)
+    spec = Spec(merge_workspaces(load_config(args.config), args.state),
+                profile, root="/")
+    ensure_web_hash(spec, name)
     return cmd_apply(argparse.Namespace(
         config=args.config, profile=args.profile, root=None, dry_run=False,
         first_boot=False, settle_delay=0))
+
+
+def ensure_web_hash(spec, name, etc="/etc/agent-box"):
+    """Give a new web user a password hash before apply lists it.
+
+    write_auth_env reads every listed hash file, so a missing one would stop
+    /run/agent-box-web/env from being written and caddy from starting for
+    every user. Same rule as first_boot: all users share the box's web
+    password, so the new user reuses the root user's existing hash. An
+    existing hash file is never touched.
+    """
+    if not spec.web_enable:
+        return
+    target = Path(etc) / f"{name}.hash"
+    if target.is_file():
+        return
+    source = Path(etc) / f"{spec.root_user.name}.hash"
+    if not source.is_file():
+        raise ConfigError(f"cannot give {name} web access: {source} is "
+                          "missing; nothing was applied")
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(source.read_text().strip() + "\n")
 
 
 def main(argv=None):
