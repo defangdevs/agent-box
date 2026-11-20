@@ -17,11 +17,11 @@ import time
 from urllib.request import urlopen
 
 
-REV = "af3d7eb7ac1fe6e0ff8330a33a4936c103f80445"
+REV = "1144d340db7385ae6a9fdfcc440630533c39871b"
 FILES = {
-    "bridge.mjs": "d4f0a60f85bc14e870ba0dd4a8706992550c23f9949d83f926b332e3d9ba98c9",
-    "state.mjs": "f66f127f150a3f46a4de6a40e4e860ec088a949641b64e407f01f4d27ae91af3",
-    "package.json": "a685e52bfe73a8965869cf1884c98280bca5a9ada31ae2fa1ce8829dc5cb16eb",
+    "bridge.mjs": "3eb441badd1e0ba74a6e9c1f58ac7a8c1eb65154820ff5381d23a482b4b797a9",
+    "state.mjs": "1f2678c8a8311e9bfab64a47b7a04b2e0126732ab145492890c774cadb3779ed",
+    "package.json": "2bae40c8aadfcaf160e275dfaec65eceacb33ca05db1bdb616144207f7fa3bb2",
     "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
 # local-router's single file, fetched with the bridge at the same REV. The
