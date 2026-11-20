@@ -842,7 +842,7 @@ if [ -n "$WATCH_ROUTE_BIN" ] && [ -x "$WATCH_ROUTE_BIN" ]; then
       --arg event "${LOCAL_WEBHOOK_SPAWN_EVENT:-}" --arg text "$PROMPT" \
       --argjson meta "${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
       '{id: $id, source: $src, key: $key, topic: $topic, event: $event, text: $text, meta: $meta}' 2>/dev/null \
-    | timeout 120 "$WATCH_ROUTE_BIN" route)" || route_decision=""
+    | timeout 400 "$WATCH_ROUTE_BIN" route)" || route_decision=""
   case "$(printf '%s' "$route_decision" | "$JQ" -r '.action // empty' 2>/dev/null)" in
     CONTINUE)
       echo "agent-box-webhook-spawn: routed this batch to session" \

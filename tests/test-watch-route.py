@@ -282,7 +282,7 @@ class WatchRouteTest(unittest.TestCase):
             return mock.Mock(returncode=0, stdout="", stderr="", check_returncode=mock.Mock())
         sources = self.home / ".local/state/local-webhook/sources.json"
         sources.parent.mkdir(parents=True, exist_ok=True)
-        sources.write_text(json.dumps({"sources": {"routed": {"keyPath": "session"}}}))
+        sources.write_text(json.dumps({"sources": {"routed": {"keyPath": "session", "format": "generic", "retainPayload": True}}}))
         with mock.patch.object(self.wr, "load_router", return_value=stub), \
                 mock.patch.object(self.wr, "run", side_effect=fake_run):
             result = self.wr.route(self.request())
@@ -322,6 +322,76 @@ class WatchRouteTest(unittest.TestCase):
         with mock.patch.object(self.wr, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")):
             with self.assertRaises(RuntimeError):
                 self.wr.ensure_routed_source()
+
+    def test_an_incomplete_routed_source_is_set_up_again(self):
+        sources = self.home / ".local/state/local-webhook/sources.json"
+        sources.parent.mkdir(parents=True, exist_ok=True)
+        sources.write_text(json.dumps({"sources": {"routed": {"keyPath": "session"}}}))
+        with mock.patch.object(self.wr, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")) as run:
+            with self.assertRaises(RuntimeError):      # the stub does not repair it
+                self.wr.ensure_routed_source()
+        self.assertEqual(run.call_args[0][0][1:], ["setup", "routed"])
+
+    def test_a_batch_too_long_for_one_message_starts_a_session(self):
+        self.owner()
+        request = dict(self.request(), text="x" * (self.wr.MAX_TEXT + 1))
+        with mock.patch.object(self.wr, "load_router", return_value=StubRouter({"action": "CONTINUE", "thread": "A"})), \
+                mock.patch.object(self.wr, "run", side_effect=AssertionError("must not wake or emit")):
+            self.assertEqual(self.wr.route(request)["reason"], "delivery-failed")
+
+    def test_an_emit_timeout_counts_as_delivered_but_a_refusal_does_not(self):
+        import subprocess
+        self.owner()
+        stub = StubRouter({"action": "CONTINUE", "thread": "A"})
+
+        def runner(failure):
+            def fake(argv, **kwargs):
+                if argv[1:2] == ["emit"]:
+                    raise failure
+                return mock.Mock(returncode=0, stdout="", stderr="", check_returncode=mock.Mock())
+            return fake
+        sources = self.home / ".local/state/local-webhook/sources.json"
+        sources.parent.mkdir(parents=True, exist_ok=True)
+        sources.write_text(json.dumps({"sources": {"routed": {
+            "keyPath": "session", "format": "generic", "retainPayload": True}}}))
+        with mock.patch.object(self.wr, "load_router", return_value=stub), \
+                mock.patch.object(self.wr, "run", side_effect=runner(subprocess.TimeoutExpired("emit", 60))):
+            self.assertEqual(self.wr.route(self.request())["action"], "CONTINUE")
+        self.setUp()
+        self.owner()
+        sources.parent.mkdir(parents=True, exist_ok=True)
+        sources.write_text(json.dumps({"sources": {"routed": {
+            "keyPath": "session", "format": "generic", "retainPayload": True}}}))
+        with mock.patch.object(self.wr, "load_router", return_value=stub), \
+                mock.patch.object(self.wr, "run", side_effect=runner(subprocess.CalledProcessError(1, "emit"))):
+            self.assertEqual(self.wr.route(self.request())["action"], "NEW")
+
+    def test_a_branch_without_a_slash_is_evidence_but_a_shared_one_is_not(self):
+        o = self.wr.objects({"key": "acme/widgets", "meta": {"branch": "fix-router"}})
+        self.assertEqual(o["branches"], ["fix-router"])
+        self.assertEqual(self.wr.objects({"key": "acme/widgets", "meta": {"branch": "master"}})["branches"], [])
+
+    def test_a_number_in_another_repositorys_url_is_not_evidence(self):
+        o = self.wr.objects(self.request())
+        self.assertEqual(self.wr.mentions("see other/payments/issues/42", o)[0], 0)
+        self.assertEqual(self.wr.mentions("see acme/widgets/issues/42", o)[0], 1)
+
+    def test_a_repo_only_candidate_does_not_call_the_model(self):
+        self.claude_transcript(CLAUDE_ID, [claude_line("user", "tidy widgets")])
+        self.register("owner", native=CLAUDE_ID)
+        with mock.patch.object(self.wr, "load_router", side_effect=AssertionError("asked")):
+            self.assertEqual(self.wr.decide(self.request())["action"], "NEW")
+
+    def test_a_codex_thread_that_changed_since_selection_is_not_delivered_to(self):
+        self.register("cx", harness="codex")
+        (self.home / ".local/state/agent-box").mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(self.wr, "CODEX_THREADS", self.home / "threads.json"):
+            (self.home / "threads.json").write_text(json.dumps({"cx": {"thread": THREAD}}))
+            with mock.patch.object(self.wr, "run", return_value=mock.Mock(check_returncode=mock.Mock())), \
+                    mock.patch.object(self.wr, "ensure_routed_source"):
+                with self.assertRaises(RuntimeError):
+                    self.wr.deliver("cx", {"harness": "codex", "native": "99999999-9999-9999-9999-999999999999"},
+                                    self.request(), "x")
 
     def test_old_decision_records_are_pruned(self):
         old = self.wr.STATE / "stale.json"

@@ -12069,6 +12069,7 @@ MAX_CANDIDATES = 8
 MAX_LINKS = 3
 ROUTE_TIMEOUT = 45          # one model call; the receiver allows a spawn 600 s
 SCAN_LIMIT = 400            # transcript files examined per call
+MAX_TEXT = 20000            # one routed message; a longer batch starts a worker instead
 INBOX_TTL_HOURS = "8"       # local-webhook's longest session TTL; renewed on delivery
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,149}")
 
@@ -12097,7 +12098,10 @@ Answer: {{"action": "CONTINUE|NEW|NEW_LINKS", "thread": "<letter or null>", "lin
 
 # The receiver unit's PATH carries none of the profile, and the model call is a
 # harness CLI (claude, codex) installed in the user's profile.
-os.environ["PATH"] = os.pathsep.join([str(HOME / ".nix-profile/bin"), "/nix/var/nix/profiles/agent-box/bin",
+# agent-box-webhook starts python3 by bare name, so this interpreter's own
+# directory goes first: the unit's PATH may hold no python3 at all.
+os.environ["PATH"] = os.pathsep.join([os.path.dirname(os.path.realpath(sys.executable)),
+                                      str(HOME / ".nix-profile/bin"), "/nix/var/nix/profiles/agent-box/bin",
                                       os.environ.get("PATH", "")])
 
 
@@ -12107,6 +12111,9 @@ def log(text):
 
 # ------------------------------------------------------------------ objects
 
+SHARED_BRANCHES = {"main", "master", "develop", "development", "trunk", "head", "dev", "staging", "production", "release"}
+
+
 def clean(value, limit=200):
     return re.sub(r"[\x00-\x1f\x7f]", " ", str(value or ""))[:limit].strip()
 
@@ -12115,7 +12122,7 @@ def objects(request):
     """What the batch is about, as the strings a transcript would contain."""
     meta = request.get("meta") if isinstance(request.get("meta"), dict) else {}
     key = clean(request.get("key"), 200)
-    out = {"repo": key.split("/")[-1] if "/" in key else key, "numbers": [], "branches": [], "shas": []}
+    out = {"key": key, "repo": key.split("/")[-1] if "/" in key else key, "numbers": [], "branches": [], "shas": []}
     number = clean(meta.get("number"), 12)
     if number.isdigit():
         out["numbers"].append(number)
@@ -12123,7 +12130,7 @@ def objects(request):
         value = clean(meta.get(field), 200)
         value = value[len("refs/heads/"):] if value.startswith("refs/heads/") else value
         # A shared ref ("main") is everybody's: it says nothing about one session.
-        if "/" in value and value not in out["branches"]:
+        if value and value.lower() not in SHARED_BRANCHES and value not in out["branches"]:
             out["branches"].append(value)
     sha = clean(meta.get("sha"), 40)
     if re.fullmatch(r"[0-9a-f]{7,40}", sha):
@@ -12135,14 +12142,19 @@ def mentions(blob, objs):
     """(score, what matched). A number, branch or sha is evidence of the object;
     the repo name alone only says the session worked in that repository."""
     found = []
+    repo = bool(objs["repo"]) and objs["repo"] in blob
+    # A URL that names another owner/repo is not evidence of this object. A bare
+    # "#42" or "gh pr view 42" is: the session's repository is not in the text.
+    key = (objs.get("key") or "").lower()
+    own = re.sub(r"([\w.-]{1,100}/[\w.-]{1,100})/(?:pull|issues)/\d{1,12}",
+                 lambda m: m.group(0) if m.group(1).lower().endswith(key) and key else " ", blob)
     for n in objs["numbers"]:
         # "#42", a URL, "PR 42", "gh pr view 42", "gh issue comment 42", "--claim 42"
-        if re.search(r"(?:#|/pull/|/issues/|--claim |\b(?:pr|issue)s? (?:[a-z]{3,8} )?)%s\b" % re.escape(n), blob,
+        if re.search(r"(?:#|/pull/|/issues/|--claim |\b(?:pr|issue)s? (?:[a-z]{3,8} )?)%s\b" % re.escape(n), own,
                      re.IGNORECASE):
             found.append("#" + n)
     found += [b for b in objs["branches"] if b in blob]
     found += [s for s in objs["shas"] if s in blob]
-    repo = bool(objs["repo"]) and objs["repo"] in blob
     return len(found), found, repo
 
 
@@ -12313,7 +12325,8 @@ def gather(objs):
         last = next((t for r, t in reversed(said) if r == "assistant"), "")
         candidates.append({"id": name, "harness": harness, "interactive": entry.get("origin") != "webhook",
                            "stopped": entry.get("stopped") is True, "score": score, "found": found,
-                           "age": age, "history": history, "last": last, "path": str(path)})
+                           "age": age, "history": history, "last": last, "path": str(path),
+                           "native": path.stem[-36:]})
     candidates.sort(key=lambda c: (-c["score"], c["age"]))
     candidates = candidates[:MAX_CANDIDATES]
     links = []
@@ -12447,7 +12460,9 @@ def ensure_routed_source():
             entry = json.loads(sources.read_text())["sources"]["routed"]
         except (OSError, ValueError, KeyError, TypeError):
             return False
-        return isinstance(entry, dict) and entry.get("keyPath") == "session" and entry.get("trust") != "owner"
+        if not isinstance(entry, dict) or entry.get("trust") == "owner":
+            return False
+        return (entry.get("keyPath"), entry.get("format"), entry.get("retainPayload")) == ("session", "generic", True)
     if good():
         return
     result = run([WEBHOOK_BIN, "setup", "routed"], timeout=30)
@@ -12456,24 +12471,37 @@ def ensure_routed_source():
 
 
 def deliver(name, candidate, request, why):
-    """Wake NAME, renew its routed subscription, emit the batch on the bus."""
+    """Wake NAME, renew its routed subscription, emit the batch on the bus.
+    Raises BEFORE anything is emitted when the batch cannot be delivered whole
+    or the session cannot be reached, so the caller can start a worker instead.
+    Returns normally once an emit has been attempted: from then on the outcome
+    may be unknown, and a second worker could duplicate the work."""
+    text = str(request.get("text") or "")
+    if len(text) > MAX_TEXT:
+        raise RuntimeError("batch is %d characters, more than one message carries" % len(text))
     run([SESSION_BIN, "whatsapp", "wake", name], timeout=180).check_returncode()
     ensure_routed_source()
     env = dict(os.environ, LOCAL_WEBHOOK_SESSION="%s-%s" % (os.environ.get("USER") or "", name))
     env.pop("LOCAL_WEBHOOK_CODEX_THREAD", None)
     if candidate["harness"] == "codex":
         thread = json.loads(CODEX_THREADS.read_text())[name]["thread"]
+        if thread.lower() != str(candidate.get("native") or "").lower():
+            raise RuntimeError("the thread of %s changed since its transcript was read" % name)
         env["LOCAL_WEBHOOK_CODEX_THREAD"] = thread
     run([WEBHOOK_BIN, "subscribe", "routed:" + name, "--ttl", INBOX_TTL_HOURS,
          "--note", "GitHub events the standing watch routed to this session"],
         timeout=60, env=env).check_returncode()
+    if candidate["harness"] == "codex":
+        # subscribe only warns when it cannot start the delivery peer.
+        info = json.loads(run([WEBHOOK_BIN, "status"], timeout=30, env=env).stdout or "{}")
+        if not info.get("codexPeer") or str(info.get("codexThread") or "").lower() != thread.lower():
+            raise RuntimeError("no delivery peer is attached to the thread of %s" % name)
     payload = {"session": name, "via": clean(request.get("topic"), 200), "event": clean(request.get("event"), 100),
-               "reason": clean(why, 200), "text": str(request.get("text") or "")[:20000],
+               "reason": clean(why, 200), "text": text,
                "note": "Routed here by the standing watch because this session already works on the object "
                        "these events are about. The text below is the watch's rendering of an UNTRUSTED event."}
     delivery = "watch-" + str(request.get("id") or hashlib.sha256(payload["text"].encode()).hexdigest())[:40]
-    run([WEBHOOK_BIN, "emit", "routed", "-", "--event", "batch", "--delivery-id", delivery],
-        input=json.dumps(payload), timeout=60).check_returncode()
+    return payload, delivery
 
 
 # ------------------------------------------------------------------ routing
@@ -12483,7 +12511,9 @@ def decide(request):
     candidates, links = gather(objs)
     result = {"action": "NEW", "session": None, "links": [], "reason": "no-candidate"}
     answer = None
-    if candidates:
+    # A candidate that only touched the repository is context for the model, not
+    # a reason to ask it: no object evidence, no model call.
+    if any(c["score"] for c in candidates):
         try:
             answer = ask(load_router(), candidates, str(request.get("text") or ""))
         except Exception as error:     # no router, no network: fail open
@@ -12537,16 +12567,38 @@ def route(request):
     request = dict(request, id=batch)
     result = decide(request)
     target = result.pop("_c", None)
+
+    def remember(value):
+        pending = record.with_name(record.name + ".%d.tmp" % os.getpid())
+        pending.write_text(json.dumps(value))
+        pending.chmod(0o600)
+        pending.replace(record)
     if result["action"] == "CONTINUE":
         try:
-            deliver(result["session"], target, request, result["reason"])
+            payload, delivery = deliver(result["session"], target, request, result["reason"])
         except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:
             log("could not deliver to %s: %s" % (result["session"], str(error)[:200]))
             result = {"action": "NEW", "session": None, "links": [], "reason": "delivery-failed"}
-    pending = record.with_name(record.name + ".%d.tmp" % os.getpid())
-    pending.write_text(json.dumps(result))
-    pending.chmod(0o600)
-    pending.replace(record)
+        else:
+            # Written BEFORE the emit: whatever happens next (a timeout, a kill, a
+            # failed write afterwards) a repeat answers CONTINUE instead of
+            # delivering twice, and no worker starts for a batch the session may hold.
+            try:
+                remember(result)
+            except OSError as error:
+                log("could not record the decision: %s" % str(error)[:200])
+            try:
+                run([WEBHOOK_BIN, "emit", "routed", "-", "--event", "batch", "--delivery-id", delivery],
+                    input=json.dumps(payload), timeout=60).check_returncode()
+            except subprocess.TimeoutExpired:
+                log("emit timed out; the outcome is unknown, so the batch counts as delivered")
+            except (OSError, subprocess.SubprocessError) as error:
+                log("could not emit to %s: %s" % (result["session"], str(error)[:200]))
+                result = {"action": "NEW", "session": None, "links": [], "reason": "delivery-failed"}
+    try:
+        remember(result)
+    except OSError as error:
+        log("could not record the decision: %s" % str(error)[:200])
     return result
 
 
@@ -19077,7 +19129,7 @@ if [ -n "$WATCH_ROUTE_BIN" ] && [ -x "$WATCH_ROUTE_BIN" ]; then
       --arg event "''${LOCAL_WEBHOOK_SPAWN_EVENT:-}" --arg text "$PROMPT" \
       --argjson meta "''${LOCAL_WEBHOOK_SPAWN_META:-{\}}" \
       '{id: $id, source: $src, key: $key, topic: $topic, event: $event, text: $text, meta: $meta}' 2>/dev/null \
-    | timeout 120 "$WATCH_ROUTE_BIN" route)" || route_decision=""
+    | timeout 400 "$WATCH_ROUTE_BIN" route)" || route_decision=""
   case "$(printf '%s' "$route_decision" | "$JQ" -r '.action // empty' 2>/dev/null)" in
     CONTINUE)
       echo "agent-box-webhook-spawn: routed this batch to session" \
