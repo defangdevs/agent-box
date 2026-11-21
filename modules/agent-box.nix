@@ -10288,11 +10288,15 @@ finish_wait() {
             if "$SESSION_SELF" rm --now "$_fname"; then
               [ -z "$_fkeep" ] || rm -f "$_fkeep"
               return 0
+            else
+              _frc=$?
+              # Failed. Put the claim back only if the session is still listed;
+              # a delisted name must not keep claiming topics.
+              if [ -n "$_fkeep" ]; then
+                if taken "$_fname" && [ ! -e "$_ffilter" ]; then mv -f "$_fkeep" "$_ffilter"; else rm -f "$_fkeep"; fi
+              fi
+              return "$_frc"
             fi
-            # Removal failed: the session is still listed and must keep its claim.
-            _frc=$?
-            [ -z "$_fkeep" ] || { [ -e "$_ffilter" ] && rm -f "$_fkeep" || mv -f "$_fkeep" "$_ffilter"; }
-            return "$_frc"
           fi
           [ -z "$_fkeep" ] || { [ -e "$_ffilter" ] && rm -f "$_fkeep" || mv -f "$_fkeep" "$_ffilter"; }
           _fquiet=0
