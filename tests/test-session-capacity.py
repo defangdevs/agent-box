@@ -2,6 +2,7 @@
 """Shared capacity policy and real concurrent CLI admission (issue #662)."""
 import concurrent.futures
 import importlib.util
+import getpass
 import json
 import os
 from pathlib import Path
@@ -589,6 +590,9 @@ class Cli(unittest.TestCase):
         transcript.write_text(json.dumps(
             {"type": "assistant", "message": {"stop_reason": "end_turn"}}
             if closed else {"type": "user", "message": {"content": "work"}}) + "\n")
+        # The caller is this session: that is what makes `rm` defer.
+        self.env.pop("TMUX", None)
+        self.env["LOCAL_WEBHOOK_SESSION"] = getpass.getuser() + "-" + name
         self.env.update({"AGENT_BOX_FINISH_POLL_S": "0.2",
                          "AGENT_BOX_FINISH_TIMEOUT_S": "20"})
         return transcript
@@ -610,7 +614,7 @@ class Cli(unittest.TestCase):
 
     def test_finish_removes_a_quiet_session_after_returning(self):
         self.finishing_session()
-        done = self.run_cli("finish", "hook-x")
+        done = self.run_cli("rm", "hook-x")
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn("will be removed", done.stdout)
         self.assertTrue(self.wait_for(lambda: not self.listed()), self.finish_log())
@@ -618,7 +622,7 @@ class Cli(unittest.TestCase):
 
     def test_finish_waits_out_an_open_turn_then_removes(self):
         transcript = self.finishing_session(closed=False)
-        self.assertEqual(self.run_cli("finish", "hook-x").returncode, 0)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
         time.sleep(1.0)
         self.assertTrue(self.listed(), "an open turn must never be cut short")
         with transcript.open("a") as handle:
@@ -629,7 +633,7 @@ class Cli(unittest.TestCase):
     def test_finish_stands_down_when_a_delivery_arrives_after_it(self):
         # The PR 1076 race: events land after the agent's last look.
         transcript = self.finishing_session(closed=False)
-        self.assertEqual(self.run_cli("finish", "hook-x").returncode, 0)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
         time.sleep(0.5)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1))
         with transcript.open("a") as handle:
@@ -641,13 +645,19 @@ class Cli(unittest.TestCase):
                         self.finish_log())
         self.assertTrue(self.listed(), "a session with unread input must stay")
 
-    def test_finish_refuses_a_session_it_cannot_prove_one_shot_or_listed(self):
+    def test_rm_is_immediate_for_other_callers_and_for_now(self):
+        self.finishing_session()
+        self.env["LOCAL_WEBHOOK_SESSION"] = getpass.getuser() + "-someone-else"
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        self.assertFalse(self.listed())
+        self.finishing_session()
+        self.assertEqual(self.run_cli("rm", "--now", "hook-x").returncode, 0)
+        self.assertFalse(self.listed())
+
+    def test_self_rm_of_a_non_ephemeral_session_is_immediate(self):
         self.finishing_session(ephemeral=False)
-        refused = self.run_cli("finish", "hook-x")
-        self.assertEqual(refused.returncode, 2)
-        self.assertIn("not a one-shot", refused.stderr)
-        self.assertTrue(self.listed())
-        self.assertEqual(self.run_cli("finish", "nobody").returncode, 2)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        self.assertFalse(self.listed())
 
     def test_concurrent_manual_adds_bypass_full_hook_capacity(self):
         for name in ("hook-a", "hook-b"):
