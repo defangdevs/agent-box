@@ -52,6 +52,20 @@ def capacity_main():
             result = hibernation_candidate(
                 sessions, name=sys.argv[3], quiet=sys.argv[4])
             return 1 if result is None else 0
+        if command == "finish-state":
+            # May a session that ran `finish` be removed yet? See
+            # finish_state(): idle, busy, input or unknown on stdout.
+            if len(sys.argv) != 5:
+                print("usage: agent-box-session-capacity finish-state REGISTRY NAME SINCE",
+                      file=sys.stderr)
+                return 2
+            try:
+                since = float(sys.argv[4])
+            except ValueError:
+                print("finish-state: SINCE must be epoch seconds", file=sys.stderr)
+                return 2
+            print(finish_state(sys.argv[3], sessions.get(sys.argv[3]), since))
+            return 0
         if command not in ("check", "spawn"):
             print("unknown capacity command: %s" % command, file=sys.stderr)
             return 2
