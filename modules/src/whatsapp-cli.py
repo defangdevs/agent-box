@@ -17,10 +17,10 @@ import time
 from urllib.request import urlopen
 
 
-REV = "1144d340db7385ae6a9fdfcc440630533c39871b"
+REV = "20e25996360cd0d82d09124d7a3816f113d602a8"
 FILES = {
-    "bridge.mjs": "3eb441badd1e0ba74a6e9c1f58ac7a8c1eb65154820ff5381d23a482b4b797a9",
-    "state.mjs": "1f2678c8a8311e9bfab64a47b7a04b2e0126732ab145492890c774cadb3779ed",
+    "bridge.mjs": "76de0b8bd7cf9c583ae4e2ab62af5192f3b31aebe9dacbe84441aeae11cbaed3",
+    "state.mjs": "05f4aa63ebb4dbe0be83d14b6bc04ac940d6f8ac2abe6c6e73e4cfc6c92ef6fc",
     "package.json": "2bae40c8aadfcaf160e275dfaec65eceacb33ca05db1bdb616144207f7fa3bb2",
     "package-lock.json": "90d22fc38b86ae7f3588505408e175e332145736a11b9da22c2dceb457747e21",
 }
@@ -615,8 +615,16 @@ def route_request(request, router=None):
     router = router or load_router()
     sessions = [{"id": name, "messages": known[name].get("messages") or []} for name in known]
     current = state.get("current") if state.get("current") in known else None
-    decision = router.route({"text": message.get("text") or "", "ts": message.get("ts")},
-                            sessions, current, backend=router_backend(router))
+    route_message = {"text": message.get("text") or "", "ts": message.get("ts")}
+    # The bridge resolves a WhatsApp quote to an earlier inbound message. Only
+    # trust a recorded decision whose session is still the same registry entry.
+    quoted = message.get("reply_to_message")
+    previous = decisions.get(quoted) if isinstance(quoted, str) else None
+    if isinstance(previous, dict):
+        name, sid = previous.get("session"), previous.get("id")
+        if isinstance(name, str) and name in known and sid and live[name].get("id") == sid:
+            route_message["reply_to"] = name
+    decision = router.route(route_message, sessions, current, backend=router_backend(router))
     if decision.get("reason") == "fallback" and decision.get("error"):
         try:
             ROUTE_BACKEND_CACHE.unlink()

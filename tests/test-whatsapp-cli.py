@@ -337,6 +337,24 @@ class WhatsAppRouteTest(unittest.TestCase):
         self.assertEqual(msgs[-1]["topic"], "VAT rate Greece")
         self.assertEqual(self.state()["current"], "wa-vat")
 
+    def test_quote_resolves_only_a_matching_live_session_identity(self):
+        for quote, saved_id, live_id, expected in [
+            ("M1", "v1", "v1", "wa-vat"),
+            ("missing", "v1", "v1", None),
+            ("M1", "v1", "v2", None),
+            ("M1", None, "v1", None),
+            (["bad"], "v1", "v1", None),
+        ]:
+            with self.subTest(quote=quote, saved_id=saved_id, live_id=live_id):
+                self.live([{"name": "wa-vat", "id": live_id, "harness": "claude", "stopped": False}])
+                self.cli.write_private(self.cli.ROUTE_STATE, {"current": "wa-vat", "sessions": {
+                    "wa-vat": {"id": live_id, "messages": []}}, "decisions": {
+                    "M1": {"session": "wa-vat", "id": saved_id}}})
+                router = FakeRouter({"action": "CONTINUE", "session": "wa-vat", "links": [], "reason": "llm"})
+                request = dict(self.REQUEST, message=dict(self.REQUEST["message"], reply_to_message=quote))
+                self.cli.route_request(request, router)
+                self.assertEqual(router.calls[0]["message"].get("reply_to"), expected)
+
     def test_existing_owner_source_is_not_set_up_again(self):
         sources = self.root / ".local/state/local-webhook/sources.json"
         sources.parent.mkdir(parents=True)
