@@ -2296,7 +2296,7 @@
         )
         assert rc == 0, (stale, rc, out, machine.execute(
             "jq -c '.sessions|keys' /home/agent/.config/agent-box/sessions.json;"
-            " sudo -u agent tmux -L agent-box ls 2>&1"
+            " sudo -u agent env TMUX_TMPDIR=/run/agent-box-agent tmux -L agent-box ls 2>&1"
         )[1])
 
     # --- who "@self" is, resolved at runtime (issue #261) -------------------
