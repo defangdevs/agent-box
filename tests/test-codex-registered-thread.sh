@@ -268,6 +268,7 @@ codex_rollout_uuid() {
   case "$1" in
     launch-for-tui) _resolved=01a10363-0000-7000-8000-000000000004 ;;
     launch-for-effective) _resolved=01a10364-0000-7000-8000-000000000005 ;;
+    launch-for-unselected) _resolved=01a10366-0000-7000-8000-000000000007 ;;
     (*) return 0 ;;
   esac
   [ "$2" = "$TEST_ROOT/home-for-default" ] || return 0
@@ -290,5 +291,24 @@ grep -Fx 'effective:01a10364-0000-7000-8000-000000000005' "$calls" >/dev/null \
   || { echo "FAIL: synchronized Codex threads were not persisted as native IDs" >&2; exit 1; }
 ! grep -F 'manual-remote:' "$calls" >/dev/null \
   || { echo "FAIL: a manual Remote Control registration was overwritten" >&2; exit 1; }
+
+# #1101: an externally supervised bridge has no stock ready marker. Routed
+# sessions are still published; the selected target and whatsapp-flagged
+# sessions (the stock bridge's business) are not.
+rm -f "$state/ready" "$calls" "$native_calls"
+mkdir -p "$HOME/.local/state/agent-box/router"
+printf '{"sessions":{"unselected":{}}}' > "$HOME/.local/state/agent-box/router/state.json"
+codex_sync_last=0
+sync_codex_threads
+grep -Fx 'unselected:01a10366-0000-7000-8000-000000000007' "$calls" >/dev/null \
+  || { echo "FAIL: routed session not synced without ready marker" >&2; exit 1; }
+! grep -E '^(tui|remote|effective):' "$calls" >/dev/null 2>&1 \
+  || { echo "FAIL: stock-bridge sessions synced without ready marker" >&2; exit 1; }
+rm -f "$calls"
+rm -f "$HOME/.local/state/agent-box/router/state.json"
+codex_sync_last=0
+sync_codex_threads
+[ ! -e "$calls" ] \
+  || { echo "FAIL: synced with no ready marker and no routed sessions" >&2; exit 1; }
 
 echo "codex_registered_thread: ok"
