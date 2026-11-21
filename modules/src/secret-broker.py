@@ -67,9 +67,10 @@ class SystemdLauncher(Launcher):
     def _unit_name(job):
         return f"agent-box-secret-job-{job.id}"
 
-    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd,
+              browser=None):
         frame_bytes = encode_worker_frame(argv_or_command, shell, secret_values,
-                                          nonsecret_env, cwd)
+                                          nonsecret_env, cwd, browser)
         cmd = [
             "systemd-run", "--pipe", "--quiet", "--collect",
             f"--unit={self._unit_name(job)}",
@@ -153,8 +154,12 @@ class Broker:
             return {"ok": True, **self.job_manager.status(profile, req["jobId"])}
         if op == "cancel":
             return {"ok": True, **self.job_manager.cancel(profile, req["jobId"])}
-        store = self._store(profile, create=(op == "set"))
-        if op in ("list", "set", "remove"):
+        # Not save-cookies: its job can still be refused (both job slots
+        # busy) or fail, and a namespace made for it would keep one of
+        # SECRET_MAX_NAMESPACES_PER_USER forever. Its sink creates the
+        # namespace only when it has a validated capture to store.
+        store = self._store(profile, create=(op in ("set", "generate")))
+        if op in ("list", "set", "remove", "generate"):
             if store is None:
                 if op == "list":
                     return {"ok": True, "secrets": []}
@@ -164,10 +169,89 @@ class Broker:
             # A missing namespace resolves no name, so _dispatch reports
             # "no such secret: NAME" for each; with no secretNames the job
             # simply runs.
-            resolve = store.get if store is not None else (lambda name: None)
+            resolve = self._exec_resolver(store)
             job_id = self.job_manager.start(profile, req, resolve)
             return {"ok": True, "jobId": job_id}
+        if op in ("fill", "save-cookies", "load-cookies"):
+            builtin, resolve = self._browser_job(store, profile, req, op)
+            job_id = self.job_manager.start(profile, req, resolve, builtin)
+            return {"ok": True, "jobId": job_id}
         raise SecretError("unsupported operation")
+
+    @staticmethod
+    def _exec_resolver(store):
+        """What exec may inject for a name: the value, a TOTP secret's
+        current code (never its seed), and nothing at all for a fill-only
+        secret - that one goes only to the fill op, onto its own origins."""
+        def resolve(name):
+            if store is None:
+                return None
+            # One record version supplies both the permission and the
+            # value, so a concurrent replace cannot pair them up wrong.
+            snap = store.snapshot(name)
+            if snap is None:
+                return None
+            meta, value = snap
+            if meta["fillOnly"]:
+                raise SecretError(f"{name} is fill-only: use fill, not exec")
+            if meta["kind"] == "totp":
+                return totp_code(value)
+            return value
+        return resolve
+
+    def _browser_job(self, store, profile, req, op):
+        """The fixed worker-side CDP job for one browser op. The origins
+        that bound it come from the RECORD (fill, load-cookies) or from the
+        request that is about to replace the record (save-cookies) - never
+        from the page, which is what the worker checks against them."""
+        name = req["name"]
+        browser = {"mode": op, "port": req["cdpPort"], "targetId": req.get("targetId")}
+        if op == "save-cookies":
+            browser["origins"] = list(req["origins"])
+            meta = record_meta_from_request(req, kind="cookies")
+            return ({"secretNames": [], "browser": browser,
+                     "capture": self._cookie_sink(profile, name, meta)}, None)
+        # The kind and origins that authorize this job and the value it
+        # carries come from ONE record version: a save-cookies finishing in
+        # the background must not hand the old record's origin policy a new
+        # record's value.
+        snap = store.snapshot(name) if store is not None else None
+        if snap is None:
+            raise SecretError(f"no such secret: {name}")
+        meta, value = snap
+        if not meta["origins"]:
+            raise SecretError(f"{name} has no origins: set it again with --origin")
+        if op == "fill" and meta["kind"] == "cookies":
+            raise SecretError(f"{name} holds cookies: use load-cookies")
+        if op == "load-cookies" and meta["kind"] != "cookies":
+            raise SecretError(f"{name} does not hold cookies")
+        browser["origins"] = meta["origins"]
+        browser["secret"] = name
+        if op == "fill":
+            browser["selector"] = req["selector"]
+
+        def resolve(asked):
+            if asked != name:
+                return None
+            return totp_code(value) if meta["kind"] == "totp" else value
+        return {"secretNames": [name], "browser": browser}, resolve
+
+    def _cookie_sink(self, profile, name, meta):
+        """Stores what a save-cookies worker printed. Runs on the job's
+        drain thread, so it opens a Store of its own rather than borrow the
+        cached one, which the serving thread may evict and close meanwhile."""
+        def sink(captured):
+            value = captured.decode("utf-8")
+            if not valid_secret_value(value):
+                raise SecretError("captured cookies are empty or too large to store")
+            count = len(parse_cookie_state(value))
+            store = Store(self.store_root, profile, self.user, self.uid, self.root_key)
+            try:
+                version = store.set(name, value, meta)
+            finally:
+                store.close()
+            return f"saved {count} cookies as {name} (v{version})\n"
+        return sink
 
 
 def _safe_send(conn, reply):
