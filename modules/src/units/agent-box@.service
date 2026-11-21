@@ -8,6 +8,7 @@ Type=exec
 User=%i
 Restart=always
 RestartSec=2s
+ExecStartPre=agent-box-gpg-init
 ExecStart=agent-box-supervisor
 ExecStop=tmux -L agent-box kill-server
 RuntimeDirectory=agent-box-%i
