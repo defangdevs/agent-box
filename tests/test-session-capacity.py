@@ -2,6 +2,7 @@
 """Shared capacity policy and real concurrent CLI admission (issue #662)."""
 import concurrent.futures
 import importlib.util
+import getpass
 import json
 import os
 from pathlib import Path
@@ -307,6 +308,54 @@ class Hibernation(unittest.TestCase):
         self.assertIsNone(capacity.hibernation_candidate(
             sessions, name="idle", quiet=selected["quiet"]))
 
+    def finish_probe(self, sessions, since):
+        return capacity.finish_state("idle", sessions["idle"], since)
+
+    def test_finish_waits_for_a_closed_turn_and_an_empty_queue(self):
+        # The PR 1076 sequence: the agent's last look, then deliveries queued
+        # behind it, then the self-rm. Only a closed turn with nothing queued
+        # lets `finish` remove the session.
+        since = 1_000.0
+        sessions, transcript = self.claude()
+        self.assertEqual(self.finish_probe(sessions, since), "idle")
+        sessions, transcript = self.claude(closed=False)
+        self.assertEqual(self.finish_probe(sessions, since), "busy")
+        sessions, transcript = self.claude()
+        self.append(transcript, {"type": "queue-operation", "operation": "enqueue",
+                                 "timestamp": "1970-01-01T00:20:00Z"})
+        self.assertEqual(self.finish_probe(sessions, since), "input")
+        # Queued BEFORE finish ran: not new input, but the turn it left open
+        # still holds the session until the harness has started on it.
+        sessions, transcript = self.claude()
+        self.append(transcript, {"type": "queue-operation", "operation": "enqueue",
+                                 "timestamp": "1970-01-01T00:10:00Z"})
+        self.assertEqual(self.finish_probe(sessions, since), "busy")
+
+    def test_finish_stands_down_for_a_delivery_or_a_person_but_not_a_tool_result(self):
+        since = 1_000.0
+        later = "1970-01-01T00:20:00Z"
+        result = {"type": "user", "timestamp": later, "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": "ok"}]}}
+        closed = {"type": "assistant", "timestamp": later, "message": {
+            "stop_reason": "end_turn", "content": []}}
+        sessions, transcript = self.claude()
+        self.append(transcript, result, closed)
+        self.assertEqual(self.finish_probe(sessions, since), "idle")
+        for content in ("<channel source=\"local-webhook\">", [
+                {"type": "text", "text": "hello"}]):
+            sessions, transcript = self.claude()
+            self.append(transcript, {"type": "user", "timestamp": later,
+                                     "message": {"content": content}}, closed)
+            self.assertEqual(self.finish_probe(sessions, since), "input")
+
+    def test_finish_never_decides_without_a_transcript(self):
+        sessions, transcript = self.claude()
+        transcript.unlink()
+        self.assertEqual(self.finish_probe(sessions, 0), "unknown")
+        self.assertEqual(capacity.finish_state("idle", None, 0), "unknown")
+        self.assertEqual(capacity.finish_state(
+            "idle", {"agent": "shell"}, 0), "unknown")
+
     def test_open_truncated_and_recent_claude_turns_stay_resident(self):
         sessions, transcript = self.claude(closed=False)
         self.assertIsNone(capacity.hibernation_candidate(sessions))
@@ -489,7 +538,11 @@ class Cli(unittest.TestCase):
         self.limit.write_text("2\n")
         self.registry.write_text(json.dumps({"version": 1, "sessions": {}}))
         self.cli = self.work / "session"
-        self.cli.write_text(expand(SRC / "session-cli.sh"))
+        # Executable with a shebang, like the installed wrapper: `finish`
+        # re-enters the CLI by path for its detached waiter.
+        self.cli.write_text("#!" + shutil.which("bash") + "\n"
+                            + expand(SRC / "session-cli.sh"))
+        self.cli.chmod(0o755)
         helper = self.work / "capacity"
         helper.write_text("#!" + sys.executable + "\n" +
                           (SRC / "lib/session-capacity.py").read_text() + "\n" +
@@ -517,6 +570,116 @@ class Cli(unittest.TestCase):
 
     def add_hook(self, name):
         return self.run_cli("add", name, "--origin", "webhook")
+
+    LAUNCH = "22222222-2222-4222-8222-222222222222"
+
+    def finishing_session(self, name="hook-x", ephemeral=True, closed=True):
+        """A registered one-shot Claude session whose transcript the waiter reads."""
+        entry = {"agent": "claude", "origin": "webhook", "hasRun": True,
+                 "boxSessionId": self.LAUNCH}
+        if ephemeral:
+            entry["ephemeral"] = True
+        self.registry.write_text(json.dumps(
+            {"version": 1, "sessions": {name: entry}}))
+        state = self.work / ".local/state/agent-box/session" / (name + ".json")
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"launchSessionId": self.LAUNCH,
+                                     "nativeSessionId": self.LAUNCH}))
+        transcript = self.work / ".claude/projects/-w" / (self.LAUNCH + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text(json.dumps(
+            {"type": "assistant", "message": {"stop_reason": "end_turn"}}
+            if closed else {"type": "user", "message": {"content": "work"}}) + "\n")
+        # The caller is this session: that is what makes `rm` defer.
+        self.env.pop("TMUX", None)
+        self.env["LOCAL_WEBHOOK_SESSION"] = getpass.getuser() + "-" + name
+        self.env.update({"AGENT_BOX_FINISH_POLL_S": "0.2",
+                         "AGENT_BOX_FINISH_TIMEOUT_S": "20"})
+        return transcript
+
+    def wait_for(self, predicate, seconds=15):
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.1)
+        return predicate()
+
+    def listed(self, name="hook-x"):
+        return name in json.loads(self.registry.read_text())["sessions"]
+
+    def finish_log(self, name="hook-x"):
+        path = self.work / ".local/state/agent-box/finish" / (name + ".log")
+        return path.read_text() if path.exists() else ""
+
+    def test_finish_removes_a_quiet_session_after_returning(self):
+        self.finishing_session()
+        done = self.run_cli("rm", "hook-x")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("will be removed", done.stdout)
+        self.assertTrue(self.wait_for(lambda: not self.listed()), self.finish_log())
+        self.assertIn("idle, nothing queued", self.finish_log())
+
+    def test_finish_waits_out_an_open_turn_then_removes(self):
+        transcript = self.finishing_session(closed=False)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        time.sleep(1.0)
+        self.assertTrue(self.listed(), "an open turn must never be cut short")
+        with transcript.open("a") as handle:
+            handle.write(json.dumps({"type": "assistant", "message": {
+                "stop_reason": "end_turn"}}) + "\n")
+        self.assertTrue(self.wait_for(lambda: not self.listed()), self.finish_log())
+
+    def test_finish_stands_down_when_a_delivery_arrives_after_it(self):
+        # The PR 1076 race: events land after the agent's last look.
+        transcript = self.finishing_session(closed=False)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        time.sleep(0.5)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1))
+        with transcript.open("a") as handle:
+            handle.write(json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                     "timestamp": stamp}) + "\n")
+            handle.write(json.dumps({"type": "assistant", "message": {
+                "stop_reason": "end_turn"}}) + "\n")
+        self.assertTrue(self.wait_for(lambda: "standing down" in self.finish_log()),
+                        self.finish_log())
+        self.assertTrue(self.listed(), "a session with unread input must stay")
+
+    def test_a_dequeue_after_rm_is_not_new_input(self):
+        transcript = self.finishing_session(closed=False)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        time.sleep(0.5)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1))
+        with transcript.open("a") as handle:
+            handle.write(json.dumps({"type": "queue-operation", "operation": "dequeue",
+                                     "timestamp": stamp}) + "\n")
+            handle.write(json.dumps({"type": "assistant", "message": {
+                "stop_reason": "end_turn"}}) + "\n")
+        self.assertTrue(self.wait_for(lambda: not self.listed()), self.finish_log())
+
+    def test_waiter_leaves_a_replacement_under_the_same_name_alone(self):
+        self.finishing_session(closed=False)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        data = json.loads(self.registry.read_text())
+        data["sessions"]["hook-x"]["boxSessionId"] = "other-launch"
+        self.registry.write_text(json.dumps(data))
+        self.assertTrue(self.wait_for(lambda: "different launch" in self.finish_log()),
+                        self.finish_log())
+        self.assertTrue(self.listed())
+
+    def test_rm_is_immediate_for_other_callers_and_for_now(self):
+        self.finishing_session()
+        self.env["LOCAL_WEBHOOK_SESSION"] = getpass.getuser() + "-someone-else"
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        self.assertFalse(self.listed())
+        self.finishing_session()
+        self.assertEqual(self.run_cli("rm", "--now", "hook-x").returncode, 0)
+        self.assertFalse(self.listed())
+
+    def test_self_rm_of_a_non_ephemeral_session_is_immediate(self):
+        self.finishing_session(ephemeral=False)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        self.assertFalse(self.listed())
 
     def test_concurrent_manual_adds_bypass_full_hook_capacity(self):
         for name in ("hook-a", "hook-b"):

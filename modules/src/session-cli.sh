@@ -20,6 +20,9 @@ JQ=jq
 REGISTRY_PROG=agent-box-session
 @@include:lib/registry.sh@@
 @@include:lib/lease.sh@@
+# This script, for the detached half of `rm` (it must re-enter by path:
+# the caller's PATH is not the waiter's).
+SESSION_SELF="${AGENT_BOX_SESSION_BIN:-$0}"
 AGENTS="${AGENT_BOX_AGENTS:?}"
 DEFAULT_AGENT="${AGENT_BOX_DEFAULT_AGENT:?}"
 # NOT ${TMUX_TMPDIR:-...}: the socket dir is the agent unit's
@@ -66,7 +69,7 @@ usage() {
   echo "                             [--prompt TEXT] [--resume-prompt TEXT] [--ephemeral]"
   echo "                             [--whatsapp true|false]"
   echo "                             [-- EXTRA_ARGS...]"
-  echo "       agent-box-session rm NAME"
+  echo "       agent-box-session rm [--now] NAME"
   echo "       agent-box-session stop NAME"
   echo "       agent-box-session hibernate [--exclude NAME...]"
   echo "       agent-box-session restart NAME | --all"
@@ -114,6 +117,10 @@ usage() {
   echo "ls/peers flag 'UNRESOLVED ASSIGNMENT' when a hook-* session's worker"
   echo "died or vanished (crash, reboot, OOM-kill) before saying it was done —"
   echo "check its pane or worktree; nothing here retries the work for you."
+  echo "rm run BY a one-shot (--ephemeral) session on itself returns at once and"
+  echo "removes it only once its last turn is closed and nothing is queued behind"
+  echo "it, so an event delivered a moment ago is read first (and cancels the"
+  echo "removal) instead of dying with the pane. --now removes at once."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
   echo "hibernate is demand-driven: only at the hook limit, park the oldest"
@@ -404,6 +411,108 @@ prune_session_state() {
   rm -f "$(session_state_file "$1")"
 }
 taken() { "$JQ" -e --arg n "$1" '.sessions | has($n)' "$REGISTRY_FILE" >/dev/null; }
+# The session this shell runs in, or empty. Same rule as `peers`: ask tmux only
+# when there is a client ($TMUX guard: display-message without one answers with
+# the most recently active session), else the supervisor's LOCAL_WEBHOOK_SESSION.
+self_session() {
+  _sme=""
+  if [ -n "${TMUX:-}" ]; then
+    _sme="$(t display-message -p '#S' 2>/dev/null || true)"
+  fi
+  if [ -z "$_sme" ] && [ -n "${LOCAL_WEBHOOK_SESSION:-}" ]; then
+    _sme="${LOCAL_WEBHOOK_SESSION#"$(id -un)-"}"
+  fi
+  printf '%s' "$_sme"
+}
+
+# Wait until a session that ran `rm` on itself can be delisted without losing input,
+# then delist it (the `rm` verb, so the prune and lease steps stay in one
+# place). Runs detached, as `finish-wait`, because the caller IS the session
+# and `rm` kills its pane.
+#
+# What is waited for is the transcript's word (finish_state in
+# session-hibernation.py): the last turn is closed and no input is queued behind
+# it. A delivery that arrives after the caller's last look is queued by the
+# harness and read only AFTER the current turn, which a self-`rm` used to cut
+# short (PR 1076: five review comments landed 0.1 s before the delist). The
+# waiter therefore never kills a turn: busy means wait, new input means stand
+# down. The subscription (the claim) stays in force until the last moment so an
+# event in the window reaches THIS session; it is taken away only for a final
+# look, and put back if that look finds input after all. What lands after the
+# claim is gone goes to the standing watch, which spawns for it as for any
+# unowned event.
+finish_wait() {
+  _fname="$1"; _fsince="$2"; _fbid="${3:-}"
+  _ftimeout="${AGENT_BOX_FINISH_TIMEOUT_S:-900}"
+  _fpoll="${AGENT_BOX_FINISH_POLL_S:-2}"
+  _fquiet_need="${AGENT_BOX_FINISH_QUIET_POLLS:-2}"
+  _fdeadline=$(( $(date +%s) + _ftimeout ))
+  _fquiet=0; _funknown=0
+  _fsd="${LOCAL_WEBHOOK_STATE_DIR:-$HOME/.local/state/local-webhook}"
+  _ffilter="$_fsd/filter.$(id -un)-$_fname.json"
+  _fstate() {
+    "${AGENT_BOX_CAPACITY_BIN:-agent-box-session-capacity}" finish-state \
+      "$REGISTRY_FILE" "$_fname" "$_fsince" 2>/dev/null || echo unknown
+  }
+  while :; do
+    if [ "$(date +%s)" -ge "$_fdeadline" ]; then
+      echo "rm $_fname: still busy after ${_ftimeout}s; left running, remove it with 'agent-box-session rm $_fname'"
+      return 1
+    fi
+    taken "$_fname" || { echo "rm $_fname: already gone"; return 0; }
+    # The name alone is not the session: if it was removed and the name reused,
+    # the replacement is not ours to remove.
+    if [ -n "$_fbid" ] && [ "$("$JQ" -r --arg n "$_fname" '.sessions[$n].boxSessionId // ""' \
+        "$REGISTRY_FILE" 2>/dev/null)" != "$_fbid" ]; then
+      echo "rm $_fname: the name now belongs to a different launch; leaving it alone"
+      return 0
+    fi
+    case "$(_fstate)" in
+      idle)
+        _funknown=0
+        _fquiet=$((_fquiet + 1))
+        if [ "$_fquiet" -ge "$_fquiet_need" ]; then
+          # Final look with routing off. Move the filter aside rather than
+          # delete it: if input slipped in before this instant the session
+          # is not finished, and it must still hold its claim.
+          _fkeep="$(mktemp "$_ffilter.keep.XXXXXX" 2>/dev/null)" || _fkeep=""
+          if [ -f "$_ffilter" ] && [ -n "$_fkeep" ]; then mv -f "$_ffilter" "$_fkeep"; else rm -f "$_fkeep"; _fkeep=""; fi
+          if [ "$(_fstate)" = idle ]; then
+            echo "rm $_fname: idle, nothing queued; removing"
+            if "$SESSION_SELF" rm --now "$_fname"; then
+              [ -z "$_fkeep" ] || rm -f "$_fkeep"
+              return 0
+            else
+              _frc=$?
+              # Failed. Put the claim back only if the session is still listed;
+              # a delisted name must not keep claiming topics.
+              if [ -n "$_fkeep" ]; then
+                if taken "$_fname" && [ ! -e "$_ffilter" ]; then mv -f "$_fkeep" "$_ffilter"; else rm -f "$_fkeep"; fi
+              fi
+              return "$_frc"
+            fi
+          fi
+          [ -z "$_fkeep" ] || { [ -e "$_ffilter" ] && rm -f "$_fkeep" || mv -f "$_fkeep" "$_ffilter"; }
+          _fquiet=0
+        fi
+        ;;
+      input)
+        echo "rm $_fname: new input reached the session after rm; standing down (run rm again when it is done)"
+        return 0
+        ;;
+      busy) _fquiet=0; _funknown=0 ;;
+      *)
+        _fquiet=0
+        _funknown=$((_funknown + 1))
+        if [ "$_funknown" -ge 15 ]; then
+          echo "rm $_fname: no transcript to read; left running, remove it with 'agent-box-session rm $_fname'"
+          return 1
+        fi
+        ;;
+    esac
+    sleep "$_fpoll"
+  done
+}
 # Free to MINT, which is not the same question as `taken`: stop and start ask
 # whether a session exists, and answering "yes" for a reserved name would have
 # them write a stub entry under it. Only auto-naming asks this one — and it
@@ -1371,9 +1480,29 @@ case "$cmd" in
     fi
     ;;
   rm)
+    now=0
+    if [ "${1:-}" = "--now" ]; then now=1; shift; fi
     name="${1:-}"
     valid_name "$name" || { usage >&2; exit 2; }
     registry_ensure
+    # A one-shot session removing ITSELF kills the pane running the turn that
+    # called us, and anything queued behind that turn dies unread. Defer to a
+    # detached waiter that removes it once the turn is closed and the queue
+    # is empty (finish_wait). --now, and any other caller, removes at once.
+    if [ "$now" = 0 ] && [ "$(self_session)" = "$name" ] && taken "$name" &&
+      "$JQ" -e --arg n "$name" '.sessions[$n].ephemeral == true' \
+        "$REGISTRY_FILE" >/dev/null 2>&1; then
+      _fdir="$HOME/.local/state/agent-box/finish"
+      mkdir -p "$_fdir" 2>/dev/null
+      since="$(date +%s.%N)"
+      bid="$("$JQ" -r --arg n "$name" '.sessions[$n].boxSessionId // ""' "$REGISTRY_FILE")"
+      # setsid: the Bash tool kills its children when the call returns, and the
+      # waiter has to outlive that to see the turn close.
+      "${AGENT_BOX_SETSID_BIN:-setsid}" -f "$SESSION_SELF" finish-wait "$name" "$since" "$bid" \
+        </dev/null >>"$_fdir/$name.log" 2>&1
+      echo "session '$name' will be removed once its turn is closed and nothing is queued; new input cancels that, then run rm again (log: $_fdir/$name.log; 'rm --now $name' removes at once)"
+      exit 0
+    fi
     registry_edit --arg n "$name" 'del(.sessions[$n])'
     kill_session "$name" || exit 1
     prune_filter "$name"
@@ -1381,6 +1510,14 @@ case "$cmd" in
     hooklog_end "$name" rm
     lease_clear "$name"
     echo "session '$name' removed"
+    ;;
+  finish-wait)
+    # Internal: the detached half of `finish`.
+    name="${1:-}"; since="${2:-}"; bid="${3:-}"
+    valid_name "$name" || exit 2
+    case "$since" in (""|*[!0-9.]*) exit 2 ;; esac
+    registry_ensure
+    finish_wait "$name" "$since" "$bid"
     ;;
   stop)
     # Park a listed session (issue #167): flag it stopped FIRST so the
