@@ -41,7 +41,7 @@ let
     users = builtins.attrNames emailUsers;
     inherit (cfg.email) certificateFile keyFile maxMessageBytes;
   };
-  supportedAgents = [ "claude" "codex" ];
+  supportedAgents = [ "claude" "codex" "gemini" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
   # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
   # tmux session, for manual investigation/clean-up. "shell" is always
@@ -801,7 +801,8 @@ let
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
-    else agentPkgs.codex;
+    else if agent == "codex" then agentPkgs.codex
+    else agentPkgs.gemini-cli;
   # The harnesses baked into the system closure — EMPTY by default since
   # issue #416. `installAgents` is the ALLOW-list (which agents a session may
   # name); this is the much smaller question of which of them the box pays
@@ -2013,13 +2014,13 @@ in
     agent = lib.mkOption {
       type = lib.types.enum supportedAgents;
       default = "claude";
-      description = "Default agent CLI to run. Supported values: claude, codex.";
+      description = "Default agent CLI to run. Supported values: claude, codex, gemini.";
     };
 
     package = lib.mkOption {
       type = lib.types.nullOr lib.types.package;
       default = null;
-      defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex")'';
+      defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex"; pkgs.gemini-cli for agent = "gemini")'';
       description = ''
         Package to run for every agent user. Leave null to use the selected
         agent's default package.

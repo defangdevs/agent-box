@@ -1151,6 +1151,9 @@ case "$cmd" in
     if [ -z "$remote_control" ]; then
       remote_control=true
       [ "$harness" = codex ] && remote_control=false
+      # gemini has no Remote Control at all; record false so the registry
+      # never claims a mirror that cannot exist.
+      [ "$harness" = gemini ] && remote_control=false
     fi
     # Compatibility: before issue #915 Codex used remoteControl itself as
     # its daemon discriminator. Preserve that input while writing the new,

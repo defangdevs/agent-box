@@ -271,6 +271,7 @@ let
   agentPackage = agent:
     if agent == "claude" then agentPkgs.claude-code
     else if agent == "codex" then agentPkgs.codex
+    else if agent == "gemini" then agentPkgs.gemini-cli
     else throw "nix/runtime.nix: unknown agent \"${agent}\" in eagerAgents";
 
   webhookEnabled = localWebhookScript != null;

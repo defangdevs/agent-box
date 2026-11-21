@@ -26,7 +26,7 @@ usage: agent-box-harness ls
   upgrade   move those onto the pin this box carries now; no NAME means
             every harness this box installed for you
 
-A harness is the CLI PROGRAM a session runs (claude, codex) — not an agent
+A harness is the CLI PROGRAM a session runs (claude, codex, gemini) — not an agent
 profile, which is a harness plus a model and an effort level. `agent-box-
 profile` is the other one.
 
@@ -65,7 +65,7 @@ _hc_main() {
       shift
       # No NAME means every harness this box installs. Word splitting is
       # the point here: agent_names prints one per line and none of them
-      # can contain a space (agent_attr is a closed set of two literals).
+      # can contain a space (agent_attr is a closed set of literals).
       # shellcheck disable=SC2046
       [ $# -gt 0 ] || set -- $(agent_names)
       _hc_rc=0

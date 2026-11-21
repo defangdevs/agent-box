@@ -840,7 +840,7 @@ let
     users = builtins.attrNames emailUsers;
     inherit (cfg.email) certificateFile keyFile maxMessageBytes;
   };
-  supportedAgents = [ "claude" "codex" ];
+  supportedAgents = [ "claude" "codex" "gemini" ];
   # Everything a session's `agent` field may name: the agent CLIs plus the
   # pseudo-agent "shell" (issue #113) — a plain login shell in a supervised
   # tmux session, for manual investigation/clean-up. "shell" is always
@@ -1607,7 +1607,7 @@ let
       memory guarantee.
     - Manage your own sessions without a rebuild:
       `agent-box-session ls|peers|add|rm|stop|restart`. `add` takes an optional name
-      plus `--harness claude|codex|shell`, `--cwd DIR` and `--prompt "TASK"` -
+      plus `--harness claude|codex|gemini|shell`, `--cwd DIR` and `--prompt "TASK"` -
       use it to fan out work, add a reviewer agent, or open a plain shell. The
       kickoff prompt fires once: a later respawn (crash, reboot, Spot restart)
       resumes that session's transcript instead of redoing the work. An agent
@@ -1638,7 +1638,14 @@ let
       unavailable. The same is true of any other CLI: `nix profile add
       nixpkgs#<pkg>` puts it in `~/.nix-profile/bin`, which is FIRST on your
       PATH, so an install is visible to a pane that is already running.
-    - `--harness` picks the CLI PROGRAM (claude, codex, shell). An agent PROFILE
+    - The `gemini` harness (Google's Gemini CLI) has no sign-in card, because the
+      CLI has no non-interactive login command. Give it a key with
+      `agent-box-session env set GEMINI_API_KEY VALUE` (or the Vertex variables),
+      or sign in with Google from inside the session's own terminal. It has no
+      Remote Control, WhatsApp or webhook channel; a profile's MODEL maps to
+      `-m`, and EFFORT and SYSTEM_PROMPT are ignored (put instructions in
+      GEMINI.md, which is seeded as a link to the box guide).
+    - `--harness` picks the CLI PROGRAM (claude, codex, gemini, shell). An agent PROFILE
       is the worker: a harness plus a model, an effort level, an appended system
       prompt and environment. Keep the two words apart, because the harnesses
       themselves do not: `claude --agent` and `opencode --agent` both name a
@@ -8786,7 +8793,8 @@ done
   agentPackage = agent:
     if cfg.package != null then cfg.package
     else if agent == "claude" then agentPkgs.claude-code
-    else agentPkgs.codex;
+    else if agent == "codex" then agentPkgs.codex
+    else agentPkgs.gemini-cli;
   # The harnesses baked into the system closure — EMPTY by default since
   # issue #416. `installAgents` is the ALLOW-list (which agents a session may
   # name); this is the much smaller question of which of them the box pays
@@ -10896,6 +10904,9 @@ case "$cmd" in
     if [ -z "$remote_control" ]; then
       remote_control=true
       [ "$harness" = codex ] && remote_control=false
+      # gemini has no Remote Control at all; record false so the registry
+      # never claims a mirror that cannot exist.
+      [ "$harness" = gemini ] && remote_control=false
     fi
     # Compatibility: before issue #915 Codex used remoteControl itself as
     # its daemon discriminator. Preserve that input while writing the new,
@@ -12757,7 +12768,7 @@ set -eu
 # exports, exactly as src/session-cli.sh does (issue #154, Phase 2).
 JQ=jq
 # An agent PROFILE (issue #321): the concrete worker, as opposed to the
-# HARNESS (claude/codex/shell) that `agent-box-session --harness` selects. A
+# HARNESS (claude/codex/gemini/shell) that `agent-box-session --harness` selects. A
 # profile names a harness plus the knobs that make two sessions on the same
 # harness different workers — model, effort, an appended system prompt, and
 # environment for the session.
@@ -12804,7 +12815,7 @@ usage() {
   echo "       agent-box-session add [NAME] --profile PROFILE"
   echo "Reserved keys (turned into harness arguments):"
   echo "  HARNESS        $PROFILE_HARNESSES  (required; 'shell' is a session kind, not a worker)"
-  echo "  MODEL          claude: --model VALUE; codex: -m VALUE"
+  echo "  MODEL          claude: --model VALUE; codex, gemini: -m VALUE"
   echo "  EFFORT         claude: --effort VALUE; codex: -c model_reasoning_effort=VALUE"
   echo "  SYSTEM_PROMPT  claude: --append-system-prompt VALUE"
   echo "Any OTHER key is environment for sessions started with this profile,"
@@ -13010,6 +13021,15 @@ launch_json() {
       # the key silently — a profile whose prompt never arrives is worse than
       # one that refuses to pretend.
       [ -n "$res_SYSTEM_PROMPT" ] && warn="$warn|SYSTEM_PROMPT is ignored for the codex harness (no --append-system-prompt equivalent); put the instructions in the working directory's AGENTS.md"
+      ;;
+    gemini)
+      [ -n "$res_MODEL" ] && set -- "$@" -m "$res_MODEL"
+      # gemini has neither a reasoning-effort flag nor an
+      # --append-system-prompt equivalent; its instructions come from
+      # GEMINI.md (seeded to point at the box guide). Say so rather than
+      # dropping the keys silently.
+      [ -n "$res_EFFORT" ] && warn="$warn|EFFORT is ignored for the gemini harness (no reasoning-effort flag)"
+      [ -n "$res_SYSTEM_PROMPT" ] && warn="$warn|SYSTEM_PROMPT is ignored for the gemini harness (no --append-system-prompt equivalent); put the instructions in the working directory's GEMINI.md"
       ;;
     *)
       # shell, and any harness added later: no argument mapping exists, so
@@ -13366,7 +13386,7 @@ agent_names() {
   # a list: agent-box-harness needs to ITERATE it (an `upgrade` with no
   # argument means all of them), and a second hand-written list somewhere
   # else is a list that drifts.
-  printf '%s\n' claude codex
+  printf '%s\n' claude codex gemini
 }
 
 agent_attr() {
@@ -13377,6 +13397,7 @@ agent_attr() {
   case "$1" in
     (claude) printf 'claude-code\n' ;;
     (codex)  printf 'codex\n' ;;
+    (gemini) printf 'gemini-cli\n' ;;
     (*) return 1 ;;
   esac
 }
@@ -13872,7 +13893,7 @@ usage: agent-box-harness ls
   upgrade   move those onto the pin this box carries now; no NAME means
             every harness this box installed for you
 
-A harness is the CLI PROGRAM a session runs (claude, codex) — not an agent
+A harness is the CLI PROGRAM a session runs (claude, codex, gemini) — not an agent
 profile, which is a harness plus a model and an effort level. `agent-box-
 profile` is the other one.
 
@@ -13911,7 +13932,7 @@ _hc_main() {
       shift
       # No NAME means every harness this box installs. Word splitting is
       # the point here: agent_names prints one per line and none of them
-      # can contain a space (agent_attr is a closed set of two literals).
+      # can contain a space (agent_attr is a closed set of literals).
       # shellcheck disable=SC2046
       [ $# -gt 0 ] || set -- $(agent_names)
       _hc_rc=0
@@ -22519,7 +22540,7 @@ esac
       # a list: agent-box-harness needs to ITERATE it (an `upgrade` with no
       # argument means all of them), and a second hand-written list somewhere
       # else is a list that drifts.
-      printf '%s\n' claude codex
+      printf '%s\n' claude codex gemini
     }
 
     agent_attr() {
@@ -22530,6 +22551,7 @@ esac
       case "$1" in
         (claude) printf 'claude-code\n' ;;
         (codex)  printf 'codex\n' ;;
+        (gemini) printf 'gemini-cli\n' ;;
         (*) return 1 ;;
       esac
     }
@@ -23944,6 +23966,25 @@ esac
             cmd="$(printf '%q' "$BASH") -c $(printf '%q' 'export AGENT_BOX_CODEX_PID=$$; exec "$@"') agent-box-codex $cmd"
           fi
           ;;
+        gemini)
+          # Gemini CLI. -i runs the kickoff prompt and then stays interactive
+          # (plain `gemini PROMPT` also does, but -i cannot be mistaken for the
+          # headless -p). --session-id stamps the box id as the conversation id,
+          # which is what lets a respawn find the transcript again; --resume
+          # latest continues the project's newest one. skipPermissions maps to
+          # the documented yolo approval mode, the same trade the claude and
+          # codex arms make: the box is the sandbox. extraArgs go last so an
+          # explicit flag of the user's has the last word.
+          [ "$skip" = true ] && cmd="$cmd --approval-mode yolo"
+          cmd="$cmd --skip-trust"
+          if [ "$resuming" = true ]; then
+            cmd="$cmd --resume latest"
+          else
+            cmd="$cmd --session-id $(printf '%q' "$bid")"
+          fi
+          append_extra
+          [ -n "$prompt" ] && cmd="$cmd -i $(printf '%q' "$prompt")"
+          ;;
         shell)
           append_extra
           ;;
@@ -24014,6 +24055,22 @@ esac
         if [ ! -e "$cxhome/AGENTS.md" ]; then
           mkdir -p "$cxhome"
           ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"
+        fi
+      fi
+      # gemini reads GEMINI.md (never AGENTS.md) from the project root down,
+      # plus one global file at ~/.gemini/GEMINI.md: the same two scopes as
+      # claude's CLAUDE.md, handled the same way - a project-scope symlink to
+      # the seeded AGENTS.md and a user-scope one to the canonical guide, both
+      # IFF absent so a repo's own GEMINI.md and hand edits survive.
+      if [ "$agent" = gemini ]; then
+        if [ -n "''${AGENT_BOX_AGENTS_POINTER:-}" ] \
+             && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/GEMINI.md" ]; then
+          ln -s AGENTS.md "$wd/GEMINI.md"
+        fi
+        if [ -n "''${AGENT_BOX_GUIDE_TARGET:-}" ] \
+             && [ ! -e "$HOME/.gemini/GEMINI.md" ]; then
+          mkdir -p "$HOME"/.gemini
+          ln -s "$AGENT_BOX_GUIDE_TARGET" "$HOME"/.gemini/GEMINI.md
         fi
       fi
       # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn
@@ -24682,13 +24739,13 @@ in
     agent = lib.mkOption {
       type = lib.types.enum supportedAgents;
       default = "claude";
-      description = "Default agent CLI to run. Supported values: claude, codex.";
+      description = "Default agent CLI to run. Supported values: claude, codex, gemini.";
     };
 
     package = lib.mkOption {
       type = lib.types.nullOr lib.types.package;
       default = null;
-      defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex")'';
+      defaultText = lib.literalExpression ''null (pkgs.claude-code for agent = "claude"; pkgs.codex for agent = "codex"; pkgs.gemini-cli for agent = "gemini")'';
       description = ''
         Package to run for every agent user. Leave null to use the selected
         agent's default package.
@@ -41200,7 +41257,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         # real Codex profile opens its TUI; a real Claude
                         # profile preserves the older additive RC flag.
                         "remoteControl": (codex_daemon or claude_daemon
-                                          or agent != "codex"),
+                                          or agent not in ("codex", "gemini")),
                         "remoteControlDaemon": codex_daemon or claude_daemon,
                         # Compatibility for releases before issue #915.
                         "remoteControlServer": claude_daemon,

@@ -1442,7 +1442,7 @@ agent_names() {
   # a list: agent-box-harness needs to ITERATE it (an `upgrade` with no
   # argument means all of them), and a second hand-written list somewhere
   # else is a list that drifts.
-  printf '%s\n' claude codex
+  printf '%s\n' claude codex gemini
 }
 
 agent_attr() {
@@ -1453,6 +1453,7 @@ agent_attr() {
   case "$1" in
     (claude) printf 'claude-code\n' ;;
     (codex)  printf 'codex\n' ;;
+    (gemini) printf 'gemini-cli\n' ;;
     (*) return 1 ;;
   esac
 }
@@ -2867,6 +2868,25 @@ start_session() {
         cmd="$(printf '%q' "$BASH") -c $(printf '%q' 'export AGENT_BOX_CODEX_PID=$$; exec "$@"') agent-box-codex $cmd"
       fi
       ;;
+    gemini)
+      # Gemini CLI. -i runs the kickoff prompt and then stays interactive
+      # (plain `gemini PROMPT` also does, but -i cannot be mistaken for the
+      # headless -p). --session-id stamps the box id as the conversation id,
+      # which is what lets a respawn find the transcript again; --resume
+      # latest continues the project's newest one. skipPermissions maps to
+      # the documented yolo approval mode, the same trade the claude and
+      # codex arms make: the box is the sandbox. extraArgs go last so an
+      # explicit flag of the user's has the last word.
+      [ "$skip" = true ] && cmd="$cmd --approval-mode yolo"
+      cmd="$cmd --skip-trust"
+      if [ "$resuming" = true ]; then
+        cmd="$cmd --resume latest"
+      else
+        cmd="$cmd --session-id $(printf '%q' "$bid")"
+      fi
+      append_extra
+      [ -n "$prompt" ] && cmd="$cmd -i $(printf '%q' "$prompt")"
+      ;;
     shell)
       append_extra
       ;;
@@ -2937,6 +2957,22 @@ start_session() {
     if [ ! -e "$cxhome/AGENTS.md" ]; then
       mkdir -p "$cxhome"
       ln -s "$AGENT_BOX_GUIDE_TARGET" "$cxhome/AGENTS.md"
+    fi
+  fi
+  # gemini reads GEMINI.md (never AGENTS.md) from the project root down,
+  # plus one global file at ~/.gemini/GEMINI.md: the same two scopes as
+  # claude's CLAUDE.md, handled the same way - a project-scope symlink to
+  # the seeded AGENTS.md and a user-scope one to the canonical guide, both
+  # IFF absent so a repo's own GEMINI.md and hand edits survive.
+  if [ "$agent" = gemini ]; then
+    if [ -n "${AGENT_BOX_AGENTS_POINTER:-}" ] \
+         && [ -e "$wd/AGENTS.md" ] && [ ! -e "$wd/GEMINI.md" ]; then
+      ln -s AGENTS.md "$wd/GEMINI.md"
+    fi
+    if [ -n "${AGENT_BOX_GUIDE_TARGET:-}" ] \
+         && [ ! -e "$HOME/.gemini/GEMINI.md" ]; then
+      mkdir -p "$HOME"/.gemini
+      ln -s "$AGENT_BOX_GUIDE_TARGET" "$HOME"/.gemini/GEMINI.md
     fi
   fi
   # The env-exec wrapper loads ~/.config/agent-box/env NOW — at spawn

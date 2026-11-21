@@ -112,7 +112,7 @@ agent_names() {
   # a list: agent-box-harness needs to ITERATE it (an `upgrade` with no
   # argument means all of them), and a second hand-written list somewhere
   # else is a list that drifts.
-  printf '%s\n' claude codex
+  printf '%s\n' claude codex gemini
 }
 
 agent_attr() {
@@ -123,6 +123,7 @@ agent_attr() {
   case "$1" in
     (claude) printf 'claude-code\n' ;;
     (codex)  printf 'codex\n' ;;
+    (gemini) printf 'gemini-cli\n' ;;
     (*) return 1 ;;
   esac
 }
