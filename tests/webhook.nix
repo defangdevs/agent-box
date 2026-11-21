@@ -2290,7 +2290,14 @@
         "jq -r '.sessions | keys[] | select(startswith(\"hook-\"))'"
         " /home/agent/.config/agent-box/sessions.json"
     ).split():
-        machine.succeed(f"sudo -u agent env HOME=/home/agent agent-box-session rm {stale}")
+        # Exit 2 here failed CI with no output (#1095): show stderr and state.
+        rc, out = machine.execute(
+            f"sudo -u agent env HOME=/home/agent agent-box-session rm {stale} 2>&1"
+        )
+        assert rc == 0, (stale, rc, out, machine.execute(
+            "jq -c '.sessions|keys' /home/agent/.config/agent-box/sessions.json;"
+            " sudo -u agent tmux -L agent-box ls 2>&1"
+        )[1])
 
     # --- who "@self" is, resolved at runtime (issue #261) -------------------
     # webhook-spawn.sh seeds every hook-* session with an exclude naming
