@@ -794,7 +794,9 @@ it to run `agent-box-session rm NAME` when done. Run by a session on itself, `rm
 returns at once and the removal waits for the session's last turn to close with
 nothing queued behind it, because a delivery that lands just before an immediate
 self-`rm` sits unread in the harness's queue and dies with the pane. New input
-after that cancels the removal; the session reads it and runs `rm` again.
+after that cancels the removal; the session reads it and runs `rm` again. Claude
+transcripts show queued input; Codex rollouts do not, so for Codex the waiter only
+waits out an open turn and cannot see input still queued behind it.
 (`rm --now NAME`, or `rm` from any other session, delists at once.) What is NOT reaped is a hook session that CRASHED: a non-zero exit is
 never parked, so it stays listed and attachable for you to read - `rm` it once
 you have. That cleanup is load-bearing: one RAM-sized limit (about one session

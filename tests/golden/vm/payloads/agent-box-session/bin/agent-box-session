@@ -1121,7 +1121,7 @@ self_session() {
 # claim is gone goes to the standing watch, which spawns for it as for any
 # unowned event.
 finish_wait() {
-  _fname="$1"; _fsince="$2"
+  _fname="$1"; _fsince="$2"; _fbid="${3:-}"
   _ftimeout="${AGENT_BOX_FINISH_TIMEOUT_S:-900}"
   _fpoll="${AGENT_BOX_FINISH_POLL_S:-2}"
   _fquiet_need="${AGENT_BOX_FINISH_QUIET_POLLS:-2}"
@@ -1139,6 +1139,13 @@ finish_wait() {
       return 1
     fi
     taken "$_fname" || { echo "rm $_fname: already gone"; return 0; }
+    # The name alone is not the session: if it was removed and the name reused,
+    # the replacement is not ours to remove.
+    if [ -n "$_fbid" ] && [ "$("$JQ" -r --arg n "$_fname" '.sessions[$n].boxSessionId // ""' \
+        "$REGISTRY_FILE" 2>/dev/null)" != "$_fbid" ]; then
+      echo "rm $_fname: the name now belongs to a different launch; leaving it alone"
+      return 0
+    fi
     case "$(_fstate)" in
       idle)
         _funknown=0
@@ -1150,17 +1157,22 @@ finish_wait() {
           _fkeep="$(mktemp "$_ffilter.keep.XXXXXX" 2>/dev/null)" || _fkeep=""
           if [ -f "$_ffilter" ] && [ -n "$_fkeep" ]; then mv -f "$_ffilter" "$_fkeep"; else rm -f "$_fkeep"; _fkeep=""; fi
           if [ "$(_fstate)" = idle ]; then
-            [ -z "$_fkeep" ] || rm -f "$_fkeep"
             echo "rm $_fname: idle, nothing queued; removing"
-            "$SESSION_SELF" rm --now "$_fname"
-            return $?
+            if "$SESSION_SELF" rm --now "$_fname"; then
+              [ -z "$_fkeep" ] || rm -f "$_fkeep"
+              return 0
+            fi
+            # Removal failed: the session is still listed and must keep its claim.
+            _frc=$?
+            [ -z "$_fkeep" ] || { [ -e "$_ffilter" ] && rm -f "$_fkeep" || mv -f "$_fkeep" "$_ffilter"; }
+            return "$_frc"
           fi
           [ -z "$_fkeep" ] || { [ -e "$_ffilter" ] && rm -f "$_fkeep" || mv -f "$_fkeep" "$_ffilter"; }
           _fquiet=0
         fi
         ;;
       input)
-        echo "rm $_fname: new input reached the session after finish; standing down (run rm again when it is done)"
+        echo "rm $_fname: new input reached the session after rm; standing down (run rm again when it is done)"
         return 0
         ;;
       busy) _fquiet=0; _funknown=0 ;;
@@ -2158,9 +2170,10 @@ case "$cmd" in
       _fdir="$HOME/.local/state/agent-box/finish"
       mkdir -p "$_fdir" 2>/dev/null
       since="$(date +%s.%N)"
+      bid="$("$JQ" -r --arg n "$name" '.sessions[$n].boxSessionId // ""' "$REGISTRY_FILE")"
       # setsid: the Bash tool kills its children when the call returns, and the
       # waiter has to outlive that to see the turn close.
-      "${AGENT_BOX_SETSID_BIN:-setsid}" -f "$SESSION_SELF" finish-wait "$name" "$since" \
+      "${AGENT_BOX_SETSID_BIN:-setsid}" -f "$SESSION_SELF" finish-wait "$name" "$since" "$bid" \
         </dev/null >>"$_fdir/$name.log" 2>&1
       echo "session '$name' will be removed once its turn is closed and nothing is queued; new input cancels that, then run rm again (log: $_fdir/$name.log; 'rm --now $name' removes at once)"
       exit 0
@@ -2175,11 +2188,11 @@ case "$cmd" in
     ;;
   finish-wait)
     # Internal: the detached half of `finish`.
-    name="${1:-}"; since="${2:-}"
+    name="${1:-}"; since="${2:-}"; bid="${3:-}"
     valid_name "$name" || exit 2
     case "$since" in (""|*[!0-9.]*) exit 2 ;; esac
     registry_ensure
-    finish_wait "$name" "$since"
+    finish_wait "$name" "$since" "$bid"
     ;;
   stop)
     # Park a listed session (issue #167): flag it stopped FIRST so the

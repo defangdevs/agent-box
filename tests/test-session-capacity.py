@@ -645,6 +645,28 @@ class Cli(unittest.TestCase):
                         self.finish_log())
         self.assertTrue(self.listed(), "a session with unread input must stay")
 
+    def test_a_dequeue_after_rm_is_not_new_input(self):
+        transcript = self.finishing_session(closed=False)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        time.sleep(0.5)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1))
+        with transcript.open("a") as handle:
+            handle.write(json.dumps({"type": "queue-operation", "operation": "dequeue",
+                                     "timestamp": stamp}) + "\n")
+            handle.write(json.dumps({"type": "assistant", "message": {
+                "stop_reason": "end_turn"}}) + "\n")
+        self.assertTrue(self.wait_for(lambda: not self.listed()), self.finish_log())
+
+    def test_waiter_leaves_a_replacement_under_the_same_name_alone(self):
+        self.finishing_session(closed=False)
+        self.assertEqual(self.run_cli("rm", "hook-x").returncode, 0)
+        data = json.loads(self.registry.read_text())
+        data["sessions"]["hook-x"]["boxSessionId"] = "other-launch"
+        self.registry.write_text(json.dumps(data))
+        self.assertTrue(self.wait_for(lambda: "different launch" in self.finish_log()),
+                        self.finish_log())
+        self.assertTrue(self.listed())
+
     def test_rm_is_immediate_for_other_callers_and_for_now(self):
         self.finishing_session()
         self.env["LOCAL_WEBHOOK_SESSION"] = getpass.getuser() + "-someone-else"

@@ -835,8 +835,12 @@ def finish_state(name, entry, since):
             if stamp is None or stamp <= since:
                 continue
             kind = record.get("type")
+            # Only an enqueue adds input; a dequeue or remove of something
+            # queued before `since` is the harness draining, not new work.
             if kind == "queue-operation":
-                return "input"
+                if record.get("operation") == "enqueue":
+                    return "input"
+                continue
             message = record.get("message")
             if kind == "user" and isinstance(message, dict):
                 content = message.get("content")
