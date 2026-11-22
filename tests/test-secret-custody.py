@@ -16,6 +16,7 @@ AGENT_BOX_TEST_PYBIN at one if `sys.executable` lacks it, e.g.:
   nix build --no-link --print-out-paths \
     '.#legacyPackages.$(nix eval --raw --impure --expr builtins.currentSystem).python3.withPackages(ps: [ps.cryptography])'
 """
+import io
 import json
 import os
 import socket
@@ -139,7 +140,8 @@ class Custody(unittest.TestCase):
         seen.append(self.broker.ask({"op": "list"}))
         self.assertNotIn(CANARY, repr(seen))
         self.assertEqual(seen[1]["secrets"],
-                         [{"name": "TOKEN", "version": 1, "configured": True}])
+                         [{"name": "TOKEN", "version": 1, "configured": True,
+                       "kind": "value", "origins": [], "fillOnly": False}])
         self.assertEqual(seen[3]["secrets"],
                          [{"name": "TOKEN", "version": 2, "configured": False}])
 
@@ -683,6 +685,22 @@ class Custody(unittest.TestCase):
         self.assertTrue(resp["ok"], resp)
         self.assertTrue(os.path.isdir(ghost))
 
+    def test_refused_save_cookies_does_not_create_a_namespace(self):
+        jobs = []
+        for _ in range(ns["SECRET_MAX_JOBS_PER_USER"]):
+            resp = self.broker.ask({"op": "exec", "argv": ["sleep", "5"], "secretNames": [],
+                                    "cwd": self.tmp, "profile": "busy"})
+            self.assertTrue(resp["ok"], resp)
+            jobs.append(resp["jobId"])
+        resp = self.broker.ask({"op": "save-cookies", "name": "S", "cdpPort": 9,
+                                "origins": ["https://a.example"], "profile": "fresh"})
+        # Jobs are capped per user, not per profile.
+        self.assertFalse(resp["ok"], resp)
+        self.assertFalse(os.path.exists(os.path.join(self.broker.root, "fresh")),
+                         "a refused save-cookies created a namespace")
+        for job_id in jobs:
+            self.broker.ask({"op": "cancel", "jobId": job_id, "profile": "busy"})
+
     def test_exec_concurrency_cap_per_user(self):
         jobs = []
         for _ in range(ns["SECRET_MAX_JOBS_PER_USER"]):
@@ -785,6 +803,533 @@ class Bounds(unittest.TestCase):
         # The retention sweep frees the slots again.
         manager.sweep(-1)
         manager.start("p", dict(req), lambda name: None)
+
+    def test_capture_bytes_never_reach_stdout_even_when_written_late(self):
+        """The worker exits 0 but a descendant keeps stdout open past the
+        drain's join and writes cookie bytes after the capture is finished.
+        Those bytes must never be stored, never appear in status, and not be
+        retained on the job (CodeRabbit on PR 1076)."""
+        late = "late-c00kie-bytes-" + CANARY
+
+        class Launcher:
+            def start(self, job, *args):
+                job.handle = subprocess.Popen(
+                    ["/bin/sh", "-c", "(sleep 7; printf '%s' \"$1\") 2>/dev/null & exit 0",
+                     "sh", late],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, start_new_session=True)
+
+            def poll(self, job):
+                return job.handle.poll()
+
+            def kill(self, job):
+                pass
+
+        stored = []
+        manager = ns["JobManager"](Launcher(), 4096, 2)
+        builtin = {"secretNames": [], "browser": {"mode": "save-cookies"},
+                   "capture": lambda raw: stored.append(raw) or "saved\n"}
+        job_id = manager.start("p", {"op": "save-cookies"}, lambda name: None, builtin)
+        deadline = time.time() + 15
+        while manager.status("p", job_id)["state"] in ("pending", "running"):
+            self.assertLess(time.time(), deadline)
+            time.sleep(0.1)
+        status = manager.status("p", job_id)
+        self.assertEqual(status["state"], "error", status)
+        self.assertIn("not read to the end", status["stderr"])
+        # Outlast the descendant's write and EOF.
+        time.sleep(3)
+        status = manager.status("p", job_id)
+        self.assertNotIn(late, json.dumps(status))
+        self.assertEqual(status["stdout"], "")
+        self.assertEqual(stored, [])
+        job = manager._jobs[job_id]
+        self.assertEqual(job.capture_out, b"")
+        self.assertEqual(job.stdout, b"")
+
+    def test_capture_is_discarded_when_reading_it_fails(self):
+        """A read error ends the stdout pump without EOF; the prefix it
+        had read must not reach the sink (CodeRabbit on PR 1076)."""
+        prefix = b'{"cookies": [{"name": "sid", "value": "' + CANARY.encode()
+
+        class FailingStream:
+            def __init__(self):
+                self.chunks = [prefix]
+
+            def read(self, size):
+                if self.chunks:
+                    return self.chunks.pop(0)
+                raise OSError(5, "injected read failure")
+
+            def close(self):
+                pass
+
+        class Handle:
+            stdout = FailingStream()
+            stderr = io.BytesIO(b"")
+
+            def poll(self):
+                return 0
+
+        class Launcher:
+            def start(self, job, *args):
+                job.handle = Handle()
+
+            def poll(self, job):
+                return 0
+
+            def kill(self, job):
+                pass
+
+        stored = []
+        manager = ns["JobManager"](Launcher(), 4096, 2)
+        builtin = {"secretNames": [], "browser": {"mode": "save-cookies"},
+                   "capture": lambda raw: stored.append(raw) or "saved\n"}
+        job_id = manager.start("p", {"op": "save-cookies"}, lambda name: None, builtin)
+        deadline = time.time() + 10
+        while manager.status("p", job_id)["state"] in ("pending", "running"):
+            self.assertLess(time.time(), deadline)
+            time.sleep(0.05)
+        status = manager.status("p", job_id)
+        self.assertEqual(status["state"], "error", status)
+        self.assertIn("not read to the end", status["stderr"])
+        self.assertNotIn(CANARY, json.dumps(status))
+        self.assertEqual(stored, [])
+        self.assertEqual(manager._jobs[job_id].capture_out, b"")
+
+    def test_origin_metadata_never_makes_a_profile_unlistable(self):
+        """Each record may carry 8 origins of up to 256 bytes, so enough of
+        them would overflow one list reply; the write that would do that is
+        refused instead (CodeRabbit on PR 1076)."""
+        store = ns["Store"](os.path.join(self.tmp, "store"), "p", "agent", os.getuid(),
+                            b"\x00" * 32)
+        self.addCleanup(store.close)
+        host = ".".join(["a" * 60] * 3)
+        origins = [f"https://{host}{i}.example:{4430 + i}" for i in range(ns["SECRET_MAX_ORIGINS"])]
+        for origin in origins:
+            self.assertEqual(ns["normalize_origin"](origin), origin)
+        meta = {"kind": "password", "origins": origins, "fillOnly": True}
+        refused = None
+        for index in range(ns["SECRET_MAX_NAMES"]):
+            try:
+                store.set(f"N{index}", "v", meta)
+            except ns["SecretError"] as exc:
+                refused = (index, str(exc))
+                break
+        self.assertIsNotNone(refused, "every write passed; the budget never bit")
+        self.assertIn("origin", refused[1])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "store", "p", f"N{refused[0]}.rec")))
+        listed = store.list()
+        self.assertEqual(len(listed), refused[0])
+        # The reply the broker sends for it fits in one frame.
+        left, right = socket.socketpair()
+        self.addCleanup(left.close)
+        self.addCleanup(right.close)
+        ns["send_frame"](left, {"ok": True, "secrets": listed})
+        # Rotating an existing record is measured against itself, not added
+        # on top of it.
+        store.set("N0", "w", meta)
+
+    def test_snapshot_takes_meta_and_value_from_one_read(self):
+        store = ns["Store"](os.path.join(self.tmp, "store"), "p", "agent", os.getuid(),
+                            b"\x00" * 32)
+        self.addCleanup(store.close)
+        store.set("PW", CANARY, {"kind": "password", "origins": ["https://a.example"],
+                                 "fillOnly": True})
+        reads = []
+        real_read = store._read
+        store._read = lambda name: reads.append(name) or real_read(name)
+        meta, value = store.snapshot("PW")
+        self.assertEqual(reads, ["PW.rec"])
+        self.assertEqual(value, CANARY)
+        self.assertTrue(meta["fillOnly"])
+        self.assertIsNone(store.snapshot("MISSING"))
+
+
+TOTP_RFC_SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"  # "12345678901234567890"
+
+
+class WebsiteSecrets(unittest.TestCase):
+    """Metadata, generated passwords, TOTP and fill-only (no browser)."""
+
+    @classmethod
+    def setUpClass(cls):
+        check_crypto_available()
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.broker = Broker(self.tmp)
+        self.addCleanup(self.broker.stop)
+
+    def run_exec(self, names, script):
+        resp = self.broker.ask({"op": "exec", "argv": ["sh", "-c", script],
+                                "secretNames": names, "cwd": self.tmp})
+        self.assertTrue(resp["ok"], resp)
+        return self.broker.wait_job(resp["jobId"])
+
+    def test_totp_matches_rfc6238_vectors(self):
+        uri = f"otpauth://totp/x?secret={TOTP_RFC_SEED}&digits=8"
+        self.assertEqual(ns["totp_code"](uri, now=59), "94287082")
+        self.assertEqual(ns["totp_code"](uri, now=1111111109), "07081804")
+        self.assertEqual(ns["totp_code"](TOTP_RFC_SEED.lower(), now=59), "287082")
+
+    def test_normalize_origin(self):
+        norm = ns["normalize_origin"]
+        self.assertEqual(norm("https://Example.COM/login?x=1"), "https://example.com")
+        self.assertEqual(norm("https://example.com:443"), "https://example.com")
+        self.assertEqual(norm("https://example.com:8443/"), "https://example.com:8443")
+        self.assertEqual(norm("http://127.0.0.1:8080/x"), "http://127.0.0.1:8080")
+        for bad in ("http://example.com", "ftp://example.com", "https://user@example.com",
+                    "https://exämple.com", "example.com", ""):
+            with self.assertRaises(ns["SecretError"], msg=bad):
+                norm(bad)
+
+    def test_generate_stores_a_value_nobody_sees(self):
+        resp = self.broker.ask({"op": "generate", "name": "PW", "length": 32})
+        self.assertTrue(resp["ok"], resp)
+        out = os.path.join(self.tmp, "pw")
+        status = self.run_exec(["PW"], f'printf %s "$PW" > {out}')
+        self.assertEqual(status["state"], "done", status)
+        value = Path(out).read_text()
+        self.assertEqual(len(value), 32)
+        for cls in ("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "0123456789",
+                    ns["SECRET_GENERATE_SYMBOLS"]):
+            self.assertTrue(any(ch in cls for ch in value), cls)
+        self.assertNotIn(value, json.dumps(resp))
+
+    def test_origins_and_fill_only_show_in_list_and_block_exec(self):
+        resp = self.broker.ask({"op": "generate", "name": "SITE_PW",
+                                "origins": ["https://example.com"], "fillOnly": True})
+        self.assertTrue(resp["ok"], resp)
+        listed = self.broker.ask({"op": "list"})["secrets"]
+        self.assertEqual(listed, [{"name": "SITE_PW", "version": 1, "configured": True,
+                                   "kind": "value", "origins": ["https://example.com"],
+                                   "fillOnly": True}])
+        status = self.run_exec(["SITE_PW"], 'printf %s "$SITE_PW"')
+        self.assertEqual(status["state"], "error")
+        self.assertIn("fill-only", status["stderr"])
+        self.assertEqual(status["stdout"], "")
+
+    def test_meta_refusals(self):
+        for req in (
+            {"op": "set", "name": "A", "value": "v", "fillOnly": True},
+            {"op": "set", "name": "A", "value": "v", "origins": ["https://Example.com/"]},
+            {"op": "set", "name": "A", "value": "v", "kind": "bogus"},
+            {"op": "set", "name": "A", "value": "not base32!", "kind": "totp"},
+            {"op": "set", "name": "A", "value": "[]", "kind": "cookies"},
+            {"op": "generate", "name": "A", "length": 4},
+            {"op": "fill", "name": "A", "cdpPort": 0, "selector": "#p"},
+            {"op": "fill", "name": "A", "cdpPort": 9222},
+            {"op": "fill", "name": "A", "cdpPort": 9222, "selector": "#p", "targetId": "../x"},
+            {"op": "save-cookies", "name": "A", "cdpPort": 9222},
+        ):
+            resp = self.broker.ask(req)
+            self.assertFalse(resp["ok"], req)
+
+    def test_totp_exec_gets_the_code_never_the_seed(self):
+        self.broker.ask({"op": "set", "name": "OTP", "value": TOTP_RFC_SEED, "kind": "totp"})
+        out = os.path.join(self.tmp, "otp")
+        status = self.run_exec(["OTP"], f'printf %s "$OTP" > {out}')
+        self.assertEqual(status["state"], "done", status)
+        code = Path(out).read_text()
+        self.assertRegex(code, r"^[0-9]{6}$")
+        # Allow for a 30-second step boundary between the job and this check.
+        now = time.time()
+        self.assertIn(code, {ns["totp_code"](TOTP_RFC_SEED, now=t) for t in (now - 30, now)})
+
+    def test_fill_needs_origins_and_the_right_kind(self):
+        self.broker.ask({"op": "set", "name": "PLAIN", "value": "v"})
+        resp = self.broker.ask({"op": "fill", "name": "PLAIN", "cdpPort": 9, "selector": "#p"})
+        self.assertFalse(resp["ok"])
+        self.assertIn("no origins", resp["error"])
+        resp = self.broker.ask({"op": "load-cookies", "name": "PLAIN", "cdpPort": 9})
+        self.assertFalse(resp["ok"])
+
+    def test_cli_generate_with_origin_is_fill_only(self):
+        cli = Path(self.tmp) / "cli.py"
+        cli.write_text(CLI)
+
+        def run(*args, stdin=None):
+            return subprocess.run([PYBIN, "-I", str(cli), "--socket",
+                                   self.broker.sock, "--profile", "testprofile", *args],
+                                  input=stdin, capture_output=True, text=True)
+        made = run("generate", "SITE_PW", "--origin", "https://Example.com/signup")
+        self.assertEqual(made.returncode, 0, made.stderr)
+        self.assertEqual(run("set", "OTP", "--stdin", "--totp", "--origin", "https://example.com",
+                             stdin=TOTP_RFC_SEED + "\n").returncode, 0)
+        self.assertEqual(run("generate", "DB_PW", "--no-symbols").returncode, 0)
+        listed = run("list").stdout
+        self.assertIn("SITE_PW\tv1\tconfigured\tfill-only\thttps://example.com", listed)
+        self.assertIn("OTP\tv1\tconfigured\ttotp\tfill-only\thttps://example.com", listed)
+        self.assertIn("DB_PW\tv1\tconfigured\n", listed)
+        refused = run("exec", "--secret", "SITE_PW", "--", "true")
+        self.assertEqual(refused.returncode, 0)  # exec only starts a job
+        status = self.broker.wait_job(refused.stdout.strip())
+        self.assertIn("fill-only", status["stderr"])
+        bad = run("generate", "X", "--origin", "http://example.com")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("https", bad.stderr)
+
+    def test_fill_with_no_browser_fails_cleanly(self):
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": ["https://example.com"], "fillOnly": True})
+        port = socket.socket()
+        port.bind(("127.0.0.1", 0))
+        free = port.getsockname()[1]
+        port.close()
+        resp = self.broker.ask({"op": "fill", "name": "PW", "cdpPort": free, "selector": "#p"})
+        self.assertTrue(resp["ok"], resp)
+        status = self.broker.wait_job(resp["jobId"])
+        self.assertEqual(status["state"], "error")
+        self.assertIn("no DevTools endpoint", status["stderr"])
+        self.assertNotIn(CANARY, json.dumps(status))
+
+
+class WorkerCookies(unittest.TestCase):
+    """The worker's cookie field handling, without a browser."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.wns = {"__name__": "worker_lib"}
+        exec(compile(WORKER, "worker.py", "exec"), cls.wns)
+
+    def test_partition_keys_are_kept_or_the_cookie_is_refused(self):
+        part = {"topLevelSite": "https://top.example", "hasCrossSiteAncestor": False}
+        key = self.wns["_partition_key"]
+        self.assertEqual(key({"name": "a"}), (True, None))
+        self.assertEqual(key({"name": "a", "partitionKey": part}), (True, part))
+        self.assertEqual(key({"name": "a", "partitionKeyOpaque": True})[0], False)
+        self.assertEqual(key({"name": "a", "partitionKey": "https://top.example"})[0], False)
+
+    def test_save_and_load_carry_the_partition_key(self):
+        part = {"topLevelSite": "https://top.example", "hasCrossSiteAncestor": True}
+        browser = [
+            {"name": "p", "value": "1", "domain": "a.example", "path": "/", "partitionKey": part},
+            {"name": "u", "value": "2", "domain": "a.example", "path": "/app"},
+            {"name": "o", "value": "3", "domain": "a.example", "path": "/",
+             "partitionKeyOpaque": True},
+            {"name": "x", "value": "4", "domain": "other.example", "path": "/"},
+        ]
+        sent = []
+
+        class FakeCdp:
+            def call(self, method, **params):
+                if method == "Storage.getCookies":
+                    return {"cookies": browser}
+                if method == "Network.setCookies":
+                    sent.extend(params["cookies"])
+                    return {}
+                raise AssertionError(method)
+
+        spec = {"origins": ["https://a.example"]}
+        saved = self.wns["_browser_save_cookies"](FakeCdp(), spec)
+        names = {c["name"]: c for c in saved["cookies"]}
+        self.assertEqual(set(names), {"p", "u"})
+        self.assertEqual(names["p"]["partitionKey"], part)
+        self.assertEqual(names["u"]["path"], "/app")
+        self.wns["_browser_load_cookies"](FakeCdp(), spec, json.dumps(saved))
+        loaded = {c["name"]: c for c in sent}
+        self.assertEqual(loaded["p"]["partitionKey"], part)
+        self.assertNotIn("partitionKey", loaded["u"])
+
+
+def find_chromium():
+    for candidate in (os.environ.get("AGENT_BOX_TEST_CHROMIUM"),
+                      os.path.expanduser("~/browser/chromium/bin/chromium"),
+                      "/opt/pw-browsers/chromium",
+                      shutil.which("chromium"), shutil.which("chromium-browser")):
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+class BrowserJobs(unittest.TestCase):
+    """fill / save-cookies / load-cookies against a real headless Chromium
+    and a real local page. Skipped when no Chromium is found (set
+    AGENT_BOX_TEST_CHROMIUM)."""
+
+    @classmethod
+    def setUpClass(cls):
+        check_crypto_available()
+        cls.chromium = find_chromium()
+        if not cls.chromium:
+            raise unittest.SkipTest("no chromium (set AGENT_BOX_TEST_CHROMIUM)")
+        cls.tmp = tempfile.mkdtemp()
+        page = os.path.join(cls.tmp, "site")
+        os.mkdir(page)
+        Path(page, "login.html").write_text(
+            "<form><input id=user><input id=pw type=password><div id=d>x</div></form>")
+        cls.http = subprocess.Popen(
+            [sys.executable, "-I", "-c", (
+                "import http.server, sys\n"
+                "class H(http.server.SimpleHTTPRequestHandler):\n"
+                "    def end_headers(self):\n"
+                "        self.send_header('Set-Cookie', 'sid=s3ss10n-c00kie; Path=/; Max-Age=3600')\n"
+                "        self.send_header('Set-Cookie', 'appsid=app-s3ss10n; Path=/app; Max-Age=3600')\n"
+                "        super().end_headers()\n"
+                "    def log_message(self, *a): pass\n"
+                "s = http.server.ThreadingHTTPServer(('127.0.0.1', 0), H)\n"
+                "print(s.server_address[1], flush=True)\n"
+                "s.serve_forever()\n")],
+            cwd=page, stdout=subprocess.PIPE)
+        cls.http_port = int(cls.http.stdout.readline())
+        cls.origin = f"http://127.0.0.1:{cls.http_port}"
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        cls.cdp_port = sock.getsockname()[1]
+        sock.close()
+        cls.browser = subprocess.Popen(
+            [cls.chromium, "--headless=new", "--no-sandbox", "--disable-gpu",
+             f"--remote-debugging-port={cls.cdp_port}",
+             f"--user-data-dir={os.path.join(cls.tmp, 'profile')}",
+             f"{cls.origin}/login.html"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cls.wns = {"__name__": "worker_lib"}
+        exec(compile(WORKER, "worker.py", "exec"), cls.wns)
+        deadline = time.time() + 30
+        while True:
+            try:
+                pages = [t for t in cls.wns["_http_json"](cls.cdp_port, "/json/list")
+                         if t.get("type") == "page" and t.get("url", "").startswith(cls.origin)]
+                if pages:
+                    cls.target = pages[0]["id"]
+                    break
+            except Exception:  # noqa: BLE001 - not up yet
+                pass
+            if time.time() > deadline:
+                raise RuntimeError("chromium did not come up")
+            time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        for proc in (cls.browser, cls.http):
+            proc.kill()
+            proc.wait()
+        cls.http.stdout.close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def setUp(self):
+        self.btmp = tempfile.mkdtemp()
+        self.broker = Broker(self.btmp)
+        self.addCleanup(self.broker.stop)
+
+    def cdp(self):
+        conn = self.wns["Cdp"](self.cdp_port, self.target)
+        self.addCleanup(conn.close)
+        return conn
+
+    def page_eval(self, expression):
+        return self.cdp().call("Runtime.evaluate", expression=expression,
+                               returnByValue=True)["result"].get("value")
+
+    def run_job(self, req):
+        req = dict(req, cdpPort=self.cdp_port, targetId=self.target)
+        resp = self.broker.ask(req)
+        self.assertTrue(resp["ok"], resp)
+        return self.broker.wait_job(resp["jobId"], timeout=20)
+
+    def test_fill_types_the_value_on_a_matching_origin(self):
+        self.page_eval("document.getElementById('pw').value = 'old'")
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#pw"})
+        self.assertEqual(status["state"], "done", status)
+        self.assertNotIn(CANARY, json.dumps(status))
+        # select() first, so the old text is replaced rather than appended to.
+        self.assertEqual(self.page_eval("document.getElementById('pw').value"), CANARY)
+
+    def test_fill_refuses_another_origin_and_types_nothing(self):
+        self.page_eval("document.getElementById('user').value = ''")
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": ["https://example.com"], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#user"})
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["exitCode"], 3)
+        self.assertIn("refused", status["stderr"])
+        self.assertIn(self.origin, status["stderr"])
+        self.assertEqual(self.page_eval("document.getElementById('user').value"), "")
+
+    def test_fill_writes_the_checked_node_even_if_page_script_moves_focus(self):
+        """Page script that steals focus right after #pw takes it must not
+        redirect the value into another field (CodeRabbit on PR 1076)."""
+        self.page_eval(
+            "(() => { const pw = document.getElementById('pw'), u = document.getElementById('user');"
+            " pw.value = ''; u.value = '';"
+            " pw.addEventListener('focus', () => setTimeout(() => u.focus(), 0), {once: true});"
+            " u.focus(); })()")
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#pw"})
+        self.assertEqual(status["state"], "done", status)
+        self.assertEqual(self.page_eval("document.getElementById('pw').value"), CANARY)
+        self.assertEqual(self.page_eval("document.getElementById('user').value"), "")
+
+    def test_fill_rechecks_the_node_after_synchronous_focus_handlers(self):
+        """focus() runs page focus handlers synchronously; one that makes the
+        field read-only must stop the write (CodeRabbit on PR 1076)."""
+        self.page_eval(
+            "(() => { const pw = document.getElementById('pw');"
+            " pw.readOnly = false; pw.value = '';"
+            " pw.addEventListener('focus', () => { pw.readOnly = true; }, {once: true});"
+            " document.getElementById('user').focus(); })()")
+        self.addCleanup(self.page_eval, "document.getElementById('pw').readOnly = false")
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#pw"})
+        self.assertEqual(status["state"], "error", status)
+        self.assertIn("not editable", status["stderr"])
+        self.assertNotIn(CANARY, json.dumps(status))
+        self.assertEqual(self.page_eval("document.getElementById('pw').value"), "")
+
+    def test_fill_refuses_a_non_input(self):
+        self.broker.ask({"op": "set", "name": "PW", "value": CANARY,
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "PW", "selector": "#d"})
+        self.assertEqual(status["state"], "error")
+        self.assertIn("not an input", status["stderr"])
+
+    def test_fill_totp_types_the_current_code(self):
+        self.broker.ask({"op": "set", "name": "OTP", "value": TOTP_RFC_SEED, "kind": "totp",
+                         "origins": [self.origin], "fillOnly": True})
+        status = self.run_job({"op": "fill", "name": "OTP", "selector": "#user"})
+        self.assertEqual(status["state"], "done", status)
+        typed = self.page_eval("document.getElementById('user').value")
+        now = time.time()
+        self.assertIn(typed, {ns["totp_code"](TOTP_RFC_SEED, now=t) for t in (now - 30, now)})
+
+    def all_cookies(self):
+        return {c["name"]: c for c in self.cdp().call("Storage.getCookies")["cookies"]}
+
+    def test_cookies_round_trip_and_never_reach_the_caller(self):
+        self.cdp().call("Network.clearBrowserCookies")
+        self.page_eval("location.reload()")
+        time.sleep(1)
+        # Another site's cookie in the same browser must stay out.
+        self.cdp().call("Network.setCookie", name="other", value="not-ours",
+                        domain="unrelated.example", path="/")
+        status = self.run_job({"op": "save-cookies", "name": "SESSION",
+                               "origins": [self.origin], "fillOnly": True})
+        self.assertEqual(status["state"], "done", status)
+        self.assertNotIn("s3ss10n", json.dumps(status))
+        # sid (Path=/) AND appsid (Path=/app), which a query for origin + "/"
+        # would miss; not the unrelated site's.
+        self.assertIn("saved 2 cookies", status["stdout"])
+        listed = self.broker.ask({"op": "list"})["secrets"]
+        self.assertEqual(listed[0]["kind"], "cookies")
+        self.assertTrue(listed[0]["fillOnly"])
+
+        self.cdp().call("Network.clearBrowserCookies")
+        self.assertNotIn("s3ss10n", self.page_eval("document.cookie"))
+        status = self.run_job({"op": "load-cookies", "name": "SESSION"})
+        self.assertEqual(status["state"], "done", status)
+        self.assertIn("s3ss10n-c00kie", self.page_eval("document.cookie"))
+        restored = self.all_cookies()
+        self.assertEqual(restored["appsid"]["path"], "/app")
+        self.assertNotIn("other", restored)
+
+        # exec refuses a fill-only session...
+        resp = self.broker.ask({"op": "exec", "argv": ["true"], "secretNames": ["SESSION"]})
+        self.assertEqual(self.broker.wait_job(resp["jobId"])["state"], "error")
 
 
 if __name__ == "__main__":

@@ -80,25 +80,46 @@ class Job:
         self.stdout_truncated = False
         self.stderr_truncated = False
         self.handle = None  # set by the Launcher; opaque to everything else
+        # A browser job whose stdout is a value to STORE (save-cookies), not
+        # output for the caller: called with the raw stdout once the worker
+        # exits 0, returns the summary to report instead. While it is set,
+        # status never shows stdout at all, not even a prefix mid-run.
+        self.capture = None
+        # A capture job's stdout pump writes HERE, never to stdout: status
+        # only ever shows stdout, so the captured bytes cannot reach a
+        # caller even if the pump outlives the drain thread's join and
+        # publishes after the sink has run. capture_sealed then makes that
+        # late publish a no-op, so the bytes are not retained either.
+        self.capture_out = b""
+        self.capture_out_truncated = False
+        self.capture_sealed = False
+        # Set only once the pump has read the capture stream to a clean
+        # EOF. A pump that is no longer running may instead have died on a
+        # read error, with a prefix in capture_out that must not be stored.
+        self.capture_eof = False
         self.lock = threading.Lock()
 
     def public(self):
         with self.lock:
+            hidden = self.capture is not None
             return {
                 "jobId": self.id,
                 "state": self.state,
                 "exitCode": self.exit_code,
-                "stdout": self.stdout.decode("utf-8", "replace"),
+                "stdout": "" if hidden else self.stdout.decode("utf-8", "replace"),
                 "stderr": self.stderr.decode("utf-8", "replace"),
                 "stdoutTruncated": self.stdout_truncated,
                 "stderrTruncated": self.stderr_truncated,
             }
 
-def encode_worker_frame(argv_or_command, shell, secret_values, nonsecret_env, cwd):
+def encode_worker_frame(argv_or_command, shell, secret_values, nonsecret_env, cwd,
+                        browser=None):
     """The one place that builds secret-worker.py's stdin frame, so a field
     added to it cannot land in one Launcher and not the other - the two
     launchers differ in how the child's uid is dropped, nothing about the
-    request it is handed."""
+    request it is handed. `browser` set means a built-in browser job (fill,
+    save-cookies, load-cookies): the worker runs its own fixed CDP code
+    instead of exec'ing a caller's command."""
     frame = json.dumps({
         "argv": argv_or_command if shell is None else None,
         "command": argv_or_command if shell is not None else None,
@@ -106,6 +127,7 @@ def encode_worker_frame(argv_or_command, shell, secret_values, nonsecret_env, cw
         "secrets": secret_values,
         "env": nonsecret_env,
         "cwd": cwd,
+        "browser": browser,
     }).encode("utf-8")
     return len(frame).to_bytes(4, "big") + frame
 
@@ -132,7 +154,8 @@ def spawn_worker(argv, frame_bytes):
 class Launcher:
     """How a job's child actually starts. Subclasses own the uid drop."""
 
-    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd,
+              browser=None):
         raise NotImplementedError
 
     def poll(self, job):
@@ -154,9 +177,10 @@ class DirectLauncher(Launcher):
         self.worker_path = worker_path
         self.python_bin = python_bin
 
-    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd):
+    def start(self, job, argv_or_command, shell, secret_values, nonsecret_env, cwd,
+              browser=None):
         frame_bytes = encode_worker_frame(argv_or_command, shell, secret_values,
-                                          nonsecret_env, cwd)
+                                          nonsecret_env, cwd, browser)
         job.handle = spawn_worker([self.python_bin, self.worker_path], frame_bytes)
         return job.handle
 
@@ -194,7 +218,11 @@ class JobManager:
     def _active_count(self):
         return sum(1 for j in self._jobs.values() if j.state in ACTIVE_STATES)
 
-    def start(self, namespace, req, resolve_secret):
+    def start(self, namespace, req, resolve_secret, builtin=None):
+        """builtin, for the browser ops, is {"secretNames": [...],
+        "browser": {...}, "capture": callable-or-None}: the job runs the
+        worker's own CDP code with those names resolved, instead of the
+        caller's command."""
         fingerprint = fingerprint_request(req)
         key = req.get("idempotencyKey")
         with self._lock:
@@ -216,7 +244,7 @@ class JobManager:
             if key is not None:
                 self._by_idempotency[(namespace, key)] = job.id
         try:
-            self._dispatch(job, req, resolve_secret)
+            self._dispatch(job, req, resolve_secret, builtin)
         except Exception:
             # Anything unexpected (an OSError reading a record, say) must
             # not leave the registered job "pending": two of those would
@@ -228,8 +256,8 @@ class JobManager:
                     job.finished_at = time.time()
         return job.id
 
-    def _dispatch(self, job, req, resolve_secret):
-        names = req.get("secretNames", [])
+    def _dispatch(self, job, req, resolve_secret, builtin=None):
+        names = builtin["secretNames"] if builtin else req.get("secretNames", [])
         secret_values = {}
         for name in names:
             try:
@@ -245,13 +273,17 @@ class JobManager:
                 job.finished_at = time.time()
                 return
             secret_values[name] = value
-        argv_or_command = req["argv"] if "argv" in req else req["command"]
-        shell = req.get("shell")
+        if builtin:
+            argv_or_command, shell, browser = None, None, builtin["browser"]
+            job.capture = builtin.get("capture")
+        else:
+            argv_or_command = req["argv"] if "argv" in req else req["command"]
+            shell, browser = req.get("shell"), None
         job.started_at = time.time()
         job.state = "running"
         try:
             self.launcher.start(job, argv_or_command, shell, secret_values,
-                                req.get("env", {}), req.get("cwd"))
+                                req.get("env", {}), req.get("cwd"), browser)
         except Exception as exc:
             # A job that failed to even START (systemd-run missing, a fork
             # failure, a frame too large for the pipe) must not stay
@@ -306,6 +338,8 @@ class JobManager:
                     clean = clean[:self.max_output_bytes]
                     truncated = True
                 with job.lock:
+                    if attr == "capture_out" and job.capture_sealed:
+                        return
                     setattr(job, attr, clean)
                     setattr(job, attr + "_truncated", truncated)
 
@@ -322,7 +356,8 @@ class JobManager:
                         truncated = True
                         discarded = True
                         with job.lock:
-                            setattr(job, attr + "_truncated", True)
+                            if not (attr == "capture_out" and job.capture_sealed):
+                                setattr(job, attr + "_truncated", True)
                         continue
                     if len(chunk) > room:
                         raw.extend(chunk[:room])
@@ -332,13 +367,17 @@ class JobManager:
                         raw.extend(chunk)
                     publish(False)
                 publish(True)
+                if attr == "capture_out":
+                    with job.lock:
+                        job.capture_eof = True
             finally:
                 # Job.handle outlives the child for the retention window;
                 # without this each finished job keeps two descriptors open.
                 with contextlib.suppress(OSError, ValueError):
                     stream.close()
 
-        out_thread = threading.Thread(target=pump, args=(proc.stdout, "stdout"), daemon=True)
+        out_attr = "capture_out" if job.capture is not None else "stdout"
+        out_thread = threading.Thread(target=pump, args=(proc.stdout, out_attr), daemon=True)
         err_thread = threading.Thread(target=pump, args=(proc.stderr, "stderr"), daemon=True)
         out_thread.start()
         err_thread.start()
@@ -368,6 +407,40 @@ class JobManager:
                 rc = self.launcher.poll(job)
                 job.exit_code = rc
                 job.state = "done" if rc == 0 else "error"
+            if job.capture is not None:
+                self._finish_capture(job, complete=job.capture_eof)
+
+    def _finish_capture(self, job, complete):
+        """Runs under job.lock. Hands a capture job's private output to its
+        sink and reports the sink's summary as stdout; on any failure the
+        job is an error and the captured bytes are dropped, never shown.
+        complete is False unless the stdout pump read to a clean EOF before
+        the join's deadline - it may still be blocked (a descendant holding
+        the pipe) or have died on a read error. Either way what it published
+        may be a prefix, so it is never stored."""
+        captured, job.capture_out = job.capture_out, b""
+        truncated = job.capture_out_truncated
+        job.capture_sealed = True
+        sink, job.capture = job.capture, None
+        job.stdout = b""
+        if job.state != "done":
+            return
+        if not complete:
+            job.state = "error"
+            job.stderr = b"captured value was not read to the end; nothing stored"
+            return
+        if truncated:
+            job.state = "error"
+            job.stderr = b"captured value too large to store"
+            return
+        try:
+            job.stdout = sink(captured).encode("utf-8")
+        except SecretError as exc:
+            job.state = "error"
+            job.stderr = str(exc).encode("utf-8")
+        except Exception as exc:  # noqa: BLE001 - must not kill the drain thread
+            job.state = "error"
+            job.stderr = f"failed to store captured value: {type(exc).__name__}".encode("utf-8")
 
     def status(self, namespace, job_id):
         job = self._jobs.get(job_id)
