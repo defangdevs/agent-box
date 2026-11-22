@@ -23680,7 +23680,11 @@ esac
       # prompt; the launch marker remains the fallback for older sessions.
       # Ten seconds bounds the scan cost for the selected prompt-less session
       # while staying below local-whatsapp's normal retry interval.
-      [ -f "$HOME/.local/state/local-whatsapp/ready" ] || return 0
+      # Without the stock bridge's ready marker (an externally supervised bridge
+      # deliberately avoids it, #1101) only routed sessions are published: the
+      # router owns their delivery whichever bridge carries the message.
+      _stock=true
+      [ -f "$HOME/.local/state/local-whatsapp/ready" ] || _stock=false
       _now="$(date +%s)"
       [ "$((_now - codex_sync_last))" -ge 10 ] || return 0
       codex_sync_last=$_now
@@ -23691,6 +23695,7 @@ esac
       _routed="$($JQ -c '[.sessions // {} | keys[]]' \
         "$HOME/.local/state/agent-box/router/state.json" 2>/dev/null)" || _routed='[]'
       [ -n "$_routed" ] || _routed='[]'
+      [ "$_stock" = true ] || [ "$_routed" != '[]' ] || return 0
       while IFS=$'\t' read -r _name _rc _profile; do
         case "$_name" in (*[!A-Za-z0-9_-]*|"") continue ;; esac
         [ "$_profile" != "." ] || _profile=""
@@ -23714,11 +23719,12 @@ esac
           codex_publish_thread "$_name" "$_thread"
           record_native_session "$_name" "$_thread"
         fi
-      done < <($JQ -r --arg target "$_target" --argjson routed "$_routed" '
+      done < <($JQ -r --arg target "$_target" --argjson routed "$_routed" \
+        --argjson stock "$_stock" '
         .sessions | to_entries[]
         | select((.value.agent // "") == "codex"
             and .value.stopped != true
-            and (.value.whatsapp == true or .key == $target
+            and (($stock and (.value.whatsapp == true or .key == $target))
                  or (.key as $k | $routed | index($k)) != null))
         | [.key,
            (if (.value.remoteControlDaemon == true
