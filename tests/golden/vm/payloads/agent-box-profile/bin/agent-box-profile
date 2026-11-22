@@ -1,5 +1,5 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
-export AGENT_BOX_AGENTS='claude codex shell'
+export AGENT_BOX_AGENTS='claude codex gemini shell'
 export AGENT_BOX_DEFAULT_AGENT=claude
 # A profile file is the env store in another directory, so it has the same
 # one parser (issue #212).
@@ -10,7 +10,7 @@ set -eu
 # exports, exactly as src/session-cli.sh does (issue #154, Phase 2).
 JQ=jq
 # An agent PROFILE (issue #321): the concrete worker, as opposed to the
-# HARNESS (claude/codex/shell) that `agent-box-session --harness` selects. A
+# HARNESS (claude/codex/gemini/shell) that `agent-box-session --harness` selects. A
 # profile names a harness plus the knobs that make two sessions on the same
 # harness different workers — model, effort, an appended system prompt, and
 # environment for the session.
@@ -57,7 +57,7 @@ usage() {
   echo "       agent-box-session add [NAME] --profile PROFILE"
   echo "Reserved keys (turned into harness arguments):"
   echo "  HARNESS        $PROFILE_HARNESSES  (required; 'shell' is a session kind, not a worker)"
-  echo "  MODEL          claude: --model VALUE; codex: -m VALUE"
+  echo "  MODEL          claude: --model VALUE; codex, gemini: -m VALUE"
   echo "  EFFORT         claude: --effort VALUE; codex: -c model_reasoning_effort=VALUE"
   echo "  SYSTEM_PROMPT  claude: --append-system-prompt VALUE"
   echo "Any OTHER key is environment for sessions started with this profile,"
@@ -263,6 +263,15 @@ launch_json() {
       # the key silently — a profile whose prompt never arrives is worse than
       # one that refuses to pretend.
       [ -n "$res_SYSTEM_PROMPT" ] && warn="$warn|SYSTEM_PROMPT is ignored for the codex harness (no --append-system-prompt equivalent); put the instructions in the working directory's AGENTS.md"
+      ;;
+    gemini)
+      [ -n "$res_MODEL" ] && set -- "$@" -m "$res_MODEL"
+      # gemini has neither a reasoning-effort flag nor an
+      # --append-system-prompt equivalent; its instructions come from
+      # GEMINI.md (seeded to point at the box guide). Say so rather than
+      # dropping the keys silently.
+      [ -n "$res_EFFORT" ] && warn="$warn|EFFORT is ignored for the gemini harness (no reasoning-effort flag)"
+      [ -n "$res_SYSTEM_PROMPT" ] && warn="$warn|SYSTEM_PROMPT is ignored for the gemini harness (no --append-system-prompt equivalent); put the instructions in the working directory's GEMINI.md"
       ;;
     *)
       # shell, and any harness added later: no argument mapping exists, so

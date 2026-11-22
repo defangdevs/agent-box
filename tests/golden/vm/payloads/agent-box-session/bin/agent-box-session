@@ -1,5 +1,5 @@
 #!/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bash-5.3p15/bin/bash
-export AGENT_BOX_AGENTS='claude codex shell'
+export AGENT_BOX_AGENTS='claude codex gemini shell'
 export AGENT_BOX_DEFAULT_AGENT=claude
 # sessions.json lock (issue #254). Pinned in the WRAPPER, not in a unit
 # environment like the supervisor's other AGENT_BOX_*_BIN pins: this CLI
@@ -1939,6 +1939,9 @@ case "$cmd" in
     if [ -z "$remote_control" ]; then
       remote_control=true
       [ "$harness" = codex ] && remote_control=false
+      # gemini has no Remote Control at all; record false so the registry
+      # never claims a mirror that cannot exist.
+      [ "$harness" = gemini ] && remote_control=false
     fi
     # Compatibility: before issue #915 Codex used remoteControl itself as
     # its daemon discriminator. Preserve that input while writing the new,
