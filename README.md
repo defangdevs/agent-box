@@ -117,6 +117,9 @@ refused, and a failure rolls back to what was running.
 Verifying releases against an offline signing key is tracked in
 [issue 46](https://github.com/defangdevs/agent-box/issues/46).
 
+To install an unmerged PR or branch on a native test box and restore its saved
+revision afterward, use the operator-only [test-box helper](docs/test-box-updates.md).
+
 Template source: [`deploy/aws/lightsail-template.yaml`](./deploy/aws/lightsail-template.yaml).
 See [`deploy/aws/README.md`](./deploy/aws/README.md) for design notes and the S3-hosting
 setup.
