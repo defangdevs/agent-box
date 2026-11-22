@@ -3319,6 +3319,8 @@ class Renderer:
             if e.get("condition", "always") == "always" or self.spec.webhook_enable
         ] + [
             f'ExecSearchPath={path}',
+            "ExecStartPre=",
+            f"ExecStartPre={self.contract_bin(agent_box_contract['execStartPre'][0])}",
             "ExecStart=",
             f"ExecStart={self.contract_bin(agent_box_contract['execStart'][0])}",
             "ExecStop=",

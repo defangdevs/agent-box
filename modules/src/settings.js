@@ -18,6 +18,8 @@
       }
       button.setAttribute("aria-controls", id);
       button.setAttribute("aria-expanded", String(!editor.hidden));
+      var label = button.getAttribute(editor.hidden ? "data-open-label" : "data-close-label");
+      if (label) { button.textContent = label; }
     });
   }
   function refreshEditorProfiles(editor, incoming) {
@@ -1310,6 +1312,14 @@
     e.preventDefault();
     var plain = b.getAttribute("data-copy");
     if (plain) { copyText(plain).then(function (ok) { flashCopy(b, ok); }); return; }
+    var target = b.getAttribute("data-copy-target");
+    if (target) {
+      var source = document.getElementById(target);
+      copyText(source ? source.textContent : "")
+        .then(function (ok) { flashCopy(b, ok); })
+        .catch(function () { flashCopy(b, false); });
+      return;
+    }
     var url = b.getAttribute("data-secret-url");
     if (!url) { return; }
     fetchSecret(url).then(function (secret) {
