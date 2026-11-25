@@ -9,6 +9,7 @@ import json as hibernate_json
 import os as hibernate_os
 from pathlib import Path as HibernatePath
 import re as hibernate_re
+import sys as hibernate_sys
 import time as hibernate_time
 
 
@@ -494,8 +495,22 @@ def _hibernate_tmux_state(name):
     return int(fields[0]), int(fields[1])
 
 
+def hibernation_pane_quiet(name, now=None, tmux_state=None):
+    """Idle mode's last look at the pane: nobody attached, nobody typing.
+
+    Asked outside the registry lock (it runs tmux, issue #748) and immediately
+    before the kill, because the verify step under the lock cannot ask it.
+    Unknown is not quiet.
+    """
+    threshold = _hibernate_idle_threshold()
+    now = hibernate_time.time() if now is None else now
+    pane = (tmux_state or _hibernate_tmux_state)(name)
+    return (pane is not None and pane[0] == 0
+            and now - pane[1] >= threshold)
+
+
 def hibernation_probe(name, entry, live, now=None, parked=False, idle=False,
-                      tmux_state=None):
+                      tmux_state=None, check_pane=True):
     # parked=True re-probes a session hibernate_one already marked stopped,
     # so our own marker must not veto it. idle=True widens the pool from
     # hooks to every Claude/Codex session and swaps the pressure grace for
@@ -544,12 +559,12 @@ def hibernation_probe(name, entry, live, now=None, parked=False, idle=False,
                      else _hibernate_idle_seconds())
         if now - idle_since < threshold:
             return None
-        if idle:
-            pane = (tmux_state or _hibernate_tmux_state)(name)
-            # Somebody is looking at the pane, or typed into it recently
-            # (a half-written prompt is input the transcript cannot see).
-            if pane is None or pane[0] > 0 or now - pane[1] < threshold:
-                return None
+        # Somebody is looking at the pane, or typed into it recently (a
+        # half-written prompt is input the transcript cannot see). Not asked
+        # when verifying under the registry lock: tmux must not run there.
+        if idle and check_pane and not hibernation_pane_quiet(
+                name, now, tmux_state):
+            return None
     evidence = {
         "name": name,
         "entry": entry,
@@ -613,7 +628,7 @@ def hibernation_candidate(sessions, excludes=(), name=None, token=None,
     if name is not None:
         entry = sessions.get(name)
         result = hibernation_probe(name, entry, live, parked=quiet is not None,
-                                   idle=idle)
+                                   idle=idle, check_pane=token is None)
         if result is None:
             return None
         if quiet is not None:
@@ -627,9 +642,11 @@ def hibernation_candidate(sessions, excludes=(), name=None, token=None,
             continue
         try:
             result = hibernation_probe(candidate_name, entry, live, idle=idle)
-        except SessionHibernationError:
+        except SessionHibernationError as exc:
             # One session with unreadable evidence stays resident and must
             # not hide the others (#885). Configuration was validated above.
+            print("hibernate: %s stays resident: %s" % (candidate_name, exc),
+                  file=hibernate_sys.stderr)
             continue
         if result is not None:
             candidates.append(result)

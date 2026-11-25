@@ -910,6 +910,19 @@ record_hibernated_native() {
     || { rm -f "$_pending"; return 75; }
 }
 
+mark_hibernated() {
+  _state="$(session_state_file "$1")"
+  [ -r "$_state" ] || return 0
+  _pending="$(mktemp "$_state.XXXXXX" 2>/dev/null)" || return 0
+  if "$JQ" '(if type == "object" then . else {} end) | .hibernated = true' \
+       "$_state" > "$_pending" 2>/dev/null && [ -s "$_pending" ]; then
+    chmod 600 "$_pending" 2>/dev/null
+    mv -f "$_pending" "$_state" 2>/dev/null || rm -f "$_pending"
+  else
+    rm -f "$_pending"
+  fi
+}
+
 hibernate_one() {
   # hibernate_one [EXCLUDED_NAME...] -- free one worker slot, but only while
   # capacity is actually full. The capacity helper performs the expensive
@@ -1042,6 +1055,15 @@ hibernate_one() {
     _undo_hibernation || return $?
     return 1
   fi
+  # Idle mode only, and not part of _still_quiet: that also runs after the
+  # kill, when there is no pane left to ask about. This is the last chance
+  # to see somebody sit down at the session; the verify under the lock
+  # could not ask (tmux must not run there).
+  if [ "${HIBERNATE_IDLE:-}" = 1 ] \
+      && ! "$_cap" hibernate-pane "$REGISTRY_FILE" "$_name" >/dev/null 2>&1; then
+    _undo_hibernation || return $?
+    return 1
+  fi
 
   # tmux kill-session returns once the session is destroyed, not once the
   # native process has exited, so it can still land one last transcript write
@@ -1090,6 +1112,13 @@ hibernate_one() {
     "$REGISTRY_FILE" 2>/dev/null)" || _still=false
   registry_unlock
   [ "$_still" = true ] || return 1
+  # The runtime is gone and the park stands. Say so in the sidecar so the
+  # NEXT spawn is a wake, not a crash recovery: nothing was outstanding when
+  # we parked (no lease, no live subscription, a closed turn), so the
+  # supervisor must not inject its "you were interrupted" notice, which a
+  # filter file that still lists expired topics would otherwise trigger. Last
+  # and best effort: no marker only costs that one notice.
+  mark_hibernated "$_name"
   printf '%s\n' "$_verified"
 }
 prune_session_state() {

@@ -137,6 +137,10 @@ plainly rather than handing it back.
   seconds ago, with nobody attached to its pane or typing in it for that long.
   Wake one with `agent-box-session restart NAME`; a routed WhatsApp or webhook
   message does it too. A session with Remote Control on is never idle-parked.
+  Without root on the host, set the same thing from the env store:
+  `agent-box-session env set AGENT_BOX_IDLE_HIBERNATE_S 7200` (0 turns it off;
+  it overrides the box configuration and applies on the next sweep, about
+  five minutes).
   An open turn, unresolved assignment, webhook subscription, pending delivery,
   unknown transcript state, or Claude/Codex Remote Control server remains
   resident. `sessionHibernationGraceSeconds` sets the minimum age of the

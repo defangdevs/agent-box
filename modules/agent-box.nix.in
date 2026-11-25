@@ -2003,7 +2003,8 @@ in
         apply (open turn, unresolved assignment, live webhook subscription,
         pending WhatsApp message, unknown transcript state). A session with
         Remote Control enabled is never parked: its mirror in the apps would
-        vanish.
+        vanish. A user's env store value AGENT_BOX_IDLE_HIBERNATE_S overrides
+        this (0 turns it off), for users without root on the host.
       '';
     };
 

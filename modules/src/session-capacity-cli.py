@@ -5,7 +5,7 @@ import sys
 def capacity_main():
     if len(sys.argv) < 3:
         print("usage: agent-box-session-capacity "
-              "check|spawn|hibernate-candidate|hibernate-verify REGISTRY [ARGS...]",
+              "check|spawn|hibernate-candidate|hibernate-verify|hibernate-pane REGISTRY [ARGS...]",
               file=sys.stderr)
         return 2
     try:
@@ -52,6 +52,14 @@ def capacity_main():
             result = hibernation_candidate(
                 sessions, name=sys.argv[3], quiet=sys.argv[4])
             return 1 if result is None else 0
+        if command == "hibernate-pane":
+            # Idle mode's pre-kill look at the pane. Exit 1: somebody is
+            # attached or typing (or tmux cannot say), so do not park.
+            if len(sys.argv) != 4:
+                print("usage: agent-box-session-capacity hibernate-pane REGISTRY NAME",
+                      file=sys.stderr)
+                return 2
+            return 0 if hibernation_pane_quiet(sys.argv[3]) else 1
         if command == "finish-state":
             # May a session that ran `finish` be removed yet? See
             # finish_state(): idle, busy, input or unknown on stdout.
