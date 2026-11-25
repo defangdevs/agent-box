@@ -3266,6 +3266,22 @@ class ConfigSchemaTest(unittest.TestCase):
                 self.refused(lambda c: c.update(
                     sessionHibernationGraceSeconds=value)))
 
+    def test_session_idle_hibernate_is_off_unless_positive(self):
+        self.assertEqual(
+            self.spec(lambda c: c.pop("sessionIdleHibernateSeconds", None))
+            .session_idle_hibernate_seconds, 0)
+        self.assertEqual(
+            self.spec(lambda c: c.update(sessionIdleHibernateSeconds=None))
+            .session_idle_hibernate_seconds, 0)
+        self.assertEqual(
+            self.spec(lambda c: c.update(sessionIdleHibernateSeconds=7200))
+            .session_idle_hibernate_seconds, 7200)
+        for value in [-1, True, "hours", 1.5]:
+            self.assertIn(
+                "sessionIdleHibernateSeconds",
+                self.refused(lambda c: c.update(
+                    sessionIdleHibernateSeconds=value)))
+
     def test_claude_remote_control_server_has_one_unambiguous_shape(self):
         # The valid form is accepted and rendered by the golden fixture.
         self.spec(lambda c: c["users"]["agent"]["sessions"]["main"].update(

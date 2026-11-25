@@ -1599,13 +1599,23 @@ let
       of physical RAM and overridable by `sessionLimit` in the box configuration.
       Running and pending hooks reserve slots. User-created sessions, including
       manual CLI/UI adds, sign-in and pairing sessions, bypass the cap and are
-      never hibernated. Shell panes do not use a slot either. Restarting a stopped
+      not hibernated under pressure. Shell panes do not use a slot either. Restarting a stopped
       hook needs a free slot; `restart --all` refuses without changing anything if
       its hook starts would exceed the limit. When a new hook is refused at the
       limit, Agentbox may hibernate the oldest conservatively idle Claude or Codex
       hook: its process exits, its stable name and native conversation ID stay
       recorded, and a later routed message resumes that exact conversation through
-      the hook capacity gate. It never hibernates merely because a hook is idle.
+      the hook capacity gate. Nothing is hibernated merely for being idle unless
+      the operator sets `sessionIdleHibernateSeconds` (off by default). With it
+      set to N seconds the supervisor also parks, with `agent-box-session hibernate
+      --idle`, any Claude or Codex session of any origin whose last turn closed N
+      seconds ago, with nobody attached to its pane or typing in it for that long.
+      Wake one with `agent-box-session restart NAME`; a routed WhatsApp or webhook
+      message does it too. A session with Remote Control on is never idle-parked.
+      Without root on the host, set the same thing from the env store:
+      `agent-box-session env set AGENT_BOX_IDLE_HIBERNATE_S 7200` (0 turns it off;
+      it overrides the box configuration and applies on the next sweep, about
+      five minutes).
       An open turn, unresolved assignment, webhook subscription, pending delivery,
       unknown transcript state, or Claude/Codex Remote Control server remains
       resident. `sessionHibernationGraceSeconds` sets the minimum age of the
@@ -6768,6 +6778,7 @@ import json as hibernate_json
 import os as hibernate_os
 from pathlib import Path as HibernatePath
 import re as hibernate_re
+import sys as hibernate_sys
 import time as hibernate_time
 
 
@@ -7083,7 +7094,41 @@ def _hibernate_codex_transcript(name, entry):
     return native, path, state_path
 
 
-def _hibernate_has_watch(name):
+def _hibernate_hours(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if value >= 0 and value == value else None
+
+
+def _hibernate_topic_expired(topic, default_ttl, now):
+    """local-webhook's entry_expired(), and nothing looser.
+
+    The clock runs from subscribedAt only; a per-entry ttlHours beats the
+    file's, and 0 means pinned. Anything this cannot prove expired (a topic
+    that is not an object, no or unparseable subscribedAt, a ttl that is not
+    a number) is live: unknown never permits parking.
+    """
+    if not isinstance(topic, dict):
+        return False
+    ttl = topic.get("ttlHours")
+    ttl = _hibernate_hours(default_ttl if ttl is None else ttl)
+    if not ttl:
+        return False
+    stamp = topic.get("subscribedAt")
+    if not isinstance(stamp, str) or not stamp:
+        return False
+    import datetime as hibernate_datetime
+    try:
+        started = hibernate_datetime.datetime.fromisoformat(
+            stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        return False
+    return now - started.timestamp() > ttl * 3600
+
+
+def _hibernate_has_watch(name, now=None):
     user = hibernate_os.environ.get("USER") or ""
     state_dir = HibernatePath(hibernate_os.environ.get(
         "LOCAL_WEBHOOK_STATE_DIR",
@@ -7098,14 +7143,18 @@ def _hibernate_has_watch(name):
     if not isinstance(topics, list):
         return True, path, _hibernate_hash(path)
     enabled = value.get("enabled") is not False
+    now = hibernate_time.time() if now is None else now
     # inbox:<name> is the message router's delivery address for this session.
     # The router wakes the session before every delivery and the bus spools
     # the message while it starts, so that subscription alone is no reason to
     # keep the runtime resident. Anything else, or an unreadable entry, is.
+    # A subscription local-webhook already considers expired no longer routes
+    # events (#884); it only lingers in the file until the next write.
     blocking = [topic for topic in topics
                 if not (isinstance(topic, dict) and isinstance(topic.get("topic"), str)
                         and topic["topic"].startswith("inbox:")
-                        and topic.get("deliverTo", "session") == "session")]
+                        and topic.get("deliverTo", "session") == "session")
+                and not _hibernate_topic_expired(topic, value.get("ttlHours"), now)]
     return enabled and bool(blocking), path, _hibernate_hash(path)
 
 
@@ -7166,17 +7215,87 @@ def _hibernate_idle_seconds():
     return int(raw)
 
 
-def hibernation_probe(name, entry, live, now=None, parked=False):
+# Idle hibernation (AGENT_BOX_HIBERNATE_MODE=idle) is the second, opt-in way
+# a session is parked: not because a slot is wanted, but because nobody has
+# used it for AGENT_BOX_IDLE_HIBERNATE_S seconds. It reuses every fence of the
+# pressure path (closed turn, no lease, no live subscription, no pending
+# WhatsApp message, exact native identity) and adds the ones an interactive
+# session needs: nobody attached to its pane, no recent keystroke, and no
+# Remote Control mirror whose app view would vanish.
+def _hibernate_idle_mode():
+    mode = hibernate_os.environ.get("AGENT_BOX_HIBERNATE_MODE", "")
+    if mode not in ("", "idle"):
+        raise SessionHibernationError(
+            "AGENT_BOX_HIBERNATE_MODE must be empty or idle")
+    return mode == "idle"
+
+
+def _hibernate_idle_threshold():
+    raw = hibernate_os.environ.get("AGENT_BOX_IDLE_HIBERNATE_S", "")
+    if not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+        raise SessionHibernationError(
+            "AGENT_BOX_IDLE_HIBERNATE_S must be a positive integer in idle mode")
+    # Never shorter than the pressure path's own grace period.
+    return max(int(raw), _hibernate_idle_seconds())
+
+
+def _hibernate_tmux_state(name):
+    """(attached clients, last client activity epoch) of a session's pane.
+
+    None means tmux could not say, which is never permission to park.
+    """
+    command = [hibernate_os.environ.get("AGENT_BOX_TMUX_BIN", "tmux"),
+               "-L", hibernate_os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box"),
+               "display-message", "-p", "-t", "=" + name + ":",
+               "#{session_attached} #{session_activity}"]
+    env = dict(hibernate_os.environ)
+    if env.get("AGENT_BOX_TMUX_TMPDIR"):
+        env["TMUX_TMPDIR"] = env["AGENT_BOX_TMUX_TMPDIR"]
+    import subprocess as hibernate_subprocess
+    try:
+        proc = hibernate_subprocess.run(command, capture_output=True, text=True,
+                                        timeout=5, check=False, env=env)
+    except (OSError, hibernate_subprocess.TimeoutExpired):
+        return None
+    fields = proc.stdout.split()
+    if proc.returncode != 0 or len(fields) != 2 or not all(
+            field.isascii() and field.isdecimal() for field in fields):
+        return None
+    return int(fields[0]), int(fields[1])
+
+
+def hibernation_pane_quiet(name, now=None, tmux_state=None):
+    """Idle mode's last look at the pane: nobody attached, nobody typing.
+
+    Asked outside the registry lock (it runs tmux, issue #748) and immediately
+    before the kill, because the verify step under the lock cannot ask it.
+    Unknown is not quiet.
+    """
+    threshold = _hibernate_idle_threshold()
+    now = hibernate_time.time() if now is None else now
+    pane = (tmux_state or _hibernate_tmux_state)(name)
+    return (pane is not None and pane[0] == 0
+            and now - pane[1] >= threshold)
+
+
+def hibernation_probe(name, entry, live, now=None, parked=False, idle=False,
+                      tmux_state=None, check_pane=True):
     # parked=True re-probes a session hibernate_one already marked stopped,
-    # so our own marker must not veto it.
+    # so our own marker must not veto it. idle=True widens the pool from
+    # hooks to every Claude/Codex session and swaps the pressure grace for
+    # the idle threshold; see _hibernate_idle_mode.
     if not isinstance(entry, dict) or name not in live:
         return None
     harness = entry.get("agent")
     if harness not in ("claude", "codex"):
         return None
-    if (not capacity_is_hook(name, entry)
+    if ((not idle and not capacity_is_hook(name, entry))
             or (entry.get("stopped") is True and not parked)
             or _hibernate_crashed(entry)):
+        return None
+    if idle and entry.get("remoteControl") is True:
+        # A mirrored Claude TUI or Codex pairing daemon: parking it would
+        # drop the conversation out from under the app that shows it.
         return None
     # These panes own a daemon, not one resumable conversation. Recognize
     # both legacy harness-specific encodings as well as the canonical bit.
@@ -7203,8 +7322,18 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
     # A parked re-probe (the quiet checks around the kill) skips the age
     # test: the selection already proved the idle time, and an exiting
     # Claude writes its last records just then, which renews the mtime.
-    if not parked and now - idle_since < _hibernate_idle_seconds():
-        return None
+    # The same goes for the pane checks: killing the pane is what changes them.
+    if not parked:
+        threshold = (_hibernate_idle_threshold() if idle
+                     else _hibernate_idle_seconds())
+        if now - idle_since < threshold:
+            return None
+        # Somebody is looking at the pane, or typed into it recently (a
+        # half-written prompt is input the transcript cannot see). Not asked
+        # when verifying under the registry lock: tmux must not run there.
+        if idle and check_pane and not hibernation_pane_quiet(
+                name, now, tmux_state):
+            return None
     evidence = {
         "name": name,
         "entry": entry,
@@ -7259,9 +7388,16 @@ def hibernation_candidate(sessions, excludes=(), name=None, token=None,
         except SessionCapacityError as exc:
             raise SessionHibernationError(str(exc)) from exc
     excluded = set(excludes)
+    idle = _hibernate_idle_mode()
+    # Configuration errors are for the caller, not something to swallow
+    # per session below.
+    _hibernate_idle_seconds()
+    if idle:
+        _hibernate_idle_threshold()
     if name is not None:
         entry = sessions.get(name)
-        result = hibernation_probe(name, entry, live, parked=quiet is not None)
+        result = hibernation_probe(name, entry, live, parked=quiet is not None,
+                                   idle=idle, check_pane=token is None)
         if result is None:
             return None
         if quiet is not None:
@@ -7273,7 +7409,14 @@ def hibernation_candidate(sessions, excludes=(), name=None, token=None,
     for candidate_name, entry in sessions.items():
         if candidate_name in excluded:
             continue
-        result = hibernation_probe(candidate_name, entry, live)
+        try:
+            result = hibernation_probe(candidate_name, entry, live, idle=idle)
+        except SessionHibernationError as exc:
+            # One session with unreadable evidence stays resident and must
+            # not hide the others (#885). Configuration was validated above.
+            print("hibernate: %s stays resident: %s" % (candidate_name, exc),
+                  file=hibernate_sys.stderr)
+            continue
         if result is not None:
             candidates.append(result)
     if not candidates:
@@ -7453,7 +7596,7 @@ import sys
 def capacity_main():
     if len(sys.argv) < 3:
         print("usage: agent-box-session-capacity "
-              "check|spawn|hibernate-candidate|hibernate-verify REGISTRY [ARGS...]",
+              "check|spawn|hibernate-candidate|hibernate-verify|hibernate-pane REGISTRY [ARGS...]",
               file=sys.stderr)
         return 2
     try:
@@ -7500,6 +7643,14 @@ def capacity_main():
             result = hibernation_candidate(
                 sessions, name=sys.argv[3], quiet=sys.argv[4])
             return 1 if result is None else 0
+        if command == "hibernate-pane":
+            # Idle mode's pre-kill look at the pane. Exit 1: somebody is
+            # attached or typing (or tmux cannot say), so do not park.
+            if len(sys.argv) != 4:
+                print("usage: agent-box-session-capacity hibernate-pane REGISTRY NAME",
+                      file=sys.stderr)
+                return 2
+            return 0 if hibernation_pane_quiet(sys.argv[3]) else 1
         if command == "finish-state":
             # May a session that ran `finish` be removed yet? See
             # finish_state(): idle, busy, input or unknown on stdout.
@@ -9156,6 +9307,7 @@ done
     # a lock. util-linux is the only package that ships flock.
     export AGENT_BOX_CAPACITY_BIN=${capacityCli}/bin/agent-box-session-capacity
     export AGENT_BOX_HIBERNATE_IDLE_S=${toString cfg.sessionHibernationGraceSeconds}
+    export AGENT_BOX_IDLE_HIBERNATE_S=${toString cfg.sessionIdleHibernateSeconds}
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
     # Agent profiles (issue #321): `add --profile` resolves the harness and
     # its arguments by shelling out to agent-box-profile, and this CLI runs
@@ -9898,7 +10050,7 @@ usage() {
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm [--now] NAME"
   echo "       agent-box-session stop NAME"
-  echo "       agent-box-session hibernate [--exclude NAME...]"
+  echo "       agent-box-session hibernate [--idle [SECONDS]] [--exclude NAME...]"
   echo "       agent-box-session restart NAME | --all"
   echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | wake NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
@@ -9950,8 +10102,12 @@ usage() {
   echo "removal) instead of dying with the pane. --now removes at once."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
-  echo "hibernate is demand-driven: only at the hook limit, park the oldest"
-  echo "conservatively quiescent resumable hook. User sessions are never hibernated."
+  echo "hibernate parks ONE conservatively quiescent resumable session. By default"
+  echo "that is demand-driven: only at the hook limit, the oldest idle hook."
+  echo "--idle [SECONDS] parks, with no pressure needed, the longest-idle session of"
+  echo "any origin that has been quiet that long and that nobody is attached to or"
+  echo "mirroring in an app (default: sessionIdleHibernateSeconds; exit 3 if that is"
+  echo "0). The supervisor runs it on a timer when that option is positive."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
 # The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
@@ -10053,6 +10209,19 @@ record_hibernated_native() {
     || { rm -f "$_pending"; return 75; }
 }
 
+mark_hibernated() {
+  _state="$(session_state_file "$1")"
+  [ -r "$_state" ] || return 0
+  _pending="$(mktemp "$_state.XXXXXX" 2>/dev/null)" || return 0
+  if "$JQ" '(if type == "object" then . else {} end) | .hibernated = true' \
+       "$_state" > "$_pending" 2>/dev/null && [ -s "$_pending" ]; then
+    chmod 600 "$_pending" 2>/dev/null
+    mv -f "$_pending" "$_state" 2>/dev/null || rm -f "$_pending"
+  else
+    rm -f "$_pending"
+  fi
+}
+
 hibernate_one() {
   # hibernate_one [EXCLUDED_NAME...] -- free one worker slot, but only while
   # capacity is actually full. The capacity helper performs the expensive
@@ -10071,13 +10240,18 @@ hibernate_one() {
   # and issue #748's rule is that no writer holds the shared file lock across
   # that potentially slow subprocess. A second check after the transition,
   # while the old pane still counts live, closes the slot-freed race.
-  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
-    :
-  else
-    return $?
+  # Idle hibernation (`hibernate --idle`) parks because nobody is using the
+  # session, not because a slot is wanted: both pressure gates are skipped.
+  # Everything that proves the session quiet is not.
+  if [ "''${HIBERNATE_IDLE:-}" != 1 ]; then
+    if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+      :
+    else
+      return $?
+    fi
+    printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
+      || return 1
   fi
-  printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
-    || return 1
 
   registry_lock || return "$REGISTRY_BUSY_RC"
   if _verified="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
@@ -10132,7 +10306,9 @@ hibernate_one() {
   # live pane and therefore still counts here; a value below max means some
   # OTHER slot became free while selection was running, so undo without
   # killing anything.
-  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+  if [ "''${HIBERNATE_IDLE:-}" = 1 ]; then
+    :
+  elif _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
     if ! printf '%s' "$_capacity" | "$JQ" -e \
         '.used >= .max' >/dev/null 2>&1; then
       _undo_hibernation || return $?
@@ -10175,6 +10351,15 @@ hibernate_one() {
       "$_cap" hibernate-quiet "$REGISTRY_FILE" "$_name" "$_quiet" 2>&1)"
   }
   if ! _still_quiet; then
+    _undo_hibernation || return $?
+    return 1
+  fi
+  # Idle mode only, and not part of _still_quiet: that also runs after the
+  # kill, when there is no pane left to ask about. This is the last chance
+  # to see somebody sit down at the session; the verify under the lock
+  # could not ask (tmux must not run there).
+  if [ "''${HIBERNATE_IDLE:-}" = 1 ] \
+      && ! "$_cap" hibernate-pane "$REGISTRY_FILE" "$_name" >/dev/null 2>&1; then
     _undo_hibernation || return $?
     return 1
   fi
@@ -10226,6 +10411,13 @@ hibernate_one() {
     "$REGISTRY_FILE" 2>/dev/null)" || _still=false
   registry_unlock
   [ "$_still" = true ] || return 1
+  # The runtime is gone and the park stands. Say so in the sidecar so the
+  # NEXT spawn is a wake, not a crash recovery: nothing was outstanding when
+  # we parked (no lease, no live subscription, a closed turn), so the
+  # supervisor must not inject its "you were interrupted" notice, which a
+  # filter file that still lists expired topics would otherwise trigger. Last
+  # and best effort: no marker only costs that one notice.
+  mark_hibernated "$_name"
   printf '%s\n' "$_verified"
 }
 prune_session_state() {
@@ -10439,10 +10631,38 @@ case "$cmd" in
   hibernate)
     excludes=()
     while [ $# -gt 0 ]; do
-      [ "$1" = --exclude ] && [ $# -ge 2 ] && valid_name "$2" \
-        || { usage >&2; exit 2; }
-      excludes+=("$2")
-      shift 2
+      case "$1" in
+        (--exclude)
+          [ $# -ge 2 ] && valid_name "$2" || { usage >&2; exit 2; }
+          excludes+=("$2")
+          shift 2
+          ;;
+        (--idle)
+          # Park the longest-idle session of ANY origin that has been quiet
+          # for SECONDS, with no slot pressure needed.
+          # SECONDS is optional: without it the box's configured
+          # sessionIdleHibernateSeconds applies, and 0 there means off.
+          case "''${2:-}" in
+            ("") shift ;;
+            (--exclude) shift ;;
+            ([1-9]*)
+              case "$2" in (*[!0-9]*) usage >&2; exit 2 ;; esac
+              AGENT_BOX_IDLE_HIBERNATE_S="$2"
+              shift 2
+              ;;
+            (*) usage >&2; exit 2 ;;
+          esac
+          case "''${AGENT_BOX_IDLE_HIBERNATE_S:-0}" in
+            (""|*[!0-9]*|0*)
+              echo "idle hibernation is off (sessionIdleHibernateSeconds is 0)" >&2
+              exit 3
+              ;;
+          esac
+          export HIBERNATE_IDLE=1 AGENT_BOX_HIBERNATE_MODE=idle \
+                 AGENT_BOX_IDLE_HIBERNATE_S
+          ;;
+        (*) usage >&2; exit 2 ;;
+      esac
     done
     registry_ensure
     if hibernate_one "''${excludes[@]}"; then
@@ -23485,6 +23705,21 @@ esac
       [ "$st" != closed ]
     }
 
+    hibernated_marker_take() {
+      # True once, right after a hibernation: the sidecar says the last runtime
+      # was parked on purpose (see mark_hibernated in session-cli.sh). The marker
+      # is cleared as it is read, so a later crash respawn is judged afresh.
+      _f="$(session_state_file "$1")"
+      [ "$($JQ -r '.hibernated // false' "$_f" 2>/dev/null)" = true ] || return 1
+      _t="$(mktemp "$_f.XXXXXX" 2>/dev/null)" || return 0
+      if $JQ 'del(.hibernated)' "$_f" > "$_t" 2>/dev/null && [ -s "$_t" ]; then
+        mv -f "$_t" "$_f" 2>/dev/null || rm -f "$_t"
+      else
+        rm -f "$_t"
+      fi
+      return 0
+    }
+
     session_watches_events() {
       # True when $1 held at least one webhook subscription when it died. The
       # filter file outlives the process that wrote it (local-webhook keys it on
@@ -23912,6 +24147,10 @@ esac
       # unfinished work AND lets an already-finished task exit instead of
       # looping — resumePrompt overrides it per session.
       resuming=false; prompt="$ip"
+      woken=false
+      if [ "$hasrun" = true ] && hibernated_marker_take "$sname"; then
+        woken=true
+      fi
       if [ "$hasrun" = true ]; then
         resuming=true
         if [ -n "$rp" ]; then
@@ -23924,6 +24163,7 @@ esac
           prompt="$ip"
         elif { [ "$agent" = claude ] || { [ "$agent" = codex ] \
                && [ -n "$codex_target" ]; }; } \
+             && [ "$woken" = false ] \
              && restart_notice_wanted "$sname" "$bid" "$agent"; then
           # An interrupted session is caught up by --resume but starts no turn of
           # its own, so a session with outstanding work waits forever unless this
@@ -24712,6 +24952,38 @@ esac
       fi
     }
 
+    # Idle hibernation (sessionIdleHibernateSeconds): free the runtime of sessions
+    # nobody has used for a while. `hibernate --idle` does every check and parks
+    # one session per call, or exits non-zero (3: the option is off, 1: nothing
+    # eligible). One per pass: each call scans transcripts and may wait for the
+    # pane to exit, the thresholds are hours and the pass repeats every few
+    # minutes, so a backlog drains without ever holding the reconcile loop (and the
+    # respawn of a crashed session) for long. A failure never stops the loop.
+    #
+    # The user's env store (agent-box-session env set AGENT_BOX_IDLE_HIBERNATE_S N,
+    # or the settings page) overrides the box's sessionIdleHibernateSeconds, so a
+    # user without root on the host can turn it on, tune it, or set 0 to turn it
+    # off. Anything but a non-negative integer there is ignored.
+    park_idle_sessions() {
+      _idle=""
+      _store="''${AGENT_BOX_ENVSTORE_BIN:-}"
+      if [ -x "$_store" ]; then
+        _idle="$("$_store" json 2>/dev/null \
+          | "$JQ" -r '.AGENT_BOX_IDLE_HIBERNATE_S // empty' 2>/dev/null)" || _idle=""
+        case "$_idle" in (""|*[!0-9]*) _idle="" ;; esac
+      fi
+      # 10# so "007" is seven, not an octal error; 0 is an explicit "off".
+      if [ -n "$_idle" ]; then
+        _idle=$((10#$_idle))
+        [ "$_idle" -gt 0 ] || return 0
+      fi
+      if [ -n "$_idle" ]; then
+        agent-box-session hibernate --idle "$_idle" >/dev/null 2>&1 || true
+      else
+        agent-box-session hibernate --idle >/dev/null 2>&1 || true
+      fi
+    }
+
     # Park Claude sessions whose Remote Control conversation was archived in the
     # app (#940): the TUI keeps running after the server closes the bridge, so
     # nothing else ever frees the pane. Parked, not removed: `restart` resumes it.
@@ -24756,6 +25028,11 @@ esac
       _arch_tick=$(( ''${_arch_tick:-0} + 1 ))
       if [ $(( _arch_tick % 15 )) -eq 0 ]; then
         park_archived_rc
+      fi
+      # Every ~5 minutes: an idle threshold is hours, and each pass reads
+      # transcripts.
+      if [ $(( _arch_tick % 150 )) -eq 0 ]; then
+        park_idle_sessions
       fi
       sync_codex_threads
       supervise_whatsapp
@@ -24881,9 +25158,27 @@ in
       description = ''
         Minimum age of a hook harness's terminal turn record before a full
         hook budget may hibernate that quiescent hook to admit another one. Zero is
-        useful for tests. This is not an idle reaper: no session is parked
-        while the hook session limit has room. User-created sessions are never
-        hibernated.
+        useful for tests. This does not park anything while the hook session
+        limit has room: see sessionIdleHibernateSeconds for that.
+      '';
+    };
+
+    sessionIdleHibernateSeconds = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        Zero (the default) turns idle hibernation off. A positive value makes
+        the supervisor park, whatever the hook budget, any Claude or Codex
+        session whose last turn closed at least this many seconds ago and
+        that nobody is attached to or has typed into for as long: the
+        runtime exits, its name and native conversation stay recorded, and
+        `agent-box-session restart NAME` (or a routed WhatsApp or webhook
+        message) resumes that same conversation. The usual quiescence checks
+        apply (open turn, unresolved assignment, live webhook subscription,
+        pending WhatsApp message, unknown transcript state). A session with
+        Remote Control enabled is never parked: its mirror in the apps would
+        vanish. A user's env store value AGENT_BOX_IDLE_HIBERNATE_S overrides
+        this (0 turns it off), for users without root on the host.
       '';
     };
 

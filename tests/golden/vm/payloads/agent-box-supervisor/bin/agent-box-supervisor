@@ -2185,6 +2185,21 @@ claude_turn_open() {
   [ "$st" != closed ]
 }
 
+hibernated_marker_take() {
+  # True once, right after a hibernation: the sidecar says the last runtime
+  # was parked on purpose (see mark_hibernated in session-cli.sh). The marker
+  # is cleared as it is read, so a later crash respawn is judged afresh.
+  _f="$(session_state_file "$1")"
+  [ "$($JQ -r '.hibernated // false' "$_f" 2>/dev/null)" = true ] || return 1
+  _t="$(mktemp "$_f.XXXXXX" 2>/dev/null)" || return 0
+  if $JQ 'del(.hibernated)' "$_f" > "$_t" 2>/dev/null && [ -s "$_t" ]; then
+    mv -f "$_t" "$_f" 2>/dev/null || rm -f "$_t"
+  else
+    rm -f "$_t"
+  fi
+  return 0
+}
+
 session_watches_events() {
   # True when $1 held at least one webhook subscription when it died. The
   # filter file outlives the process that wrote it (local-webhook keys it on
@@ -2612,6 +2627,10 @@ start_session() {
   # unfinished work AND lets an already-finished task exit instead of
   # looping — resumePrompt overrides it per session.
   resuming=false; prompt="$ip"
+  woken=false
+  if [ "$hasrun" = true ] && hibernated_marker_take "$sname"; then
+    woken=true
+  fi
   if [ "$hasrun" = true ]; then
     resuming=true
     if [ -n "$rp" ]; then
@@ -2624,6 +2643,7 @@ start_session() {
       prompt="$ip"
     elif { [ "$agent" = claude ] || { [ "$agent" = codex ] \
            && [ -n "$codex_target" ]; }; } \
+         && [ "$woken" = false ] \
          && restart_notice_wanted "$sname" "$bid" "$agent"; then
       # An interrupted session is caught up by --resume but starts no turn of
       # its own, so a session with outstanding work waits forever unless this
@@ -3412,6 +3432,38 @@ reap_ephemeral() {
   fi
 }
 
+# Idle hibernation (sessionIdleHibernateSeconds): free the runtime of sessions
+# nobody has used for a while. `hibernate --idle` does every check and parks
+# one session per call, or exits non-zero (3: the option is off, 1: nothing
+# eligible). One per pass: each call scans transcripts and may wait for the
+# pane to exit, the thresholds are hours and the pass repeats every few
+# minutes, so a backlog drains without ever holding the reconcile loop (and the
+# respawn of a crashed session) for long. A failure never stops the loop.
+#
+# The user's env store (agent-box-session env set AGENT_BOX_IDLE_HIBERNATE_S N,
+# or the settings page) overrides the box's sessionIdleHibernateSeconds, so a
+# user without root on the host can turn it on, tune it, or set 0 to turn it
+# off. Anything but a non-negative integer there is ignored.
+park_idle_sessions() {
+  _idle=""
+  _store="${AGENT_BOX_ENVSTORE_BIN:-}"
+  if [ -x "$_store" ]; then
+    _idle="$("$_store" json 2>/dev/null \
+      | "$JQ" -r '.AGENT_BOX_IDLE_HIBERNATE_S // empty' 2>/dev/null)" || _idle=""
+    case "$_idle" in (""|*[!0-9]*) _idle="" ;; esac
+  fi
+  # 10# so "007" is seven, not an octal error; 0 is an explicit "off".
+  if [ -n "$_idle" ]; then
+    _idle=$((10#$_idle))
+    [ "$_idle" -gt 0 ] || return 0
+  fi
+  if [ -n "$_idle" ]; then
+    agent-box-session hibernate --idle "$_idle" >/dev/null 2>&1 || true
+  else
+    agent-box-session hibernate --idle >/dev/null 2>&1 || true
+  fi
+}
+
 # Park Claude sessions whose Remote Control conversation was archived in the
 # app (#940): the TUI keeps running after the server closes the bridge, so
 # nothing else ever frees the pane. Parked, not removed: `restart` resumes it.
@@ -3456,6 +3508,11 @@ while true; do
   _arch_tick=$(( ${_arch_tick:-0} + 1 ))
   if [ $(( _arch_tick % 15 )) -eq 0 ]; then
     park_archived_rc
+  fi
+  # Every ~5 minutes: an idle threshold is hours, and each pass reads
+  # transcripts.
+  if [ $(( _arch_tick % 150 )) -eq 0 ]; then
+    park_idle_sessions
   fi
   sync_codex_threads
   supervise_whatsapp

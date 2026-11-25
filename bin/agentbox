@@ -755,6 +755,9 @@ BOX_SCHEMA = _Obj({
     "sessionHibernationGraceSeconds": _Scalar(
         "a non-negative integer",
         lambda v: type(v) is int and v >= 0),
+    "sessionIdleHibernateSeconds": _Scalar(
+        "a non-negative integer",
+        lambda v: type(v) is int and v >= 0),
     "schemaVersion": SCHEMA_VERSION,
     "domain": STR,
     # Only consulted when `domain` is being auto-derived from the public IP
@@ -857,6 +860,10 @@ class Spec:
             "sessionHibernationGraceSeconds")
         if self.session_hibernation_grace_seconds is None:
             self.session_hibernation_grace_seconds = 30
+        self.session_idle_hibernate_seconds = data.get(
+            "sessionIdleHibernateSeconds")
+        if self.session_idle_hibernate_seconds is None:
+            self.session_idle_hibernate_seconds = 0
         self.domain = data.get("domain") or ""
         # Default matches the literal that used to be baked into first_boot()
         # (issue #647): an unset domainSuffix derives exactly the sslip.io
@@ -4034,6 +4041,8 @@ class Renderer:
                f"export AGENT_BOX_CAPACITY_BIN={q(f'{self.bin}/agent-box-session-capacity')}\n"
                f"export AGENT_BOX_HIBERNATE_IDLE_S="
                f"{self.spec.session_hibernation_grace_seconds}\n"
+               f"export AGENT_BOX_IDLE_HIBERNATE_S="
+               f"{self.spec.session_idle_hibernate_seconds}\n"
                f"export AGENT_BOX_FLOCK_BIN={q(f'{self.bin}/flock')}\n"
                # The env store's one reader/writer (issue #212): `env
                # ls/set/rm` here and the settings page must agree
