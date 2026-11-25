@@ -2145,6 +2145,19 @@ reap_ephemeral() {
   fi
 }
 
+# Idle hibernation (sessionIdleHibernateSeconds): free the runtime of sessions
+# nobody has used for a while. `hibernate --idle` does every check and parks
+# one session per call, or exits non-zero (3: the option is off, 1: nothing
+# eligible); the cap stops a registry full of eligible sessions from holding
+# a tick for long. A failure never stops the reconcile loop.
+park_idle_sessions() {
+  _i=0
+  while [ "$_i" -lt 8 ]; do
+    agent-box-session hibernate --idle >/dev/null 2>&1 || return 0
+    _i=$((_i + 1))
+  done
+}
+
 # Park Claude sessions whose Remote Control conversation was archived in the
 # app (#940): the TUI keeps running after the server closes the bridge, so
 # nothing else ever frees the pane. Parked, not removed: `restart` resumes it.
@@ -2189,6 +2202,11 @@ while true; do
   _arch_tick=$(( ${_arch_tick:-0} + 1 ))
   if [ $(( _arch_tick % 15 )) -eq 0 ]; then
     park_archived_rc
+  fi
+  # Every ~5 minutes: an idle threshold is hours, and each pass reads
+  # transcripts.
+  if [ $(( _arch_tick % 150 )) -eq 0 ]; then
+    park_idle_sessions
   fi
   sync_codex_threads
   supervise_whatsapp

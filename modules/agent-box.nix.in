@@ -1039,6 +1039,7 @@ let
     # a lock. util-linux is the only package that ships flock.
     export AGENT_BOX_CAPACITY_BIN=${capacityCli}/bin/agent-box-session-capacity
     export AGENT_BOX_HIBERNATE_IDLE_S=${toString cfg.sessionHibernationGraceSeconds}
+    export AGENT_BOX_IDLE_HIBERNATE_S=${toString cfg.sessionIdleHibernateSeconds}
     export AGENT_BOX_FLOCK_BIN=${pkgs.util-linux}/bin/flock
     # Agent profiles (issue #321): `add --profile` resolves the harness and
     # its arguments by shelling out to agent-box-profile, and this CLI runs
@@ -1983,9 +1984,26 @@ in
       description = ''
         Minimum age of a hook harness's terminal turn record before a full
         hook budget may hibernate that quiescent hook to admit another one. Zero is
-        useful for tests. This is not an idle reaper: no session is parked
-        while the hook session limit has room. User-created sessions are never
-        hibernated.
+        useful for tests. This does not park anything while the hook session
+        limit has room: see sessionIdleHibernateSeconds for that.
+      '';
+    };
+
+    sessionIdleHibernateSeconds = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        Zero (the default) turns idle hibernation off. A positive value makes
+        the supervisor park, whatever the hook budget, any Claude or Codex
+        session whose last turn closed at least this many seconds ago and
+        that nobody is attached to or has typed into for as long: the
+        runtime exits, its name and native conversation stay recorded, and
+        `agent-box-session restart NAME` (or a routed WhatsApp or webhook
+        message) resumes that same conversation. The usual quiescence checks
+        apply (open turn, unresolved assignment, live webhook subscription,
+        pending WhatsApp message, unknown transcript state). A session with
+        Remote Control enabled is never parked: its mirror in the apps would
+        vanish.
       '';
     };
 

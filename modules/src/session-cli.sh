@@ -71,7 +71,7 @@ usage() {
   echo "                             [-- EXTRA_ARGS...]"
   echo "       agent-box-session rm [--now] NAME"
   echo "       agent-box-session stop NAME"
-  echo "       agent-box-session hibernate [--exclude NAME...]"
+  echo "       agent-box-session hibernate [--idle [SECONDS]] [--exclude NAME...]"
   echo "       agent-box-session restart NAME | --all"
   echo "       agent-box-session whatsapp candidates | ls | select NAME | activate NAME | wake NAME | clear"
   echo "                             | spawn PROFILE|default | NAME on|off|status"
@@ -123,8 +123,12 @@ usage() {
   echo "removal) instead of dying with the pane. --now removes at once."
   echo "stop parks a session (no respawn; an agent quitting cleanly does the"
   echo "same) until 'restart NAME' revives it; rm delists it for good."
-  echo "hibernate is demand-driven: only at the hook limit, park the oldest"
-  echo "conservatively quiescent resumable hook. User sessions are never hibernated."
+  echo "hibernate parks ONE conservatively quiescent resumable session. By default"
+  echo "that is demand-driven: only at the hook limit, the oldest idle hook."
+  echo "--idle [SECONDS] parks, with no pressure needed, the longest-idle session of"
+  echo "any origin that has been quiet that long and that nobody is attached to or"
+  echo "mirroring in an app (default: sessionIdleHibernateSeconds; exit 3 if that is"
+  echo "0). The supervisor runs it on a timer when that option is positive."
   echo "Attach: tmux -L agent-box attach -t NAME, or the browser terminal /<user>/?arg=NAME"
 }
 # The settings daemon's SESSION_RE bounds a name at NAME_MAX and DROPS what
@@ -244,13 +248,18 @@ hibernate_one() {
   # and issue #748's rule is that no writer holds the shared file lock across
   # that potentially slow subprocess. A second check after the transition,
   # while the old pane still counts live, closes the slot-freed race.
-  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
-    :
-  else
-    return $?
+  # Idle hibernation (`hibernate --idle`) parks because nobody is using the
+  # session, not because a slot is wanted: both pressure gates are skipped.
+  # Everything that proves the session quiet is not.
+  if [ "${HIBERNATE_IDLE:-}" != 1 ]; then
+    if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+      :
+    else
+      return $?
+    fi
+    printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
+      || return 1
   fi
-  printf '%s' "$_capacity" | "$JQ" -e '.used >= .max' >/dev/null 2>&1 \
-    || return 1
 
   registry_lock || return "$REGISTRY_BUSY_RC"
   if _verified="$(AGENT_BOX_HIBERNATE_ASSUME_LIVE="$_name" \
@@ -305,7 +314,9 @@ hibernate_one() {
   # live pane and therefore still counts here; a value below max means some
   # OTHER slot became free while selection was running, so undo without
   # killing anything.
-  if _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
+  if [ "${HIBERNATE_IDLE:-}" = 1 ]; then
+    :
+  elif _capacity="$("$_cap" check "$REGISTRY_FILE")"; then
     if ! printf '%s' "$_capacity" | "$JQ" -e \
         '.used >= .max' >/dev/null 2>&1; then
       _undo_hibernation || return $?
@@ -612,10 +623,38 @@ case "$cmd" in
   hibernate)
     excludes=()
     while [ $# -gt 0 ]; do
-      [ "$1" = --exclude ] && [ $# -ge 2 ] && valid_name "$2" \
-        || { usage >&2; exit 2; }
-      excludes+=("$2")
-      shift 2
+      case "$1" in
+        (--exclude)
+          [ $# -ge 2 ] && valid_name "$2" || { usage >&2; exit 2; }
+          excludes+=("$2")
+          shift 2
+          ;;
+        (--idle)
+          # Park the longest-idle session of ANY origin that has been quiet
+          # for SECONDS, with no slot pressure needed.
+          # SECONDS is optional: without it the box's configured
+          # sessionIdleHibernateSeconds applies, and 0 there means off.
+          case "${2:-}" in
+            ("") shift ;;
+            (--exclude) shift ;;
+            ([1-9]*)
+              case "$2" in (*[!0-9]*) usage >&2; exit 2 ;; esac
+              AGENT_BOX_IDLE_HIBERNATE_S="$2"
+              shift 2
+              ;;
+            (*) usage >&2; exit 2 ;;
+          esac
+          case "${AGENT_BOX_IDLE_HIBERNATE_S:-0}" in
+            (""|*[!0-9]*|0*)
+              echo "idle hibernation is off (sessionIdleHibernateSeconds is 0)" >&2
+              exit 3
+              ;;
+          esac
+          export HIBERNATE_IDLE=1 AGENT_BOX_HIBERNATE_MODE=idle \
+                 AGENT_BOX_IDLE_HIBERNATE_S
+          ;;
+        (*) usage >&2; exit 2 ;;
+      esac
     done
     registry_ensure
     if hibernate_one "${excludes[@]}"; then

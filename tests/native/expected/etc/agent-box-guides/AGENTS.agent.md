@@ -176,13 +176,19 @@ plainly rather than handing it back.
   of physical RAM and overridable by `sessionLimit` in the box configuration.
   Running and pending hooks reserve slots. User-created sessions, including
   manual CLI/UI adds, sign-in and pairing sessions, bypass the cap and are
-  never hibernated. Shell panes do not use a slot either. Restarting a stopped
+  not hibernated under pressure. Shell panes do not use a slot either. Restarting a stopped
   hook needs a free slot; `restart --all` refuses without changing anything if
   its hook starts would exceed the limit. When a new hook is refused at the
   limit, Agentbox may hibernate the oldest conservatively idle Claude or Codex
   hook: its process exits, its stable name and native conversation ID stay
   recorded, and a later routed message resumes that exact conversation through
-  the hook capacity gate. It never hibernates merely because a hook is idle.
+  the hook capacity gate. Nothing is hibernated merely for being idle unless
+  the operator sets `sessionIdleHibernateSeconds` (off by default). With it
+  set to N seconds the supervisor also parks, with `agent-box-session hibernate
+  --idle`, any Claude or Codex session of any origin whose last turn closed N
+  seconds ago, with nobody attached to its pane or typing in it for that long.
+  Wake one with `agent-box-session restart NAME`; a routed WhatsApp or webhook
+  message does it too. A session with Remote Control on is never idle-parked.
   An open turn, unresolved assignment, webhook subscription, pending delivery,
   unknown transcript state, or Claude/Codex Remote Control server remains
   resident. `sessionHibernationGraceSeconds` sets the minimum age of the

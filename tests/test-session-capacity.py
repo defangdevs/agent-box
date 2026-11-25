@@ -492,6 +492,156 @@ class Hibernation(unittest.TestCase):
         self.assertIsNone(capacity.hibernation_candidate(
             {"unknown": {"agent": "claude", "origin": "webhook"}}))
 
+    # --- idle hibernation (AGENT_BOX_HIBERNATE_MODE=idle) -----------------
+    def age(self, path, seconds=3600):
+        old = time.time() - seconds
+        os.utime(path, (old, old))
+
+    def idle_env(self, seconds="60"):
+        patch = mock.patch.dict(os.environ, {
+            "AGENT_BOX_HIBERNATE_MODE": "idle",
+            "AGENT_BOX_IDLE_HIBERNATE_S": seconds})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def quiet_pane(self, attached=0, last=1_000_000_000):
+        patch = mock.patch.object(capacity, "_hibernate_tmux_state",
+                                  return_value=(attached, last))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_idle_mode_parks_a_user_session_that_pressure_mode_never_would(self):
+        sessions, transcript = self.claude()
+        self.age(transcript)
+        sessions["idle"]["origin"] = "user"
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        self.idle_env()
+        self.quiet_pane()
+        selected = capacity.hibernation_candidate(sessions)
+        self.assertEqual(selected["name"], "idle")
+        # Verify and the post-kill quiet check take the same path.
+        verified = capacity.hibernation_candidate(
+            sessions, name="idle", token=selected["token"])
+        self.assertEqual(verified["token"], selected["token"])
+        self.assertIsNotNone(capacity.hibernation_candidate(
+            sessions, name="idle", quiet=selected["quiet"]))
+
+    def test_idle_mode_applies_to_codex_user_sessions(self):
+        launch = "33333333-3333-4333-8333-333333333333"
+        self.state("cx", launch)
+        rollout = (self.home / ".codex/sessions/2026/11/20"
+                   / ("rollout-2026-11-20T00-00-00-%s.jsonl" % launch))
+        rollout.parent.mkdir(parents=True)
+        rollout.write_text(json.dumps({"type": "event_msg", "payload": {
+            "type": "task_complete"}}) + "\n")
+        self.live.write_text("cx\n")
+        self.write_json(".local/state/agent-box/live-session-id/" + launch, launch)
+        (self.home / (".local/state/agent-box/live-session-id/" + launch)
+         ).write_text(launch)
+        self.age(rollout)
+        sessions = {"cx": {"agent": "codex", "origin": "user"}}
+        self.idle_env()
+        self.quiet_pane()
+        self.assertEqual(capacity.hibernation_candidate(sessions)["name"], "cx")
+        sessions["cx"]["remoteControl"] = True
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
+    def test_idle_mode_requires_the_idle_threshold_not_just_the_grace(self):
+        sessions, transcript = self.claude()
+        self.age(transcript)
+        sessions["idle"].pop("origin")
+        self.idle_env(str(10 ** 12))
+        self.quiet_pane()
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+        # Pressure mode of the same hook is unaffected by the idle setting.
+        sessions["idle"]["origin"] = "webhook"
+        patch = mock.patch.dict(os.environ, {"AGENT_BOX_HIBERNATE_MODE": ""})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.assertEqual(capacity.hibernation_candidate(sessions)["name"], "idle")
+
+    def test_idle_mode_leaves_a_session_somebody_is_using_alone(self):
+        sessions, transcript = self.claude()
+        self.age(transcript)
+        sessions["idle"]["origin"] = "user"
+        self.idle_env()
+        for pane in ((1, 1_000_000_000),          # a client is attached
+                     (0, int(time.time()) - 5),   # typed 5s ago
+                     None):                       # tmux cannot say
+            with mock.patch.object(capacity, "_hibernate_tmux_state",
+                                   return_value=pane):
+                self.assertIsNone(capacity.hibernation_candidate(sessions), pane)
+
+    def test_idle_mode_keeps_every_other_quiescence_fence(self):
+        sessions, transcript = self.claude(closed=False)
+        sessions["idle"]["origin"] = "user"
+        self.idle_env()
+        self.quiet_pane()
+        self.assertIsNone(capacity.hibernation_candidate(sessions))  # open turn
+        sessions, transcript = self.claude()
+        self.age(transcript)
+        sessions["idle"]["origin"] = "user"
+        for flag in ({"remoteControl": True}, {"remoteControlServer": True},
+                     {"remoteControlDaemon": True}, {"stopped": True},
+                     {"died": 1}, {"agent": "shell"}):
+            entry = dict(sessions["idle"], **flag)
+            self.assertIsNone(capacity.hibernation_candidate({"idle": entry}), flag)
+        self.write_json("webhook/filter.tester-idle.json", {
+            "enabled": True, "topics": [{"topic": "github:o/r"}]})
+        self.assertIsNone(capacity.hibernation_candidate(sessions))  # live watch
+
+    def test_idle_mode_configuration_errors_are_loud(self):
+        sessions, _ = self.claude()
+        for value in ("", "0", "-1", "soon"):
+            self.idle_env(value)
+            with self.assertRaises(capacity.SessionHibernationError):
+                capacity.hibernation_candidate(sessions)
+        patch = mock.patch.dict(os.environ, {"AGENT_BOX_HIBERNATE_MODE": "always"})
+        patch.start()
+        self.addCleanup(patch.stop)
+        with self.assertRaises(capacity.SessionHibernationError):
+            capacity.hibernation_candidate(sessions)
+
+    def test_one_unreadable_session_does_not_hide_the_others(self):
+        sessions, _ = self.claude()
+        sessions["bad"] = {"agent": "claude", "origin": "webhook"}
+        self.write_json(".local/state/agent-box/session/bad.json", {})
+        (self.home / ".local/state/agent-box/session/bad.json").write_text("{")
+        self.live.write_text("bad\nidle\n")
+        self.assertEqual(capacity.hibernation_candidate(sessions)["name"], "idle")
+
+    def test_expired_subscriptions_do_not_keep_a_session_resident(self):
+        sessions, _ = self.claude()
+        old = "2000-01-01T00:00:00.000Z"
+        fresh = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        cases = [
+            # (filter, parks?)
+            ({"ttlHours": 1, "topics": [{"topic": "github:o/r", "subscribedAt": old}]}, True),
+            ({"ttlHours": 1, "topics": [{"topic": "github:o/r", "subscribedAt": old},
+                                         {"topic": "github:o/s", "subscribedAt": fresh}]}, False),
+            ({"ttlHours": 1, "topics": [{"topic": "github:o/r", "subscribedAt": old,
+                                          "ttlHours": 0}]}, False),       # pinned
+            ({"ttlHours": 0, "topics": [{"topic": "github:o/r", "subscribedAt": old}]}, False),
+            ({"ttlHours": 1, "topics": [{"topic": "github:o/r", "subscribedAt": old,
+                                          "ttlHours": 10 ** 9}]}, False),  # entry ttl wins
+            ({"ttlHours": 1, "topics": [{"topic": "github:o/r"}]}, False),  # no timestamp
+            ({"ttlHours": 1, "topics": [{"topic": "github:o/r",
+                                          "subscribedAt": "garbage"}]}, False),
+            ({"ttlHours": "1", "topics": [{"topic": "github:o/r",
+                                            "subscribedAt": old}]}, False),
+            ({"ttlHours": 1, "topics": ["github:o/r"]}, False),          # not an object
+            ({"ttlHours": 1, "topics": [{"topic": "github:o/r", "subscribedAt": old,
+                                          "ttlHours": True}]}, False),
+            ({"enabled": False, "ttlHours": 1,
+              "topics": [{"topic": "github:o/r", "subscribedAt": fresh}]}, True),
+        ]
+        for value, parks in cases:
+            self.write_json("webhook/filter.tester-idle.json", value)
+            self.assertEqual(capacity.hibernation_candidate(sessions) is not None,
+                             parks, value)
+        (self.home / "webhook/filter.tester-idle.json").write_text("{")
+        self.assertIsNone(capacity.hibernation_candidate(sessions))
+
     def test_ephemeral_hook_is_eligible_but_manual_session_never_is(self):
         sessions, _ = self.claude()
         sessions["idle"]["ephemeral"] = True
@@ -787,6 +937,7 @@ class Cli(unittest.TestCase):
             "    fi\n"
             "    : > \"$TEST_LIVE_FILE\" ;;\n"
             "  has-session) grep -Fx \"${5#=}\" \"$TEST_LIVE_FILE\" >/dev/null ;;\n"
+            "  display-message) echo \"${TEST_PANE:-0 1000000000}\" ;;\n"
             "  *) exit 1 ;;\n"
             "esac\n")
         tmux.chmod(0o755)
@@ -823,6 +974,45 @@ class Cli(unittest.TestCase):
         self.assertNotIn("stopped", entry)
         self.assertNotIn("hibernatedAt", entry)
         self.assertNotIn("hibernationGeneration", entry)
+
+    def test_hibernate_idle_parks_without_pressure_and_is_off_by_default(self):
+        live = self.make_live_claude()
+        old = time.time() - 3600
+        for transcript in (self.work / ".claude/projects/-work").glob("*.jsonl"):
+            os.utime(transcript, (old, old))
+        self.registry.write_text(json.dumps({"version": 1, "sessions": {
+            "idle": {"agent": "claude", "origin": "user", "hasRun": True,
+                     "boxSessionId": "44444444-4444-4444-8444-444444444444"}}}))
+        self.limit.write_text("9\n")
+        # No pressure and no option: nothing happens, and it says why.
+        result = self.run_cli("hibernate", "--idle")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("off", result.stderr)
+        self.assertEqual(live.read_text(), "idle\n")
+        # A pane somebody is attached to is left alone.
+        self.env["TEST_PANE"] = "1 1000000000"
+        self.assertEqual(self.run_cli("hibernate", "--idle", "60").returncode, 1)
+        self.assertEqual(live.read_text(), "idle\n")
+        # Quiet, configured: parked, marker set, and restart revives it.
+        self.env["TEST_PANE"] = "0 1000000000"
+        self.env["AGENT_BOX_IDLE_HIBERNATE_S"] = "60"
+        result = self.run_cli("hibernate", "--idle")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["name"], "idle")
+        entry = json.loads(self.registry.read_text())["sessions"]["idle"]
+        self.assertTrue(entry["stopped"])
+        self.assertTrue(entry["hibernatedAt"])
+        self.assertEqual(live.read_text(), "")
+        self.assertEqual(self.run_cli("hibernate", "--idle").returncode, 1)
+        self.assertEqual(self.run_cli("restart", "idle").returncode, 0)
+        self.assertNotIn("stopped", json.loads(
+            self.registry.read_text())["sessions"]["idle"])
+
+    def test_hibernate_idle_rejects_bad_arguments(self):
+        for args in (("--idle", "0"), ("--idle", "-5"), ("--idle", "9x"),
+                     ("--bogus",)):
+            result = self.run_cli("hibernate", *args)
+            self.assertIn(result.returncode, (2,), (args, result.stderr))
 
     def test_ephemeral_cleanup_keeps_hibernated_hooks_until_explicit_stop(self):
         self.registry.write_text(json.dumps({"version": 1, "sessions": {

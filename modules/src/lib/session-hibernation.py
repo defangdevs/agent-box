@@ -324,7 +324,41 @@ def _hibernate_codex_transcript(name, entry):
     return native, path, state_path
 
 
-def _hibernate_has_watch(name):
+def _hibernate_hours(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if value >= 0 and value == value else None
+
+
+def _hibernate_topic_expired(topic, default_ttl, now):
+    """local-webhook's entry_expired(), and nothing looser.
+
+    The clock runs from subscribedAt only; a per-entry ttlHours beats the
+    file's, and 0 means pinned. Anything this cannot prove expired (a topic
+    that is not an object, no or unparseable subscribedAt, a ttl that is not
+    a number) is live: unknown never permits parking.
+    """
+    if not isinstance(topic, dict):
+        return False
+    ttl = topic.get("ttlHours")
+    ttl = _hibernate_hours(default_ttl if ttl is None else ttl)
+    if not ttl:
+        return False
+    stamp = topic.get("subscribedAt")
+    if not isinstance(stamp, str) or not stamp:
+        return False
+    import datetime as hibernate_datetime
+    try:
+        started = hibernate_datetime.datetime.fromisoformat(
+            stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if started.tzinfo is None:
+        return False
+    return now - started.timestamp() > ttl * 3600
+
+
+def _hibernate_has_watch(name, now=None):
     user = hibernate_os.environ.get("USER") or ""
     state_dir = HibernatePath(hibernate_os.environ.get(
         "LOCAL_WEBHOOK_STATE_DIR",
@@ -339,14 +373,18 @@ def _hibernate_has_watch(name):
     if not isinstance(topics, list):
         return True, path, _hibernate_hash(path)
     enabled = value.get("enabled") is not False
+    now = hibernate_time.time() if now is None else now
     # inbox:<name> is the message router's delivery address for this session.
     # The router wakes the session before every delivery and the bus spools
     # the message while it starts, so that subscription alone is no reason to
     # keep the runtime resident. Anything else, or an unreadable entry, is.
+    # A subscription local-webhook already considers expired no longer routes
+    # events (#884); it only lingers in the file until the next write.
     blocking = [topic for topic in topics
                 if not (isinstance(topic, dict) and isinstance(topic.get("topic"), str)
                         and topic["topic"].startswith("inbox:")
-                        and topic.get("deliverTo", "session") == "session")]
+                        and topic.get("deliverTo", "session") == "session")
+                and not _hibernate_topic_expired(topic, value.get("ttlHours"), now)]
     return enabled and bool(blocking), path, _hibernate_hash(path)
 
 
@@ -407,17 +445,73 @@ def _hibernate_idle_seconds():
     return int(raw)
 
 
-def hibernation_probe(name, entry, live, now=None, parked=False):
+# Idle hibernation (AGENT_BOX_HIBERNATE_MODE=idle) is the second, opt-in way
+# a session is parked: not because a slot is wanted, but because nobody has
+# used it for AGENT_BOX_IDLE_HIBERNATE_S seconds. It reuses every fence of the
+# pressure path (closed turn, no lease, no live subscription, no pending
+# WhatsApp message, exact native identity) and adds the ones an interactive
+# session needs: nobody attached to its pane, no recent keystroke, and no
+# Remote Control mirror whose app view would vanish.
+def _hibernate_idle_mode():
+    mode = hibernate_os.environ.get("AGENT_BOX_HIBERNATE_MODE", "")
+    if mode not in ("", "idle"):
+        raise SessionHibernationError(
+            "AGENT_BOX_HIBERNATE_MODE must be empty or idle")
+    return mode == "idle"
+
+
+def _hibernate_idle_threshold():
+    raw = hibernate_os.environ.get("AGENT_BOX_IDLE_HIBERNATE_S", "")
+    if not raw.isascii() or not raw.isdecimal() or int(raw) <= 0:
+        raise SessionHibernationError(
+            "AGENT_BOX_IDLE_HIBERNATE_S must be a positive integer in idle mode")
+    # Never shorter than the pressure path's own grace period.
+    return max(int(raw), _hibernate_idle_seconds())
+
+
+def _hibernate_tmux_state(name):
+    """(attached clients, last client activity epoch) of a session's pane.
+
+    None means tmux could not say, which is never permission to park.
+    """
+    command = [hibernate_os.environ.get("AGENT_BOX_TMUX_BIN", "tmux"),
+               "-L", hibernate_os.environ.get("AGENT_BOX_TMUX_SOCKET", "agent-box"),
+               "display-message", "-p", "-t", "=" + name + ":",
+               "#{session_attached} #{session_activity}"]
+    env = dict(hibernate_os.environ)
+    if env.get("AGENT_BOX_TMUX_TMPDIR"):
+        env["TMUX_TMPDIR"] = env["AGENT_BOX_TMUX_TMPDIR"]
+    import subprocess as hibernate_subprocess
+    try:
+        proc = hibernate_subprocess.run(command, capture_output=True, text=True,
+                                        timeout=5, check=False, env=env)
+    except (OSError, hibernate_subprocess.TimeoutExpired):
+        return None
+    fields = proc.stdout.split()
+    if proc.returncode != 0 or len(fields) != 2 or not all(
+            field.isascii() and field.isdecimal() for field in fields):
+        return None
+    return int(fields[0]), int(fields[1])
+
+
+def hibernation_probe(name, entry, live, now=None, parked=False, idle=False,
+                      tmux_state=None):
     # parked=True re-probes a session hibernate_one already marked stopped,
-    # so our own marker must not veto it.
+    # so our own marker must not veto it. idle=True widens the pool from
+    # hooks to every Claude/Codex session and swaps the pressure grace for
+    # the idle threshold; see _hibernate_idle_mode.
     if not isinstance(entry, dict) or name not in live:
         return None
     harness = entry.get("agent")
     if harness not in ("claude", "codex"):
         return None
-    if (not capacity_is_hook(name, entry)
+    if ((not idle and not capacity_is_hook(name, entry))
             or (entry.get("stopped") is True and not parked)
             or _hibernate_crashed(entry)):
+        return None
+    if idle and entry.get("remoteControl") is True:
+        # A mirrored Claude TUI or Codex pairing daemon: parking it would
+        # drop the conversation out from under the app that shows it.
         return None
     # These panes own a daemon, not one resumable conversation. Recognize
     # both legacy harness-specific encodings as well as the canonical bit.
@@ -444,8 +538,18 @@ def hibernation_probe(name, entry, live, now=None, parked=False):
     # A parked re-probe (the quiet checks around the kill) skips the age
     # test: the selection already proved the idle time, and an exiting
     # Claude writes its last records just then, which renews the mtime.
-    if not parked and now - idle_since < _hibernate_idle_seconds():
-        return None
+    # The same goes for the pane checks: killing the pane is what changes them.
+    if not parked:
+        threshold = (_hibernate_idle_threshold() if idle
+                     else _hibernate_idle_seconds())
+        if now - idle_since < threshold:
+            return None
+        if idle:
+            pane = (tmux_state or _hibernate_tmux_state)(name)
+            # Somebody is looking at the pane, or typed into it recently
+            # (a half-written prompt is input the transcript cannot see).
+            if pane is None or pane[0] > 0 or now - pane[1] < threshold:
+                return None
     evidence = {
         "name": name,
         "entry": entry,
@@ -500,9 +604,16 @@ def hibernation_candidate(sessions, excludes=(), name=None, token=None,
         except SessionCapacityError as exc:
             raise SessionHibernationError(str(exc)) from exc
     excluded = set(excludes)
+    idle = _hibernate_idle_mode()
+    # Configuration errors are for the caller, not something to swallow
+    # per session below.
+    _hibernate_idle_seconds()
+    if idle:
+        _hibernate_idle_threshold()
     if name is not None:
         entry = sessions.get(name)
-        result = hibernation_probe(name, entry, live, parked=quiet is not None)
+        result = hibernation_probe(name, entry, live, parked=quiet is not None,
+                                   idle=idle)
         if result is None:
             return None
         if quiet is not None:
@@ -514,7 +625,12 @@ def hibernation_candidate(sessions, excludes=(), name=None, token=None,
     for candidate_name, entry in sessions.items():
         if candidate_name in excluded:
             continue
-        result = hibernation_probe(candidate_name, entry, live)
+        try:
+            result = hibernation_probe(candidate_name, entry, live, idle=idle)
+        except SessionHibernationError:
+            # One session with unreadable evidence stays resident and must
+            # not hide the others (#885). Configuration was validated above.
+            continue
         if result is not None:
             candidates.append(result)
     if not candidates:
