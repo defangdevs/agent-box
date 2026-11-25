@@ -101,6 +101,8 @@ EXPORTED = re.compile(r"^\s*export (AGENT_BOX_[A-Z0-9_]+)=", re.MULTILINE)
 INTERNAL = {
     "AGENT_BOX_SESSION_ID": "supervisor tells the session's own hook which "
                             "session it is in",
+    "AGENT_BOX_HIBERNATE_MODE": "`hibernate --idle` hands the idle mode to "
+                                "the capacity helper it spawns",
     "AGENT_BOX_PROFILE": "the session CLI hands the chosen profile to the "
                          "supervisor it spawns",
     "AGENT_BOX_REGISTRY_LOCK_FD": "registry.sh passes its open lock fd down",
